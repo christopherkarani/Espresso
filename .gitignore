@@ -1,0 +1,27 @@
+# Swift / SPM
+.build/
+.swiftpm/
+Package.resolved
+*.xcodeproj
+*.xcworkspace
+DerivedData/
+xcuserdata/
+
+# macOS
+.DS_Store
+._*
+
+# IDE
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Claude Code local settings
+.claude/
+
+# Large model weights (>10MB binaries)
+# Golden test fixtures are tracked; add entries here for actual model weights
+*.gguf
+*.safetensors

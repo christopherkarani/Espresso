@@ -1,0 +1,20 @@
+program(1.3)
+[buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, {"coremlc-version", "3505.4.1"}, {"coremltools-component-milinternal", ""}, {"coremltools-version", "9.0"}})]
+{
+    func main<ios18>(tensor<fp32, [1, 4, 1, 2]> x) {
+        string c_pad_type = const()[name = string("c_pad_type"), val = string("valid")];
+        tensor<int32, [2]> c_strides = const()[name = string("c_strides"), val = tensor<int32, [2]>([1, 1])];
+        tensor<int32, [4]> c_pad = const()[name = string("c_pad"), val = tensor<int32, [4]>([0, 0, 0, 0])];
+        tensor<int32, [2]> c_dilations = const()[name = string("c_dilations"), val = tensor<int32, [2]>([1, 1])];
+        int32 c_groups = const()[name = string("c_groups"), val = int32(1)];
+        string to_fp16 = const()[name = string("to_fp16"), val = string("fp16")];
+        tensor<fp16, [1, 4, 1, 2]> x16 = cast(dtype = to_fp16, x = x)[name = string("cast_in")];
+        tensor<fp16, [6, 4, 1, 1]> W1 = const()[name = string("W1"), val = tensor<fp16, [6, 4, 1, 1]>(BLOBFILE(path = string("@model_path/weights/weight.bin"), offset = uint64(64)))];
+        tensor<fp16, [6, 4, 1, 1]> W3 = const()[name = string("W3"), val = tensor<fp16, [6, 4, 1, 1]>(BLOBFILE(path = string("@model_path/weights/weight.bin"), offset = uint64(176)))];
+        tensor<fp16, [1, 6, 1, 2]> h1 = conv(dilations = c_dilations, groups = c_groups, pad = c_pad, pad_type = c_pad_type, strides = c_strides, weight = W1, x = x16)[name = string("conv_w1")];
+        tensor<fp16, [1, 6, 1, 2]> h3 = conv(dilations = c_dilations, groups = c_groups, pad = c_pad, pad_type = c_pad_type, strides = c_strides, weight = W3, x = x16)[name = string("conv_w3")];
+        string to_fp32 = const()[name = string("to_fp32"), val = string("fp32")];
+        tensor<fp32, [1, 6, 1, 2]> out1 = cast(dtype = to_fp32, x = h1)[name = string("cast_h1")];
+        tensor<fp32, [1, 6, 1, 2]> out3 = cast(dtype = to_fp32, x = h3)[name = string("cast_h3")];
+    } -> (out1, out3);
+}

@@ -1,0 +1,12 @@
+=== Non-causal SDPA (baseline) ===
+compile FAIL: 
+SDPA compile: FAIL
+
+=== Decomposed causal attention ===
+compile FAIL: 
+Q@K^T compile: FAIL
+compile FAIL: 
+scores@V compile: FAIL
+Some kernels failed to compile, aborting
+
+DONE

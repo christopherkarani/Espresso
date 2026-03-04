@@ -1,0 +1,11 @@
+=== Fused QKV vs 3x Separate Convs ===
+DIM=768 SEQ=64
+
+compile FAIL: 
+Fused QKV: FAIL
+compile FAIL: 
+compile FAIL: 
+compile FAIL: 
+Separate Q,K,V: FAIL FAIL FAIL
+
+DONE

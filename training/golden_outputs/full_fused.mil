@@ -1,0 +1,40 @@
+program(1.3)
+[buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, {"coremlc-version", "3505.4.1"}, {"coremltools-component-milinternal", ""}, {"coremltools-version", "9.0"}})]
+{
+    func main<ios18>(tensor<fp16, [1, 768, 1, 64]> x) {
+        string pt = const()[name = string("pt"), val = string("valid")];
+        tensor<int32, [2]> st = const()[name = string("st"), val = tensor<int32, [2]>([1, 1])];
+        tensor<int32, [4]> pd = const()[name = string("pd"), val = tensor<int32, [4]>([0, 0, 0, 0])];
+        tensor<int32, [2]> dl = const()[name = string("dl"), val = tensor<int32, [2]>([1, 1])];
+        int32 gr1 = const()[name = string("g1"), val = int32(1)];
+        tensor<fp16, [768, 768, 1, 1]> Wq = const()[name = string("Wq"), val = tensor<fp16, [768, 768, 1, 1]>(BLOBFILE(path = string("@model_path/weights/wq.bin"), offset = uint64(64)))];
+        tensor<fp16, [768, 768, 1, 1]> Wk = const()[name = string("Wk"), val = tensor<fp16, [768, 768, 1, 1]>(BLOBFILE(path = string("@model_path/weights/wk.bin"), offset = uint64(64)))];
+        tensor<fp16, [768, 768, 1, 1]> Wv = const()[name = string("Wv"), val = tensor<fp16, [768, 768, 1, 1]>(BLOBFILE(path = string("@model_path/weights/wv.bin"), offset = uint64(64)))];
+        tensor<fp16, [768, 768, 1, 1]> Wout = const()[name = string("Wo"), val = tensor<fp16, [768, 768, 1, 1]>(BLOBFILE(path = string("@model_path/weights/wo.bin"), offset = uint64(64)))];
+        tensor<fp16, [1, 768, 1, 64]> q_flat = conv(dilations = dl, groups = gr1, pad = pd, pad_type = pt, strides = st, weight = Wq, x = x)[name = string("cq")];
+        tensor<fp16, [1, 768, 1, 64]> k_flat = conv(dilations = dl, groups = gr1, pad = pd, pad_type = pt, strides = st, weight = Wk, x = x)[name = string("ck")];
+        tensor<fp16, [1, 768, 1, 64]> v_flat = conv(dilations = dl, groups = gr1, pad = pd, pad_type = pt, strides = st, weight = Wv, x = x)[name = string("cv")];
+        tensor<int32, [4]> qsh = const()[name = string("qsh"), val = tensor<int32, [4]>([1, 12, 64, 64])];
+        tensor<fp16, [1, 12, 64, 64]> q_4d = reshape(shape = qsh, x = q_flat)[name = string("rq")];
+        tensor<int32, [4]> perm = const()[name = string("pm"), val = tensor<int32, [4]>([0, 1, 3, 2])];
+        tensor<fp16, [1, 12, 64, 64]> q = transpose(perm = perm, x = q_4d)[name = string("tq")];
+        tensor<fp16, [1, 12, 64, 64]> k_4d = reshape(shape = qsh, x = k_flat)[name = string("rk")];
+        tensor<fp16, [1, 12, 64, 64]> k = transpose(perm = perm, x = k_4d)[name = string("tk")];
+        tensor<fp16, [1, 12, 64, 64]> v_4d = reshape(shape = qsh, x = v_flat)[name = string("rv")];
+        tensor<fp16, [1, 12, 64, 64]> v = transpose(perm = perm, x = v_4d)[name = string("tv")];
+        bool ty = const()[name = string("ty"), val = bool(true)];
+        bool tx = const()[name = string("tx"), val = bool(false)];
+        tensor<fp16, [1, 12, 64, 64]> scores = matmul(transpose_x = tx, transpose_y = ty, x = q, y = k)[name = string("mm1")];
+        fp16 sc = const()[name = string("sc"), val = fp16(0.125000)];
+        tensor<fp16, [1, 12, 64, 64]> scaled = mul(x = scores, y = sc)[name = string("scl")];
+        tensor<fp16, [1, 1, 64, 64]> cmask = const()[name = string("cm"), val = tensor<fp16, [1, 1, 64, 64]>(BLOBFILE(path = string("@model_path/weights/mask.bin"), offset = uint64(64)))];
+        tensor<fp16, [1, 12, 64, 64]> masked = add(x = scaled, y = cmask)[name = string("msk")];
+        int32 sax = const()[name = string("sax"), val = int32(-1)];
+        tensor<fp16, [1, 12, 64, 64]> attn_w = softmax(axis = sax, x = masked)[name = string("sm")];
+        tensor<fp16, [1, 12, 64, 64]> attn_4d = matmul(transpose_x = tx, transpose_y = tx, x = attn_w, y = v)[name = string("mm2")];
+        tensor<fp16, [1, 12, 64, 64]> attn_t = transpose(perm = perm, x = attn_4d)[name = string("ta")];
+        tensor<int32, [4]> osh = const()[name = string("osh"), val = tensor<int32, [4]>([1, 768, 1, 64])];
+        tensor<fp16, [1, 768, 1, 64]> attn_flat = reshape(shape = osh, x = attn_t)[name = string("ra")];
+        tensor<fp16, [1, 768, 1, 64]> out = conv(dilations = dl, groups = gr1, pad = pd, pad_type = pt, strides = st, weight = Wout, x = attn_flat)[name = string("co")];
+    } -> (out);
+}

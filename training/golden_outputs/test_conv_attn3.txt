@@ -1,0 +1,12 @@
+=== Grouped Conv Causal Attention (layout A) ===
+HEADS=12 HD=64 SEQ=64
+
+Compiling Q@K^T (grouped conv, groups=12)...
+compile FAIL: 
+  FAIL
+Compiling scores@V (grouped conv, groups=12)...
+compile FAIL: 
+  FAIL
+FAIL
+
+DONE

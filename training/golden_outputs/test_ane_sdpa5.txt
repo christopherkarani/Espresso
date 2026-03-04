@@ -1,0 +1,13 @@
+Test 1: no mask
+  no-mask: diff_causal=0.725586 diff_nocausal=0.055584 → NON-CAUSAL
+
+Test 2: inline causal mask
+  compile FAIL: _ANECompiler : ANECCompile() FAILED
+
+Test 3: BLOBFILE causal mask
+  blob-mask: diff_causal=0.725586 diff_nocausal=0.055584 → NON-CAUSAL
+
+Test 4: mask as runtime input
+  runtime-mask: eval FAIL: processRequest:model:qos:qIndex:modelStringID:options:returnValue:error:: ANEProgramProcessRequestDirect() Failed with status=0x1d : statusType=0x9: Program Inference error
+
+DONE

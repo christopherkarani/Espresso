@@ -1,0 +1,13 @@
+=== Test 1: Full fused attention (QKV + matmul + softmax + Wo) ===
+  compile FAIL: 
+  Full fused attention FAILED to compile on ANE
+
+=== Test 2: Fused FFN benchmark ===
+  compile FAIL: 
+  FFN: FAIL
+
+=== Summary ===
+Full transformer layer = Attention + FFN
+2 ANE dispatches (+ CPU RMSNorm/residual) for entire forward pass
+
+DONE

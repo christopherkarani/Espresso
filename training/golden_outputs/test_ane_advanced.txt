@@ -1,0 +1,203 @@
+=== ANE Advanced Interface Probe ===
+
+--- Part 1: Event/Sync Classes ---
+
+=== _ANESharedEvents ===
+  Class methods:
+    + new  [@16@0:8]
+    + sharedEventsWithSignalEvents:waitEvents:  [@32@0:8@16@24]
+  Instance methods:
+    - init  [@16@0:8]
+    - description  [@16@0:8]
+    - .cxx_destruct  [v16@0:8]
+    - initWithSignalEvents:waitEvents:  [@32@0:8@16@24]
+    - setSignalEvents:  [v24@0:8@16]
+    - setWaitEvents:  [v24@0:8@16]
+    - signalEvents  [@16@0:8]
+    - waitEvents  [@16@0:8]
+  Properties:
+    @property signalEvents  [T@"NSArray",&,N,V_signalEvents]
+    @property waitEvents  [T@"NSArray",&,N,V_waitEvents]
+
+=== _ANESharedSignalEvent ===
+  Class methods:
+    + supportsSecureCoding  [B16@0:8]
+    + new  [@16@0:8]
+    + signalEventWithValue:symbolIndex:eventType:sharedEvent:  [@44@0:8Q16I24q28@36]
+  Instance methods:
+    - eventType  [q16@0:8]
+    - setValue:  [v24@0:8Q16]
+    - value  [Q16@0:8]
+    - encodeWithCoder:  [v24@0:8@16]
+    - init  [@16@0:8]
+    - description  [@16@0:8]
+    - initWithCoder:  [@24@0:8@16]
+    - sharedEvent  [@16@0:8]
+    - .cxx_destruct  [v16@0:8]
+    - agentMask  [Q16@0:8]
+    - initWithValue:symbolIndex:eventType:sharedEvent:agentMask:  [@52@0:8Q16I24q28@36Q44]
+    - setAgentMask:  [v24@0:8Q16]
+    - symbolIndex  [I16@0:8]
+    - waitEvent  [@16@0:8]
+  Properties:
+    @property sharedEvent  [T@"IOSurfaceSharedEvent",R,N,V_sharedEvent]
+    @property value  [TQ,N,V_value]
+    @property symbolIndex  [TI,R,N,V_symbolIndex]
+    @property agentMask  [TQ,N,V_agentMask]
+    @property eventType  [Tq,R,N,V_eventType]
+
+=== _ANESharedWaitEvent ===
+  Class methods:
+    + new  [@16@0:8]
+    + waitEventWithValue:sharedEvent:  [@32@0:8Q16@24]
+    + waitEventWithValue:sharedEvent:eventType:  [@40@0:8Q16@24Q32]
+  Instance methods:
+    - eventType  [Q16@0:8]
+    - setValue:  [v24@0:8Q16]
+    - value  [Q16@0:8]
+    - init  [@16@0:8]
+    - description  [@16@0:8]
+    - sharedEvent  [@16@0:8]
+    - .cxx_destruct  [v16@0:8]
+    - initWithValue:sharedEvent:eventType:  [@40@0:8Q16@24Q32]
+  Properties:
+    @property sharedEvent  [T@"IOSurfaceSharedEvent",R,N,V_sharedEvent]
+    @property value  [TQ,N,V_value]
+    @property eventType  [TQ,R,N,V_eventType]
+  _ANEEvent: NOT FOUND
+  _ANEFenceEvent: NOT FOUND
+  _ANESharedEvents alloc/init: nil
+  _ANESharedSignalEvent alloc/init: nil
+  _ANESharedWaitEvent alloc/init: nil
+
+--- Part 2: VirtualClient / ChainingRequest ---
+
+=== _ANEVirtualClient ===
+  Class methods:
+    + updateError:errorLength:error:  [B40@0:8^{__IOSurface=}16Q24^@32]
+    + updateError:errorLength:errorCode:error:  [B48@0:8^{__IOSurface=}16Q24q32^@40]
+    + copyDictionaryDataToStruct:dictionary:  [v32@0:8^{VirtANEModel=IqIIIIQQQQ[32I][32Q][32I][32Q]QQQcCIQIIIQIIQIQ[64I][64I][64I][64I]IQQ[64I][64I]IIIIIIQqIIQIQIQIQIQIQIQ}16^{__CFDictionary=}24]
+    + dictionaryGetUInt32ForKey:key:  [I32@0:8^{__CFDictionary=}16^{__CFString=}24]
+    + shouldUsePrecompiledPath:options:shouldUseChunking:chunkingThreshold:  [B48@0:8@16@24^B32Q40]
+    + new  [@16@0:8]
+    + getCodeSigningIdentity  [@16@0:8]
+    + dictionaryGetInt8ForKey:key:  [c32@0:8^{__CFDictionary=}16^{__CFString=}24]
+    + freeModelFileIOSurfaces:  [v24@0:8^{__CFArray=}16]
+    + getDictionaryWithJSONEncodingFromIOSurface:withArchivedDataSize:  [@32@0:8^{__IOSurface=}16Q24]
+    + printStruct:  [v24@0:8^{VirtANEModel=IqIIIIQQQQ[32I][32Q][32I][32Q]QQQcCIQIIIQIIQIQ[64I][64I][64I][64I]IQQ[64I][64I]IIIIIIQqIIQIQIQIQIQIQIQ}16]
+    + getCFDictionaryFromIOSurface:dataLength:  [^{__CFDictionary=}32@0:8^{__IOSurface=}16Q24]
+    + sharedConnection  [@16@0:8]
+    + updatePerformanceStats:performanceStatsLength:perfStatsRawIOSurfaceRef:performanceStatsRawLength:hwExecutionTime:  [@56@0:8^{__IOSurface=}16Q24^{__IOSurface=}32Q40Q48]
+    + dictionaryGetNSStringForKey:key:  [@32@0:8^{__CFDictionary=}16^{__CFString=}24]
+    + copyLLIRBundleToIOSurface:writtenDataSize:  [^{__IOSurface=}32@0:8@16^Q24]
+    + dictionaryGetInt64ForKey:key:  [q32@0:8^{__CFDictionary=}16^{__CFString=}24]
+    + getObjectFromIOSurface:classType:length:  [@40@0:8^{__IOSurface=}16#24Q32]
+    + dictionaryGetUInt64ForKey:key:  [Q32@0:8^{__CFDictionary=}16^{__CFString=}24]
+    + setCodeSigningIdentity:  [B24@0:8^{__CFDictionary=}16]
+    + createIOSurface:ioSID:  [^{__IOSurface=}32@0:8Q16^I24]
+    + printIOSurfaceDataInBytes:  [v24@0:8^{__IOSurface=}16]
+  Instance methods:
+    - isInternalBuild  [B16@0:8]
+    - validateNetworkCreate:uuid:function:directoryPath:scratchPadPath:milTextData:  [^{__CFDictionary=}64@0:8Q16@24@32@40@48@56]
+    - hasANE  [B16@0:8]
+    - doEvaluateWithModelLegacy:options:request:qos:completionEvent:error:  [B60@0:8@16@24@32I40@44^@52]
+    - copyModelOptionFiles:options:vmData:  [v40@0:8@16@24^{VMData=^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}[32^{__IOSurface}][32^{__IOSurface}]{VirtANEModel=IqIIIIQQQQ[32I][32Q][32I][32Q]QQQcCIQIIIQIIQIQ[64I][64I][64I][64I]IQQ[64I][64I]IIIIIIQqIIQIQIQIQIQIQIQ}{VirtANEModel=IqIIIIQQQQ[32I][32Q][32I][32Q]QQQcCIQIIIQIIQIQ[64I][64I][64I][64I]IQQ[64I][64I]IIIIIIQqIIQIQIQIQIQIQIQ}^{__IOSurface}^{__IOSurface}}32]
+    - purgeCompiledModel:  [v24@0:8@16]
+    - compileModel:options:qos:error:  [B44@0:8@16@24I32^@36]
+    - callIOUserClient:inParams:outParams:  [B36@0:8I16^{VirtANEModel=IqIIIIQQQQ[32I][32Q][32I][32Q]QQQcCIQIIIQIIQIQ[64I][64I][64I][64I]IQQ[64I][64I]IIIIIIQqIIQIQIQIQIQIQIQ}20^{VirtANEModel=IqIIIIQQQQ[32I][32Q][32I][32Q]QQQcCIQIIIQIIQIQ[64I][64I][64I][64I]IQQ[64I][64I]IIIIIIQqIIQIQIQIQIQIQIQ}28]
+    - copyToIOSurface:length:ioSID:  [^{__IOSurface=}40@0:8@16Q24^I32]
+    - copyToIOSurface:size:ioSID:  [^{__IOSurface=}40@0:8*16Q24^I32]
+    - releaseIOSurfaces:  [v24@0:8^{VMData=^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}[32^{__IOSurface}][32^{__IOSurface}]{VirtANEModel=IqIIIIQQQQ[32I][32Q][32I][32Q]QQQcCIQIIIQIIQIQ[64I][64I][64I][64I]IQQ[64I][64I]IIIIIIQqIIQIQIQIQIQIQIQ}{VirtANEModel=IqIIIIQQQQ[32I][32Q][32I][32Q]QQQcCIQIIIQIIQIQ[64I][64I][64I][64I]IQQ[64I][64I]IIIIIIQqIIQIQIQIQIQIQIQ}^{__IOSurface}^{__IOSurface}}16]
+    - dealloc  [v16@0:8]
+    - numANECores  [I16@0:8]
+    - sendGuestBuildVersion  [v16@0:8]
+    - loadModelNewInstance:options:modelInstParams:qos:error:  [B52@0:8@16@24@32I40^@44]
+    - getDeviceInfo  [{DeviceExtendedInfo={DeviceInfo=IqqB}BII[32c]}16@0:8]
+    - compiledModelExistsMatchingHash:  [B24@0:8@16]
+    - sessionHintWithModel:hint:options:report:error:  [B56@0:8@16@24@32@40^@48]
+    - transferFileToHostWithPath:withChunkSize:withUUID:withModelInputPath:overWriteFileNameWith:  [B52@0:8@16I24@28@36@44]
+    - printDictionary:  [v24@0:8^{__CFDictionary=}16]
+    - numANEs  [I16@0:8]
+    - copyErrorValue:  [v24@0:8^{VMData=^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}[32^{__IOSurface}][32^{__IOSurface}]{VirtANEModel=IqIIIIQQQQ[32I][32Q][32I][32Q]QQQcCIQIIIQIIQIQ[64I][64I][64I][64I]IQQ[64I][64I]IIIIIIQqIIQIQIQIQIQIQIQ}{VirtANEModel=IqIIIIQQQQ[32I][32Q][32I][32Q]QQQcCIQIIIQIIQIQ[64I][64I][64I][64I]IQQ[64I][64I]IIIIIIQqIIQIQIQIQIQIQIQ}^{__IOSurface}^{__IOSurface}}16]
+    - aneBoardtype  [q16@0:8]
+    - copyErrorValue:vmData:  [v32@0:8^{__CFDictionary=}16^{VMData=^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}[32^{__IOSurface}][32^{__IOSurface}]{VirtANEModel=IqIIIIQQQQ[32I][32Q][32I][32Q]QQQcCIQIIIQIIQIQ[64I][64I][64I][64I]IQQ[64I][64I]IIIIIIQqIIQIQIQIQIQIQIQ}{VirtANEModel=IqIIIIQQQQ[32I][32Q][32I][32Q]QQQcCIQIIIQIIQIQ[64I][64I][64I][64I]IQQ[64I][64I]IIIIIIQqIIQIQIQIQIQIQIQ}^{__IOSurface}^{__IOSurface}}24]
+    - exchangeBuildVersionInfo  [{BuildVersionInfo=IIQ[32C]CQQ[15Q]}16@0:8]
+    - getValidateNetworkVersion  [Q16@0:8]
+    - doMapIOSurfacesWithModel:request:cacheInference:error:  [B44@0:8@16@24B32^@36]
+    - validateNetworkCreateMLIR:validation_params:  [^{__CFDictionary=}32@0:8Q16^{__CFDictionary=}24]
+    - updateError:error:  [B32@0:8^{VMData=^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}[32^{__IOSurface}][32^{__IOSurface}]{VirtANEModel=IqIIIIQQQQ[32I][32Q][32I][32Q]QQQcCIQIIIQIIQIQ[64I][64I][64I][64I]IQQ[64I][64I]IIIIIIQqIIQIQIQIQIQIQIQ}{VirtANEModel=IqIIIIQQQQ[32I][32Q][32I][32Q]QQQcCIQIIIQIIQIQ[64I][64I][64I][64I]IQQ[64I][64I]IIIIIIQqIIQIQIQIQIQIQIQ}^{__IOSurface}^{__IOSurface}}16^@24]
+    - init  [@16@0:8]
+    - endRealTimeTask  [B16@0:8]
+    - echo:  [B24@0:8@16]
+    - negotiatedDataInterfaceVersion  [I16@0:8]
+    - aneArchitectureTypeStr  [@16@0:8]
+    - doEvaluateWithModel:options:request:qos:completionEvent:error:  [B60@0:8@16@24@32I40@44^@52]
+    - copyDictionaryToIOSurface:copiedDataSize:createdIOSID:  [^{__IOSurface=}40@0:8@16^Q24^I32]
+    - loadModelNewInstanceLegacy:options:modelInstParams:qos:error:  [B52@0:8@16@24@32I40^@44]
+    - outputDictIOSurfaceSize  [Q16@0:8]
+    - queue  [@16@0:8]
+    - doJsonParsingMatchWeightName:  [@24@0:8@16]
+    - unloadModel:options:qos:error:  [B44@0:8@16@24I32^@36]
+    - copyModelOptionFiles:options:dictionary:vmData:  [v48@0:8@16@24^{__CFDictionary=}32^{VMData=^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}[32^{__IOSurface}][32^{__IOSurface}]{VirtANEModel=IqIIIIQQQQ[32I][32Q][32I][32Q]QQQcCIQIIIQIIQIQ[64I][64I][64I][64I]IQQ[64I][64I]IIIIIIQqIIQIQIQIQIQIQIQ}{VirtANEModel=IqIIIIQQQQ[32I][32Q][32I][32Q]QQQcCIQIIIQIIQIQ[64I][64I][64I][64I]IQQ[64I][64I]IIIIIIQqIIQIQIQIQIQIQIQ}^{__IOSurface}^{__IOSurface}}40]
+    - copyModelMetaData:options:dictionary:vmData:  [v48@0:8@16@24^{__CFDictionary=}32^{VMData=^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}[32^{__IOSurface}][32^{__IOSurface}]{VirtANEModel=IqIIIIQQQQ[32I][32Q][32I][32Q]QQQcCIQIIIQIIQIQ[64I][64I][64I][64I]IQQ[64I][64I]IIIIIIQqIIQIQIQIQIQIQIQ}{VirtANEModel=IqIIIIQQQQ[32I][32Q][32I][32Q]QQQcCIQIIIQIIQIQ[64I][64I][64I][64I]IQQ[64I][64I]IIIIIIQqIIQIQIQIQIQIQIQ}^{__IOSurface}^{__IOSurface}}40]
+    - loadModel:options:qos:error:  [B44@0:8@16@24I32^@36]
+    - copyFilesInDirectoryToIOSurfaces:ioSurfaceRefs:ioSurfaceSizes:fileNames:  [B48@0:8@16^{__CFArray=}24@32@40]
+    - checkKernReturnValue:selector:outParams:  [v32@0:8i16I20^{VirtANEModel=IqIIIIQQQQ[32I][32Q][32I][32Q]QQQcCIQIIIQIIQIQ[64I][64I][64I][64I]IQQ[64I][64I]IIIIIIQqIIQIQIQIQIQIQIQ}24]
+    - readWeightFilename:  [@24@0:8@16]
+    - initWithSingletonAccess  [@16@0:8]
+    - evaluateWithModel:options:request:qos:error:  [B52@0:8@16@24@32I40^@44]
+    - callIOUserClientWithDictionary:inDictionary:error:  [^{__CFDictionary=}36@0:8I16^{__CFDictionary=}20^@28]
+    - copyOptions:dictionary:vmData:  [v40@0:8@16^{__CFDictionary=}24^{VMData=^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}[32^{__IOSurface}][32^{__IOSurface}]{VirtANEModel=IqIIIIQQQQ[32I][32Q][32I][32Q]QQQcCIQIIIQIIQIQ[64I][64I][64I][64I]IQQ[64I][64I]IIIIIIQqIIQIQIQIQIQIQIQ}{VirtANEModel=IqIIIIQQQQ[32I][32Q][32I][32Q]QQQcCIQIIIQIIQIQ[64I][64I][64I][64I]IQQ[64I][64I]IIIIIIQqIIQIQIQIQIQIQIQ}^{__IOSurface}^{__IOSurface}}32]
+    - copyAllModelFiles:dictionary:ioSurfaceRefs:  [B40@0:8@16^{__CFDictionary=}24^{__CFArray=}32]
+    - connect  [I16@0:8]
+    - parallelDecompressedData:  [@24@0:8@16]
+    - updatePerformanceStats:  [@24@0:8^{VMData=^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}[32^{__IOSurface}][32^{__IOSurface}]{VirtANEModel=IqIIIIQQQQ[32I][32Q][32I][32Q]QQQcCIQIIIQIIQIQ[64I][64I][64I][64I]IQQ[64I][64I]IIIIIIQqIIQIQIQIQIQIQIQ}{VirtANEModel=IqIIIIQQQQ[32I][32Q][32I][32Q]QQQcCIQIIIQIIQIQ[64I][64I][64I][64I]IQQ[64I][64I]IIIIIIQqIIQIQIQIQIQIQIQ}^{__IOSurface}^{__IOSurface}}16]
+    - beginRealTimeTask  [B16@0:8]
+    - mapIOSurfacesWithModel:request:cacheInference:error:  [B44@0:8@16@24B32^@36]
+    - purgeCompiledModelMatchingHash:  [v24@0:8@16]
+    - getModelAttribute:  [@24@0:8^{VMData=^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}[32^{__IOSurface}][32^{__IOSurface}]{VirtANEModel=IqIIIIQQQQ[32I][32Q][32I][32Q]QQQcCIQIIIQIIQIQ[64I][64I][64I][64I]IQQ[64I][64I]IIIIIIQqIIQIQIQIQIQIQIQ}{VirtANEModel=IqIIIIQQQQ[32I][32Q][32I][32Q]QQQcCIQIIIQIIQIQ[64I][64I][64I][64I]IQQ[64I][64I]IIIIIIQqIIQIQIQIQIQIQIQ}^{__IOSurface}^{__IOSurface}}16]
+    - negotiatedCapabilityMask  [Q16@0:8]
+    - hostBuildVersionStr  [@16@0:8]
+    - validateEnvironmentForPrecompiledBinarySupport  [B16@0:8]
+    - copyOptions:vmData:  [v32@0:8@16^{VMData=^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}[32^{__IOSurface}][32^{__IOSurface}]{VirtANEModel=IqIIIIQQQQ[32I][32Q][32I][32Q]QQQcCIQIIIQIIQIQ[64I][64I][64I][64I]IQQ[64I][64I]IIIIIIQqIIQIQIQIQIQIQIQ}{VirtANEModel=IqIIIIQQQQ[32I][32Q][32I][32Q]QQQcCIQIIIQIIQIQ[64I][64I][64I][64I]IQQ[64I][64I]IIIIIIQqIIQIQIQIQIQIQIQ}^{__IOSurface}^{__IOSurface}}24]
+    - .cxx_destruct  [v16@0:8]
+    - copyModel:options:vmData:  [v40@0:8@16@24^{VMData=^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}^{__IOSurface}[32^{__IOSurface}][32^{__IOSurface}]{VirtANEModel=IqIIIIQQQQ[32I][32Q][32I][32Q]QQQcCIQIIIQIIQIQ[64I][64I][64I][64I]IQQ[64I][64I]IIIIIIQqIIQIQIQIQIQIQIQ}{VirtANEModel=IqIIIIQQQQ[32I][32Q][32I][32Q]QQQcCIQIIIQIIQIQ[64I][64I][64I][64I]IQQ[64I][64I]IIIIIIQqIIQIQIQIQIQIQIQ}^{__IOSurface}^{__IOSurface}}32]
+    - compiledModelExistsFor:  [B24@0:8@16]
+  Properties:
+    @property connect  [TI,R,N,V_connect]
+    @property queue  [T@"NSObject<OS_dispatch_queue>",R,N,V_queue]
+
+=== _ANEChainingRequest ===
+  Class methods:
+    + supportsSecureCoding  [B16@0:8]
+    + chainingRequestWithInputs:outputSets:lbInputSymbolId:lbOutputSymbolId:procedureIndex:signalEvents:transactionHandle:fwEnqueueDelay:memoryPoolId:  [@88@0:8@16@24@32@40@48@56@64@72@80]
+  Instance methods:
+    - validate  [B16@0:8]
+    - encodeWithCoder:  [v24@0:8@16]
+    - description  [@16@0:8]
+    - initWithCoder:  [@24@0:8@16]
+    - .cxx_destruct  [v16@0:8]
+    - memoryPoolId  [@16@0:8]
+    - procedureIndex  [@16@0:8]
+    - fwEnqueueDelay  [@16@0:8]
+    - initWithInputs:outputs:lbInputSymbolId:lbOutputSymbolId:procedureIndex:signalEvents:transactionHandle:fwEnqueueDelay:memoryPoolId:  [@88@0:8@16@24@32@40@48@56@64@72@80]
+    - inputBuffer  [@16@0:8]
+    - loopbackInputSymbolIndex  [@16@0:8]
+    - loopbackOutputSymbolIndex  [@16@0:8]
+    - outputSets  [@16@0:8]
+    - signalEvents  [@16@0:8]
+    - transactionHandle  [@16@0:8]
+  Properties:
+    @property inputBuffer  [T@"NSArray",R,N,V_inputBuffer]
+    @property outputSets  [T@"NSArray",R,N,V_outputSets]
+    @property loopbackInputSymbolIndex  [T@"NSArray",R,N,V_loopbackInputSymbolIndex]
+    @property loopbackOutputSymbolIndex  [T@"NSArray",R,N,V_loopbackOutputSymbolIndex]
+    @property signalEvents  [T@"NSArray",R,N,V_signalEvents]
+    @property transactionHandle  [T@"NSNumber",R,N,V_transactionHandle]
+    @property procedureIndex  [T@"NSNumber",R,N,V_procedureIndex]
+    @property fwEnqueueDelay  [T@"NSNumber",R,N,V_fwEnqueueDelay]
+    @property memoryPoolId  [T@"NSNumber",R,N,V_memoryPoolId]
+  _ANEMultiRequest: NOT FOUND
+  _ANEBatchRequest: NOT FOUND
+
+--- Part 3: weightsBuffer IOSurface test ---

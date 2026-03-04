@@ -1,0 +1,23 @@
+program(1.3)
+[buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, {"coremlc-version", "3505.4.1"}, {"coremltools-component-milinternal", ""}, {"coremltools-version", "9.0"}})]
+{
+    func main<ios18>(tensor<fp32, [1, 4, 1, 2]> x) {
+        string c_pad_type = const()[name = string("c_pad_type"), val = string("valid")];
+        tensor<int32, [2]> c_strides = const()[name = string("c_strides"), val = tensor<int32, [2]>([1, 1])];
+        tensor<int32, [4]> c_pad = const()[name = string("c_pad"), val = tensor<int32, [4]>([0, 0, 0, 0])];
+        tensor<int32, [2]> c_dilations = const()[name = string("c_dilations"), val = tensor<int32, [2]>([1, 1])];
+        int32 c_groups = const()[name = string("c_groups"), val = int32(1)];
+        string to_fp16 = const()[name = string("to_fp16"), val = string("fp16")];
+        tensor<fp16, [1, 4, 1, 2]> x16 = cast(dtype = to_fp16, x = x)[name = string("cast_in")];
+        tensor<fp16, [4, 4, 1, 1]> Wq = const()[name = string("Wq"), val = tensor<fp16, [4, 4, 1, 1]>(BLOBFILE(path = string("@model_path/weights/weight.bin"), offset = uint64(64)))];
+        tensor<fp16, [4, 4, 1, 1]> Wk = const()[name = string("Wk"), val = tensor<fp16, [4, 4, 1, 1]>(BLOBFILE(path = string("@model_path/weights/weight.bin"), offset = uint64(160)))];
+        tensor<fp16, [4, 4, 1, 1]> Wv = const()[name = string("Wv"), val = tensor<fp16, [4, 4, 1, 1]>(BLOBFILE(path = string("@model_path/weights/weight.bin"), offset = uint64(256)))];
+        tensor<fp16, [1, 4, 1, 2]> q16 = conv(dilations = c_dilations, groups = c_groups, pad = c_pad, pad_type = c_pad_type, strides = c_strides, weight = Wq, x = x16)[name = string("conv_q")];
+        tensor<fp16, [1, 4, 1, 2]> k16 = conv(dilations = c_dilations, groups = c_groups, pad = c_pad, pad_type = c_pad_type, strides = c_strides, weight = Wk, x = x16)[name = string("conv_k")];
+        tensor<fp16, [1, 4, 1, 2]> v16 = conv(dilations = c_dilations, groups = c_groups, pad = c_pad, pad_type = c_pad_type, strides = c_strides, weight = Wv, x = x16)[name = string("conv_v")];
+        string to_fp32 = const()[name = string("to_fp32"), val = string("fp32")];
+        tensor<fp32, [1, 4, 1, 2]> q = cast(dtype = to_fp32, x = q16)[name = string("cast_q")];
+        tensor<fp32, [1, 4, 1, 2]> k = cast(dtype = to_fp32, x = k16)[name = string("cast_k")];
+        tensor<fp32, [1, 4, 1, 2]> v = cast(dtype = to_fp32, x = v16)[name = string("cast_v")];
+    } -> (q, k, v);
+}

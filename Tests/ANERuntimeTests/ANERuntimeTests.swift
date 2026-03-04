@@ -1,0 +1,1264 @@
+import XCTest
+import Foundation
+import Darwin
+@testable import ANERuntime
+import ANEInterop
+import MILGenerator
+import ANETypes
+import IOSurface
+
+private let identityChannels = 4
+private let identitySpatial = 8
+private let identityElementCount = identityChannels * identitySpatial
+private let identityInputBytes = identityElementCount * MemoryLayout<UInt16>.stride
+private let identityOutputBytes = identityInputBytes
+private let identityWeightPath = "@model_path/weights/weight.bin"
+
+private let fwdAttnInputBytes = 393_216
+private let fwdAttnOutputBytes = 2_359_296
+private let fwdFFNInputBytes = 393_216
+private let fwdFFNOutputBytes = 3_932_160
+private let ffnBwdInputBytes = 2_490_368
+private let ffnBwdOutputBytes = 2_490_368
+private let sdpaBwd1InputBytes = 1_572_864
+private let sdpaBwd1OutputBytes = 3_538_944
+private let sdpaBwd2InputBytes = 3_932_160
+private let sdpaBwd2OutputBytes = 786_432
+private let qkvBwdInputBytes = 1_179_648
+private let qkvBwdOutputBytes = 393_216
+private let sdpaBwd2InputChannels = 2 * ModelConfig.scoreCh + 2 * ModelConfig.dim
+private let sdpaBwd2OutputChannels = 2 * ModelConfig.dim
+private let sdpaSpatial = ModelConfig.seqLen
+
+private func fillTensor(_ buffer: borrowing TensorBuffer, value: Float) {
+    buffer.withUnsafeMutableBufferPointer { ptr in
+        guard let base = ptr.baseAddress else { return }
+        for i in 0..<ptr.count {
+            base[i] = value
+        }
+    }
+}
+
+private func fillLayerWeights(_ weights: borrowing LayerWeights, value: Float) {
+    fillTensor(weights.Wq, value: value)
+    fillTensor(weights.Wk, value: value)
+    fillTensor(weights.Wv, value: value)
+    fillTensor(weights.Wo, value: value)
+    fillTensor(weights.W1, value: value)
+    fillTensor(weights.W2, value: value)
+    fillTensor(weights.W3, value: value)
+    fillTensor(weights.rmsAtt, value: value)
+    fillTensor(weights.rmsFfn, value: value)
+}
+
+private func makeTempBinaryPath(prefix: String) -> String {
+    let fileName = "\(prefix)-\(UUID().uuidString).bin"
+    return FileManager.default.temporaryDirectory.appendingPathComponent(fileName).path
+}
+
+private func llamaHeaderData(
+    dim: Int32,
+    hiddenDim: Int32,
+    nLayers: Int32,
+    nHeads: Int32,
+    nKvHeads: Int32,
+    vocabSize: Int32,
+    seqLen: Int32
+) -> Data {
+    var fields: [Int32] = [dim, hiddenDim, nLayers, nHeads, nKvHeads, vocabSize, seqLen]
+    for i in fields.indices {
+        fields[i] = fields[i].littleEndian
+    }
+    return fields.withUnsafeBytes { raw in
+        Data(raw)
+    }
+}
+
+private func hasNonZeroElement(_ buffer: borrowing TensorBuffer) -> Bool {
+    buffer.withUnsafeBufferPointer { ptr in
+        ptr.contains(where: { $0 != 0 })
+    }
+}
+
+private func storiesModelPath() -> String? {
+    if let envPath = ProcessInfo.processInfo.environment["STORIES_MODEL_PATH"], !envPath.isEmpty,
+       FileManager.default.fileExists(atPath: envPath) {
+        return envPath
+    }
+
+    let repoRoot = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+    let candidates = [
+        repoRoot.appendingPathComponent("assets/models/stories110M.bin").path,
+        repoRoot.appendingPathComponent("training/../../assets/models/stories110M.bin")
+            .standardizedFileURL.path,
+    ]
+
+    for candidate in candidates where FileManager.default.fileExists(atPath: candidate) {
+        return candidate
+    }
+    return nil
+}
+
+/// Skip if ANE runtime is unavailable.
+private func requireANEAvailable(file: StaticString = #filePath, line: UInt = #line) throws {
+    let handle = dlopen(
+        "/System/Library/PrivateFrameworks/AppleNeuralEngine.framework/AppleNeuralEngine",
+        RTLD_NOW
+    )
+    if handle == nil {
+        throw XCTSkip("AppleNeuralEngine.framework unavailable", file: file, line: line)
+    }
+    dlclose(handle)
+
+    let requiredClasses = [
+        "_ANEInMemoryModelDescriptor",
+        "_ANEInMemoryModel",
+        "_ANERequest",
+        "_ANEIOSurfaceObject",
+    ]
+    for c in requiredClasses where NSClassFromString(c) == nil {
+        throw XCTSkip("ANE private class missing: \(c)", file: file, line: line)
+    }
+
+    ane_interop_init()
+}
+
+/// Skip tests that require ANE hardware unless ANE_HARDWARE_TESTS=1.
+private func requireANEHardwareTestsEnabled(file: StaticString = #filePath, line: UInt = #line) throws {
+    guard ProcessInfo.processInfo.environment["ANE_HARDWARE_TESTS"] == "1" else {
+        throw XCTSkip("Set ANE_HARDWARE_TESTS=1 to run ANE hardware tests", file: file, line: line)
+    }
+    try requireANEAvailable(file: file, line: line)
+}
+
+private func requireObjCCrossValidation(file: StaticString = #filePath, line: UInt = #line) throws {
+    guard ProcessInfo.processInfo.environment["OBJC_CROSS_VALIDATION"] == "1" else {
+        throw XCTSkip("ObjC cross-validation test (set OBJC_CROSS_VALIDATION=1)", file: file, line: line)
+    }
+}
+
+private func probeANEEvalWithInterop() -> Bool {
+    ane_interop_init()
+
+    let savedCompileCount = ane_interop_compile_count()
+    defer { ane_interop_set_compile_count(savedCompileCount) }
+
+    let mil = GenericMIL.conv(inCh: identityChannels, outCh: identityChannels, spatial: identitySpatial)
+    guard let milData = mil.data(using: .utf8), !milData.isEmpty else {
+        return false
+    }
+
+    let weightBlob = makeIdentityWeightBlob(channels: identityChannels)
+    var inputSize = identityInputBytes
+    var outputSize = identityOutputBytes
+
+    let handle: OpaquePointer? = milData.withUnsafeBytes { milRaw in
+        let milBuf = milRaw.bindMemory(to: UInt8.self)
+        guard let milBase = milBuf.baseAddress else {
+            return nil
+        }
+
+        return weightBlob.withUnsafeBytes { weightRaw in
+                let weightBuf = weightRaw.bindMemory(to: UInt8.self)
+            return identityWeightPath.withCString { cPath in
+                var paths: [UnsafePointer<CChar>?] = [cPath]
+                var datas: [UnsafePointer<UInt8>?] = [weightBuf.baseAddress]
+                let lens: [Int] = [weightBuf.count]
+
+                return paths.withUnsafeMutableBufferPointer { pathBuf in
+                    datas.withUnsafeMutableBufferPointer { dataBuf in
+                        lens.withUnsafeBufferPointer { lenBuf in
+                            withUnsafePointer(to: &inputSize) { inSizePtr in
+                                withUnsafePointer(to: &outputSize) { outSizePtr in
+                                    ane_interop_compile(
+                                        milBase,
+                                        milBuf.count,
+                                        pathBuf.baseAddress,
+                                        dataBuf.baseAddress,
+                                        lenBuf.baseAddress,
+                                        1,
+                                        1,
+                                        inSizePtr,
+                                        1,
+                                        outSizePtr
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    guard let handle else {
+        return false
+    }
+    defer { ane_interop_free(handle) }
+    return ane_interop_eval(handle)
+}
+
+private enum ANEEvalProbe {
+    static let isAvailable = probeANEEvalWithInterop()
+}
+
+private func makeIdentityWeightBlob(channels: Int) -> Data {
+    var weights = [Float](repeating: 0, count: channels * channels)
+    for i in 0..<channels {
+        weights[i * channels + i] = 1
+    }
+    return WeightBlob.build(from: weights, rows: channels, cols: channels)
+}
+
+private func makeIdentityKernel(checkBudget: Bool = true) throws -> ANEKernel {
+    let mil = GenericMIL.conv(inCh: identityChannels, outCh: identityChannels, spatial: identitySpatial)
+    let weightBlob = makeIdentityWeightBlob(channels: identityChannels)
+    return try ANEKernel(
+        milText: mil,
+        weights: [(path: identityWeightPath, data: weightBlob)],
+        inputBytes: identityInputBytes,
+        outputBytes: identityOutputBytes,
+        checkBudget: checkBudget
+    )
+}
+
+private func blobPayloadFP16(_ blob: Data, index: Int) -> Float {
+    let byteOffset = 128 + index * MemoryLayout<UInt16>.stride
+    precondition(byteOffset + 1 < blob.count, "FP16 payload index out of range")
+    let lo = UInt16(blob[byteOffset])
+    let hi = UInt16(blob[byteOffset + 1]) << 8
+    let bits = lo | hi
+    return Float(Float16(bitPattern: bits))
+}
+
+private func maxAbsDiff(actual: [Float], expected: [Float]) -> (index: Int, actual: Float, expected: Float, diff: Float) {
+    precondition(actual.count == expected.count, "Mismatched vector lengths")
+    var bestIndex = 0
+    var bestActual: Float = 0
+    var bestExpected: Float = 0
+    var bestDiff: Float = -.infinity
+    for i in actual.indices {
+        let a = actual[i]
+        let e = expected[i]
+        let d = abs(a - e)
+        if d > bestDiff {
+            bestDiff = d
+            bestIndex = i
+            bestActual = a
+            bestExpected = e
+        }
+    }
+    return (bestIndex, bestActual, bestExpected, bestDiff)
+}
+
+private func crossValidationFixtureURL(_ name: String) -> URL {
+    URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .appendingPathComponent("Fixtures")
+        .appendingPathComponent(name)
+}
+
+private func loadFloat32LEFixture(
+    _ name: String,
+    expectedCount: Int,
+    file: StaticString = #filePath,
+    line: UInt = #line
+) throws -> [Float] {
+    let url = crossValidationFixtureURL(name)
+    guard FileManager.default.fileExists(atPath: url.path) else {
+        throw XCTSkip("Missing ObjC golden fixture: \(url.path)", file: file, line: line)
+    }
+    let data = try Data(contentsOf: url, options: .mappedIfSafe)
+    let expectedBytes = expectedCount * MemoryLayout<UInt32>.stride
+    guard data.count == expectedBytes else {
+        throw XCTSkip(
+            "Fixture size mismatch for \(name): expected \(expectedBytes) bytes, got \(data.count)",
+            file: file,
+            line: line
+        )
+    }
+
+    var values = [Float](repeating: 0, count: expectedCount)
+    data.withUnsafeBytes { raw in
+        guard let base = raw.baseAddress else { return }
+        let bytes = base.assumingMemoryBound(to: UInt8.self)
+        for i in 0..<expectedCount {
+            let o = i * 4
+            let bits = UInt32(bytes[o]) | (UInt32(bytes[o + 1]) << 8) | (UInt32(bytes[o + 2]) << 16) | (UInt32(bytes[o + 3]) << 24)
+            values[i] = Float(bitPattern: bits)
+        }
+    }
+    return values
+}
+
+private func set2x2Sentinel(
+    _ buffer: borrowing TensorBuffer,
+    cols: Int,
+    v00: Float,
+    v01: Float,
+    v10: Float,
+    v11: Float
+) {
+    buffer.withUnsafeMutableBufferPointer { ptr in
+        guard ptr.count >= cols + 2 else { return }
+        ptr[0] = v00
+        ptr[1] = v01
+        ptr[cols] = v10
+        ptr[cols + 1] = v11
+    }
+}
+
+final class ANERuntimeTests: XCTestCase {
+    func test_ane_error_conforms_to_sendable_and_error() {
+        func requireErrorAndSendable<T: Error & Sendable>(_: T.Type) {}
+        requireErrorAndSendable(ANEError.self)
+
+        let errors: [ANEError] = [
+            .invalidArguments("x"),
+            .compilationFailed,
+            .evaluationFailed,
+            .compileBudgetExhausted,
+            .surfaceAllocationFailed,
+            .invalidSurfaceIndex(0),
+            .inputSurfaceUnavailable(0),
+            .outputSurfaceUnavailable(0),
+        ]
+        let descriptions = errors.map(\.localizedDescription)
+        XCTAssertEqual(Set(descriptions).count, errors.count)
+    }
+
+    func test_compile_identity_kernel_succeeds() throws {
+        try requireANEHardwareTestsEnabled()
+
+        let kernel = try makeIdentityKernel()
+        let input = try kernel.inputSurface(at: 0)
+        let output = try kernel.outputSurface(at: 0)
+
+        XCTAssertEqual(IOSurfaceGetAllocSize(input), identityInputBytes)
+        XCTAssertEqual(IOSurfaceGetAllocSize(output), identityOutputBytes)
+    }
+
+    func test_compile_invalid_mil_throws_compilation_failed() throws {
+        try requireANEHardwareTestsEnabled()
+
+        do {
+            _ = try ANEKernel(
+                milText: "this is not valid MIL",
+                weights: [],
+                inputBytes: identityInputBytes,
+                outputBytes: identityOutputBytes
+            )
+            XCTFail("Expected compilation failure")
+        } catch ANEError.compilationFailed {
+            return
+        } catch {
+            XCTFail("Expected .compilationFailed, got \(error)")
+        }
+    }
+
+    func test_eval_identity_roundtrip() throws {
+        try requireANEHardwareTestsEnabled()
+
+        let kernel = try makeIdentityKernel()
+        let input = (1...identityElementCount).map(Float.init)
+        var output = [Float](repeating: 0, count: identityElementCount)
+        let inputSurface = try kernel.inputSurface(at: 0)
+        let outputSurface = try kernel.outputSurface(at: 0)
+
+        input.withUnsafeBufferPointer { inputBuf in
+            SurfaceIO.writeFP16(
+                to: inputSurface,
+                data: inputBuf,
+                channels: identityChannels,
+                spatial: identitySpatial
+            )
+        }
+
+        if !ANEEvalProbe.isAvailable {
+            do {
+                try kernel.eval()
+                throw XCTSkip("ANE baseline probe unavailable; identity eval succeeded on this host")
+            } catch ANEError.evaluationFailed {
+                throw XCTSkip("ANE baseline probe unavailable; identity eval failed as expected on this host")
+            } catch {
+                throw XCTSkip("ANE baseline probe unavailable; identity eval produced unexpected error: \(error)")
+            }
+        }
+
+        try kernel.eval()
+
+        output.withUnsafeMutableBufferPointer { outputBuf in
+            SurfaceIO.readFP16(
+                from: outputSurface,
+                into: outputBuf,
+                channelOffset: 0,
+                channels: identityChannels,
+                spatial: identitySpatial
+            )
+        }
+
+        for i in 0..<identityElementCount {
+            XCTAssertEqual(output[i], input[i], accuracy: 1e-2)
+        }
+    }
+
+    func test_eval_returns_throws_on_failure() throws {
+        try requireANEHardwareTestsEnabled()
+        let kernel = try makeIdentityKernel()
+        ane_interop_set_force_eval_failure(true)
+        defer { ane_interop_set_force_eval_failure(false) }
+
+        do {
+            try kernel.eval()
+            XCTFail("Expected .evaluationFailed")
+        } catch ANEError.evaluationFailed {
+            return
+        } catch {
+            XCTFail("Expected .evaluationFailed, got \(error)")
+        }
+    }
+
+    func test_kernel_deinit_frees_handle() throws {
+        try requireANEHardwareTestsEnabled()
+        let baseline = ane_interop_live_handle_count()
+
+        do {
+            let kernel = try makeIdentityKernel()
+            XCTAssertEqual(ane_interop_live_handle_count(), baseline + 1)
+            XCTAssertEqual(IOSurfaceGetAllocSize(try kernel.inputSurface(at: 0)), identityInputBytes)
+        }
+        XCTAssertEqual(ane_interop_live_handle_count(), baseline)
+
+        do {
+            let secondKernel = try makeIdentityKernel()
+            XCTAssertEqual(ane_interop_live_handle_count(), baseline + 1)
+            XCTAssertEqual(IOSurfaceGetAllocSize(try secondKernel.outputSurface(at: 0)), identityOutputBytes)
+        }
+        XCTAssertEqual(ane_interop_live_handle_count(), baseline)
+    }
+
+    func test_compile_budget_tracks_count() throws {
+        try requireANEHardwareTestsEnabled()
+
+        let previous = CompileBudget.currentCount
+        defer { try? CompileBudget.setCount(previous) }
+
+        do {
+            let kernel = try makeIdentityKernel(checkBudget: false)
+            _ = try kernel.inputSurface(at: 0)
+        }
+
+        XCTAssertEqual(CompileBudget.currentCount, previous + 1)
+    }
+
+    func test_compile_budget_exhausted_blocks_compile() throws {
+        let previous = CompileBudget.currentCount
+        defer { try? CompileBudget.setCount(previous) }
+
+        try CompileBudget.setCount(CompileBudget.maxCompiles)
+        XCTAssertTrue(CompileBudget.isExhausted)
+
+        do {
+            _ = try makeIdentityKernel(checkBudget: true)
+            XCTFail("Expected .compileBudgetExhausted")
+        } catch ANEError.compileBudgetExhausted {
+            XCTAssertEqual(CompileBudget.currentCount, CompileBudget.maxCompiles)
+        } catch {
+            XCTFail("Expected .compileBudgetExhausted, got \(error)")
+        }
+    }
+
+    func test_compile_budget_boundary_allows_only_one_concurrent_compile() throws {
+        try requireANEHardwareTestsEnabled()
+
+        final class CompileOutcomes: @unchecked Sendable {
+            private let lock = NSLock()
+            private(set) var successCount = 0
+            private(set) var errors = [ANEError]()
+
+            func recordSuccess() {
+                lock.lock()
+                successCount += 1
+                lock.unlock()
+            }
+
+            func recordFailure(_ error: ANEError) {
+                lock.lock()
+                errors.append(error)
+                lock.unlock()
+            }
+        }
+
+        let previous = CompileBudget.currentCount
+        defer { try? CompileBudget.setCount(previous) }
+        try CompileBudget.setCount(CompileBudget.maxCompiles - 1)
+
+        let outcomes = CompileOutcomes()
+
+        DispatchQueue.concurrentPerform(iterations: 2) { _ in
+            do {
+                _ = try makeIdentityKernel(checkBudget: true)
+                outcomes.recordSuccess()
+            } catch let error as ANEError {
+                outcomes.recordFailure(error)
+            } catch {
+                outcomes.recordFailure(.compilationFailed)
+            }
+        }
+
+        XCTAssertEqual(outcomes.successCount, 1, "Exactly one compile should reserve the final budget slot")
+
+        let exhaustedCount = outcomes.errors.reduce(into: 0) { partialResult, error in
+            if case .compileBudgetExhausted = error {
+                partialResult += 1
+            }
+        }
+        XCTAssertEqual(exhaustedCount, 1, "One compile should fail with .compileBudgetExhausted")
+    }
+
+    func test_layer_kernel_set_compile_time_under_2000ms() throws {
+        try requireANEHardwareTestsEnabled()
+
+        let layerWeights = LayerWeights()
+        fillLayerWeights(layerWeights, value: 0.01)
+
+        let start = Date()
+        _ = try LayerKernelSet(weights: layerWeights)
+        let elapsedMs = Date().timeIntervalSince(start) * 1000.0
+        XCTAssertLessThan(elapsedMs, 2000.0, "compile took \(elapsedMs)ms")
+    }
+
+    func test_surface_access_invalid_index_throws_typed_error() throws {
+        try requireANEHardwareTestsEnabled()
+        let kernel = try makeIdentityKernel()
+
+        do {
+            _ = try kernel.inputSurface(at: -1)
+            XCTFail("Expected .invalidSurfaceIndex")
+        } catch ANEError.invalidSurfaceIndex(-1) {
+            // expected
+        } catch {
+            XCTFail("Expected .invalidSurfaceIndex(-1), got \(error)")
+        }
+
+        do {
+            _ = try kernel.outputSurface(at: Int(Int32.max) + 1)
+            XCTFail("Expected .invalidSurfaceIndex")
+        } catch ANEError.invalidSurfaceIndex(Int(Int32.max) + 1) {
+            // expected
+        } catch {
+            XCTFail("Expected .invalidSurfaceIndex(Int32.max + 1), got \(error)")
+        }
+    }
+
+    func test_layer_kernel_set_compiles_all_five_and_surface_sizes() throws {
+        try requireANEHardwareTestsEnabled()
+
+        let layerWeights = LayerWeights()
+        fillLayerWeights(layerWeights, value: 0.01)
+
+        let kernels = try LayerKernelSet(weights: layerWeights)
+
+        XCTAssertGreaterThanOrEqual(IOSurfaceGetAllocSize(try kernels.fwdAttn.inputSurface(at: 0)), fwdAttnInputBytes)
+        XCTAssertGreaterThanOrEqual(IOSurfaceGetAllocSize(try kernels.fwdAttn.outputSurface(at: 0)), fwdAttnOutputBytes)
+
+        XCTAssertGreaterThanOrEqual(IOSurfaceGetAllocSize(try kernels.fwdFFN.inputSurface(at: 0)), fwdFFNInputBytes)
+        XCTAssertGreaterThanOrEqual(IOSurfaceGetAllocSize(try kernels.fwdFFN.outputSurface(at: 0)), fwdFFNOutputBytes)
+
+        XCTAssertGreaterThanOrEqual(IOSurfaceGetAllocSize(try kernels.ffnBwd.inputSurface(at: 0)), ffnBwdInputBytes)
+        XCTAssertGreaterThanOrEqual(IOSurfaceGetAllocSize(try kernels.ffnBwd.outputSurface(at: 0)), ffnBwdOutputBytes)
+
+        XCTAssertGreaterThanOrEqual(IOSurfaceGetAllocSize(try kernels.sdpaBwd1.inputSurface(at: 0)), sdpaBwd1InputBytes)
+        XCTAssertGreaterThanOrEqual(IOSurfaceGetAllocSize(try kernels.sdpaBwd1.outputSurface(at: 0)), sdpaBwd1OutputBytes)
+
+        XCTAssertGreaterThanOrEqual(IOSurfaceGetAllocSize(try kernels.qkvBwd.inputSurface(at: 0)), qkvBwdInputBytes)
+        XCTAssertGreaterThanOrEqual(IOSurfaceGetAllocSize(try kernels.qkvBwd.outputSurface(at: 0)), qkvBwdOutputBytes)
+    }
+
+    func test_fwd_attn_output_has_6xdim_channels() throws {
+        try requireANEHardwareTestsEnabled()
+
+        let dim = ModelConfig.dim
+        let seqLen = ModelConfig.seqLen
+        let layerWeights = LayerWeights()
+        fillLayerWeights(layerWeights, value: 0.01)
+        let kernels = try LayerKernelSet(weights: layerWeights)
+
+        let inputSurface = try kernels.fwdAttn.inputSurface(at: 0)
+        let outputSurface = try kernels.fwdAttn.outputSurface(at: 0)
+
+        var input = [Float](repeating: 0, count: dim * seqLen)
+        for i in input.indices {
+            input[i] = Float(i % 64 + 1) * 0.01
+        }
+        input.withUnsafeBufferPointer { buf in
+            SurfaceIO.writeFP16(to: inputSurface, data: buf, channels: dim, spatial: seqLen)
+        }
+
+        try kernels.fwdAttn.eval()
+
+        let offsets = [0, dim, 2 * dim, 3 * dim, 4 * dim, 5 * dim]
+        for offset in offsets {
+            var region = [Float](repeating: 0, count: dim * seqLen)
+            region.withUnsafeMutableBufferPointer { out in
+                SurfaceIO.readFP16(
+                    from: outputSurface,
+                    into: out,
+                    channelOffset: offset,
+                    channels: dim,
+                    spatial: seqLen
+                )
+            }
+
+            XCTAssertTrue(region.allSatisfy(\.isFinite), "Non-finite values at offset \(offset)")
+            XCTAssertTrue(region.contains(where: { $0 != 0 }), "All-zero region at offset \(offset)")
+        }
+    }
+
+    func test_fwd_attn_numerical_equivalence_with_objc() throws {
+        try requireANEHardwareTestsEnabled()
+        try requireObjCCrossValidation()
+
+        let dim = ModelConfig.dim
+        let seqLen = ModelConfig.seqLen
+        let expectedOOut = try loadFloat32LEFixture(
+            "fwd_attn_oOut_seq256_f32le.bin",
+            expectedCount: dim * seqLen
+        )
+
+        let layerWeights = LayerWeights()
+        fillLayerWeights(layerWeights, value: 0.01)
+        let kernels = try LayerKernelSet(weights: layerWeights)
+
+        let inputSurface = try kernels.fwdAttn.inputSurface(at: 0)
+        let outputSurface = try kernels.fwdAttn.outputSurface(at: 0)
+
+        var input = [Float](repeating: 0, count: dim * seqLen)
+        for i in 0..<(dim * seqLen) {
+            input[i] = Float(i % 64 + 1) * 0.01
+        }
+        input.withUnsafeBufferPointer { buf in
+            SurfaceIO.writeFP16(to: inputSurface, data: buf, channels: dim, spatial: seqLen)
+        }
+
+        try kernels.fwdAttn.eval()
+
+        var oOut = [Float](repeating: 0, count: dim * seqLen)
+        oOut.withUnsafeMutableBufferPointer { out in
+            SurfaceIO.readFP16(from: outputSurface, into: out, channelOffset: 0, channels: dim, spatial: seqLen)
+        }
+
+        let worst = maxAbsDiff(actual: oOut, expected: expectedOOut)
+        XCTAssertLessThan(
+            worst.diff,
+            1e-2,
+            "max diff=\(worst.diff) at idx \(worst.index), actual=\(worst.actual), expected=\(worst.expected)"
+        )
+    }
+
+    func test_fwd_ffn_numerical_equivalence_with_objc() throws {
+        try requireANEHardwareTestsEnabled()
+        try requireObjCCrossValidation()
+
+        let dim = ModelConfig.dim
+        let seqLen = ModelConfig.seqLen
+        let expectedY = try loadFloat32LEFixture(
+            "fwd_ffn_y_seq256_f32le.bin",
+            expectedCount: dim * seqLen
+        )
+
+        let layerWeights = LayerWeights()
+        fillLayerWeights(layerWeights, value: 0.01)
+        let kernels = try LayerKernelSet(weights: layerWeights)
+
+        let attnIn = try kernels.fwdAttn.inputSurface(at: 0)
+        let attnOut = try kernels.fwdAttn.outputSurface(at: 0)
+        let ffnIn = try kernels.fwdFFN.inputSurface(at: 0)
+        let ffnOut = try kernels.fwdFFN.outputSurface(at: 0)
+
+        var input = [Float](repeating: 0, count: dim * seqLen)
+        for i in 0..<(dim * seqLen) {
+            input[i] = Float(i % 64 + 1) * 0.01
+        }
+        input.withUnsafeBufferPointer { buf in
+            SurfaceIO.writeFP16(to: attnIn, data: buf, channels: dim, spatial: seqLen)
+        }
+
+        try kernels.fwdAttn.eval()
+
+        var oOut = [Float](repeating: 0, count: dim * seqLen)
+        oOut.withUnsafeMutableBufferPointer { out in
+            SurfaceIO.readFP16(from: attnOut, into: out, channelOffset: 0, channels: dim, spatial: seqLen)
+        }
+        oOut.withUnsafeBufferPointer { buf in
+            SurfaceIO.writeFP16(to: ffnIn, data: buf, channels: dim, spatial: seqLen)
+        }
+
+        try kernels.fwdFFN.eval()
+
+        var y = [Float](repeating: 0, count: dim * seqLen)
+        y.withUnsafeMutableBufferPointer { out in
+            SurfaceIO.readFP16(from: ffnOut, into: out, channelOffset: 0, channels: dim, spatial: seqLen)
+        }
+
+        let worst = maxAbsDiff(actual: y, expected: expectedY)
+        XCTAssertLessThan(
+            worst.diff,
+            1e-2,
+            "max diff=\(worst.diff) at idx \(worst.index), actual=\(worst.actual), expected=\(worst.expected)"
+        )
+    }
+
+    func test_ffn_bwd_numerical_equivalence_with_objc() throws {
+        try requireANEHardwareTestsEnabled()
+        try requireObjCCrossValidation()
+
+        let dim = ModelConfig.dim
+        let hidden = ModelConfig.hidden
+        let seqLen = ModelConfig.seqLen
+        let expectedDX = try loadFloat32LEFixture(
+            "ffn_bwd_dx_seq256_f32le.bin",
+            expectedCount: dim * seqLen
+        )
+
+        let layerWeights = LayerWeights()
+        fillLayerWeights(layerWeights, value: 0.01)
+        let kernels = try LayerKernelSet(weights: layerWeights)
+
+        let ffnBwdIn = try kernels.ffnBwd.inputSurface(at: 0)
+        let ffnBwdOut = try kernels.ffnBwd.outputSurface(at: 0)
+
+        var ffnBwdInput = [Float](repeating: 0, count: (dim + 2 * hidden) * seqLen)
+        for i in 0..<((dim + 2 * hidden) * seqLen) {
+            ffnBwdInput[i] = Float(i % 128 + 1) * 0.005
+        }
+        ffnBwdInput.withUnsafeBufferPointer { buf in
+            SurfaceIO.writeFP16(
+                to: ffnBwdIn,
+                data: buf,
+                channels: dim + 2 * hidden,
+                spatial: seqLen
+            )
+        }
+
+        try kernels.ffnBwd.eval()
+
+        var dx = [Float](repeating: 0, count: dim * seqLen)
+        dx.withUnsafeMutableBufferPointer { out in
+            SurfaceIO.readFP16(from: ffnBwdOut, into: out, channelOffset: 0, channels: dim, spatial: seqLen)
+        }
+
+        let worst = maxAbsDiff(actual: dx, expected: expectedDX)
+        XCTAssertLessThan(
+            worst.diff,
+            1e-2,
+            "max diff=\(worst.diff) at idx \(worst.index), actual=\(worst.actual), expected=\(worst.expected)"
+        )
+    }
+
+    func test_layer_kernel_set_compile_specs_match_paths_and_io_without_hardware() throws {
+        let layerWeights = LayerWeights()
+        fillLayerWeights(layerWeights, value: 0.01)
+
+        let specs = LayerKernelSet.compileSpecs(weights: layerWeights)
+        XCTAssertEqual(specs.count, 5)
+
+        let byKind = Dictionary(uniqueKeysWithValues: specs.map { ($0.kind, $0) })
+
+        XCTAssertEqual(
+            byKind[.fwdAttn]?.weightPaths ?? [],
+            [
+                "@model_path/weights/rms1.bin",
+                "@model_path/weights/wq.bin",
+                "@model_path/weights/wk.bin",
+                "@model_path/weights/wv.bin",
+                "@model_path/weights/wo.bin",
+                "@model_path/weights/mask.bin",
+            ]
+        )
+        XCTAssertEqual(byKind[.fwdAttn]?.inputBytes, fwdAttnInputBytes)
+        XCTAssertEqual(byKind[.fwdAttn]?.outputBytes, fwdAttnOutputBytes)
+
+        XCTAssertEqual(
+            byKind[.fwdFFN]?.weightPaths ?? [],
+            [
+                "@model_path/weights/rms2.bin",
+                "@model_path/weights/w1.bin",
+                "@model_path/weights/w3.bin",
+                "@model_path/weights/w2.bin",
+            ]
+        )
+        XCTAssertEqual(byKind[.fwdFFN]?.inputBytes, fwdFFNInputBytes)
+        XCTAssertEqual(byKind[.fwdFFN]?.outputBytes, fwdFFNOutputBytes)
+
+        XCTAssertEqual(
+            byKind[.ffnBwd]?.weightPaths ?? [],
+            [
+                "@model_path/weights/w2t.bin",
+                "@model_path/weights/w1t.bin",
+                "@model_path/weights/w3t.bin",
+            ]
+        )
+        XCTAssertEqual(byKind[.ffnBwd]?.inputBytes, ffnBwdInputBytes)
+        XCTAssertEqual(byKind[.ffnBwd]?.outputBytes, ffnBwdOutputBytes)
+
+        XCTAssertEqual(
+            byKind[.sdpaBwd1]?.weightPaths ?? [],
+            [
+                "@model_path/weights/mask.bin",
+                "@model_path/weights/wot.bin",
+            ]
+        )
+        XCTAssertEqual(byKind[.sdpaBwd1]?.inputBytes, sdpaBwd1InputBytes)
+        XCTAssertEqual(byKind[.sdpaBwd1]?.outputBytes, sdpaBwd1OutputBytes)
+
+        XCTAssertEqual(
+            byKind[.qkvBwd]?.weightPaths ?? [],
+            [
+                "@model_path/weights/wqt.bin",
+                "@model_path/weights/wkt.bin",
+                "@model_path/weights/wvt.bin",
+            ]
+        )
+        XCTAssertEqual(byKind[.qkvBwd]?.inputBytes, qkvBwdInputBytes)
+        XCTAssertEqual(byKind[.qkvBwd]?.outputBytes, qkvBwdOutputBytes)
+    }
+
+    func test_layer_kernel_set_transposed_blob_mapping_without_hardware() throws {
+        let layerWeights = LayerWeights()
+        fillLayerWeights(layerWeights, value: 0)
+
+        set2x2Sentinel(layerWeights.W2, cols: ModelConfig.hidden, v00: 1, v01: 2, v10: 3, v11: 4)
+        set2x2Sentinel(layerWeights.Wq, cols: ModelConfig.dim, v00: 5, v01: 6, v10: 7, v11: 8)
+        set2x2Sentinel(layerWeights.Wo, cols: ModelConfig.dim, v00: 9, v01: 10, v10: 11, v11: 12)
+
+        let specs = LayerKernelSet.compileSpecs(weights: layerWeights)
+        let byKind = Dictionary(uniqueKeysWithValues: specs.map { ($0.kind, $0) })
+
+        guard
+            let fwdFFN = byKind[.fwdFFN],
+            let ffnBwd = byKind[.ffnBwd],
+            let fwdAttn = byKind[.fwdAttn],
+            let sdpaBwd1 = byKind[.sdpaBwd1],
+            let qkvBwd = byKind[.qkvBwd]
+        else {
+            XCTFail("Missing one or more layer compile specs")
+            return
+        }
+
+        guard
+            let w2 = fwdFFN.weights.first(where: { $0.path == "@model_path/weights/w2.bin" })?.data,
+            let w2t = ffnBwd.weights.first(where: { $0.path == "@model_path/weights/w2t.bin" })?.data,
+            let wq = fwdAttn.weights.first(where: { $0.path == "@model_path/weights/wq.bin" })?.data,
+            let wqt = qkvBwd.weights.first(where: { $0.path == "@model_path/weights/wqt.bin" })?.data,
+            let wot = sdpaBwd1.weights.first(where: { $0.path == "@model_path/weights/wot.bin" })?.data
+        else {
+            XCTFail("Missing expected weight blobs in compile specs")
+            return
+        }
+
+        XCTAssertEqual(blobPayloadFP16(w2, index: 0), 1, accuracy: 1e-3)
+        XCTAssertEqual(blobPayloadFP16(w2, index: 1), 2, accuracy: 1e-3)
+        XCTAssertEqual(blobPayloadFP16(w2, index: ModelConfig.hidden), 3, accuracy: 1e-3)
+        XCTAssertEqual(blobPayloadFP16(w2, index: ModelConfig.hidden + 1), 4, accuracy: 1e-3)
+
+        XCTAssertEqual(blobPayloadFP16(w2t, index: 0), 1, accuracy: 1e-3)
+        XCTAssertEqual(blobPayloadFP16(w2t, index: 1), 3, accuracy: 1e-3)
+        XCTAssertEqual(blobPayloadFP16(w2t, index: ModelConfig.dim), 2, accuracy: 1e-3)
+        XCTAssertEqual(blobPayloadFP16(w2t, index: ModelConfig.dim + 1), 4, accuracy: 1e-3)
+
+        XCTAssertEqual(blobPayloadFP16(wq, index: 0), 5, accuracy: 1e-3)
+        XCTAssertEqual(blobPayloadFP16(wq, index: 1), 6, accuracy: 1e-3)
+        XCTAssertEqual(blobPayloadFP16(wqt, index: 0), 5, accuracy: 1e-3)
+        XCTAssertEqual(blobPayloadFP16(wqt, index: 1), 7, accuracy: 1e-3)
+        XCTAssertEqual(blobPayloadFP16(wqt, index: ModelConfig.dim), 6, accuracy: 1e-3)
+        XCTAssertEqual(blobPayloadFP16(wqt, index: ModelConfig.dim + 1), 8, accuracy: 1e-3)
+
+        XCTAssertEqual(blobPayloadFP16(wot, index: 0), 9, accuracy: 1e-3)
+        XCTAssertEqual(blobPayloadFP16(wot, index: 1), 11, accuracy: 1e-3)
+        XCTAssertEqual(blobPayloadFP16(wot, index: ModelConfig.dim), 10, accuracy: 1e-3)
+        XCTAssertEqual(blobPayloadFP16(wot, index: ModelConfig.dim + 1), 12, accuracy: 1e-3)
+    }
+
+    func test_layer_kernel_set_partial_compile_failure_cleanup() throws {
+        try requireANEHardwareTestsEnabled()
+
+        let baselineHandles = ane_interop_live_handle_count()
+        let previousCount = CompileBudget.currentCount
+        defer { try? CompileBudget.setCount(previousCount) }
+
+        // CompileBudget.maxCompiles is fixed, so reserve only two slots.
+        try CompileBudget.setCount(CompileBudget.maxCompiles - 2)
+
+        let layerWeights = LayerWeights()
+        fillLayerWeights(layerWeights, value: 0.01)
+
+        do {
+            _ = try LayerKernelSet(weights: layerWeights)
+            XCTFail("Expected .compileBudgetExhausted")
+        } catch ANEError.compileBudgetExhausted {
+            XCTAssertEqual(ane_interop_live_handle_count(), baselineHandles)
+        } catch {
+            XCTFail("Expected .compileBudgetExhausted, got \(error)")
+        }
+    }
+
+    func test_layer_kernel_set_deinit_frees_all_handles() throws {
+        try requireANEHardwareTestsEnabled()
+
+        let baselineHandles = ane_interop_live_handle_count()
+
+        do {
+            let layerWeights = LayerWeights()
+            fillLayerWeights(layerWeights, value: 0.01)
+            let kernels = try LayerKernelSet(weights: layerWeights)
+            _ = try kernels.fwdAttn.inputSurface(at: 0)
+            XCTAssertEqual(ane_interop_live_handle_count(), baselineHandles + 5)
+        }
+
+        XCTAssertEqual(ane_interop_live_handle_count(), baselineHandles)
+    }
+
+    func test_static_kernel_compiles_without_weights() throws {
+        try requireANEHardwareTestsEnabled()
+
+        let staticKernel = try StaticKernel()
+        XCTAssertGreaterThanOrEqual(IOSurfaceGetAllocSize(try staticKernel.kernel.inputSurface(at: 0)), sdpaBwd2InputBytes)
+        XCTAssertGreaterThanOrEqual(IOSurfaceGetAllocSize(try staticKernel.kernel.outputSurface(at: 0)), sdpaBwd2OutputBytes)
+    }
+
+    func test_static_kernel_compile_contract_without_hardware() {
+        let contract = StaticKernel.compileContract
+        XCTAssertEqual(contract.weightCount, 0)
+        XCTAssertEqual(contract.inputBytes, sdpaBwd2InputBytes)
+        XCTAssertEqual(contract.outputBytes, sdpaBwd2OutputBytes)
+    }
+
+    func test_static_kernel_survives_layer_kernel_set_dealloc() throws {
+        try requireANEHardwareTestsEnabled()
+
+        let staticKernel = try StaticKernel()
+        _ = try staticKernel.kernel.inputSurface(at: 0)
+        _ = try staticKernel.kernel.outputSurface(at: 0)
+
+        do {
+            let layerWeights = LayerWeights()
+            fillLayerWeights(layerWeights, value: 0.01)
+            let kernels = try LayerKernelSet(weights: layerWeights)
+            _ = try kernels.sdpaBwd1.outputSurface(at: 0)
+        }
+
+        _ = try staticKernel.kernel.inputSurface(at: 0)
+        _ = try staticKernel.kernel.outputSurface(at: 0)
+    }
+
+    func test_model_weight_loader_config_mismatch() throws {
+        let path = makeTempBinaryPath(prefix: "cfg-mismatch")
+        defer { try? FileManager.default.removeItem(atPath: path) }
+
+        let header = llamaHeaderData(
+            dim: 4,
+            hiddenDim: 8,
+            nLayers: 1,
+            nHeads: 1,
+            nKvHeads: 1,
+            vocabSize: 3,
+            seqLen: 2
+        )
+        try header.write(to: URL(fileURLWithPath: path))
+
+        do {
+            _ = try ModelWeightLoader.load(from: path)
+            XCTFail("Expected .configMismatch")
+        } catch let ModelLoadError.configMismatch(expected, got) {
+            XCTAssertTrue(expected.contains("768"))
+            XCTAssertTrue(got.contains("4"))
+        } catch {
+            XCTFail("Expected .configMismatch, got \(error)")
+        }
+    }
+
+    func test_model_weight_loader_vocab_mismatch_fails_fast() throws {
+        let path = makeTempBinaryPath(prefix: "vocab-mismatch")
+        defer { try? FileManager.default.removeItem(atPath: path) }
+
+        let header = llamaHeaderData(
+            dim: Int32(ModelConfig.dim),
+            hiddenDim: Int32(ModelConfig.hidden),
+            nLayers: Int32(ModelConfig.nLayers),
+            nHeads: Int32(ModelConfig.heads),
+            nKvHeads: Int32(ModelConfig.heads),
+            vocabSize: Int32(ModelConfig.vocab - 1),
+            seqLen: Int32(ModelConfig.seqLen)
+        )
+        try header.write(to: URL(fileURLWithPath: path))
+
+        do {
+            _ = try ModelWeightLoader.load(from: path)
+            XCTFail("Expected .configMismatch for vocab mismatch")
+        } catch ModelLoadError.configMismatch {
+            // Expected.
+        } catch {
+            XCTFail("Expected .configMismatch, got \(error)")
+        }
+    }
+
+    func test_model_weight_loader_file_not_found() throws {
+        let path = "/nonexistent/path/model-\(UUID().uuidString).bin"
+
+        do {
+            _ = try ModelWeightLoader.load(from: path)
+            XCTFail("Expected .fileNotFound")
+        } catch let ModelLoadError.fileNotFound(actualPath) {
+            XCTAssertEqual(actualPath, path)
+        } catch {
+            XCTFail("Expected .fileNotFound, got \(error)")
+        }
+    }
+
+    func test_model_weight_loader_header_parsing() throws {
+        let positivePath = makeTempBinaryPath(prefix: "header-positive")
+        defer { try? FileManager.default.removeItem(atPath: positivePath) }
+        let positiveHeader = llamaHeaderData(
+            dim: 768,
+            hiddenDim: 2048,
+            nLayers: 12,
+            nHeads: 12,
+            nKvHeads: 12,
+            vocabSize: 32_000,
+            seqLen: 256
+        )
+        try positiveHeader.write(to: URL(fileURLWithPath: positivePath))
+
+        guard let positiveFile = fopen(positivePath, "rb") else {
+            XCTFail("Failed to open positive header fixture")
+            return
+        }
+        defer { fclose(positiveFile) }
+
+        let parsedPositive = try ModelWeightLoader.parseHeader(from: positiveFile)
+        XCTAssertEqual(parsedPositive.dim, 768)
+        XCTAssertEqual(parsedPositive.hiddenDim, 2048)
+        XCTAssertEqual(parsedPositive.nLayers, 12)
+        XCTAssertEqual(parsedPositive.nHeads, 12)
+        XCTAssertEqual(parsedPositive.nKvHeads, 12)
+        XCTAssertEqual(parsedPositive.vocabSize, 32_000)
+        XCTAssertEqual(parsedPositive.seqLen, 256)
+        XCTAssertGreaterThan(parsedPositive.vocabSize, 0)
+
+        let negativePath = makeTempBinaryPath(prefix: "header-negative")
+        defer { try? FileManager.default.removeItem(atPath: negativePath) }
+        let negativeHeader = llamaHeaderData(
+            dim: 768,
+            hiddenDim: 2048,
+            nLayers: 12,
+            nHeads: 12,
+            nKvHeads: 12,
+            vocabSize: -32_000,
+            seqLen: 256
+        )
+        try negativeHeader.write(to: URL(fileURLWithPath: negativePath))
+
+        guard let negativeFile = fopen(negativePath, "rb") else {
+            XCTFail("Failed to open negative header fixture")
+            return
+        }
+        defer { fclose(negativeFile) }
+
+        let parsedNegative = try ModelWeightLoader.parseHeader(from: negativeFile)
+        XCTAssertLessThan(parsedNegative.vocabSize, 0)
+        XCTAssertEqual(abs(parsedNegative.vocabSize), 32_000)
+    }
+
+    func test_model_weight_loader_truncated_file() throws {
+        let path = makeTempBinaryPath(prefix: "truncated")
+        defer { try? FileManager.default.removeItem(atPath: path) }
+
+        let header = llamaHeaderData(
+            dim: Int32(ModelConfig.dim),
+            hiddenDim: Int32(ModelConfig.hidden),
+            nLayers: Int32(ModelConfig.nLayers),
+            nHeads: Int32(ModelConfig.heads),
+            nKvHeads: Int32(ModelConfig.heads),
+            vocabSize: Int32(ModelConfig.vocab),
+            seqLen: Int32(ModelConfig.seqLen)
+        )
+
+        var fileData = Data()
+        fileData.append(header)
+        fileData.append(Data(count: 100))
+        try fileData.write(to: URL(fileURLWithPath: path))
+
+        do {
+            _ = try ModelWeightLoader.load(from: path)
+            XCTFail("Expected .truncatedFile")
+        } catch let ModelLoadError.truncatedFile(expectedBytes, actualBytes) {
+            XCTAssertGreaterThan(expectedBytes, actualBytes)
+            XCTAssertGreaterThan(actualBytes, 0)
+        } catch {
+            XCTFail("Expected .truncatedFile, got \(error)")
+        }
+    }
+
+    func test_model_weight_loader_payload_layout_matches_llama2c_order_and_sizes() {
+        let sharedLayout = ModelWeightLoader.payloadLayout(vocabSize: Int32(ModelConfig.vocab))
+        XCTAssertEqual(
+            sharedLayout.map(\.name),
+            [
+                "embed",
+                "rms_att[all]",
+                "wq[all]",
+                "wk[all]",
+                "wv[all]",
+                "wo[all]",
+                "rms_ffn[all]",
+                "w1[all]",
+                "w2[all]",
+                "w3[all]",
+                "rms_final",
+            ]
+        )
+
+        let expectedCounts = [
+            ModelConfig.vocab * ModelConfig.dim,
+            ModelConfig.nLayers * ModelConfig.dim,
+            ModelConfig.nLayers * ModelConfig.dim * ModelConfig.dim,
+            ModelConfig.nLayers * ModelConfig.dim * ModelConfig.dim,
+            ModelConfig.nLayers * ModelConfig.dim * ModelConfig.dim,
+            ModelConfig.nLayers * ModelConfig.dim * ModelConfig.dim,
+            ModelConfig.nLayers * ModelConfig.dim,
+            ModelConfig.nLayers * ModelConfig.hidden * ModelConfig.dim,
+            ModelConfig.nLayers * ModelConfig.dim * ModelConfig.hidden,
+            ModelConfig.nLayers * ModelConfig.hidden * ModelConfig.dim,
+            ModelConfig.dim,
+        ]
+        XCTAssertEqual(sharedLayout.map(\.floatCount), expectedCounts)
+
+        let unsharedLayout = ModelWeightLoader.payloadLayout(vocabSize: -Int32(ModelConfig.vocab))
+        XCTAssertEqual(unsharedLayout.last?.name, "wcls")
+        XCTAssertEqual(unsharedLayout.last?.floatCount, ModelConfig.vocab * ModelConfig.dim)
+    }
+
+    func test_model_weight_loader_unshared_classifier_truncated_file() throws {
+        let path = makeTempBinaryPath(prefix: "truncated-unshared-classifier")
+        defer { try? FileManager.default.removeItem(atPath: path) }
+
+        let header = llamaHeaderData(
+            dim: Int32(ModelConfig.dim),
+            hiddenDim: Int32(ModelConfig.hidden),
+            nLayers: Int32(ModelConfig.nLayers),
+            nHeads: Int32(ModelConfig.heads),
+            nKvHeads: Int32(ModelConfig.heads),
+            vocabSize: -Int32(ModelConfig.vocab),
+            seqLen: Int32(ModelConfig.seqLen)
+        )
+        try header.write(to: URL(fileURLWithPath: path))
+
+        let layout = ModelWeightLoader.payloadLayout(vocabSize: -Int32(ModelConfig.vocab))
+        guard let classifierSegment = layout.last, classifierSegment.name == "wcls" else {
+            XCTFail("Expected unshared layout to include trailing wcls segment")
+            return
+        }
+
+        let bytesBeforeClassifier = layout.dropLast().reduce(0) { $0 + $1.byteCount }
+        let partialClassifierBytes = 8
+        let totalBytes = header.count + bytesBeforeClassifier + partialClassifierBytes
+
+        let fd = open(path, O_RDWR)
+        guard fd >= 0 else {
+            XCTFail("Failed to open temp file for sparse extension")
+            return
+        }
+        defer { close(fd) }
+        XCTAssertEqual(ftruncate(fd, off_t(totalBytes)), 0)
+
+        do {
+            _ = try ModelWeightLoader.load(from: path)
+            XCTFail("Expected .truncatedFile while reading unshared classifier payload")
+        } catch let ModelLoadError.truncatedFile(expectedBytes, actualBytes) {
+            XCTAssertEqual(expectedBytes, classifierSegment.byteCount)
+            XCTAssertEqual(actualBytes, partialClassifierBytes)
+        } catch {
+            XCTFail("Expected .truncatedFile, got \(error)")
+        }
+    }
+
+    func test_load_stories110m_weights_integration() throws {
+        guard let path = storiesModelPath() else {
+            throw XCTSkip("stories110M.bin not found; set STORIES_MODEL_PATH or place model in assets/models")
+        }
+
+        let loaded = try ModelWeightLoader.load(from: path)
+        XCTAssertEqual(loaded.layers.count, ModelConfig.nLayers)
+        XCTAssertEqual(loaded.rmsFinal.count, ModelConfig.dim)
+        XCTAssertEqual(loaded.embed.count, ModelConfig.vocab * ModelConfig.dim)
+        XCTAssertTrue(loaded.sharedClassifier)
+        XCTAssertTrue(hasNonZeroElement(loaded.layers[0].Wq))
+        XCTAssertTrue(hasNonZeroElement(loaded.rmsFinal))
+    }
+
+    func test_layer_kernel_set_recompile_with_different_weights() throws {
+        try requireANEHardwareTestsEnabled()
+
+        let weightsA = LayerWeights()
+        fillLayerWeights(weightsA, value: 0.01)
+        let kernelsA = try LayerKernelSet(weights: weightsA)
+        _ = try kernelsA.fwdFFN.outputSurface(at: 0)
+
+        let weightsB = LayerWeights()
+        fillLayerWeights(weightsB, value: 0.02)
+        let kernelsB = try LayerKernelSet(weights: weightsB)
+        _ = try kernelsB.qkvBwd.outputSurface(at: 0)
+    }
+
+    func test_static_kernel_eval_produces_output() throws {
+        try requireANEHardwareTestsEnabled()
+
+        let staticKernel = try StaticKernel()
+        let inputSurface = try staticKernel.kernel.inputSurface(at: 0)
+        let outputSurface = try staticKernel.kernel.outputSurface(at: 0)
+
+        var input = [Float](repeating: 0, count: sdpaBwd2InputChannels * sdpaSpatial)
+        for i in input.indices {
+            input[i] = Float((i % 113) + 1) * 0.001
+        }
+        input.withUnsafeBufferPointer { buffer in
+            SurfaceIO.writeFP16(
+                to: inputSurface,
+                data: buffer,
+                channels: sdpaBwd2InputChannels,
+                spatial: sdpaSpatial
+            )
+        }
+
+        if !ANEEvalProbe.isAvailable {
+            do {
+                try staticKernel.kernel.eval()
+                throw XCTSkip("ANE baseline probe unavailable; static kernel eval succeeded on this host")
+            } catch ANEError.evaluationFailed {
+                throw XCTSkip("ANE eval unavailable for static kernel on this host")
+            } catch {
+                throw error
+            }
+        }
+
+        try staticKernel.kernel.eval()
+
+        var output = [Float](repeating: 0, count: sdpaBwd2OutputChannels * sdpaSpatial)
+        output.withUnsafeMutableBufferPointer { buffer in
+            SurfaceIO.readFP16(
+                from: outputSurface,
+                into: buffer,
+                channelOffset: 0,
+                channels: sdpaBwd2OutputChannels,
+                spatial: sdpaSpatial
+            )
+        }
+
+        XCTAssertTrue(output.allSatisfy(\.isFinite))
+        XCTAssertTrue(output.contains(where: { $0 != 0 }))
+    }
+}
