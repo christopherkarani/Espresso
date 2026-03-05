@@ -35,6 +35,10 @@ Goal: deliver maximum defensible ANE decode throughput and best-justified prefil
 - [x] Strict fairness snapshot after optimization:
   - `/tmp/decode_syncopt_coreml_max128_20260305` fastest Core ML naive median `0.988 ms`, ANE median `0.488 ms`, strict speedup `2.02x`.
 - [x] Step 5a status: complete for this pass (window-sync + packing path). Further dispatch reduction remains in Step 5b.
+- [x] Decode runtime option sweep on top of Step 5a:
+  - quick matrix: `/tmp/decode_syncopt_opts_max128_20260305`
+  - confirmation repeats: `/tmp/decode_syncopt_confirm_evalpath_max128_20260305`
+  - verdict: no reproducible gain over baseline; keep default eval path (`ABANDON`).
 
 ## ANE 10x Tuning Program (2026-03-05)
 Goal: iterate aggressively until ANE direct is 10x faster than Core ML across compute-only + end-to-end benchmarks, or prove a hard floor via ANE `hwExecutionTime`.

@@ -53,6 +53,7 @@ Main benchmark commands used:
 | A11 | Decode eval path sweep (`inmem`, `client`, `clientDirect`, `realtime`) | Test whether failure depended on eval path rather than kernel contract | `/tmp/decode_evalpath_*.log` | All eval paths failed identically for unsupported decode-attn contract (`statusType=0x9`) | **ABANDON** (for this failure mode) |
 | A12 | Compile cache policy reproducibility check (`auto` vs `preferCached`) | Improve compile stability and iteration time | `/tmp/decode_repro_ane10x_run1`, `/tmp/decode_repro_ane10x_run2` | Median latency stable (`0.648479` vs `0.648500` ms/token; delta `0.0032%`), compile time collapsed (`49.49s` → `52.7ms`) | **SHIP** (`preferCached`) |
 | A13 | Decode tile-sync optimization (boundary-only window sync + incremental lane cache updates + removed redundant lane-zero copies) | Full-window cache sync every token was dominating decode IO at `maxSeq > 32` | Commit `5c016ec`; `/tmp/decode_syncopt_before_max128_20260305`, `/tmp/decode_syncopt_after_max128_20260305`, `/tmp/decode_syncopt_before_max256_20260305`, `/tmp/decode_syncopt_after_max256_20260305` | Large, repeatable IO reduction and throughput gain for tiled decode contexts (`128/256`) while preserving hardware correctness tests | **SHIP** |
+| A14 | Decode runtime option sweep on top of A13 (`queue depth`, `eval path`, `power`, `wired`, `pool`, `late latch`, `fences`, `fw signal`) | Try to stack additional constant-factor wins after tile-sync optimization | `/tmp/decode_syncopt_opts_max128_20260305`, `/tmp/decode_syncopt_confirm_evalpath_max128_20260305` | One-shot sweep suggested `ANE_EVAL_PATH=clientDirect`, but 3x confirmation showed baseline parity/no stable gain (median baseline `~0.672–0.676`, candidate `~0.677–0.679`) | **ABANDON** (no reproducible gain) |
 
 ---
 
@@ -105,6 +106,14 @@ Interpretation:
 - Standalone ANE-only confirmation remains fast/stable:
   - `/tmp/decode_syncopt_confirm_max32_20260305` median `0.486 ms`, mean `0.488 ms`, `2047 tok/s`.
 Inference: mixed-run thermal state materially affects ANE median on this host; treat strict speedup claims from long mixed runs conservatively and include artifact provenance.
+
+6) Decode runtime option sweep (post-A13):
+- Quick matrix: `/tmp/decode_syncopt_opts_max128_20260305`
+  - Best one-shot median appeared to be `ANE_EVAL_PATH=clientDirect` (`0.507 ms`) vs baseline (`0.663 ms`) in that run order.
+- Confirmation repeats: `/tmp/decode_syncopt_confirm_evalpath_max128_20260305`
+  - Baseline medians: `0.672`, `0.672`, `0.676`
+  - `clientDirect` medians: `0.677`, `0.679`, `0.679`
+- Verdict: runtime option did not hold up under repeats; keep default eval path.
 
 ### Prefill snapshots
 
