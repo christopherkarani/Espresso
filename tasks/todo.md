@@ -53,6 +53,11 @@ Goal: land autoregressive decode with persistent FP16 KV-cache surfaces and prov
   - `ESPRESSO_BENCH_SEED=1 .build/release/espresso-bench --perf-stats --inference-only --profile-kernels --warmup 50 --iterations 1000 --output /tmp/prefill_profile_ane10x_20260305`
   - Summary table now reports host eval + host overhead + IO lock/body/unlock + handoff split per layer.
   - `hwExecutionTime` remains unavailable on this host build (`_ANEPerformanceStats` request-buffer factory returns nil), and summary explicitly marks HW columns as unavailable.
+- 2026-03-05 post-commit artifact verification (`git_sha=bdb0bd76209701cf910972693e5df0ee58f7ce85`):
+  - Decode profile: `/tmp/decode_profile_bdb0bd7` (`--decode --profile-kernels --warmup 20 --iterations 200 --decode-steps 32 --decode-max-seq 32`)
+    - ANE median `0.646 ms/token`, fastest Core ML median `1.722 ms/token`, strict speedup `2.67x`.
+  - Prefill profile: `/tmp/prefill_profile_bdb0bd7` (`--perf-stats --inference-only --profile-kernels --warmup 20 --iterations 200`)
+    - ANE median `1.872 ms`, Core ML `.all` median `1.541 ms`.
 - 2026-03-05 reproducibility check:
   - Run1: `/tmp/decode_repro_ane10x_run1` (`ANE_COMPILE_CACHE_POLICY=auto`) median `0.648479 ms/token`
   - Run2: `/tmp/decode_repro_ane10x_run2` (`ANE_COMPILE_CACHE_POLICY=preferCached`) median `0.648500 ms/token`
