@@ -8,6 +8,7 @@ import Espresso
 struct BenchmarkOptions {
     var aneOnly: Bool = false
     var inference: Bool = false
+    var diagnostic: Bool = false
     var sustained: Bool = false
     var warmup: Int = 50
     var iterations: Int = 1000
@@ -24,6 +25,8 @@ struct BenchmarkOptions {
                 opts.aneOnly = true
             case "--inference":
                 opts.inference = true
+            case "--diagnostic":
+                opts.diagnostic = true
             case "--sustained":
                 opts.sustained = true
             case "--warmup":
@@ -83,6 +86,7 @@ struct BenchmarkOptions {
         Options:
           --ane-only         Skip Core ML benchmarks
           --inference        Run inference-optimized forward pass (fused residuals)
+          --diagnostic       Run diagnostic experiments (convs-only, batched-head, whole-model)
           --sustained        Run 60-second sustained thermal test
           --warmup N         Warmup iterations (default: 50)
           --iterations N     Measured iterations (default: 1000)
@@ -137,6 +141,94 @@ if opts.inference {
         printStderr("ANE Fused Inference benchmark failed: \(error)")
         printStderr("Continuing without fused results...")
     }
+}
+
+// --- Benchmark 1d: Diagnostic Experiments (optional) ---
+var diagnosticConvsOnly: ANEDirectBench.Result? = nil
+var diagnosticBatchedHead: ANEDirectBench.Result? = nil
+var diagnosticWholeModel: ANEDirectBench.Result? = nil
+
+if opts.diagnostic {
+    printStderr("\n=== Phase 2 Diagnostic Experiments ===")
+    printStderr("Running fused baseline + 3 diagnostic experiments...")
+
+    // Exp 1: Convs-Only
+    do {
+        diagnosticConvsOnly = try DiagnosticBench.runConvsOnly(
+            warmup: opts.warmup, iterations: opts.iterations, nLayers: opts.nLayers)
+    } catch {
+        printStderr("Diagnostic Exp 1 (Convs-Only) failed: \(error)")
+    }
+
+    // Exp 2: Batched-Head
+    do {
+        diagnosticBatchedHead = try DiagnosticBench.runBatchedHead(
+            warmup: opts.warmup, iterations: opts.iterations, nLayers: opts.nLayers)
+    } catch {
+        printStderr("Diagnostic Exp 2 (Batched-Head) failed: \(error)")
+    }
+
+    // Exp 3: Whole-Model
+    do {
+        diagnosticWholeModel = try DiagnosticBench.runWholeModel(
+            warmup: opts.warmup, iterations: opts.iterations, nLayers: opts.nLayers)
+    } catch {
+        printStderr("Diagnostic Exp 3 (Whole-Model) failed: \(error)")
+    }
+
+    // Print comparative table
+    printStderr("\n=== Diagnostic Results Summary ===")
+    printStderr(String(format: "%-25s %10s %10s %10s %10s",
+        "Experiment", "Median", "Mean", "P95", "ms/layer"))
+
+    let nL = Double(opts.nLayers)
+
+    if let fused = fusedResult {
+        let r = fused.benchmarkResult
+        printStderr(String(format: "%-25s %10.3f %10.3f %10.3f %10.3f",
+            "Fused (baseline)", r.median, r.mean, r.p95, r.median / nL))
+    }
+
+    if let co = diagnosticConvsOnly {
+        let r = co.benchmarkResult
+        printStderr(String(format: "%-25s %10.3f %10.3f %10.3f %10.3f",
+            "Convs-Only", r.median, r.mean, r.p95, r.median / nL))
+    }
+
+    if let bh = diagnosticBatchedHead {
+        let r = bh.benchmarkResult
+        printStderr(String(format: "%-25s %10.3f %10.3f %10.3f %10.3f",
+            "Batched-Head", r.median, r.mean, r.p95, r.median / nL))
+    }
+
+    if let wm = diagnosticWholeModel {
+        let r = wm.benchmarkResult
+        printStderr(String(format: "%-25s %10.3f %10.3f %10.3f %10.3f",
+            "Whole-Model", r.median, r.mean, r.p95, r.median / nL))
+    }
+
+    // Overhead decomposition
+    if let fused = fusedResult, let co = diagnosticConvsOnly {
+        let fusedPerLayer = fused.benchmarkResult.median / nL
+        let convsPerLayer = co.benchmarkResult.median / nL
+        let attnOverhead = fusedPerLayer - convsPerLayer
+        printStderr(String(format: "\n  Per-layer budget decomposition:"))
+        printStderr(String(format: "    Pure convolution compute: %.3f ms/layer", convsPerLayer))
+        printStderr(String(format: "    Attention + norm overhead: %.3f ms/layer", attnOverhead))
+        printStderr(String(format: "    Hardware floor: 0.213 ms/layer"))
+    }
+
+    if let fused = fusedResult, let wm = diagnosticWholeModel {
+        let dispatchOverhead = (fused.benchmarkResult.median - wm.benchmarkResult.median) / max(1.0, nL - 1.0)
+        printStderr(String(format: "    Dispatch overhead per layer: %.3f ms", dispatchOverhead))
+    }
+
+    if let fused = fusedResult, let bh = diagnosticBatchedHead {
+        let delta = bh.benchmarkResult.median - fused.benchmarkResult.median
+        printStderr(String(format: "    Batched vs Split-Head delta: %+.3f ms", delta))
+    }
+
+    printStderr("")
 }
 
 // --- Benchmark 2: Core ML (optional) ---
@@ -234,6 +326,26 @@ do {
                 to: "\(outputDir)/\(filename)_latencies.csv"
             )
         }
+    }
+
+    // Diagnostic CSVs
+    if let co = diagnosticConvsOnly {
+        try ResultsFormatter.writeCSV(
+            latencies: co.benchmarkResult.latencies,
+            to: "\(outputDir)/diagnostic_convs_only_latencies.csv"
+        )
+    }
+    if let bh = diagnosticBatchedHead {
+        try ResultsFormatter.writeCSV(
+            latencies: bh.benchmarkResult.latencies,
+            to: "\(outputDir)/diagnostic_batched_head_latencies.csv"
+        )
+    }
+    if let wm = diagnosticWholeModel {
+        try ResultsFormatter.writeCSV(
+            latencies: wm.benchmarkResult.latencies,
+            to: "\(outputDir)/diagnostic_whole_model_latencies.csv"
+        )
     }
 
     // Summary report

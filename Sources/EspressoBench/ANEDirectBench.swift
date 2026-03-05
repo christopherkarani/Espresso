@@ -385,7 +385,7 @@ enum ANEDirectBench {
 
     // MARK: - Helpers
 
-    private static func randomFill(_ buffer: borrowing TensorBuffer, range: ClosedRange<Float> = -0.1...0.1) {
+    static func randomFill(_ buffer: borrowing TensorBuffer, range: ClosedRange<Float> = -0.1...0.1) {
         buffer.withUnsafeMutablePointer { ptr in
             for i in 0..<buffer.count {
                 ptr[i] = Float.random(in: range)
@@ -393,7 +393,7 @@ enum ANEDirectBench {
         }
     }
 
-    private static func onesFill(_ buffer: borrowing TensorBuffer) {
+    static func onesFill(_ buffer: borrowing TensorBuffer) {
         buffer.withUnsafeMutablePointer { ptr in
             for i in 0..<buffer.count {
                 ptr[i] = 1.0
