@@ -84,6 +84,42 @@
 
 ---
 
+## Implementation: Fused Layer Inference (COMPLETED)
+
+### What Was Built
+- `FusedLayerInferenceGenerator`: Single MIL program per layer combining:
+  - RMSNorm1 + split-head SDPA (12 independent heads via slice_by_index) + concat + Wo + residual
+  - RMSNorm2 + SiLU-gated FFN + residual
+- `FusedInferenceKernel`: Single `~Copyable` kernel wrapper (10 weight blobs)
+- `ForwardPass.runFusedInferenceTimed`: One eval() + one I/O round-trip per layer
+
+### MIL Debugging Notes
+- `reduce_mean` and `rsqrt` are NOT valid in raw MIL text dialect — must use `reduce_sum + mul(invd)` and `pow(x, -0.5)`
+- `slice_by_index` requires explicit `begin_mask`, `end_mask`, `squeeze_mask` tensor params
+
+### Benchmark Results (6-layer, 500 iterations, 50 warmup)
+
+| Configuration | Kernels | Median | Per-Layer | Speedup vs Training |
+|---|---|---|---|---|
+| Training | 30 | 11.493 ms | 1.915 ms | 1.0x |
+| Inference (separate) | 12 | 6.759 ms | 1.127 ms | 1.70x |
+| **Fused (split-head)** | **6** | **3.871 ms** | **0.645 ms** | **2.97x** |
+
+### Analysis
+- **Fused vs Inference: 1.75x faster** — eliminates 6 eval() dispatches and 6 inter-kernel I/O round-trips
+- **Per-layer: 0.645 ms** (down from 1.127 ms)
+- **Compilation: 2.6s** (6 fused kernels vs 1.5s for 12 separate kernels — each fused kernel is larger)
+- **ANE utilization: ~33%** (up from ~19% for inference)
+- **Distance to 10x target: 8.3x improvement needed** from 0.645ms to 0.077ms
+
+### What's Left for Further Optimization
+The remaining gap to 10x is **ANE kernel compute time** — the fused kernel runs for ~0.6ms per layer, which is 3x the theoretical minimum (0.213ms at 100% utilization). The bottleneck is likely:
+1. **Reshape/transpose overhead** — still 60+ reshape/transpose ops across 12 heads
+2. **ANE scheduling** — whether 12 independent heads actually parallelize across ANE cores
+3. **Memory bandwidth** — the 256×256 attention score matrices for each head
+
+---
+
 ## Research Task #4: ANE Private API Capabilities (COMPLETED)
 
 ### Key Findings
