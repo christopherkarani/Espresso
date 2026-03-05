@@ -297,6 +297,18 @@ Prefill profile run:
     - Rebuilding `_ANERequest` is not sufficient to safely rebind decode input surfaces after model load on this host/runtime.
     - This path is too unstable to benchmark or ship, so it was reverted immediately rather than iterated in the hot path.
   - Decision: `ABANDON`.
+- Decode compile-time external surface aliasing was discarded before benchmarking:
+  - Scope attempted:
+    - added a surface-aware compile path so kernels could be built against externally supplied IOSurfaces
+    - attempted intra-layer decode chaining by compiling `decodeFFN` with `decodeAttnQKV` output 0 as its input surface
+  - Targeted hardware tests:
+    - `ANERuntimeTests/test_kernel_rejects_undersized_external_input_surface` passed
+    - `ANERuntimeTests/test_kernel_uses_provided_external_input_surface_and_evals` failed with `statusType=0x9: Program Inference error`
+    - `InferenceOptimizationTests/test_decode_compile_time_chained_stack_matches_baseline_on_hardware` drifted to `NaN`
+  - Interpretation:
+    - the current ANE runtime contract on this host does not safely support externally supplied input IOSurfaces for these compiled kernels
+    - because the primitive itself failed on real hardware, the path was reverted immediately instead of benchmarked
+  - Decision: `ABANDON`.
 
 ### Invalid/discarded evidence
 - Parallel prefill benchmark invocation was discarded as non-defensible due host contention; only sequential reruns are used for conclusions in this document.
@@ -312,6 +324,7 @@ Inference: strict decode/prefill regression assessment must be done against the 
 ### Proven tried paths (evidence-backed)
 - Decode tiled IO reduction (A13): **works** and should be preserved as baseline.
 - Decode runtime option stacking after A13 (A14): **no stable gain**; keep default path.
+- Decode compile-time external surface aliasing: **unsafe/abandoned**; do not reuse as a dispatch-reduction path.
 - Prefill queue-depth/memory-pool combo (A15): **regressed** under sequential rerun; do not reuse.
 - Perf-stats fallback hacks (A10): **unsafe/abandoned**; do not pursue private selector spoofing.
 
@@ -330,3 +343,6 @@ Inference: strict decode/prefill regression assessment must be done against the 
 ### Practical ceiling hypothesis (current evidence)
 - With current kernel contract and 2-eval decode dispatch, decode speedups above current `~2x` strict likely require **architectural dispatch reduction (H1)** rather than additional runtime option sweeps.
 - Prefill large multi-x gains are unlikely on this host path without a meaningful reduction in host eval overhead; short-term expectation is parity-to-modest gains, not 3–6x.
+
+### Next queued experiment
+- Build a minimal `_ANEChainingRequest` proof-of-life in the interop layer and validate it on hardware before touching decode hot-path code again.

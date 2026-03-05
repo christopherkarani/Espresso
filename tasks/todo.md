@@ -762,3 +762,30 @@ Goal: maximize advantage vs Core ML by eliminating structural overhead (dispatch
 ### Phase 9 Review (Fill In As We Iterate)
 - [ ] Best observed inference median/mean vs Core ML (include absolute ms, speedup, utilization).
 - [ ] Bottleneck summary (top 3): what is structural vs fixable.
+
+---
+
+## Decode Tuning Loop (2026-03-06)
+
+### Current baseline
+- Decode benchmark-capable lineage baseline remains `bdb0bd7` with strict ANE decode speedup about `2.67x` at `maxSeq=32`.
+- Current clean-worktree quick confirm baseline stays around `0.4940 ms/token` median-of-medians at `maxSeq=32` with default `preferCached`.
+
+### What worked
+- Tiled decode IO reduction from `5c016ec` remains the best shipped improvement for longer contexts.
+
+### What did not work
+- Runtime option chasing at `maxSeq=32` did not beat baseline.
+- Request-level input rebinding after model load was unsafe on real hardware.
+- Compile-time external surface aliasing was also unsafe on real hardware:
+  - undersized input rejection passed
+  - actual eval with external input surface failed with `statusType=0x9: Program Inference error`
+  - decode chained parity test drifted to `NaN`
+
+### Why
+- The remaining decode cost is mostly eval time, not simple copy overhead.
+- External IOSurface rebinding and compile-time aliasing both failed before benchmarking, which means the runtime contract itself is the blocker rather than a small tuning issue.
+
+### Next up
+- [ ] Build a minimal `_ANEChainingRequest` proof-of-life in the interop layer.
+- [ ] Only if the primitive works on hardware, thread it into decode behind a flag and benchmark.

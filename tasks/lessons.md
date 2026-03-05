@@ -47,6 +47,7 @@
 ## 2026-03-06 — Experiment Tracking Discipline
 - Use Wax MCP continuously during long ANE tuning loops: record the baseline marker, active clean worktree/branch, each experiment hypothesis, artifact directories, verdicts, and rollback notes as the work progresses.
 - Treat Wax memory as part of the performance workflow, not an optional afterthought; if the user corrects memory/experiment tracking behavior, update both Wax and `tasks/lessons.md` immediately.
+- When a build, test, or benchmark run hits a blocker, record the failure mode, current hypothesis, and next action in Wax session memory before continuing. The issue trail matters as much as the winning runs.
 
 ## 2026-03-06 — Performance Reporting Discipline
 - Every tuning cycle must document three things explicitly: what was tried, what worked, and what did not work.
