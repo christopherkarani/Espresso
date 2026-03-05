@@ -1,5 +1,6 @@
 import Foundation
 import ANETypes
+import Espresso
 
 enum ResultsFormatter {
     static func chipName() -> String {
@@ -116,6 +117,58 @@ enum ResultsFormatter {
         return out
     }
 
+    static func formatInferenceOnlyReport(
+        inferenceResult: BenchmarkResult,
+        inferenceTimingBreakdown: (ane: Double, io: Double, elem: Double)?,
+        inferenceCompileTimeMs: Double?,
+        coreMLResults: [(label: String, result: BenchmarkResult)]?,
+        coreMLLoadTimeMs: Double?,
+        flopsPerPass: Double,
+        nLayers: Int
+    ) -> String {
+        var out = ""
+        let chip = chipName()
+        let peakTFLOPS = 18.0
+
+        out += "=== ANE DIRECT BENCHMARK (INFERENCE ONLY) ===\n"
+        out += "Chip: \(chip)\n"
+        out += String(format: "ANE Peak: %.1f TFLOPS\n", peakTFLOPS)
+        out += "Workload: \(nLayers)-layer transformer, dim=\(ModelConfig.dim), "
+        out += "seq=\(ModelConfig.seqLen), heads=\(ModelConfig.heads), hidden=\(ModelConfig.hidden)\n"
+        out += String(format: "FLOPs per forward pass: %.2f GFLOPs\n", flopsPerPass / 1e9)
+        if let compileMs = inferenceCompileTimeMs {
+            out += String(format: "Kernel compilation: %.1f ms (%d kernels)\n", compileMs, nLayers * 2)
+        }
+        out += "\n"
+
+        out += formatLatencySection(inferenceResult, flopsPerPass: flopsPerPass, peakTFLOPS: peakTFLOPS)
+
+        if let breakdown = inferenceTimingBreakdown {
+            let total = breakdown.ane + breakdown.io + breakdown.elem
+            if total > 0 {
+                out += "--- Time Breakdown (avg per forward pass) ---\n"
+                out += String(format: "ANE kernel:    %.3f ms (%.1f%%)\n", breakdown.ane, breakdown.ane / total * 100)
+                out += String(format: "Surface I/O:   %.3f ms (%.1f%%)\n", breakdown.io, breakdown.io / total * 100)
+                out += String(format: "CPU element:   %.3f ms (%.1f%%)\n\n", breakdown.elem, breakdown.elem / total * 100)
+            }
+        }
+
+        if let coreMLResults {
+            for (label, result) in coreMLResults {
+                out += "=== CORE ML BASELINE (\(label)) ===\n"
+                if let loadTime = coreMLLoadTimeMs, label.contains("all") {
+                    out += String(format: "Model load time: %.1f ms\n", loadTime)
+                }
+                out += formatLatencySection(result, flopsPerPass: flopsPerPass, peakTFLOPS: peakTFLOPS)
+                let speedup = result.median / inferenceResult.median
+                out += "--- vs ANE Direct (Inference) ---\n"
+                out += String(format: "Speedup (ANE vs this): %.2fx\n\n", speedup)
+            }
+        }
+
+        return out
+    }
+
     private static func formatLatencySection(
         _ result: BenchmarkResult,
         flopsPerPass: Double,
@@ -148,5 +201,40 @@ enum ResultsFormatter {
         let rows = latencies.enumerated().map { "\($0.offset),\(String(format: "%.6f", $0.element))" }
         let content = header + rows.joined(separator: "\n") + "\n"
         try content.write(toFile: path, atomically: true, encoding: .utf8)
+    }
+
+    static func writeInferenceKernelProfileCSV(profile: InferenceKernelProfile, to path: String) throws {
+        let posix = Locale(identifier: "en_US_POSIX")
+        var out = "layer,iteration,attn_write_us,attn_eval_us,attn_read_us,gap_attn_to_ffn_us,ffn_write_us,ffn_copy_us,ffn_eval_us,ffn_read_us\n"
+
+        for (layerIdx, layer) in profile.layers.enumerated() {
+            let n = layer.attnWriteUS.count
+            precondition(layer.attnEvalUS.count == n)
+            precondition(layer.attnReadUS.count == n)
+            precondition(layer.ffnWriteUS.count == n)
+            precondition(layer.ffnCopyUS.count == n)
+            precondition(layer.ffnEvalUS.count == n)
+            precondition(layer.ffnReadUS.count == n)
+            precondition(layer.gapAttnToFfnUS.count == n)
+
+            for i in 0..<n {
+                out += String(
+                    format: "%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+                    locale: posix,
+                    layerIdx,
+                    i,
+                    layer.attnWriteUS[i],
+                    layer.attnEvalUS[i],
+                    layer.attnReadUS[i],
+                    layer.gapAttnToFfnUS[i],
+                    layer.ffnWriteUS[i],
+                    layer.ffnCopyUS[i],
+                    layer.ffnEvalUS[i],
+                    layer.ffnReadUS[i]
+                )
+            }
+        }
+
+        try out.write(toFile: path, atomically: true, encoding: .utf8)
     }
 }

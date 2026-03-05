@@ -8,6 +8,9 @@ import Espresso
 struct BenchmarkOptions {
     var aneOnly: Bool = false
     var inference: Bool = false
+    var inferenceFP16Handoff: Bool = false
+    var inferenceOnly: Bool = false
+    var profileKernels: Bool = false
     var sustained: Bool = false
     var warmup: Int = 50
     var iterations: Int = 1000
@@ -24,6 +27,13 @@ struct BenchmarkOptions {
                 opts.aneOnly = true
             case "--inference":
                 opts.inference = true
+            case "--inference-fp16-handoff":
+                opts.inferenceFP16Handoff = true
+            case "--inference-only":
+                opts.inference = true
+                opts.inferenceOnly = true
+            case "--profile-kernels":
+                opts.profileKernels = true
             case "--sustained":
                 opts.sustained = true
             case "--warmup":
@@ -83,6 +93,9 @@ struct BenchmarkOptions {
         Options:
           --ane-only         Skip Core ML benchmarks
           --inference        Run inference-optimized forward pass (fused residuals)
+          --inference-fp16-handoff  Use FP16 surface-to-surface handoff between attn -> ffn
+          --inference-only   Run inference benchmark only (skips training benchmark to save compile budget)
+          --profile-kernels  Record per-kernel stage timing (us) and save CSV
           --sustained        Run 60-second sustained thermal test
           --warmup N         Warmup iterations (default: 50)
           --iterations N     Measured iterations (default: 1000)
@@ -108,7 +121,97 @@ printStderr(String(format: "FLOPs per forward pass: %.2f GFLOPs", flopsPerPass /
 printStderr(String(format: "Iterations: %d warmup + %d measured", opts.warmup, opts.iterations))
 printStderr("")
 
-// --- Benchmark 1: ANE Direct (training forward pass) ---
+let handoff: ForwardPass.InferenceInterKernelHandoff = opts.inferenceFP16Handoff ? .fp16SurfaceCopy : .cpuRoundTrip
+
+if opts.inferenceOnly {
+    // --- Inference-only flow (skips training compile budget) ---
+    let inferenceResult: ANEDirectBench.Result
+    do {
+        inferenceResult = try ANEDirectBench.runInference(
+            warmup: opts.warmup,
+            iterations: opts.iterations,
+            nLayers: opts.nLayers,
+            handoff: handoff,
+            profileKernels: opts.profileKernels
+        )
+    } catch {
+        printStderr("ANE Inference benchmark failed: \(error)")
+        exit(1)
+    }
+
+    // Core ML (optional)
+    var coreMLResult: CoreMLBench.Result? = nil
+    if !opts.aneOnly {
+        do {
+            coreMLResult = try CoreMLBench.run(runner: runner, modelPath: opts.coreMLModelPath)
+        } catch {
+            printStderr("Core ML benchmark failed: \(error)")
+            printStderr("Continuing with ANE-only results...")
+        }
+    }
+
+    let report = ResultsFormatter.formatInferenceOnlyReport(
+        inferenceResult: inferenceResult.benchmarkResult,
+        inferenceTimingBreakdown: inferenceResult.avgTimingBreakdown,
+        inferenceCompileTimeMs: inferenceResult.compileTimeMs,
+        coreMLResults: coreMLResult?.results,
+        coreMLLoadTimeMs: coreMLResult?.modelLoadTimeMs,
+        flopsPerPass: flopsPerPass,
+        nLayers: opts.nLayers
+    )
+    print(report)
+
+    // Save results
+    let outputDir: String
+    if let dir = opts.outputDir {
+        outputDir = dir
+    } else {
+        let dateFormatter = DateFormatter()
+        dateFormatter.dateFormat = "yyyy-MM-dd-HHmmss"
+        dateFormatter.locale = Locale(identifier: "en_US_POSIX")
+        let timestamp = dateFormatter.string(from: Date())
+        outputDir = "benchmarks/results/\(timestamp)"
+    }
+
+    do {
+        try FileManager.default.createDirectory(atPath: outputDir, withIntermediateDirectories: true)
+
+        try ResultsFormatter.writeCSV(
+            latencies: inferenceResult.benchmarkResult.latencies,
+            to: "\(outputDir)/ane_inference_latencies.csv"
+        )
+        if let profile = inferenceResult.kernelProfile {
+            try ResultsFormatter.writeInferenceKernelProfileCSV(
+                profile: profile,
+                to: "\(outputDir)/ane_inference_kernel_profile.csv"
+            )
+        }
+        if let coreML = coreMLResult {
+            for (label, result) in coreML.results {
+                let filename = label.lowercased()
+                    .replacingOccurrences(of: " ", with: "_")
+                    .replacingOccurrences(of: "(", with: "")
+                    .replacingOccurrences(of: ")", with: "")
+                    .replacingOccurrences(of: ".", with: "")
+                try ResultsFormatter.writeCSV(
+                    latencies: result.latencies,
+                    to: "\(outputDir)/\(filename)_latencies.csv"
+                )
+            }
+        }
+
+        try report.write(toFile: "\(outputDir)/summary.txt", atomically: true, encoding: .utf8)
+        printStderr("\nResults saved to: \(outputDir)/")
+    } catch {
+        printStderr("Failed to save results: \(error)")
+    }
+
+    exit(0)
+}
+
+// --- Default flow: training + (optional) inference + (optional) coreml ---
+
+// Benchmark 1: ANE Direct (training forward pass)
 let aneResult: ANEDirectBench.Result
 do {
     aneResult = try ANEDirectBench.run(warmup: opts.warmup, iterations: opts.iterations, nLayers: opts.nLayers)
@@ -117,18 +220,24 @@ do {
     exit(1)
 }
 
-// --- Benchmark 1b: ANE Direct Inference (optional, fused residuals) ---
+// Benchmark 1b: ANE Direct Inference (optional, fused residuals)
 var inferenceResult: ANEDirectBench.Result? = nil
 if opts.inference {
     do {
-        inferenceResult = try ANEDirectBench.runInference(warmup: opts.warmup, iterations: opts.iterations, nLayers: opts.nLayers)
+        inferenceResult = try ANEDirectBench.runInference(
+            warmup: opts.warmup,
+            iterations: opts.iterations,
+            nLayers: opts.nLayers,
+            handoff: handoff,
+            profileKernels: opts.profileKernels
+        )
     } catch {
         printStderr("ANE Inference benchmark failed: \(error)")
         printStderr("Continuing without inference results...")
     }
 }
 
-// --- Benchmark 2: Core ML (optional) ---
+// Benchmark 2: Core ML (optional)
 var coreMLResult: CoreMLBench.Result? = nil
 if !opts.aneOnly {
     do {
@@ -139,7 +248,7 @@ if !opts.aneOnly {
     }
 }
 
-// --- Benchmark 3: Sustained thermal test (optional) ---
+// Benchmark 3: Sustained thermal test (optional)
 var thermalBefore: String? = nil
 var thermalAfter: String? = nil
 if opts.sustained {
@@ -157,7 +266,7 @@ if opts.sustained {
     }
 }
 
-// --- Output Report ---
+// Output report
 let inferenceReportData: (result: BenchmarkResult, breakdown: (ane: Double, io: Double, elem: Double), compileMs: Double)?
 if let inf = inferenceResult {
     inferenceReportData = (result: inf.benchmarkResult, breakdown: inf.avgTimingBreakdown, compileMs: inf.compileTimeMs)
@@ -181,7 +290,7 @@ let report = ResultsFormatter.formatReport(
 )
 print(report)
 
-// --- Save Results ---
+// Save results
 let outputDir: String
 if let dir = opts.outputDir {
     outputDir = dir
@@ -196,21 +305,24 @@ if let dir = opts.outputDir {
 do {
     try FileManager.default.createDirectory(atPath: outputDir, withIntermediateDirectories: true)
 
-    // ANE Direct CSV
     try ResultsFormatter.writeCSV(
         latencies: aneResult.benchmarkResult.latencies,
         to: "\(outputDir)/ane_direct_latencies.csv"
     )
 
-    // ANE Inference CSV
     if let inf = inferenceResult {
         try ResultsFormatter.writeCSV(
             latencies: inf.benchmarkResult.latencies,
             to: "\(outputDir)/ane_inference_latencies.csv"
         )
+        if let profile = inf.kernelProfile {
+            try ResultsFormatter.writeInferenceKernelProfileCSV(
+                profile: profile,
+                to: "\(outputDir)/ane_inference_kernel_profile.csv"
+            )
+        }
     }
 
-    // Core ML CSVs
     if let coreML = coreMLResult {
         for (label, result) in coreML.results {
             let filename = label.lowercased()
@@ -225,9 +337,7 @@ do {
         }
     }
 
-    // Summary report
     try report.write(toFile: "\(outputDir)/summary.txt", atomically: true, encoding: .utf8)
-
     printStderr("\nResults saved to: \(outputDir)/")
 } catch {
     printStderr("Failed to save results: \(error)")

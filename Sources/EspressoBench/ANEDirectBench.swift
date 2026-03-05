@@ -9,6 +9,7 @@ enum ANEDirectBench {
         let benchmarkResult: BenchmarkResult
         let avgTimingBreakdown: (ane: Double, io: Double, elem: Double)
         let compileTimeMs: Double
+        let kernelProfile: InferenceKernelProfile?
     }
 
     /// Main ANE benchmark. Inlines measurement loop to avoid ~Copyable closure captures.
@@ -111,13 +112,20 @@ enum ANEDirectBench {
         return Result(
             benchmarkResult: result,
             avgTimingBreakdown: avgBreakdown,
-            compileTimeMs: compileMs
+            compileTimeMs: compileMs,
+            kernelProfile: nil
         )
     }
 
     /// Inference-optimized benchmark using fused-residual kernels.
     /// Only 2 kernels per layer (vs 5 for training), smaller output surfaces.
-    static func runInference(warmup: Int, iterations: Int, nLayers: Int = 1) throws -> Result {
+    static func runInference(
+        warmup: Int,
+        iterations: Int,
+        nLayers: Int = 1,
+        handoff: ForwardPass.InferenceInterKernelHandoff = .cpuRoundTrip,
+        profileKernels: Bool = false
+    ) throws -> Result {
         printStderr("\n=== ANE Inference Benchmark (Fused Residuals) ===")
         printStderr("Setting up \(nLayers)-layer inference forward pass...")
 
@@ -160,6 +168,8 @@ enum ANEDirectBench {
                 xCur: xCur,
                 kernels: kernels,
                 surfaceHandles: surfaceHandles,
+                handoff: handoff,
+                profiler: nil,
                 timings: &timings
             )
         }
@@ -170,6 +180,8 @@ enum ANEDirectBench {
         latencies.reserveCapacity(iterations)
         var totalTimings = StepTimingBreakdown()
 
+        let profiler = profileKernels ? InferenceKernelProfiler(layerCount: nLayers, reservedSamplesPerLayer: iterations) : nil
+
         for i in 0..<iterations {
             var stepTimings = StepTimingBreakdown()
             let state = signposter.beginInterval("InferenceForwardPass")
@@ -179,6 +191,8 @@ enum ANEDirectBench {
                 xCur: xCur,
                 kernels: kernels,
                 surfaceHandles: surfaceHandles,
+                handoff: handoff,
+                profiler: profiler,
                 timings: &stepTimings
             )
 
@@ -215,7 +229,8 @@ enum ANEDirectBench {
         return Result(
             benchmarkResult: result,
             avgTimingBreakdown: avgBreakdown,
-            compileTimeMs: compileMs
+            compileTimeMs: compileMs,
+            kernelProfile: profiler?.profile
         )
     }
 

@@ -556,3 +556,52 @@ Critical path: 1 → 2 → 5 → 6 (Phases 3 & 4 parallelizable)
 | 4 | Numerical gradient check (finite difference) | Relative: 1e-3 |
 | 5 | Same-input kernel output: Swift vs ObjC | fp16: 1e-2 |
 | 6 | End-to-end loss, gradients, benchmark | Loss: 0.01, Grad: 5%, Perf: 9.3ms |
+
+---
+
+## Phase 9: ANE Inference 10x vs Core ML (2026-03-05)
+
+Goal: maximize advantage vs Core ML by eliminating structural overhead (dispatch, I/O, coherency) and matching or exceeding Core ML's compiler/runtime optimizations. Track each optimization with: correctness test, benchmark deltas, raw CSV outputs.
+
+### A) Measurement Infrastructure (Must Be Trusted)
+- [ ] Land inference-only benchmark flow (`--inference-only`) to avoid training compile budget issues during tuning.
+- [ ] Land per-kernel stage profiling (`--profile-kernels`) and CSV export (`ane_inference_kernel_profile.csv`).
+- [ ] Benchmark: baseline inference-only profile (ANE-only):
+  - [ ] `.build/release/espresso-bench --inference-only --ane-only --profile-kernels --warmup 50 --iterations 500 --output /tmp/ane10x_profile_baseline`
+- [ ] Benchmark: fp16 handoff inference-only profile (ANE-only):
+  - [ ] `.build/release/espresso-bench --inference-only --ane-only --profile-kernels --inference-fp16-handoff --warmup 50 --iterations 500 --output /tmp/ane10x_profile_fp16`
+- [ ] Write a short readout in this file: which segment dominates (attn eval vs ffn eval vs read/write vs gaps).
+
+### B) True Hardware Execution Time (Split Wall-Time vs HW)
+- [ ] Integrate `_ANEPerformanceStats` on the private API path (must use factory methods; `alloc/init` may return `nil`).
+- [ ] Export per-eval `hwExecutionTimeUS` (and any other useful fields) to CSV alongside wall-time segments.
+- [ ] Verify: wall-time ~= hw-time + overhead; quantify overhead and whether it changes with each optimization.
+
+### C) IOSurface Copy / Coherency Experiments (Fix fp16 handoff Regression)
+- [ ] Implement multiple FP16 handoff strategies in `SurfaceIO`:
+  - [ ] Strategy 1: lock src, memcpy -> temp, unlock; lock dst, memcpy temp -> dst, unlock.
+  - [ ] Strategy 2: reverse lock order (dst then src) and benchmark.
+  - [ ] Strategy 3: avoid holding 2 surface locks simultaneously (if current impl does).
+- [ ] Add ANE hardware correctness test: fp16 handoff strategies match CPU round-trip (tight tolerances).
+- [ ] Benchmark each strategy with `--profile-kernels` and compare `*_eval_us` vs baseline.
+
+### D) Kernel Dispatch Overhead: Zero-Gap Chaining / Realtime Eval
+- [ ] Prototype chaining (attn -> ffn) using `_ANEChainingRequest` or equivalent if exposed.
+- [ ] Prototype realtime evaluation path (if available) to reduce scheduler overhead.
+- [ ] Benchmark: measure `gap_attn_to_ffn_us` and driver overhead deltas.
+
+### E) Kernel Fusion (Reduce Dispatch Count)
+- [ ] Attempt a single fused MIL program for one transformer layer (attn + ffn).
+- [ ] If compile rejects full fusion, bisect: fuse (attn block) and/or (ffn block) further and measure dispatch counts.
+
+### F) Automated Tuning Harness
+- [ ] Add a small runner that sweeps knobs (handoff strategy, queue depth, chaining on/off, realtime on/off) and writes a `best_of.json` + CSVs.
+- [ ] Run nightly-style sweep locally for 30-60 mins to find best stable config.
+
+### G) Theoretical Bound / Reality Check
+- [ ] Write `docs/ane_roofline.md`: MACs + bytes moved for this layer; estimate lower bound latency.
+- [ ] Decide: is “10x faster than Core ML” physically possible for the identical workload? If not, document the max-possible gap and why.
+
+### Phase 9 Review (Fill In As We Iterate)
+- [ ] Best observed inference median/mean vs Core ML (include absolute ms, speedup, utilization).
+- [ ] Bottleneck summary (top 3): what is structural vs fixable.

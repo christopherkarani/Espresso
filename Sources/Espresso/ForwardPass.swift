@@ -250,6 +250,7 @@ public enum ForwardPass {
         seqLen: Int = ModelConfig.seqLen,
         surfaceHandles: [InferenceSurfaceHandles]? = nil,
         handoff: InferenceInterKernelHandoff = .cpuRoundTrip,
+        profiler: InferenceKernelProfiler? = nil,
         timings: inout StepTimingBreakdown
     ) throws(ANEError) {
         precondition(dim > 0 && seqLen > 0)
@@ -273,11 +274,16 @@ public enum ForwardPass {
             xCur.withUnsafeBufferPointer { xBuf in
                 SurfaceIO.writeFP16(to: attnIn, data: xBuf, channels: dim, spatial: seqLen)
             }
-            timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
+            let attnWriteDelta = RuntimeClock.now() - t0
+            timings.tIO += RuntimeClock.ms(attnWriteDelta)
+            let attnWriteUS = RuntimeClock.us(attnWriteDelta)
 
             t0 = RuntimeClock.now()
             try kernels[L].fwdAttn.eval()
-            timings.tAne += RuntimeClock.ms(RuntimeClock.now() - t0)
+            let attnEvalDelta = RuntimeClock.now() - t0
+            timings.tAne += RuntimeClock.ms(attnEvalDelta)
+            let attnEvalUS = RuntimeClock.us(attnEvalDelta)
+            let attnEvalEndTick = RuntimeClock.now()
 
             // Read only dim channels (the fused residual result).
             let attnOut: IOSurfaceRef
@@ -295,6 +301,10 @@ public enum ForwardPass {
                 ffnIn = try kernels[L].fwdFFN.inputSurface(at: 0)
             }
 
+            var attnReadUS: Double = 0
+            var ffnWriteUS: Double = 0
+            var ffnCopyUS: Double = 0
+
             switch handoff {
             case .cpuRoundTrip:
                 t0 = RuntimeClock.now()
@@ -307,13 +317,17 @@ public enum ForwardPass {
                         spatial: seqLen
                     )
                 }
-                timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
+                let attnReadDelta = RuntimeClock.now() - t0
+                timings.tIO += RuntimeClock.ms(attnReadDelta)
+                attnReadUS = RuntimeClock.us(attnReadDelta)
 
                 t0 = RuntimeClock.now()
                 xCur.withUnsafeBufferPointer { xBuf in
                     SurfaceIO.writeFP16(to: ffnIn, data: xBuf, channels: dim, spatial: seqLen)
                 }
-                timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
+                let ffnWriteDelta = RuntimeClock.now() - t0
+                timings.tIO += RuntimeClock.ms(ffnWriteDelta)
+                ffnWriteUS = RuntimeClock.us(ffnWriteDelta)
             case .fp16SurfaceCopy:
                 t0 = RuntimeClock.now()
                 do {
@@ -328,12 +342,19 @@ public enum ForwardPass {
                 } catch {
                     throw .invalidArguments("SurfaceIO.copyFP16 failed: \(error)")
                 }
-                timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
+                let ffnCopyDelta = RuntimeClock.now() - t0
+                timings.tIO += RuntimeClock.ms(ffnCopyDelta)
+                ffnCopyUS = RuntimeClock.us(ffnCopyDelta)
             }
 
-            t0 = RuntimeClock.now()
+            let ffnEvalStartTick = RuntimeClock.now()
+            let gapUS = RuntimeClock.us(ffnEvalStartTick - attnEvalEndTick)
+
+            t0 = ffnEvalStartTick
             try kernels[L].fwdFFN.eval()
-            timings.tAne += RuntimeClock.ms(RuntimeClock.now() - t0)
+            let ffnEvalDelta = RuntimeClock.now() - t0
+            timings.tAne += RuntimeClock.ms(ffnEvalDelta)
+            let ffnEvalUS = RuntimeClock.us(ffnEvalDelta)
 
             // Read only dim channels (the fused residual result).
             let ffnOut: IOSurfaceRef
@@ -353,7 +374,21 @@ public enum ForwardPass {
                     spatial: seqLen
                 )
             }
-            timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
+            let ffnReadDelta = RuntimeClock.now() - t0
+            timings.tIO += RuntimeClock.ms(ffnReadDelta)
+            let ffnReadUS = RuntimeClock.us(ffnReadDelta)
+
+            profiler?.record(
+                layerIndex: L,
+                attnWriteUS: attnWriteUS,
+                attnEvalUS: attnEvalUS,
+                attnReadUS: attnReadUS,
+                ffnWriteUS: ffnWriteUS,
+                ffnCopyUS: ffnCopyUS,
+                ffnEvalUS: ffnEvalUS,
+                ffnReadUS: ffnReadUS,
+                gapAttnToFfnUS: gapUS
+            )
         }
     }
 }

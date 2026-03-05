@@ -42,4 +42,10 @@ enum RuntimeClock {
         let nanos = (Double(delta) * Double(timebase.numer)) / Double(timebase.denom)
         return nanos / 1_000_000.0
     }
+
+    @inline(__always)
+    static func us(_ delta: UInt64) -> Double {
+        let nanos = (Double(delta) * Double(timebase.numer)) / Double(timebase.denom)
+        return nanos / 1_000.0
+    }
 }

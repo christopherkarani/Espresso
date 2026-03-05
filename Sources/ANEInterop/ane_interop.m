@@ -5,6 +5,7 @@
 #import <objc/message.h>
 #import <objc/runtime.h>
 #include <stdint.h>
+#include <stdlib.h>
 
 #include "ane_interop.h"
 
@@ -27,6 +28,14 @@ static int g_compile_count = 0;
 static int g_last_compile_error = ANE_INTEROP_COMPILE_ERROR_NONE;
 static int g_force_eval_failure = 0;
 static int g_live_handle_count = 0;
+
+static bool ane_interop_trace_enabled(void) {
+    static int cached = -1;
+    if (cached == -1) {
+        cached = (getenv("ANE_INTEROP_TRACE") != NULL) ? 1 : 0;
+    }
+    return cached == 1;
+}
 
 static void ane_interop_set_compile_error(int value) {
     __sync_lock_test_and_set(&g_last_compile_error, value);
@@ -179,6 +188,21 @@ ANEHandle *ane_interop_compile(const uint8_t *milText, size_t milLen,
             return NULL;
         }
         NSString *td = [NSTemporaryDirectory() stringByAppendingPathComponent:hx];
+        if (ane_interop_trace_enabled()) {
+            fprintf(
+                stderr,
+                "ANE compile: id=%s tmpdir=%s milLen=%zu weights=%d inputs=%d outputs=%d\n",
+                [((NSString *)hx) UTF8String],
+                [td UTF8String],
+                milLen,
+                weightCount,
+                nInputs,
+                nOutputs
+            );
+            for (NSString *path in weights) {
+                fprintf(stderr, "  weight: %s (%zu bytes)\n", [path UTF8String], [weights[path][@"data"] length]);
+            }
+        }
         NSFileManager *fm = [NSFileManager defaultManager];
         if (![fm createDirectoryAtPath:[td stringByAppendingPathComponent:@"weights"]
            withIntermediateDirectories:YES attributes:nil error:nil]) {
