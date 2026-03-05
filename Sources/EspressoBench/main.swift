@@ -128,6 +128,17 @@ if opts.inference {
     }
 }
 
+// --- Benchmark 1c: ANE Fused Inference (split-head + kernel fusion) ---
+var fusedResult: ANEDirectBench.Result? = nil
+if opts.inference {
+    do {
+        fusedResult = try ANEDirectBench.runFusedInference(warmup: opts.warmup, iterations: opts.iterations, nLayers: opts.nLayers)
+    } catch {
+        printStderr("ANE Fused Inference benchmark failed: \(error)")
+        printStderr("Continuing without fused results...")
+    }
+}
+
 // --- Benchmark 2: Core ML (optional) ---
 var coreMLResult: CoreMLBench.Result? = nil
 if !opts.aneOnly {

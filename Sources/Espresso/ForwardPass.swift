@@ -232,6 +232,80 @@ public enum ForwardPass {
         )
     }
 
+    /// Surface handles for fused inference (single kernel per layer).
+    public struct FusedInferenceSurfaceHandles {
+        public let input: IOSurfaceRef
+        public let output: IOSurfaceRef
+
+        public init(kernel: borrowing FusedInferenceKernel) throws(ANEError) {
+            self.input = try kernel.kernel.inputSurface(at: 0)
+            self.output = try kernel.kernel.outputSurface(at: 0)
+        }
+    }
+
+    /// Fused inference forward pass: single kernel per layer (SDPA + FFN fused).
+    ///
+    /// Per-layer flow:
+    /// 1. Write xCur → layer input surface
+    /// 2. Eval fused kernel (RMSNorm1 + Attention + RMSNorm2 + FFN + both residuals)
+    /// 3. Read result from output surface → xCur
+    ///
+    /// Single ANE dispatch per layer. No inter-kernel I/O.
+    public static func runFusedInferenceTimed(
+        xCur: borrowing TensorBuffer,
+        kernels: borrowing LayerStorage<FusedInferenceKernel>,
+        dim: Int = ModelConfig.dim,
+        seqLen: Int = ModelConfig.seqLen,
+        surfaceHandles: [FusedInferenceSurfaceHandles]? = nil,
+        timings: inout StepTimingBreakdown
+    ) throws(ANEError) {
+        precondition(dim > 0 && seqLen > 0)
+        precondition(xCur.count == dim * seqLen)
+        if let handles = surfaceHandles {
+            precondition(handles.count == kernels.count)
+        }
+
+        for L in 0..<kernels.count {
+            let layerHandles = surfaceHandles?[L]
+
+            let layerIn: IOSurfaceRef
+            if let handles = layerHandles {
+                layerIn = handles.input
+            } else {
+                layerIn = try kernels[L].kernel.inputSurface(at: 0)
+            }
+
+            var t0 = RuntimeClock.now()
+            xCur.withUnsafeBufferPointer { xBuf in
+                SurfaceIO.writeFP16(to: layerIn, data: xBuf, channels: dim, spatial: seqLen)
+            }
+            timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
+
+            t0 = RuntimeClock.now()
+            try kernels[L].kernel.eval()
+            timings.tAne += RuntimeClock.ms(RuntimeClock.now() - t0)
+
+            let layerOut: IOSurfaceRef
+            if let handles = layerHandles {
+                layerOut = handles.output
+            } else {
+                layerOut = try kernels[L].kernel.outputSurface(at: 0)
+            }
+
+            t0 = RuntimeClock.now()
+            xCur.withUnsafeMutableBufferPointer { xBuf in
+                SurfaceIO.readFP16(
+                    from: layerOut,
+                    into: xBuf,
+                    channelOffset: 0,
+                    channels: dim,
+                    spatial: seqLen
+                )
+            }
+            timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
+        }
+    }
+
     /// Timed inference-only forward pass. Accumulates timing into `timings`.
     ///
     /// Per-layer flow:

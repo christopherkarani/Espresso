@@ -219,6 +219,110 @@ enum ANEDirectBench {
         )
     }
 
+    /// Fused layer inference benchmark: single kernel per layer (SDPA + FFN fused).
+    /// Split-head attention + optimized RMSNorm + SiLU fusion.
+    static func runFusedInference(warmup: Int, iterations: Int, nLayers: Int = 1) throws -> Result {
+        printStderr("\n=== ANE Fused Inference Benchmark (Split-Head + Kernel Fusion) ===")
+        printStderr("Setting up \(nLayers)-layer fused inference forward pass...")
+
+        let signposter = OSSignposter(subsystem: "com.espresso.bench", category: .pointsOfInterest)
+
+        // 1. Create random weights
+        let layers = LayerStorage<LayerWeights>(count: nLayers) { _ in
+            let w = LayerWeights()
+            randomFill(w.Wq); randomFill(w.Wk); randomFill(w.Wv); randomFill(w.Wo)
+            randomFill(w.W1); randomFill(w.W2); randomFill(w.W3)
+            onesFill(w.rmsAtt); onesFill(w.rmsFfn)
+            return w
+        }
+
+        // 2. Create random input
+        let xCur = TensorBuffer(count: ModelConfig.dim * ModelConfig.seqLen, zeroed: false)
+        randomFill(xCur, range: -0.1...0.1)
+
+        // 3. Compile fused kernels (1 per layer)
+        printStderr("Compiling \(nLayers) fused ANE kernels...")
+        let compileStart = ContinuousClock.now
+        let kernels = try LayerStorage<FusedInferenceKernel>(count: nLayers, throwingInitializer: { i in
+            try FusedInferenceKernel(weights: layers[i])
+        })
+        let compileMs = durationMs(ContinuousClock.now - compileStart)
+        printStderr(String(format: "  Compilation: %.1f ms (budget remaining: %d)", compileMs, CompileBudget.remaining))
+
+        // 4. Pre-resolve IOSurface handles
+        var surfaceHandles: [ForwardPass.FusedInferenceSurfaceHandles] = []
+        surfaceHandles.reserveCapacity(nLayers)
+        for i in 0..<nLayers {
+            surfaceHandles.append(try ForwardPass.FusedInferenceSurfaceHandles(kernel: kernels[i]))
+        }
+
+        // 5. Warmup
+        printStderr("Warmup: \(warmup) iterations...")
+        for _ in 0..<warmup {
+            var timings = StepTimingBreakdown()
+            try ForwardPass.runFusedInferenceTimed(
+                xCur: xCur,
+                kernels: kernels,
+                surfaceHandles: surfaceHandles,
+                timings: &timings
+            )
+        }
+
+        // 6. Measured iterations
+        printStderr("Measuring: \(iterations) iterations...")
+        var latencies: [Double] = []
+        latencies.reserveCapacity(iterations)
+        var totalTimings = StepTimingBreakdown()
+
+        for i in 0..<iterations {
+            var stepTimings = StepTimingBreakdown()
+            let state = signposter.beginInterval("FusedInferenceForwardPass")
+            let start = ContinuousClock.now
+
+            try ForwardPass.runFusedInferenceTimed(
+                xCur: xCur,
+                kernels: kernels,
+                surfaceHandles: surfaceHandles,
+                timings: &stepTimings
+            )
+
+            let ms = durationMs(ContinuousClock.now - start)
+            signposter.endInterval("FusedInferenceForwardPass", state)
+
+            latencies.append(ms)
+            totalTimings.tAne += stepTimings.tAne
+            totalTimings.tIO += stepTimings.tIO
+            totalTimings.tElem += stepTimings.tElem
+
+            if (i + 1) % 100 == 0 {
+                let currentMean = latencies.reduce(0, +) / Double(latencies.count)
+                printStderr(String(format: "  [ANE Fused] %d/%d — mean: %.3f ms", i + 1, iterations, currentMean))
+            }
+        }
+
+        let result = BenchmarkResult(
+            label: "ANE Fused Inference",
+            latencies: latencies,
+            warmupCount: warmup,
+            iterationCount: iterations
+        )
+
+        let n = Double(iterations)
+        let avgBreakdown = (
+            ane: totalTimings.tAne / n,
+            io: totalTimings.tIO / n,
+            elem: totalTimings.tElem / n
+        )
+
+        printStderr(String(format: "  Done. Mean: %.3f ms, Median: %.3f ms", result.mean, result.median))
+
+        return Result(
+            benchmarkResult: result,
+            avgTimingBreakdown: avgBreakdown,
+            compileTimeMs: compileMs
+        )
+    }
+
     /// Sustained inference for thermal monitoring. Creates its own kernel set.
     static func runSustained(
         duration: TimeInterval,
