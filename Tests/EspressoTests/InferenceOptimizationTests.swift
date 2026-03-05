@@ -165,5 +165,109 @@ final class InferenceOptimizationTests: XCTestCase {
         XCTAssertLessThanOrEqual(maxAbs, 1e-3, "max_abs_err too high: \(maxAbs)")
         XCTAssertLessThanOrEqual(meanAbs, 1e-5, "mean_abs_err too high: \(meanAbs)")
     }
-}
 
+    func test_decode_kv_cache_updates_and_mask_progresses_on_hardware() throws {
+        try requireANEHardwareTestsEnabled()
+
+        let decodeMaxSeq = DecodeKernelSet.defaultLaneSpatial
+        let decodeSteps = 4
+        let dim = ModelConfig.dim
+        let maskSentinel = Float(-1e4)
+
+        let layers = LayerStorage<LayerWeights>(count: 1) { _ in
+            let w = LayerWeights()
+            fillLayerWeights(w, seed: 0xDEC0DE)
+            return w
+        }
+
+        let decodeKernels = try LayerStorage<DecodeKernelSet>(count: 1, throwingInitializer: { i in
+            try DecodeKernelSet(weights: layers[i], maxSeq: decodeMaxSeq)
+        })
+        let decodeHandles = [try DecodeSurfaceHandles(kernels: decodeKernels[0])]
+        ForwardPass.initializeDecodeCachesAndMask(surfaceHandles: decodeHandles)
+
+        var decodeState = try DecodeState(maxSeq: decodeMaxSeq)
+        var rng = XorShift32(seed: 0xA11CE)
+        var tokenInputs = [[Float]]()
+        tokenInputs.reserveCapacity(decodeSteps)
+        for _ in 0..<decodeSteps {
+            var token = [Float](repeating: 0, count: dim)
+            for i in 0..<dim {
+                token[i] = rng.nextFloat(range: -0.1...0.1)
+            }
+            tokenInputs.append(token)
+        }
+
+        for t in 0..<decodeSteps {
+            let decodeToken = TensorBuffer(count: dim, zeroed: true)
+            tokenInputs[t].withUnsafeBufferPointer { src in
+                decodeToken.withUnsafeMutableBufferPointer { dst in
+                    for i in 0..<dim {
+                        dst[i] = src[i]
+                    }
+                }
+            }
+
+            var decodeTimings = StepTimingBreakdown()
+            try ForwardPass.runDecodeTimed(
+                xCur: decodeToken,
+                kernels: decodeKernels,
+                surfaceHandles: decodeHandles,
+                decodeState: &decodeState,
+                timings: &decodeTimings,
+                profiler: nil
+            )
+
+            var decodeOut = [Float](repeating: 0, count: dim)
+            decodeToken.withUnsafeBufferPointer { src in
+                for i in 0..<dim {
+                    decodeOut[i] = src[i]
+                }
+            }
+
+            let lane = decodeHandles[0].laneSpatial
+            var kOut = [Float](repeating: 0, count: dim * lane)
+            var vOut = [Float](repeating: 0, count: dim * lane)
+            kOut.withUnsafeMutableBufferPointer { dst in
+                SurfaceIO.readFP16(from: decodeHandles[0].attnKOut, into: dst, channelOffset: 0, channels: dim, spatial: lane)
+            }
+            vOut.withUnsafeMutableBufferPointer { dst in
+                SurfaceIO.readFP16(from: decodeHandles[0].attnVOut, into: dst, channelOffset: 0, channels: dim, spatial: lane)
+            }
+
+            var kCache = [Float](repeating: 0, count: dim * decodeMaxSeq)
+            var vCache = [Float](repeating: 0, count: dim * decodeMaxSeq)
+            kCache.withUnsafeMutableBufferPointer { dst in
+                SurfaceIO.readFP16(from: decodeHandles[0].kCache, into: dst, channelOffset: 0, channels: dim, spatial: decodeMaxSeq)
+            }
+            vCache.withUnsafeMutableBufferPointer { dst in
+                SurfaceIO.readFP16(from: decodeHandles[0].vCache, into: dst, channelOffset: 0, channels: dim, spatial: decodeMaxSeq)
+            }
+
+            for d in 0..<min(32, dim) {
+                let expectedK = kOut[d * lane]
+                let expectedV = vOut[d * lane]
+                let cachedK = kCache[d * decodeMaxSeq + t]
+                let cachedV = vCache[d * decodeMaxSeq + t]
+                XCTAssertEqual(cachedK, expectedK, accuracy: 2e-3, "k-cache mismatch at token \(t), channel \(d)")
+                XCTAssertEqual(cachedV, expectedV, accuracy: 2e-3, "v-cache mismatch at token \(t), channel \(d)")
+            }
+
+            var maskCache = [Float](repeating: 0, count: dim * decodeMaxSeq)
+            maskCache.withUnsafeMutableBufferPointer { dst in
+                SurfaceIO.readFP16(from: decodeHandles[0].maskCache, into: dst, channelOffset: 0, channels: dim, spatial: decodeMaxSeq)
+            }
+            for d in 0..<min(32, dim) {
+                XCTAssertEqual(maskCache[d * decodeMaxSeq + t], 0, accuracy: 1e-3, "mask not flipped at token \(t), channel \(d)")
+                if t + 1 < decodeMaxSeq {
+                    XCTAssertEqual(
+                        maskCache[d * decodeMaxSeq + t + 1],
+                        maskSentinel,
+                        accuracy: 1e-1,
+                        "future mask unexpectedly visible at token \(t), channel \(d)"
+                    )
+                }
+            }
+        }
+    }
+}

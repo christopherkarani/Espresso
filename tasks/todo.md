@@ -38,6 +38,17 @@ Goal: land autoregressive decode with persistent FP16 KV-cache surfaces and prov
   - Decode lane-pack runtime path now supports configurable lane width (`ESPRESSO_DECODE_LANE_SPATIAL`, clamped to default `32`) and zero-copy lane packing/unpacking via `copyFP16SpatialSlice`.
   - `_ANERequest` constructor path now includes `weightsBuffer` selector fallback in `ane_interop.m` (no change to decode failure signature).
   - Even with a probe decode-attn MIL that bypasses softmax/matmul attention math, decode-attn still fails at first eval (`statusType=0x9`), indicating the blocker is below high-level attention logic and likely in a lower-level ANE decode-kernel compatibility constraint.
+- 2026-03-05 isolation update:
+  - Added a hardware decode probe matrix (`ANERuntimeTests.test_decode_probe_passthrough_4in_3out_eval`) and verified this host only evaluates decode probes when non-token inputs stay in a narrow shape family (`x`, `x+k`, `x+k+v`, and `x+k+v+denseMask` at `maxSeq=32`).
+  - Hard constraints observed on this host: decode-attn kernels fail with `statusType=0x9` when using channel-1 mask inputs, concatenated `2*dim` cache inputs, or `maxSeq > 32` for auxiliary decode inputs.
+  - Implemented decode-attn IO contract shift to dense mask cache (`maskCache: [1, dim, 1, maxSeq]`) and kept KV as separate inputs; decode runtime now executes reliably for `decode-max-seq=32`.
+  - Added explicit decode guardrails: current ANE decode path requires `decode-max-seq == decode lane spatial == 32` (fail-fast error otherwise).
+  - Added hardware-gated decode state correctness test (`InferenceOptimizationTests.test_decode_kv_cache_updates_and_mask_progresses_on_hardware`) validating KV slice writes and mask progression.
+- 2026-03-05 benchmark snapshot (current path):
+  - `ESPRESSO_BENCH_SEED=1 .build/release/espresso-bench --decode --profile-kernels --warmup 2 --iterations 10 --decode-steps 32 --decode-max-seq 32 --output /tmp/decode_final_profile`
+  - ANE decode: mean `0.649 ms/token`, median `0.651 ms/token`, `1541.9 tok/s`
+  - Core ML naive decode fastest median (`.all`): `1.698 ms/token`
+  - Speedup vs fastest Core ML naive decode: `2.61x` (strict gate at `maxSeq=32`)
 - Next step: isolate the smallest eval-passing vs eval-failing multi-input MIL shape family (especially mixed input tensors and lane-packed outputs), then re-expand toward full decode attention.
 
 ### Decode Artifact Index (to fill during execution)

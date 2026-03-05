@@ -430,9 +430,9 @@ final class MILGeneratorTests: XCTestCase {
         XCTAssertEqual(decodeAttn.inputBytes, dim * lane * 2)
         XCTAssertEqual(
             decodeAttn.inputByteSizes,
-            [dim * lane * 2, dim * 64 * 2, dim * 64 * 2, 64 * 2]
+            [dim * lane * 2, dim * 64 * 2, dim * 64 * 2, dim * 64 * 2]
         )
-        XCTAssertEqual(decodeAttn.outputByteSizes, [3 * dim * lane * 2])
+        XCTAssertEqual(decodeAttn.outputByteSizes, [dim * lane * 2, dim * lane * 2, dim * lane * 2])
 
         XCTAssertEqual(DecodeFFNGenerator(laneSpatial: lane).inputBytes, dim * lane * 2)
         XCTAssertEqual(DecodeFFNGenerator(laneSpatial: lane).outputByteSizes, [dim * lane * 2])
@@ -444,13 +444,15 @@ final class MILGeneratorTests: XCTestCase {
 
         XCTAssertTrue(mil.contains("tensor<fp16, [1, \(ModelConfig.dim), 1, \(DecodeKernelSet.defaultLaneSpatial)]> x"))
         XCTAssertTrue(mil.contains("tensor<fp16, [1, \(ModelConfig.dim), 1, 32]> kCache"))
-        XCTAssertTrue(mil.contains("tensor<fp16, [1, 1, 1, 32]> maskVec"))
+        XCTAssertTrue(mil.contains("tensor<fp16, [1, \(ModelConfig.dim), 1, 32]> vCache"))
+        XCTAssertTrue(mil.contains("tensor<fp16, [1, \(ModelConfig.dim), 1, 32]> maskCache"))
         XCTAssertFalse(mil.contains("selfMask"))
         XCTAssertTrue(mil.contains("reduce_sum(x=qfFull,axes=raxSp,keep_dims=kd)"))
         XCTAssertTrue(mil.contains("k_ch"))
         XCTAssertTrue(mil.contains("mask0"))
         XCTAssertTrue(mil.contains("co_probe"))
-        XCTAssertTrue(mil.contains("values=(x2,kfFull,vfFull)"))
+        XCTAssertTrue(mil.contains("-> (x2,kfFull,vfFull);"))
+        XCTAssertFalse(mil.contains("values=(x2,kfFull,vfFull)"))
     }
 
     func test_decode_ffn_generator_contains_expected_decode_ops() {

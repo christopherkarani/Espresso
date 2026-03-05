@@ -337,6 +337,46 @@ private func singletonQueryMatmulMIL(heads: Int, headDim: Int, seq: Int) -> Stri
     """
 }
 
+private func decodePassthroughProbeMIL(dim: Int, laneSpatial: Int, maxSeq: Int, inputKinds: [Character], outputCount: Int) -> String {
+    precondition(!inputKinds.isEmpty)
+    precondition(outputCount == 1 || outputCount == 3)
+    var parts: [String] = []
+    for kind in inputKinds {
+        switch kind {
+        case "x":
+            parts.append("tensor<fp16, [1, \(dim), 1, \(laneSpatial)]> x")
+        case "k":
+            parts.append("tensor<fp16, [1, \(dim), 1, \(maxSeq)]> kCache")
+        case "v":
+            parts.append("tensor<fp16, [1, \(dim), 1, \(maxSeq)]> vCache")
+        case "q":
+            parts.append("tensor<fp16, [1, \(2 * dim), 1, \(maxSeq)]> kvCache")
+        case "m":
+            parts.append("tensor<fp16, [1, 1, 1, \(maxSeq)]> maskVec")
+        case "d":
+            parts.append("tensor<fp16, [1, \(dim), 1, \(maxSeq)]> maskDense")
+        default:
+            preconditionFailure("Unknown input kind \(kind)")
+        }
+    }
+    let signature = parts.joined(separator: ", ")
+    var lines: [String] = []
+    lines.append("program(1.3)")
+    lines.append("[buildInfo = dict<string, string>({{\"coremlc-component-MIL\", \"3510.2.1\"}, {\"coremlc-version\", \"3505.4.1\"}, {\"coremltools-component-milinternal\", \"\"}, {\"coremltools-version\", \"9.0\"}})]")
+    lines.append("{")
+    lines.append("    func main<ios18>(\(signature)) {")
+    lines.append("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> outX = add(x=x,y=x)[name=string(\"out_x\")];")
+    if outputCount == 3 {
+        lines.append("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> outK = add(x=x,y=x)[name=string(\"out_k\")];")
+        lines.append("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> outV = add(x=x,y=x)[name=string(\"out_v\")];")
+        lines.append("    } -> (outX,outK,outV);")
+    } else {
+        lines.append("    } -> (outX);")
+    }
+    lines.append("}")
+    return lines.joined(separator: "\n")
+}
+
 final class ANERuntimeTests: XCTestCase {
     func test_ane_error_conforms_to_sendable_and_error() {
         func requireErrorAndSendable<T: Error & Sendable>(_: T.Type) {}
@@ -529,6 +569,107 @@ final class ANERuntimeTests: XCTestCase {
 
         XCTAssertTrue(y.allSatisfy(\.isFinite))
         XCTAssertTrue(y.contains(where: { abs($0) > 0 }))
+    }
+
+    func test_decode_probe_passthrough_4in_3out_eval() throws {
+        try requireANEHardwareTestsEnabled()
+
+        let dim = ModelConfig.dim
+        let lane = DecodeKernelSet.defaultLaneSpatial
+        let maxSeq = 32
+        let xBytes = dim * lane * MemoryLayout<UInt16>.stride
+        let kvBytes = dim * maxSeq * MemoryLayout<UInt16>.stride
+        let maskBytes = maxSeq * MemoryLayout<UInt16>.stride
+
+        struct Variant {
+            let name: String
+            let inputKinds: [Character]
+            let outputCount: Int
+        }
+        let variants: [Variant] = [
+            .init(name: "x->1", inputKinds: ["x"], outputCount: 1),
+            .init(name: "x->3", inputKinds: ["x"], outputCount: 3),
+            .init(name: "xk->1", inputKinds: ["x", "k"], outputCount: 1),
+            .init(name: "xkv->1", inputKinds: ["x", "k", "v"], outputCount: 1),
+            .init(name: "xq->1", inputKinds: ["x", "q"], outputCount: 1),
+            .init(name: "xm->1", inputKinds: ["x", "m"], outputCount: 1),
+            .init(name: "xkm->1", inputKinds: ["x", "k", "m"], outputCount: 1),
+            .init(name: "xqm->1", inputKinds: ["x", "q", "m"], outputCount: 1),
+            .init(name: "xkvm->1", inputKinds: ["x", "k", "v", "m"], outputCount: 1),
+            .init(name: "xkvm->3", inputKinds: ["x", "k", "v", "m"], outputCount: 3),
+            .init(name: "xkvd->1", inputKinds: ["x", "k", "v", "d"], outputCount: 1),
+        ]
+
+        var successes: [String: Bool] = [:]
+        for variant in variants {
+            do {
+                let inputSizes = variant.inputKinds.map { kind in
+                    switch kind {
+                    case "x": return xBytes
+                    case "k", "v": return kvBytes
+                    case "q": return 2 * kvBytes
+                    case "d": return kvBytes
+                    case "m": return maskBytes
+                    default: preconditionFailure("unknown input kind \(kind)")
+                    }
+                }
+                let outputSizes = Array(repeating: xBytes, count: variant.outputCount)
+                let kernel = try ANEKernel(
+                    milText: decodePassthroughProbeMIL(
+                        dim: dim,
+                        laneSpatial: lane,
+                        maxSeq: maxSeq,
+                        inputKinds: variant.inputKinds,
+                        outputCount: variant.outputCount
+                    ),
+                    weights: [],
+                    inputSizes: inputSizes,
+                    outputSizes: outputSizes
+                )
+
+                for (inputIndex, kind) in variant.inputKinds.enumerated() {
+                    let surface = try kernel.inputSurface(at: inputIndex)
+                    switch kind {
+                    case "x":
+                        Array(repeating: Float(0.25), count: dim * lane).withUnsafeBufferPointer { src in
+                            SurfaceIO.writeFP16(to: surface, data: src, channels: dim, spatial: lane)
+                        }
+                    case "k", "v":
+                        Array(repeating: Float(0), count: dim * maxSeq).withUnsafeBufferPointer { src in
+                            SurfaceIO.writeFP16(to: surface, data: src, channels: dim, spatial: maxSeq)
+                        }
+                    case "q":
+                        Array(repeating: Float(0), count: 2 * dim * maxSeq).withUnsafeBufferPointer { src in
+                            SurfaceIO.writeFP16(to: surface, data: src, channels: 2 * dim, spatial: maxSeq)
+                        }
+                    case "m":
+                        Array(repeating: Float(-1e4), count: maxSeq).withUnsafeBufferPointer { src in
+                            SurfaceIO.writeFP16(to: surface, data: src, channels: 1, spatial: maxSeq)
+                        }
+                    case "d":
+                        Array(repeating: Float(-1e4), count: dim * maxSeq).withUnsafeBufferPointer { src in
+                            SurfaceIO.writeFP16(to: surface, data: src, channels: dim, spatial: maxSeq)
+                        }
+                    default:
+                        preconditionFailure("unknown input kind \(kind)")
+                    }
+                }
+
+                try kernel.eval()
+                let ySurface = try kernel.outputSurface(at: 0)
+                var out = [Float](repeating: 0, count: dim * lane)
+                out.withUnsafeMutableBufferPointer { dst in
+                    SurfaceIO.readFP16(from: ySurface, into: dst, channelOffset: 0, channels: dim, spatial: lane)
+                }
+                successes[variant.name] = out.allSatisfy(\.isFinite)
+            } catch {
+                print("decode probe variant \(variant.name) failed: \(error)")
+                successes[variant.name] = false
+            }
+        }
+
+        print("decode probe matrix: \(successes)")
+        XCTAssertEqual(successes["x->1"], true)
     }
 
     func test_eval_returns_throws_on_failure() throws {
@@ -1013,7 +1154,7 @@ final class ANERuntimeTests: XCTestCase {
         let layerWeights = LayerWeights()
         fillLayerWeights(layerWeights, value: 0.01)
 
-        let maxSeq = 64
+        let maxSeq = DecodeKernelSet.defaultLaneSpatial
         let specs = DecodeKernelSet.compileSpecs(weights: layerWeights, maxSeq: maxSeq)
         XCTAssertEqual(specs.count, 2)
 
@@ -1036,9 +1177,17 @@ final class ANERuntimeTests: XCTestCase {
         )
         XCTAssertEqual(
             attn.inputSizes,
-            [ModelConfig.dim * lane * 2, ModelConfig.dim * maxSeq * 2, ModelConfig.dim * maxSeq * 2, maxSeq * 2]
+            [
+                ModelConfig.dim * lane * 2,
+                ModelConfig.dim * maxSeq * 2,
+                ModelConfig.dim * maxSeq * 2,
+                ModelConfig.dim * maxSeq * 2,
+            ]
         )
-        XCTAssertEqual(attn.outputSizes, [3 * ModelConfig.dim * lane * 2])
+        XCTAssertEqual(
+            attn.outputSizes,
+            [ModelConfig.dim * lane * 2, ModelConfig.dim * lane * 2, ModelConfig.dim * lane * 2]
+        )
 
         XCTAssertEqual(
             ffn.weights.map(\.path),

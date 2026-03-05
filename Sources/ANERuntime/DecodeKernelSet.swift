@@ -46,14 +46,18 @@ public struct DecodeKernelSet: ~Copyable {
         guard maxSeq > 0 else {
             throw .invalidArguments("decode maxSeq must be > 0")
         }
-        let laneSpatial = Self.resolveDecodeLaneSpatial()
+        let laneSpatial = Self.resolvedLaneSpatialForCurrentProcess()
+        guard maxSeq == laneSpatial else {
+            throw .invalidArguments("decode maxSeq (\(maxSeq)) must equal laneSpatial (\(laneSpatial)) on current ANE path")
+        }
         let compiledAttn = try Self.compileDecodeAttnQKV(weights: weights, maxSeq: maxSeq, laneSpatial: laneSpatial)
         let compiledFFN = try Self.compileDecodeFFN(weights: weights, laneSpatial: laneSpatial)
         self.init(decodeAttnQKV: compiledAttn, decodeFFN: compiledFFN, maxSeq: maxSeq, laneSpatial: laneSpatial)
     }
 
     internal static func compileSpecs(weights: borrowing LayerWeights, maxSeq: Int) -> [CompileSpec] {
-        let laneSpatial = resolveDecodeLaneSpatial()
+        let laneSpatial = resolvedLaneSpatialForCurrentProcess()
+        precondition(maxSeq == laneSpatial)
         return [
             makeDecodeAttnQKVSpec(weights: weights, maxSeq: maxSeq, laneSpatial: laneSpatial),
             makeDecodeFFNSpec(weights: weights, laneSpatial: laneSpatial),
@@ -91,6 +95,10 @@ public struct DecodeKernelSet: ~Copyable {
                 (path: "@model_path/weights/wo.bin", data: woBlob),
             ],
             inputSizes: generator.inputByteSizes,
+            // Output surfaces:
+            // 0: x2_t  [1, dim, 1, laneSpatial]
+            // 1: k_t   [1, dim, 1, laneSpatial]
+            // 2: v_t   [1, dim, 1, laneSpatial]
             outputSizes: generator.outputByteSizes
         )
     }
@@ -130,7 +138,7 @@ public struct DecodeKernelSet: ~Copyable {
     }
 
     @inline(__always)
-    private static func resolveDecodeLaneSpatial() -> Int {
+    public static func resolvedLaneSpatialForCurrentProcess() -> Int {
         let envSpatial = ProcessInfo.processInfo.environment["ESPRESSO_DECODE_LANE_SPATIAL"].flatMap(Int.init)
         return max(defaultLaneSpatial, envSpatial ?? defaultLaneSpatial)
     }

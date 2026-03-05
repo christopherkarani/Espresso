@@ -7,10 +7,12 @@ import ANETypes
 /// - `x`:        `[1, dim, 1, laneSpatial]` (token packed at lane 0, remaining lanes zero)
 /// - `kCache`:   `[1, dim, 1, maxSeq]`
 /// - `vCache`:   `[1, dim, 1, maxSeq]`
-/// - `maskVec`:  `[1, 1, 1, maxSeq]` (`0` visible, large-negative for masked)
+/// - `maskCache`: `[1, dim, 1, maxSeq]` (per-position mask expanded across channels)
 ///
-/// Output:
-/// - concat channels `[x2, k, v]`: `[1, 3*dim, 1, laneSpatial]`
+/// Outputs:
+/// - `x2`: `[1, dim, 1, laneSpatial]`
+/// - `k`:  `[1, dim, 1, laneSpatial]`
+/// - `v`:  `[1, dim, 1, laneSpatial]`
 public struct DecodeAttentionQKVGenerator: MILProgramGenerator {
     public let maxSeq: Int
     public let laneSpatial: Int
@@ -28,20 +30,52 @@ public struct DecodeAttentionQKVGenerator: MILProgramGenerator {
             ModelConfig.dim * laneSpatial * 2,
             ModelConfig.dim * maxSeq * 2,
             ModelConfig.dim * maxSeq * 2,
-            maxSeq * 2,
+            ModelConfig.dim * maxSeq * 2,
         ]
     }
-    public var outputByteSizes: [Int] { [3 * ModelConfig.dim * laneSpatial * 2] }
+    public var outputByteSizes: [Int] {
+        [
+            ModelConfig.dim * laneSpatial * 2,
+            ModelConfig.dim * laneSpatial * 2,
+            ModelConfig.dim * laneSpatial * 2,
+        ]
+    }
 
     public var milText: String {
         let dim = ModelConfig.dim
         let maxSeq = self.maxSeq
         let lane = self.laneSpatial
         let invd: Float = 1.0 / Float(dim)
+        let probeMode = ProcessInfo.processInfo.environment["ESPRESSO_DECODE_ATTN_PROBE_MODE"] ?? "cache-touch"
 
         var b = MILBuilder(reserveCapacity: 16_384)
         b.append(MILText.header)
-        b.appendLine("    func main<ios18>(tensor<fp16, [1, \(dim), 1, \(lane)]> x, tensor<fp16, [1, \(dim), 1, \(maxSeq)]> kCache, tensor<fp16, [1, \(dim), 1, \(maxSeq)]> vCache, tensor<fp16, [1, 1, 1, \(maxSeq)]> maskVec) {")
+        b.appendLine("    func main<ios18>(tensor<fp16, [1, \(dim), 1, \(lane)]> x, tensor<fp16, [1, \(dim), 1, \(maxSeq)]> kCache, tensor<fp16, [1, \(dim), 1, \(maxSeq)]> vCache, tensor<fp16, [1, \(dim), 1, \(maxSeq)]> maskCache) {")
+
+        if probeMode == "passthrough" {
+            b.appendLine("        tensor<fp16, [1,\(dim),1,\(lane)]> outX = add(x=x,y=x)[name=string(\"out_x\")];")
+            b.appendLine("        tensor<fp16, [1,\(dim),1,\(lane)]> outK = add(x=x,y=x)[name=string(\"out_k\")];")
+            b.appendLine("        tensor<fp16, [1,\(dim),1,\(lane)]> outV = add(x=x,y=x)[name=string(\"out_v\")];")
+            b.appendLine("    } -> (outX,outK,outV);")
+            b.appendLine("}")
+            return b.text
+        }
+        if probeMode == "passthrough-touch" {
+            b.appendLine("        fp16 zc = const()[name=string(\"zc\"), val=fp16(0.0)];")
+            b.appendLine("        tensor<int32, [4]> b0 = const()[name=string(\"b0\"), val=tensor<int32, [4]>([0,0,0,0])];")
+            b.appendLine("        tensor<int32, [4]> szK = const()[name=string(\"sz_k\"), val=tensor<int32, [4]>([1,\(dim),1,\(lane)])];")
+            b.appendLine("        tensor<int32, [4]> szM = const()[name=string(\"sz_m\"), val=tensor<int32, [4]>([1,1,1,\(lane)])];")
+            b.appendLine("        tensor<fp16, [1,\(dim),1,\(lane)]> kLane = slice_by_size(x=kCache,begin=b0,size=szK)[name=string(\"k_lane\")];")
+            b.appendLine("        tensor<fp16, [1,1,1,\(lane)]> maskLane = slice_by_size(x=maskCache,begin=b0,size=szM)[name=string(\"m_lane\")];")
+            b.appendLine("        tensor<fp16, [1,\(dim),1,\(lane)]> mix = mul(x=kLane,y=maskLane)[name=string(\"mix\")];")
+            b.appendLine("        tensor<fp16, [1,\(dim),1,\(lane)]> z = mul(x=mix,y=zc)[name=string(\"z\")];")
+            b.appendLine("        tensor<fp16, [1,\(dim),1,\(lane)]> outX = add(x=x,y=z)[name=string(\"out_x\")];")
+            b.appendLine("        tensor<fp16, [1,\(dim),1,\(lane)]> outK = add(x=x,y=z)[name=string(\"out_k\")];")
+            b.appendLine("        tensor<fp16, [1,\(dim),1,\(lane)]> outV = add(x=x,y=z)[name=string(\"out_v\")];")
+            b.appendLine("    } -> (outX,outK,outV);")
+            b.appendLine("}")
+            return b.text
+        }
 
         // RMSNorm(x lane-pack)
         b.appendLine("        tensor<fp16, [1,\(dim),1,\(lane)]> sq = mul(x=x,y=x)[name=string(\"sq\")];")
@@ -71,6 +105,9 @@ public struct DecodeAttentionQKVGenerator: MILProgramGenerator {
         b.appendLine("        tensor<fp16, [1,\(dim),1,\(lane)]> kfFull = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Wk,x=xn)[name=string(\"ck\")];")
         b.appendLine("        tensor<fp16, [1,\(dim),1,\(lane)]> vfFull = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Wv,x=xn)[name=string(\"cv\")];")
         b.appendLine("        tensor<fp16, [1,\(dim),1,1]> qf = reduce_sum(x=qfFull,axes=raxSp,keep_dims=kd)[name=string(\"qf\")];")
+        b.appendLine("        tensor<int32, [4]> bMask = const()[name=string(\"b_mask\"), val=tensor<int32, [4]>([0,0,0,0])];")
+        b.appendLine("        tensor<int32, [4]> szMask = const()[name=string(\"sz_mask\"), val=tensor<int32, [4]>([1,1,1,\(maxSeq)])];")
+        b.appendLine("        tensor<fp16, [1,1,1,\(maxSeq)]> maskVec = slice_by_size(x=maskCache,begin=bMask,size=szMask)[name=string(\"mask_vec\")];")
 
         // Temporary probe path: keep cache/mask inputs live while bypassing attention math.
         b.appendLine("        tensor<fp16, [1,1,1,\(maxSeq)]> kCh = reduce_sum(x=kCache,axes=raxCh,keep_dims=kd)[name=string(\"k_ch\")];")
@@ -90,11 +127,7 @@ public struct DecodeAttentionQKVGenerator: MILProgramGenerator {
         b.appendLine("        tensor<fp16, [1,1,1,1]> z = mul(x=kvm,y=zc)[name=string(\"z\")];")
         b.appendLine("        tensor<fp16, [1,\(dim),1,\(lane)]> x2 = add(x=x,y=z)[name=string(\"res\")];")
 
-        // Emit x2, k_t, v_t in one surface.
-        b.appendLine("        int32 caxCh = const()[name=string(\"cax_ch\"), val=int32(1)];")
-        b.appendLine("        bool cid = const()[name=string(\"cid\"), val=bool(false)];")
-        b.appendLine("        tensor<fp16, [1,\(3 * dim),1,\(lane)]> out = concat(axis=caxCh,interleave=cid,values=(x2,kfFull,vfFull))[name=string(\"out\")];")
-        b.appendLine("    } -> (out);")
+        b.appendLine("    } -> (x2,kfFull,vfFull);")
         b.appendLine("}")
         return b.text
     }

@@ -9,11 +9,12 @@ public struct DecodeSurfaceHandles {
     public let attnIn: IOSurfaceRef
     public let kCache: IOSurfaceRef
     public let vCache: IOSurfaceRef
-    public let maskVec: IOSurfaceRef
-    public let attnOut: IOSurfaceRef
+    public let maskCache: IOSurfaceRef
+    public let attnX2Out: IOSurfaceRef
+    public let attnKOut: IOSurfaceRef
+    public let attnVOut: IOSurfaceRef
     public let ffnIn: IOSurfaceRef
     public let ffnOut: IOSurfaceRef
-    public let zeroScalar: IOSurfaceRef
     public let zeroLane: IOSurfaceRef
     public let tokenScratch: IOSurfaceRef
     public let maxSeq: Int
@@ -23,26 +24,21 @@ public struct DecodeSurfaceHandles {
         self.attnIn = try kernels.decodeAttnQKV.inputSurface(at: 0)
         self.kCache = try kernels.decodeAttnQKV.inputSurface(at: 1)
         self.vCache = try kernels.decodeAttnQKV.inputSurface(at: 2)
-        self.maskVec = try kernels.decodeAttnQKV.inputSurface(at: 3)
-        self.attnOut = try kernels.decodeAttnQKV.outputSurface(at: 0)
+        self.maskCache = try kernels.decodeAttnQKV.inputSurface(at: 3)
+        self.attnX2Out = try kernels.decodeAttnQKV.outputSurface(at: 0)
+        self.attnKOut = try kernels.decodeAttnQKV.outputSurface(at: 1)
+        self.attnVOut = try kernels.decodeAttnQKV.outputSurface(at: 2)
         self.ffnIn = try kernels.decodeFFN.inputSurface(at: 0)
         self.ffnOut = try kernels.decodeFFN.outputSurface(at: 0)
         self.maxSeq = kernels.maxSeq
         self.laneSpatial = kernels.laneSpatial
 
-        guard let zero = ane_interop_create_surface(2),
-              let zeroLane = ane_interop_create_surface(ModelConfig.dim * kernels.laneSpatial * 2),
+        guard let zeroLane = ane_interop_create_surface(ModelConfig.dim * kernels.laneSpatial * 2),
               let tokenScratch = ane_interop_create_surface(ModelConfig.dim * 2) else {
             throw .surfaceAllocationFailed
         }
-        self.zeroScalar = zero
         self.zeroLane = zeroLane
         self.tokenScratch = tokenScratch
-
-        let zeroValue: [Float] = [0]
-        zeroValue.withUnsafeBufferPointer { src in
-            SurfaceIO.writeFP16(to: zero, data: src, channels: 1, spatial: 1)
-        }
 
         let zeroLaneValues = Array(repeating: Float(0), count: ModelConfig.dim * kernels.laneSpatial)
         zeroLaneValues.withUnsafeBufferPointer { src in
@@ -208,7 +204,8 @@ public extension ForwardPass {
         precondition(maxSeq > 0)
 
         let zeroCache = Array(repeating: Float(0), count: dim * maxSeq)
-        let masked = Array(repeating: Float(-1e4), count: maxSeq)
+        let maskFill: Float = ProcessInfo.processInfo.environment["ESPRESSO_DECODE_MASK_INIT_ZERO"] == "1" ? 0 : -1e4
+        let masked = Array(repeating: maskFill, count: dim * maxSeq)
 
         for handles in surfaceHandles {
             precondition(handles.maxSeq == maxSeq)
@@ -217,7 +214,7 @@ public extension ForwardPass {
                 SurfaceIO.writeFP16(to: handles.vCache, data: src, channels: dim, spatial: maxSeq)
             }
             masked.withUnsafeBufferPointer { src in
-                SurfaceIO.writeFP16(to: handles.maskVec, data: src, channels: 1, spatial: maxSeq)
+                SurfaceIO.writeFP16(to: handles.maskCache, data: src, channels: dim, spatial: maxSeq)
             }
             do {
                 try SurfaceIO.copyFP16(
@@ -332,7 +329,7 @@ public extension ForwardPass {
                 continue
             }
 
-            // Kernel A: decode attention (x2 + k_t + v_t).
+            // Kernel A: decode attention (x2 + k_t + v_t as separate outputs).
             t0 = RuntimeClock.now()
             do {
                 try kernels[L].decodeAttnQKV.eval()
@@ -345,7 +342,7 @@ public extension ForwardPass {
             let attnHwNS = kernels[L].decodeAttnQKV.lastHWExecutionTimeNS()
             let attnHostOverheadUS = max(0, attnEvalUS - Double(attnHwNS) / 1_000.0)
 
-            // Update K cache at index t from channel slice [dim ..< 2*dim] of attnOut.
+            // Update K cache at index t from decode-attn K output at spatial lane 0.
             t0 = RuntimeClock.now()
             do {
                 try SurfaceIO.copyFP16SpatialSlice(
@@ -353,8 +350,8 @@ public extension ForwardPass {
                     dstChannelOffset: 0,
                     dstSpatialIndex: tokenIndex,
                     dstSpatial: maxSeq,
-                    src: handles.attnOut,
-                    srcChannelOffset: dim,
+                    src: handles.attnKOut,
+                    srcChannelOffset: 0,
                     srcSpatialIndex: 0,
                     srcSpatial: laneSpatial,
                     channels: dim
@@ -366,7 +363,7 @@ public extension ForwardPass {
             timings.tIO += RuntimeClock.ms(kUpdateDelta)
             let kUpdateUS = RuntimeClock.us(kUpdateDelta)
 
-            // Update V cache at index t from channel slice [2*dim ..< 3*dim].
+            // Update V cache at index t from decode-attn V output at spatial lane 0.
             t0 = RuntimeClock.now()
             do {
                 try SurfaceIO.copyFP16SpatialSlice(
@@ -374,8 +371,8 @@ public extension ForwardPass {
                     dstChannelOffset: 0,
                     dstSpatialIndex: tokenIndex,
                     dstSpatial: maxSeq,
-                    src: handles.attnOut,
-                    srcChannelOffset: 2 * dim,
+                    src: handles.attnVOut,
+                    srcChannelOffset: 0,
                     srcSpatialIndex: 0,
                     srcSpatial: laneSpatial,
                     channels: dim
@@ -387,19 +384,19 @@ public extension ForwardPass {
             timings.tIO += RuntimeClock.ms(vUpdateDelta)
             let vUpdateUS = RuntimeClock.us(vUpdateDelta)
 
-            // Flip mask[t] = 0 after eval so token becomes visible to next decode step.
+            // Flip expanded mask[:, t] = 0 after eval so token becomes visible to next decode step.
             t0 = RuntimeClock.now()
             do {
                 try SurfaceIO.copyFP16SpatialSlice(
-                    dst: handles.maskVec,
+                    dst: handles.maskCache,
                     dstChannelOffset: 0,
                     dstSpatialIndex: tokenIndex,
                     dstSpatial: maxSeq,
-                    src: handles.zeroScalar,
+                    src: handles.zeroLane,
                     srcChannelOffset: 0,
                     srcSpatialIndex: 0,
-                    srcSpatial: 1,
-                    channels: 1
+                    srcSpatial: laneSpatial,
+                    channels: dim
                 )
             } catch {
                 throw .invalidArguments("mask flip slice copy failed: \(error)")
@@ -408,7 +405,7 @@ public extension ForwardPass {
             timings.tIO += RuntimeClock.ms(maskDelta)
             let maskUpdateUS = RuntimeClock.us(maskDelta)
 
-            // Feed x2_t (first dim channels of attnOut) into FFN input.
+            // Feed x2_t from decode-attn X2 output into FFN input.
             t0 = RuntimeClock.now()
             do {
                 try SurfaceIO.copyFP16(
@@ -424,7 +421,7 @@ public extension ForwardPass {
                     dstChannelOffset: 0,
                     dstSpatialIndex: 0,
                     dstSpatial: laneSpatial,
-                    src: handles.attnOut,
+                    src: handles.attnX2Out,
                     srcChannelOffset: 0,
                     srcSpatialIndex: 0,
                     srcSpatial: laneSpatial,
