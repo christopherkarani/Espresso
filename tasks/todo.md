@@ -2,6 +2,20 @@
 
 ## Status: Phase 1–7 Implemented (Swift rewrite complete; ObjC archived as reference)
 
+## ANE 10x Tuning Program (2026-03-05)
+Goal: iterate aggressively until ANE direct is 10x faster than Core ML across compute-only + end-to-end benchmarks, or prove a hard floor via ANE `hwExecutionTime`.
+
+- [ ] Group 0: Lock baselines (Core ML `.all`/`.cpuAndNeuralEngine`/`.cpuAndGPU` + ANE inference) for both benchmark modes
+- [ ] Group 1: Add microsecond-level per-kernel profiler (attn/ffn: write/eval/read + gaps) with CSV output
+- [ ] Group 2: Add `_ANEPerformanceStats` plumbing to split eval host time vs `hwExecutionTime`
+- [ ] Group 3: Remove measurement noise (pre-resolve IOSurface handles; explicitly bucket surface lookup time)
+- [ ] Group 4: Eliminate intermediate FP32 round-trips (surface-to-surface FP16 handoff attnOut -> ffnIn)
+- [ ] Group 5: FP16-resident hidden-state mode (only boundary CPU I/O)
+- [ ] Group 6: True zero-copy chaining (surface rebinding or `_ANEChainingRequest` loopback path)
+- [ ] Group 7: Real-time eval path experiments (`evaluateRealTimeWithModel`, queueDepth, options sweeps)
+- [ ] Group 8: Autotune harness to sweep combinations and keep best-known results
+- [ ] Group 9: Publish evidence: updated perf report + “why 10x is/isn’t possible” analysis with `hwExecutionTime` floor
+
 ## Benchmark Suite v1 (2026-03-05)
 - [x] Task 1: Add EspressoBench target scaffold to Package.swift
 - [x] Task 2: BenchmarkRunner — measurement harness (stats, signposts, progress)

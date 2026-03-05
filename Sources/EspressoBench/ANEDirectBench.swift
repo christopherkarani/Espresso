@@ -145,18 +145,26 @@ enum ANEDirectBench {
         let compileMs = durationMs(ContinuousClock.now - compileStart)
         printStderr(String(format: "  Compilation: %.1f ms (budget remaining: %d)", compileMs, CompileBudget.remaining))
 
-        // 4. Warmup
+        // 4. Pre-resolve IOSurface handles (removes CFRetain noise from hot loop)
+        var surfaceHandles: [InferenceSurfaceHandles] = []
+        surfaceHandles.reserveCapacity(nLayers)
+        for i in 0..<nLayers {
+            surfaceHandles.append(try InferenceSurfaceHandles(kernels: kernels[i]))
+        }
+
+        // 5. Warmup
         printStderr("Warmup: \(warmup) iterations...")
         for _ in 0..<warmup {
             var timings = StepTimingBreakdown()
             try ForwardPass.runInferenceTimed(
                 xCur: xCur,
                 kernels: kernels,
+                surfaceHandles: surfaceHandles,
                 timings: &timings
             )
         }
 
-        // 5. Measured iterations
+        // 6. Measured iterations
         printStderr("Measuring: \(iterations) iterations...")
         var latencies: [Double] = []
         latencies.reserveCapacity(iterations)
@@ -170,6 +178,7 @@ enum ANEDirectBench {
             try ForwardPass.runInferenceTimed(
                 xCur: xCur,
                 kernels: kernels,
+                surfaceHandles: surfaceHandles,
                 timings: &stepTimings
             )
 

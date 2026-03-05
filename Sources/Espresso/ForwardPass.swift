@@ -201,6 +201,14 @@ public enum ForwardPass {
 
     // MARK: - Inference Path (fused residuals, no backward activations)
 
+    public enum InferenceInterKernelHandoff: Sendable {
+        /// Baseline: read attn output to CPU (fp32), then write CPU buffer back to FFN input (fp16).
+        case cpuRoundTrip
+        /// Optimization: copy attn output surface -> FFN input surface directly in fp16.
+        /// Avoids intermediate fp16<->fp32 conversions and removes one surface read + one surface write.
+        case fp16SurfaceCopy
+    }
+
     /// Inference-only forward pass using `InferenceKernelSet`.
     ///
     /// The inference kernels fuse residual additions inside the MIL program and output
@@ -241,6 +249,7 @@ public enum ForwardPass {
         dim: Int = ModelConfig.dim,
         seqLen: Int = ModelConfig.seqLen,
         surfaceHandles: [InferenceSurfaceHandles]? = nil,
+        handoff: InferenceInterKernelHandoff = .cpuRoundTrip,
         timings: inout StepTimingBreakdown
     ) throws(ANEError) {
         precondition(dim > 0 && seqLen > 0)
@@ -278,18 +287,6 @@ public enum ForwardPass {
                 attnOut = try kernels[L].fwdAttn.outputSurface(at: 0)
             }
 
-            t0 = RuntimeClock.now()
-            xCur.withUnsafeMutableBufferPointer { xBuf in
-                SurfaceIO.readFP16(
-                    from: attnOut,
-                    into: xBuf,
-                    channelOffset: 0,
-                    channels: dim,
-                    spatial: seqLen
-                )
-            }
-            timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
-
             // --- FFN forward (fused residual) ---
             let ffnIn: IOSurfaceRef
             if let handles = layerHandles {
@@ -298,11 +295,41 @@ public enum ForwardPass {
                 ffnIn = try kernels[L].fwdFFN.inputSurface(at: 0)
             }
 
-            t0 = RuntimeClock.now()
-            xCur.withUnsafeBufferPointer { xBuf in
-                SurfaceIO.writeFP16(to: ffnIn, data: xBuf, channels: dim, spatial: seqLen)
+            switch handoff {
+            case .cpuRoundTrip:
+                t0 = RuntimeClock.now()
+                xCur.withUnsafeMutableBufferPointer { xBuf in
+                    SurfaceIO.readFP16(
+                        from: attnOut,
+                        into: xBuf,
+                        channelOffset: 0,
+                        channels: dim,
+                        spatial: seqLen
+                    )
+                }
+                timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
+
+                t0 = RuntimeClock.now()
+                xCur.withUnsafeBufferPointer { xBuf in
+                    SurfaceIO.writeFP16(to: ffnIn, data: xBuf, channels: dim, spatial: seqLen)
+                }
+                timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
+            case .fp16SurfaceCopy:
+                t0 = RuntimeClock.now()
+                do {
+                    try SurfaceIO.copyFP16(
+                        dst: ffnIn,
+                        dstChannelOffset: 0,
+                        src: attnOut,
+                        srcChannelOffset: 0,
+                        channels: dim,
+                        spatial: seqLen
+                    )
+                } catch {
+                    throw .invalidArguments("SurfaceIO.copyFP16 failed: \(error)")
+                }
+                timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
             }
-            timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
 
             t0 = RuntimeClock.now()
             try kernels[L].fwdFFN.eval()
