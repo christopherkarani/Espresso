@@ -123,6 +123,25 @@ enum DecodeTiling {
     static func localIndex(for tokenIndex: Int, laneSpatial: Int) -> Int {
         tokenIndex - windowBase(for: tokenIndex, laneSpatial: laneSpatial)
     }
+
+    @inline(__always)
+    static func shouldSyncWindow(for tokenIndex: Int, laneSpatial: Int) -> Bool {
+        precondition(tokenIndex >= 0)
+        precondition(laneSpatial > 0)
+        return tokenIndex > 0 && localIndex(for: tokenIndex, laneSpatial: laneSpatial) == 0
+    }
+}
+
+enum DecodeRuntimeOptions {
+    @inline(__always)
+    static func forceFullWindowSync(env: [String: String]) -> Bool {
+        env["ESPRESSO_DECODE_FORCE_FULL_WINDOW_SYNC"] == "1"
+    }
+
+    @inline(__always)
+    static var forceFullWindowSync: Bool {
+        forceFullWindowSync(env: ProcessInfo.processInfo.environment)
+    }
 }
 
 public struct DecodeKernelProfile: Sendable {
@@ -397,12 +416,14 @@ public extension ForwardPass {
         let tokenIndex = try decodeState.beginTokenStep()
         let laneSpatial = surfaceHandles[0].laneSpatial
         let kernelMaxSeq = surfaceHandles[0].kernelMaxSeq
+        let forceFullWindowSync = DecodeRuntimeOptions.forceFullWindowSync
         precondition(laneSpatial > 0)
         for handles in surfaceHandles {
             precondition(handles.laneSpatial == laneSpatial)
             precondition(handles.kernelMaxSeq == kernelMaxSeq)
         }
         let windowBase = DecodeTiling.windowBase(for: tokenIndex, laneSpatial: kernelMaxSeq)
+        let windowLocalIndex = DecodeTiling.localIndex(for: tokenIndex, laneSpatial: kernelMaxSeq)
 
         // CPU touch at decode boundary: write token embedding/state to a compact token scratch surface.
         var t0 = RuntimeClock.now()
@@ -410,14 +431,6 @@ public extension ForwardPass {
             SurfaceIO.writeFP16(to: surfaceHandles[0].tokenScratch, data: xBuf, channels: dim, spatial: 1)
         }
         do {
-            try SurfaceIO.copyFP16(
-                dst: surfaceHandles[0].attnIn,
-                dstChannelOffset: 0,
-                src: surfaceHandles[0].zeroLane,
-                srcChannelOffset: 0,
-                channels: dim,
-                spatial: laneSpatial
-            )
             try SurfaceIO.copyFP16SpatialSlice(
                 dst: surfaceHandles[0].attnIn,
                 dstChannelOffset: 0,
@@ -439,10 +452,12 @@ public extension ForwardPass {
             let selfMaskUpdateUS: Double = 0
 
             if handles.maxSeq != handles.kernelMaxSeq {
-                t0 = RuntimeClock.now()
-                try synchronizeDecodeWindowCaches(handles: handles, windowBase: windowBase, dim: dim)
-                let windowSyncDelta = RuntimeClock.now() - t0
-                timings.tIO += RuntimeClock.ms(windowSyncDelta)
+                if forceFullWindowSync || DecodeTiling.shouldSyncWindow(for: tokenIndex, laneSpatial: kernelMaxSeq) {
+                    t0 = RuntimeClock.now()
+                    try synchronizeDecodeWindowCaches(handles: handles, windowBase: windowBase, dim: dim)
+                    let windowSyncDelta = RuntimeClock.now() - t0
+                    timings.tIO += RuntimeClock.ms(windowSyncDelta)
+                }
             }
 
             if ProcessInfo.processInfo.environment["DECODE_EVAL_FFN_ONLY"] == "1" {
@@ -503,6 +518,19 @@ public extension ForwardPass {
                     srcSpatial: laneSpatial,
                     channels: dim
                 )
+                if handles.maxSeq != handles.kernelMaxSeq && !forceFullWindowSync {
+                    try SurfaceIO.copyFP16SpatialSlice(
+                        dst: handles.kCache,
+                        dstChannelOffset: 0,
+                        dstSpatialIndex: windowLocalIndex,
+                        dstSpatial: kernelMaxSeq,
+                        src: handles.attnKOut,
+                        srcChannelOffset: 0,
+                        srcSpatialIndex: 0,
+                        srcSpatial: laneSpatial,
+                        channels: dim
+                    )
+                }
             } catch {
                 throw .invalidArguments("k-cache slice copy failed: \(error)")
             }
@@ -524,6 +552,19 @@ public extension ForwardPass {
                     srcSpatial: laneSpatial,
                     channels: dim
                 )
+                if handles.maxSeq != handles.kernelMaxSeq && !forceFullWindowSync {
+                    try SurfaceIO.copyFP16SpatialSlice(
+                        dst: handles.vCache,
+                        dstChannelOffset: 0,
+                        dstSpatialIndex: windowLocalIndex,
+                        dstSpatial: kernelMaxSeq,
+                        src: handles.attnVOut,
+                        srcChannelOffset: 0,
+                        srcSpatialIndex: 0,
+                        srcSpatial: laneSpatial,
+                        channels: dim
+                    )
+                }
             } catch {
                 throw .invalidArguments("v-cache slice copy failed: \(error)")
             }
@@ -545,6 +586,19 @@ public extension ForwardPass {
                     srcSpatial: laneSpatial,
                     channels: dim
                 )
+                if handles.maxSeq != handles.kernelMaxSeq && !forceFullWindowSync {
+                    try SurfaceIO.copyFP16SpatialSlice(
+                        dst: handles.maskCache,
+                        dstChannelOffset: 0,
+                        dstSpatialIndex: windowLocalIndex,
+                        dstSpatial: kernelMaxSeq,
+                        src: handles.zeroLane,
+                        srcChannelOffset: 0,
+                        srcSpatialIndex: 0,
+                        srcSpatial: laneSpatial,
+                        channels: dim
+                    )
+                }
             } catch {
                 throw .invalidArguments("mask flip slice copy failed: \(error)")
             }
@@ -555,14 +609,6 @@ public extension ForwardPass {
             // Feed x2_t from decode-attn X2 output into FFN input.
             t0 = RuntimeClock.now()
             do {
-                try SurfaceIO.copyFP16(
-                    dst: handles.ffnIn,
-                    dstChannelOffset: 0,
-                    src: handles.zeroLane,
-                    srcChannelOffset: 0,
-                    channels: dim,
-                    spatial: laneSpatial
-                )
                 try SurfaceIO.copyFP16SpatialSlice(
                     dst: handles.ffnIn,
                     dstChannelOffset: 0,
@@ -599,14 +645,6 @@ public extension ForwardPass {
             if L + 1 < kernels.count {
                 t0 = RuntimeClock.now()
                 do {
-                    try SurfaceIO.copyFP16(
-                        dst: surfaceHandles[L + 1].attnIn,
-                        dstChannelOffset: 0,
-                        src: surfaceHandles[L + 1].zeroLane,
-                        srcChannelOffset: 0,
-                        channels: dim,
-                        spatial: laneSpatial
-                    )
                     try SurfaceIO.copyFP16SpatialSlice(
                         dst: surfaceHandles[L + 1].attnIn,
                         dstChannelOffset: 0,

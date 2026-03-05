@@ -8,13 +8,33 @@ Goal: deliver maximum defensible ANE decode throughput and best-justified prefil
 - [ ] Step 0: Lock execution environment on `feat/ane-10x-max` clean worktree, seed/config defaults, and reproducibility metadata contract
 - [ ] Step 1: Add sweep harness for decode/prefill ANE runtime options with aggregate `summary.csv` and `best_of.json`
 - [ ] Step 2: Tighten benchmark metadata (`schema_version`, artifact manifest, effective ANE options) and strict option-application checks
-- [ ] Step 3: TDD for decode decoupled contract (`laneSpatial=32`, `decodeMaxSeq in {32,64,128,256}`) and tile-boundary progression
-- [ ] Step 4: Implement decode logical max-seq expansion via 32-lane tiled cache/mask handling while preserving KV/mask update order
-- [ ] Step 5: Reduce decode host overhead (batched copies/packing minimization) and evaluate optional dispatch-reduction path behind flags
+- [x] Step 3: TDD for decode decoupled contract (`laneSpatial=32`, `decodeMaxSeq in {32,64,128,256}`) and tile-boundary progression
+- [x] Step 4: Implement decode logical max-seq expansion via 32-lane tiled cache/mask handling while preserving KV/mask update order
+- [x] Step 5a: Reduce decode host overhead (batched copies/packing minimization)
+- [ ] Step 5b: Evaluate optional dispatch-reduction path behind flags
 - [ ] Step 6: Run decode sweep matrix (1-layer search), capture per-change before/after tables, and classify each optimization `SHIP`/`ITERATE`/`ABANDON`
 - [ ] Step 7: Run prefill high-ROI option/fusion sweep and produce bottleneck-ceiling argument from repeated profiles
 - [ ] Step 8: 12-layer final confirmation runs for best decode + prefill settings, with strict Core ML naive baseline fairness
 - [ ] Step 9: Final verification (`swift test`, targeted/hardware-gated tests, decode probe matrix), update decision log + review section, and ensure clean committed branch
+
+### Execution Review (Decode Tile-Sync Optimization, 2026-03-05)
+- [x] Added TDD coverage for tile-boundary sync policy and runtime option parsing (`DecodeStateTests`).
+- [x] Implemented boundary-only window sync + incremental tile cache updates and removed redundant lane zero-copy steps in decode hot path.
+- [x] Added rollback flag: `ESPRESSO_DECODE_FORCE_FULL_WINDOW_SYNC=1`.
+- [x] Verification:
+  - `swift test` (full suite)
+  - `ANE_HARDWARE_TESTS=1 swift test --filter ANERuntimeTests/test_decode_probe_passthrough_4in_3out_eval`
+  - `ANE_HARDWARE_TESTS=1 swift test --filter InferenceOptimizationTests/test_decode_kv_cache_updates_and_mask_progresses_on_hardware`
+- [x] Decode A/B evidence (same SHA, forced-old vs optimized):
+  - `maxSeq=128`:
+    - before `/tmp/decode_syncopt_before_max128_20260305` median `0.685 ms`, throughput `1445.1 tok/s`, IO `0.219 ms`
+    - after `/tmp/decode_syncopt_after_max128_20260305` median `0.483 ms`, throughput `2040.2 tok/s`, IO `0.032 ms`
+  - `maxSeq=256`:
+    - before `/tmp/decode_syncopt_before_max256_20260305` median `0.685 ms`, throughput `1447.9 tok/s`, IO `0.217 ms`
+    - after `/tmp/decode_syncopt_after_max256_20260305` median `0.492 ms`, throughput `1869.5 tok/s`, IO `0.035 ms`
+- [x] Strict fairness snapshot after optimization:
+  - `/tmp/decode_syncopt_coreml_max128_20260305` fastest Core ML naive median `0.988 ms`, ANE median `0.488 ms`, strict speedup `2.02x`.
+- [x] Step 5a status: complete for this pass (window-sync + packing path). Further dispatch reduction remains in Step 5b.
 
 ## ANE 10x Tuning Program (2026-03-05)
 Goal: iterate aggressively until ANE direct is 10x faster than Core ML across compute-only + end-to-end benchmarks, or prove a hard floor via ANE `hwExecutionTime`.

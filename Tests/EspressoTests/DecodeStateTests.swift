@@ -67,4 +67,38 @@ final class DecodeStateTests: XCTestCase {
             XCTAssertEqual(base + local, tokenIndex)
         }
     }
+
+    func test_decode_tiling_window_sync_only_on_tile_boundaries_after_first_token() {
+        let lane = 32
+        XCTAssertFalse(DecodeTiling.shouldSyncWindow(for: 0, laneSpatial: lane))
+        XCTAssertFalse(DecodeTiling.shouldSyncWindow(for: 1, laneSpatial: lane))
+        XCTAssertFalse(DecodeTiling.shouldSyncWindow(for: 31, laneSpatial: lane))
+        XCTAssertTrue(DecodeTiling.shouldSyncWindow(for: 32, laneSpatial: lane))
+        XCTAssertFalse(DecodeTiling.shouldSyncWindow(for: 33, laneSpatial: lane))
+        XCTAssertFalse(DecodeTiling.shouldSyncWindow(for: 63, laneSpatial: lane))
+        XCTAssertTrue(DecodeTiling.shouldSyncWindow(for: 64, laneSpatial: lane))
+    }
+
+    func test_decode_tiling_window_sync_pattern_matches_modulo_rule() {
+        let lane = 32
+        let maxSeq = lane * 8
+        for tokenIndex in 0..<maxSeq {
+            let expected = tokenIndex > 0 && tokenIndex % lane == 0
+            XCTAssertEqual(
+                DecodeTiling.shouldSyncWindow(for: tokenIndex, laneSpatial: lane),
+                expected,
+                "unexpected sync decision at token \(tokenIndex)"
+            )
+        }
+    }
+
+    func test_decode_runtime_options_force_full_window_sync_defaults_off() {
+        XCTAssertFalse(DecodeRuntimeOptions.forceFullWindowSync(env: [:]))
+        XCTAssertFalse(DecodeRuntimeOptions.forceFullWindowSync(env: ["ESPRESSO_DECODE_FORCE_FULL_WINDOW_SYNC": "0"]))
+        XCTAssertFalse(DecodeRuntimeOptions.forceFullWindowSync(env: ["ESPRESSO_DECODE_FORCE_FULL_WINDOW_SYNC": "true"]))
+    }
+
+    func test_decode_runtime_options_force_full_window_sync_enabled_by_one() {
+        XCTAssertTrue(DecodeRuntimeOptions.forceFullWindowSync(env: ["ESPRESSO_DECODE_FORCE_FULL_WINDOW_SYNC": "1"]))
+    }
 }

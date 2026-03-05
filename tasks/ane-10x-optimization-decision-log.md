@@ -52,6 +52,7 @@ Main benchmark commands used:
 | A10 | Perf-stats object fallback experiments in interop | Try to recover `hwExecutionTime` data | Local experiments + tests (`ANEPerfStatsTests`) | Forcing placeholder perf-stats object caused runtime exceptions; reverted. Host still reports factory nil. | **ABANDON** (unsafe path) |
 | A11 | Decode eval path sweep (`inmem`, `client`, `clientDirect`, `realtime`) | Test whether failure depended on eval path rather than kernel contract | `/tmp/decode_evalpath_*.log` | All eval paths failed identically for unsupported decode-attn contract (`statusType=0x9`) | **ABANDON** (for this failure mode) |
 | A12 | Compile cache policy reproducibility check (`auto` vs `preferCached`) | Improve compile stability and iteration time | `/tmp/decode_repro_ane10x_run1`, `/tmp/decode_repro_ane10x_run2` | Median latency stable (`0.648479` vs `0.648500` ms/token; delta `0.0032%`), compile time collapsed (`49.49s` → `52.7ms`) | **SHIP** (`preferCached`) |
+| A13 | Decode tile-sync optimization (boundary-only window sync + incremental lane cache updates + removed redundant lane-zero copies) | Full-window cache sync every token was dominating decode IO at `maxSeq > 32` | Commit in this pass; `/tmp/decode_syncopt_before_max128_20260305`, `/tmp/decode_syncopt_after_max128_20260305`, `/tmp/decode_syncopt_before_max256_20260305`, `/tmp/decode_syncopt_after_max256_20260305` | Large, repeatable IO reduction and throughput gain for tiled decode contexts (`128/256`) while preserving hardware correctness tests | **SHIP** |
 
 ---
 
@@ -74,6 +75,36 @@ Main benchmark commands used:
 Interpretation:
 - Decode path is materially faster than Core ML naive baseline on current supported contract.
 - 10x target is not achieved under current `maxSeq=32` constraint.
+
+3) Tile-sync optimization A/B (same SHA, forced-old path vs optimized path):
+- `maxSeq=128`:
+  - Before (forced old sync each token): `/tmp/decode_syncopt_before_max128_20260305`
+    - mean `0.692`, median `0.685`, p95 `0.748`, p99 `0.820`, `1445 tok/s`
+    - breakdown: ANE `0.409 ms`, IO `0.219 ms`
+  - After (boundary-only sync + incremental tile updates): `/tmp/decode_syncopt_after_max128_20260305`
+    - mean `0.490`, median `0.483`, p95 `0.545`, p99 `0.693`, `2040 tok/s`
+    - breakdown: ANE `0.395 ms`, IO `0.032 ms`
+- `maxSeq=256`:
+  - Before: `/tmp/decode_syncopt_before_max256_20260305`
+    - mean `0.691`, median `0.685`, p95 `0.751`, p99 `0.817`, `1448 tok/s`
+    - breakdown: ANE `0.409 ms`, IO `0.217 ms`
+  - After: `/tmp/decode_syncopt_after_max256_20260305`
+    - mean `0.535`, median `0.492`, p95 `0.700`, p99 `0.836`, `1869 tok/s`
+    - breakdown: ANE `0.436 ms`, IO `0.035 ms`
+
+4) Strict fairness snapshot after A13 (`maxSeq=128`):
+- Artifact: `/tmp/decode_syncopt_coreml_max128_20260305`
+- ANE median: `0.488 ms/token`
+- Fastest Core ML naive median: `0.988 ms/token` (`.cpuAndNeuralEngine`)
+- Strict speedup: `2.02x`
+
+5) Thermal variance note (`maxSeq=32`, mixed ANE+CoreML run order):
+- Mixed fairness runs showed ANE median drift to `~0.67 ms` in hot runs:
+  - `/tmp/decode_syncopt_coreml_max32_20260305`
+  - `/tmp/decode_syncopt_coreml_max32_r2_20260305`
+- Standalone ANE-only confirmation remains fast/stable:
+  - `/tmp/decode_syncopt_confirm_max32_20260305` median `0.486 ms`, mean `0.488 ms`, `2047 tok/s`.
+Inference: mixed-run thermal state materially affects ANE median on this host; treat strict speedup claims from long mixed runs conservatively and include artifact provenance.
 
 ### Prefill snapshots
 
@@ -182,4 +213,3 @@ Prefill profile run:
   - `ane_inference_latencies.csv`
   - `ane_inference_kernel_profile.csv`
   - Core ML latency CSVs
-
