@@ -423,6 +423,59 @@ final class ANETypesTests: XCTestCase {
         }
     }
 
+    func test_surface_copy_fp16_spatial_slice_between_surfaces() throws {
+        let channels = 6
+        let srcSpatial = 3
+        let dstSpatial = 5
+
+        let src = makeSurface(bytes: channels * srcSpatial * 2)
+        let dst = makeSurface(bytes: channels * dstSpatial * 2)
+
+        let srcInput: [Float] = (0..<(channels * srcSpatial)).map { i in
+            // Distinct per channel/spatial, representable in fp16 without large error.
+            Float(i) * 0.5 - 7.0
+        }
+        srcInput.withUnsafeBufferPointer { inputBuf in
+            SurfaceIO.writeFP16(to: src, data: inputBuf, channels: channels, spatial: srcSpatial)
+        }
+
+        let zeros = Array(repeating: Float(0), count: channels * dstSpatial)
+        zeros.withUnsafeBufferPointer { z in
+            SurfaceIO.writeFP16(to: dst, data: z, channels: channels, spatial: dstSpatial)
+        }
+
+        let srcIndex = 1
+        let dstIndex = 4
+        try SurfaceIO.copyFP16SpatialSlice(
+            dst: dst,
+            dstChannelOffset: 0,
+            dstSpatialIndex: dstIndex,
+            dstSpatial: dstSpatial,
+            src: src,
+            srcChannelOffset: 0,
+            srcSpatialIndex: srcIndex,
+            srcSpatial: srcSpatial,
+            channels: channels
+        )
+
+        var out = Array(repeating: Float.nan, count: channels * dstSpatial)
+        out.withUnsafeMutableBufferPointer { outBuf in
+            SurfaceIO.readFP16(from: dst, into: outBuf, channelOffset: 0, channels: channels, spatial: dstSpatial)
+        }
+
+        for ch in 0..<channels {
+            for sp in 0..<dstSpatial {
+                let outIdx = ch * dstSpatial + sp
+                if sp == dstIndex {
+                    let srcIdx = ch * srcSpatial + srcIndex
+                    XCTAssertEqual(out[outIdx], srcInput[srcIdx], accuracy: 1e-2)
+                } else {
+                    XCTAssertEqual(out[outIdx], 0, accuracy: 0)
+                }
+            }
+        }
+    }
+
     func test_surface_write_fp16_at_batched_regions() throws {
         let channels = 12
         let spatial = 4

@@ -48,6 +48,19 @@ void ane_interop_cvt_f16_to_f32(float *dst, const void *src, int count);
 bool ane_interop_io_copy(IOSurfaceRef dst, int dst_ch_off,
                          IOSurfaceRef src, int src_ch_off,
                          int channels, int spatial);
+/// Copy a single spatial index (token) across `channels` from `src` to `dst`.
+///
+/// Surfaces are interpreted as channel-first `[channels, spatial]` FP16 tensors.
+/// This copies one element per channel at `src_spatial_index` into `dst_spatial_index`.
+bool ane_interop_io_copy_fp16_spatial_slice(IOSurfaceRef dst,
+                                            int dst_ch_off,
+                                            int dst_spatial_index,
+                                            int dst_spatial,
+                                            IOSurfaceRef src,
+                                            int src_ch_off,
+                                            int src_spatial_index,
+                                            int src_spatial,
+                                            int channels);
 bool ane_interop_io_write_fp16(IOSurfaceRef surface,
                                const float *data, int channels, int spatial);
 bool ane_interop_io_read_fp16(IOSurfaceRef surface, int ch_off,

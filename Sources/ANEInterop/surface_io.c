@@ -86,6 +86,88 @@ cleanup:
     return ok;
 }
 
+bool ane_interop_io_copy_fp16_spatial_slice(IOSurfaceRef dst,
+                                            int dst_ch_off,
+                                            int dst_spatial_index,
+                                            int dst_spatial,
+                                            IOSurfaceRef src,
+                                            int src_ch_off,
+                                            int src_spatial_index,
+                                            int src_spatial,
+                                            int channels) {
+    if (!dst || !src) return false;
+    if (dst_ch_off < 0 || src_ch_off < 0) return false;
+    if (dst_spatial_index < 0 || src_spatial_index < 0) return false;
+    if (dst_spatial < 0 || src_spatial < 0 || channels < 0) return false;
+    if (channels == 0) return true;
+    if (dst_spatial == 0 || src_spatial == 0) return false;
+    if (dst_spatial_index >= dst_spatial || src_spatial_index >= src_spatial) return false;
+
+    size_t dstElems, srcElems;
+    size_t dstBytes, srcBytes;
+    size_t dstSpatialSz = (size_t)dst_spatial;
+    size_t srcSpatialSz = (size_t)src_spatial;
+
+    // Bounds check: ensure the highest indexed element is within alloc size.
+    // maxIndex = (ch_off + channels - 1) * spatial + spatial_index
+    if (channels > INT_MAX - dst_ch_off) return false;
+    if (channels > INT_MAX - src_ch_off) return false;
+
+    size_t dstMaxCh = (size_t)(dst_ch_off + channels - 1);
+    size_t srcMaxCh = (size_t)(src_ch_off + channels - 1);
+
+    size_t dstMaxIdxElems, srcMaxIdxElems;
+    if (mul_size_overflow(dstMaxCh, dstSpatialSz, &dstMaxIdxElems)) return false;
+    if (mul_size_overflow(srcMaxCh, srcSpatialSz, &srcMaxIdxElems)) return false;
+    if (add_size_overflow(dstMaxIdxElems, (size_t)dst_spatial_index, &dstMaxIdxElems)) return false;
+    if (add_size_overflow(srcMaxIdxElems, (size_t)src_spatial_index, &srcMaxIdxElems)) return false;
+
+    if (add_size_overflow(dstMaxIdxElems, 1, &dstElems)) return false;
+    if (add_size_overflow(srcMaxIdxElems, 1, &srcElems)) return false;
+
+    if (mul_size_overflow(dstElems, sizeof(_Float16), &dstBytes)) return false;
+    if (mul_size_overflow(srcElems, sizeof(_Float16), &srcBytes)) return false;
+
+    bool lockedDst = false;
+    bool lockedSrc = false;
+    bool ok = false;
+
+    if (IOSurfaceLock(dst, 0, NULL) != kIOReturnSuccess) return false;
+    lockedDst = true;
+
+    if (src != dst) {
+        if (IOSurfaceLock(src, kIOSurfaceLockReadOnly, NULL) != kIOReturnSuccess) goto cleanup;
+        lockedSrc = true;
+    }
+
+    void *dstBase = IOSurfaceGetBaseAddress(dst);
+    const void *srcBase = IOSurfaceGetBaseAddress(src);
+    if (!dstBase || !srcBase) goto cleanup;
+
+    size_t dstAlloc = IOSurfaceGetAllocSize(dst);
+    size_t srcAlloc = IOSurfaceGetAllocSize(src);
+    if (dstBytes > dstAlloc) goto cleanup;
+    if (srcBytes > srcAlloc) goto cleanup;
+
+    const _Float16 *srcF16 = (const _Float16 *)srcBase;
+    _Float16 *dstF16 = (_Float16 *)dstBase;
+
+    for (int c = 0; c < channels; c++) {
+        size_t dc = (size_t)(dst_ch_off + c);
+        size_t sc = (size_t)(src_ch_off + c);
+        size_t dIdx = dc * dstSpatialSz + (size_t)dst_spatial_index;
+        size_t sIdx = sc * srcSpatialSz + (size_t)src_spatial_index;
+        dstF16[dIdx] = srcF16[sIdx];
+    }
+
+    ok = true;
+
+cleanup:
+    if (lockedSrc) IOSurfaceUnlock(src, kIOSurfaceLockReadOnly, NULL);
+    if (lockedDst) IOSurfaceUnlock(dst, 0, NULL);
+    return ok;
+}
+
 bool ane_interop_io_write_fp16(IOSurfaceRef surface,
                                const float *data, int channels, int spatial) {
     return ane_interop_io_write_fp16_at(surface, 0, data, channels, spatial);

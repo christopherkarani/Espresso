@@ -235,6 +235,43 @@ public enum SurfaceIO {
         guard ok else { throw .interopCallFailed }
     }
 
+    /// Copy a single spatial index (token) across `channels` from `src` into `dst`.
+    ///
+    /// Surfaces are interpreted as channel-first `[channels, spatial]` FP16 tensors.
+    public static func copyFP16SpatialSlice(
+        dst: IOSurfaceRef,
+        dstChannelOffset: Int,
+        dstSpatialIndex: Int,
+        dstSpatial: Int,
+        src: IOSurfaceRef,
+        srcChannelOffset: Int,
+        srcSpatialIndex: Int,
+        srcSpatial: Int,
+        channels: Int
+    ) throws(SurfaceIOError) {
+        let dstOff32 = try checkedNonNegativeInt32(dstChannelOffset)
+        let srcOff32 = try checkedNonNegativeInt32(srcChannelOffset)
+        let dstSpatialIndex32 = try checkedNonNegativeInt32(dstSpatialIndex)
+        let srcSpatialIndex32 = try checkedNonNegativeInt32(srcSpatialIndex)
+        let dstSpatial32 = try checkedNonNegativeInt32(dstSpatial)
+        let srcSpatial32 = try checkedNonNegativeInt32(srcSpatial)
+        let channels32 = try checkedNonNegativeInt32(channels)
+        if channels == 0 { return }
+
+        let ok = ane_interop_io_copy_fp16_spatial_slice(
+            dst,
+            dstOff32,
+            dstSpatialIndex32,
+            dstSpatial32,
+            src,
+            srcOff32,
+            srcSpatialIndex32,
+            srcSpatial32,
+            channels32
+        )
+        guard ok else { throw .interopCallFailed }
+    }
+
     public static func copyFP16Batched(dst: IOSurfaceRef,
                                        src: IOSurfaceRef,
                                        spatial: Int,
