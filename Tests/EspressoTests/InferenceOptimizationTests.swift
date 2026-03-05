@@ -58,7 +58,8 @@ final class InferenceOptimizationTests: XCTestCase {
 
         mutating func nextFloat(range: ClosedRange<Float>) -> Float {
             let u = nextUInt32()
-            let f = Float(u) / Float(UInt32.max) // [0,1)
+            // Map to [0,1)
+            let f = Float(u) / Float(UInt32.max)
             return range.lowerBound + (range.upperBound - range.lowerBound) * f
         }
     }
