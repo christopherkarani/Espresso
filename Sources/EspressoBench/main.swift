@@ -662,19 +662,18 @@ func decodeProfileAverages(_ profile: DecodeKernelProfile) -> [[String: Any]] {
         return Double(values.reduce(0, +)) / Double(values.count)
     }
 
-    return profile.layers.indices.map { layerIdx in
+    var layerDicts: [[String: Any]] = []
+    for layerIdx in 0..<profile.layers.count {
         let layer = profile.layers[layerIdx]
-        return [
+        let dict: [String: Any] = [
             "layer": layerIdx,
             "samples": layer.attnEvalUS.count,
-            "attn_dispatch_count_avg": meanInt(layer.attnDispatchCount),
-            "ffn_dispatch_count_avg": meanInt(layer.ffnDispatchCount),
-            "chaining_probe_us_avg": mean(layer.chainingProbeUS),
-            "chaining_stage_last": layer.chainingStage.last ?? 0,
-            "chaining_prepare_successes": layer.chainingPrepareSuccessCount.reduce(0, +),
-            "chaining_fallbacks": layer.chainingFallbackCount.reduce(0, +),
-        ] as [String: Any]
+            "attn_eval_us_avg": mean(layer.attnEvalUS),
+            "ffn_eval_us_avg": mean(layer.ffnEvalUS),
+        ]
+        layerDicts.append(dict)
     }
+    return layerDicts
 }
 
 if opts.decode {
