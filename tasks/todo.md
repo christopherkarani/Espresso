@@ -1,83 +1,85 @@
-# Recurrent End-to-End Generation Benchmark (2026-03-06)
+# ANE Output-Head Optimization Gate (2026-03-07)
 
 ## Plan
-- [x] Re-read the latest recurrent/speculative findings, project memory, lessons, and current generation/bench code before changing anything.
+- [x] Re-read the latest recurrent generation findings, project memory, and the current generation harness before changing direction again.
 - [x] State the breakthrough hypothesis up front:
-  - [x] A depth-matched recurrent generation path can still preserve a large runtime advantage after adding prompt handling, output-head projection, and autoregressive loop costs.
-  - [x] The likely new bottleneck is final RMSNorm + classifier logits, not the recurrent trunk itself.
+  - [x] The recurrent trunk already moved the bottleneck to final RMSNorm + classifier logits.
+  - [x] Offloading the logits head to ANE is the highest-upside next step because it attacks the largest remaining controllable cost on the best architecture path.
 - [x] State the decisive metric and stop condition up front:
-  - [x] Continue only if end-to-end recurrent generation remains at least `2x` faster than the current transformer generation path after including logits/output head.
-  - [x] Stop deeper recurrent tuning if the gain collapses below that threshold or if compile-time iteration becomes impractical.
-- [x] Record the current controls:
-  - [x] Transformer ANE decode control remains `2.872-2.894 ms/token`.
-  - [x] CoreML `.cpuAndNeuralEngine` decode control remains `3.007 ms/token`.
-  - [x] Transformer generation harness control remains `6.110643 ms/token` on the synthetic echo path.
-  - [x] Minimal recurrent step remains `~0.20-0.32 ms/token`, but only for a single recurrent layer.
-- [x] Rewrite the task around the next honest test:
-  - [x] Integrate the recurrent path into `GenerationHarness.swift`.
-  - [x] Benchmark `2` recurrent layers first as the compile-time / structure gate.
-  - [x] Benchmark `6` recurrent layers only if `2` layers still looks structurally promising.
-  - [x] Compare against current transformer ANE generation and an honest CoreML transformer generation baseline.
-- [x] Add failing tests first for recurrent-backed generation:
-  - [ ] recurrent `AutoregressiveLanguageModel` control flow through prompt + decode loop
-  - [x] benchmark accounting exposes compile time and trunk-vs-logits timing
-  - [x] hardware-gated recurrent generation benchmark reports `2`-layer and `6`-layer numbers
-- [x] Implement recurrent generation integration with minimal surface area:
-  - [x] add recurrent generation weights/storage for multi-layer recurrent stacks
-  - [x] add a recurrent-backed `AutoregressiveLanguageModel`
-  - [x] preserve the existing token-id / embedding / argmax / logits path
-  - [x] surface compile time separately from runtime
-  - [x] surface trunk time separately from output-head/logits time
-- [x] Implement an honest CoreML generation comparison:
-  - [x] use the same token-id / embedding / output-head logic around the CoreML transformer trunk where possible
-  - [x] if the CoreML model only provides hidden-state forward passes, document that explicitly and keep the comparison aligned with the same surrounding CPU work
+  - [x] The target is to recover the lost `>=2x` end-to-end win for the `6`-layer recurrent generation path over the current transformer generation path.
+  - [x] Using the latest baseline (`4.000445 ms/token` recurrent-6 vs `6.558745 ms/token` direct transformer generation), the new head path needs to save roughly `0.72 ms/token` end-to-end to get back under `3.28 ms/token`.
+  - [x] Stop quickly if a large-vocab ANE classifier kernel:
+    - [x] fails to compile with a controlled `InvalidMILProgram` / entitlement wall / unrecoverable crash
+    - [x] or saves less than about `0.7 ms/token` end-to-end on recurrent-6 generation
+    - [x] or shifts cost into extra host I/O enough to erase the theoretical win
+- [x] Record the current baselines before implementation:
+  - [x] direct transformer generation, `6` layers: `6.558745 ms/token`, `152.47 tok/s`, trunk `5.28449`, logits `1.26048`
+  - [x] recurrent generation, `6` layers: `4.000445 ms/token`, `249.97 tok/s`, trunk `2.73244`, logits `1.26102`
+  - [x] CoreML generation baseline: `6.582224 ms/token`, `151.93 tok/s`, trunk `5.11926`, logits `1.35556`
+  - [x] key inference: the current recurrent path no longer wins by enough because logits stayed around `1.26 ms/token`
+- [x] Rewrite the work around the next honest probe:
+  - [x] build a minimal ANE-side logits kernel first
+  - [x] keep RMSNorm on CPU initially unless the classifier-only path is not enough
+  - [x] integrate the new head behind a small selectable backend in the generation harness
+  - [x] benchmark the new head on recurrent generation before touching deeper recurrent stacks
+- [x] Add failing tests first:
+  - [x] ANE classifier/logits kernel contract test
+  - [x] generation benchmark accounting for CPU-head vs ANE-head selection
+  - [x] hardware-gated recurrent generation benchmark comparing CPU logits vs ANE logits
+- [x] Implement the minimal ANE logits path:
+  - [x] add a MIL generator for single-token classifier projection (`dim -> vocab`)
+  - [x] add a runtime kernel wrapper and surface handles
+  - [x] keep the first pass minimal: CPU RMSNorm + ANE classifier projection
+  - [x] read logits back into the existing token-selection path
+  - [x] fail fast on unsupported compile/runtime behavior instead of stretching the avenue
+- [x] Integrate with the generation harness:
+  - [x] add a selectable output-head backend for generation
+  - [x] use the new backend on the recurrent generation path first
+  - [x] preserve the current CPU path as control
+  - [x] keep verification on the CPU path unless the ANE head clearly works and merits expansion
 - [x] Benchmark in order:
-  - [x] transformer ANE generation baseline
-  - [x] recurrent generation, `2` layers
-  - [x] recurrent generation, `6` layers only if justified by the `2`-layer result
-  - [x] CoreML generation baseline
+  - [x] current recurrent-6 generation control
+  - [x] recurrent-6 generation with ANE classifier head
+  - [ ] direct transformer generation with ANE classifier head only if the recurrent path clearly benefits
 - [x] Report:
   - [x] `ms/token`
   - [x] `tok/s`
   - [x] compile time
-  - [x] trunk time vs output-head/logits time
+  - [x] trunk time vs logits time
+  - [x] end-to-end delta vs current recurrent-6 control
 - [x] Apply the gate immediately after results:
-  - [ ] continue recurrent tuning only if the `6`-layer or best available depth-matched recurrent path is still `>=2x` faster end-to-end than transformer generation
-  - [x] otherwise stop and document that the trunk win did not survive full-generation overhead
+  - [ ] continue only if recurrent-6 generation gets back to about `>=2x` over direct transformer generation or shows a clearly expandable head-side win
+  - [x] otherwise stop and document that the output-head probe is not sufficient
 - [x] Append findings to `docs/fused-decode-and-next-steps.md`.
 - [x] Update project memory with durable findings.
 - [ ] Fill in this review section and commit atomically.
 
 ## Review
-- Status: completed for the depth-matched recurrent generation gate.
+- Status: completed for the classifier-only output-head probe.
 - Starting point:
-  - Direct transformer ANE decode: `2.872-2.894 ms/token`
-  - CoreML `.cpuAndNeuralEngine` decode: `3.007 ms/token`
-  - Current transformer generation harness: `6.110643 ms/token`
-  - Minimal recurrent step: `~0.20-0.32 ms/token`
-- Important validity note:
-  - The current recurrent result is only a single recurrent layer.
-  - The current transformer generation baseline is a full transformer path.
-  - Therefore the next useful experiment is depth-matched recurrent generation, not more single-step trunk timing.
+  - direct transformer generation, `6` layers: `6.558745 ms/token`, `152.47 tok/s`
+  - recurrent generation, `6` layers: `4.000445 ms/token`, `249.97 tok/s`
+  - CoreML generation baseline: `6.582224 ms/token`, `151.93 tok/s`
+- Most important current constraint:
+  - recurrent trunk latency is no longer the dominant problem
+  - logits remain about `1.26-1.36 ms/token`
+  - therefore the next honest optimization target is the output head, not more recurrent depth
 - What changed:
-  - Added `GenerationPerformanceSnapshot` / `GenerationPerformanceTrackable` to the generation harness surface.
-  - Integrated `ANERecurrentGenerationModel` into `GenerationHarness.swift`.
-  - Added recurrent generation hardware benchmarks with compile-time and trunk-vs-logits accounting.
-  - Added a benchmark-local CoreML generation wrapper that reuses token-id input, CPU embedding lookup, and CPU output-head projection around the CoreML transformer trunk.
-- Hardware benchmark results:
-  - Direct transformer ANE generation, 6 layers: `6.558745 ms/token`, `152.47 tok/s`, compile `2158.23 ms`, trunk `5.28449 ms/token`, logits `1.26048 ms/token`
-  - Recurrent generation, 2 layers: `2.271112 ms/token`, `440.32 tok/s`, compile `123.02 ms`, trunk `1.00656 ms/token`, logits `1.27095 ms/token`
-  - Recurrent generation, 6 layers: `4.000445 ms/token`, `249.97 tok/s`, compile `349.07 ms`, trunk `2.73244 ms/token`, logits `1.26102 ms/token`
-  - CoreML generation baseline, `.cpuAndNeuralEngine`: `6.582224 ms/token`, `151.93 tok/s`, compile+load `1384.60 ms`, trunk `5.11926 ms/token`, logits `1.35556 ms/token`
+  - added a selectable `GenerationOutputHeadBackend`
+  - added a minimal ANE classifier kernel (`GenerationClassifierGenerator` / `GenerationClassifierKernelSet`)
+  - routed direct and recurrent generation through the ANE classifier backend for step-level logits only
+- Important implementation finding:
+  - a single-token large-vocab classifier shape (`[1, dim, 1, 1] -> [1, vocab, 1, 1]`) compiled but failed at eval with `statusType=0x9`
+  - a lane-packed classifier shape (`[1, dim, 1, 32] -> [1, vocab, 1, 32]`) succeeded when only spatial lane `0` was written/read
+- Results on recurrent generation, `6` layers:
+  - CPU head: `3.965409 ms/token`, `252.18 tok/s`, compile `407.17 ms`, trunk `2.661490`, logits `1.292997`
+  - ANE classifier head: `3.710214 ms/token`, `269.53 tok/s`, compile `585.46 ms`, trunk `2.607659`, logits `1.094966`
+  - end-to-end savings: `0.255195 ms/token` (`6.4%`)
+  - logits savings: `0.198031 ms/token` (`15.3%`)
+  - compile-time increase: `178.29 ms`
 - Decision:
-  - `2` recurrent layers cleared the structural gate at about `2.89x` faster end-to-end than the direct transformer generation harness.
-  - `6` recurrent layers did not preserve the stricter `>=2x` depth-matched gate; they landed at about `1.64x` faster than direct transformer generation and about `1.65x` faster than the CoreML baseline.
-  - The recurrent trunk win is real, but the CPU logits/output head is now a major limiter.
-  - The next high-upside step is output-head optimization or ANE offload, not blind recurrent depth scaling.
-- Verification:
-  - `swift test`
-  - `ANE_HARDWARE_TESTS=1 swift test --filter GenerationHarnessHardwareTests/test_recurrent_generation_reports_compile_and_runtime_breakdown_on_hardware`
-  - `ANE_HARDWARE_TESTS=1 swift test --filter GenerationHarnessHardwareTests/test_recurrent_generation_6layer_and_coreml_generation_baseline_if_gate_passes`
-  - `ANE_HARDWARE_TESTS=1 swift test --filter GenerationHarnessHardwareTests/test_speculative_upper_bound_reports_metrics_on_hardware`
-- Residual test risk:
-  - Running the full `GenerationHarnessHardwareTests` class in one shot exposed a temp-dir cleanup failure in the older speculative test, while the same speculative test passes in isolation. Treat that as cross-test hygiene risk rather than a blocker on the new recurrent/CoreML measurements.
+  - this is a real gain, but it misses the predeclared `~0.7 ms/token` gate by a wide margin
+  - classifier-only ANE offload is therefore not sufficient to recover the lost `>=2x` recurrent win over direct transformer generation
+  - the next credible move is not more tuning of this exact probe; it is either:
+    - fused RMSNorm + classifier on ANE if you want one last bounded head-side attempt, or
+    - recurrent multi-layer fusion if the goal is the next materially larger win

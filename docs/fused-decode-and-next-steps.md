@@ -809,3 +809,65 @@ Verification:
 
 Residual test note:
 - Running the entire `GenerationHarnessHardwareTests` class together exposed a temp-dir cleanup failure in the older speculative test, while that same speculative test passes in isolation. That looks like cross-test hygiene in the old speculative path rather than a blocker on the recurrent/CoreML benchmark results above.
+
+## Output-Head Probe (March 7, 2026)
+
+Goal:
+- Test whether moving the recurrent generation classifier projection onto ANE can recover enough end-to-end latency to get the `6`-layer recurrent path back toward a `>=2x` win over the current direct transformer generation path.
+
+Implementation:
+- Added a swappable generation output-head backend:
+  - `GenerationOutputHeadBackend.cpu`
+  - `GenerationOutputHeadBackend.aneClassifier`
+- Added:
+  - `GenerationClassifierGenerator`
+  - `GenerationClassifierKernelSet`
+  - `ANEGenerationClassifierHead`
+- Kept final RMSNorm on CPU for this probe.
+- Verification path remains on CPU. This experiment only changes step-level autoregressive logits.
+
+Important compatibility finding:
+- A naive single-token classifier kernel (`[1, dim, 1, 1] -> [1, vocab, 1, 1]`) compiled but failed at eval on hardware with:
+  - `statusType=0x9: Program Inference error`
+- The same classifier projection became usable when packed into the repo’s proven lane shape:
+  - input `[1, dim, 1, 32]`
+  - output `[1, vocab, 1, 32]`
+  - only spatial lane `0` is written/read at runtime
+- Treat large-vocab classifier heads as another case where lane-packed decode shapes are materially safer than scalar-width shapes on this runtime.
+
+Benchmark protocol:
+- `mach_absolute_time()` / `mach_timebase_info`
+- `3` warmup iterations
+- `20` timed iterations
+- prompt `[0]`
+- `8` generated tokens
+- recurrent generation, `6` layers
+
+Results:
+- recurrent generation, CPU head:
+  - `3.965409 ms/token`
+  - `252.18 tok/s`
+  - compile `407.17 ms`
+  - trunk `2.661490 ms/token`
+  - logits `1.292997 ms/token`
+- recurrent generation, ANE classifier head:
+  - `3.710214 ms/token`
+  - `269.53 tok/s`
+  - compile `585.46 ms`
+  - trunk `2.607659 ms/token`
+  - logits `1.094966 ms/token`
+
+Delta:
+- end-to-end: `-0.255195 ms/token` (`6.4%` faster)
+- throughput: `+17.35 tok/s` (`6.9%` faster)
+- logits bucket: `-0.198031 ms/token` (`15.3%` faster)
+- compile time: `+178.29 ms`
+
+Decision:
+- This is a real win, but it is not a breakthrough.
+- The predeclared gate for continuing this avenue was about `0.7 ms/token` saved on recurrent-6 generation. The measured win (`0.255 ms/token`) is far below that threshold.
+- Therefore:
+  - classifier-only ANE offload is worth keeping because it is faster
+  - classifier-only ANE offload is not enough to restore the missing `>=2x` recurrent advantage by itself
+  - further time on this exact probe has low upside unless the next step is a fused final RMSNorm + classifier path
+- The next materially larger opportunity is still likely recurrent multi-layer fusion, not more small output-head tuning.

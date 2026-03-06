@@ -670,15 +670,59 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         XCTAssertGreaterThan(coreML.medianLogitsMsPerToken, 0)
     }
 
+    func test_recurrent_generation_ane_classifier_head_reports_comparison_on_hardware() throws {
+        try requireGenerationHardware()
+
+        let prompt: [UInt16] = [0]
+        let warmup = 3
+        let iterations = 20
+        let maxNewTokens = 8
+
+        let cpuHead = try benchmarkRecurrentEchoGeneration(
+            layerCount: 6,
+            promptTokens: prompt,
+            maxNewTokens: maxNewTokens,
+            warmup: warmup,
+            iterations: iterations,
+            outputHeadBackend: .cpu
+        )
+        let aneHead = try benchmarkRecurrentEchoGeneration(
+            layerCount: 6,
+            promptTokens: prompt,
+            maxNewTokens: maxNewTokens,
+            warmup: warmup,
+            iterations: iterations,
+            outputHeadBackend: .aneClassifier
+        )
+
+        print(
+            """
+            recurrent generation cpu-head median=\(cpuHead.medianTokenMs) ms/token tps=\(cpuHead.medianTokensPerSecond) compile=\(cpuHead.compileTimeMs) trunk=\(cpuHead.medianTrunkMsPerToken) logits=\(cpuHead.medianLogitsMsPerToken)
+            recurrent generation ane-head median=\(aneHead.medianTokenMs) ms/token tps=\(aneHead.medianTokensPerSecond) compile=\(aneHead.compileTimeMs) trunk=\(aneHead.medianTrunkMsPerToken) logits=\(aneHead.medianLogitsMsPerToken)
+            """
+        )
+
+        XCTAssertGreaterThan(cpuHead.medianTokenMs, 0)
+        XCTAssertGreaterThan(aneHead.medianTokenMs, 0)
+        XCTAssertGreaterThan(aneHead.compileTimeMs, 0)
+        XCTAssertGreaterThan(aneHead.medianLogitsMsPerToken, 0)
+    }
+
     private func benchmarkDirectEchoGeneration(
         layerCount: Int,
         promptTokens: [UInt16],
         maxNewTokens: Int,
         warmup: Int,
-        iterations: Int
+        iterations: Int,
+        outputHeadBackend: GenerationOutputHeadBackend = .cpu
     ) throws -> GenerationBenchmarkSample {
         let weights = makeEchoGenerationWeights(layerCount: layerCount)
-        let model = try ANEDirectGenerationModel(weights: weights, layerCount: layerCount, decodeMaxSeq: 32)
+        let model = try ANEDirectGenerationModel(
+            weights: weights,
+            layerCount: layerCount,
+            decodeMaxSeq: 32,
+            outputHeadBackend: outputHeadBackend
+        )
         var harness = AutoregressiveGenerationHarness(model: model, strategy: .argmax)
         return try benchmarkAutoregressiveHarness(
             harness: &harness,
@@ -739,10 +783,16 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         promptTokens: [UInt16],
         maxNewTokens: Int,
         warmup: Int,
-        iterations: Int
+        iterations: Int,
+        outputHeadBackend: GenerationOutputHeadBackend = .cpu
     ) throws -> GenerationBenchmarkSample {
         let weights = makeEchoRecurrentGenerationWeights(layerCount: layerCount)
-        let model = try ANERecurrentGenerationModel(weights: weights, layerCount: layerCount, maxSequenceTokens: 32)
+        let model = try ANERecurrentGenerationModel(
+            weights: weights,
+            layerCount: layerCount,
+            maxSequenceTokens: 32,
+            outputHeadBackend: outputHeadBackend
+        )
         var harness = AutoregressiveGenerationHarness(model: model, strategy: .argmax)
         return try benchmarkAutoregressiveHarness(
             harness: &harness,
