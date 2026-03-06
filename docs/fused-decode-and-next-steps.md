@@ -534,3 +534,74 @@ Timing impact recorded for this pass:
 - No benchmark recorded.
 - Landed decode savings: `+0.000 ms/token`
 - Cumulative savings after Avenue 6: `0.000 ms/token`
+
+## 13. Avenue 5 Revisit — Real Token-Generation Harness + Speculative Upper Bound (2026-03-06)
+
+Status: harness implemented; current speculative verifier design abandoned as structurally non-viable.
+
+What changed:
+- Added a real token-generation surface in the runtime:
+  - `AutoregressiveLanguageModel`
+  - `AutoregressiveGenerationHarness`
+  - `SpeculativeGenerationHarness`
+  - `GenerationWeights`
+  - `ANEDirectGenerationModel`
+- The new path accepts token ids, performs embedding lookup, runs the existing ANE decode loop autoregressively, applies final RMSNorm + classifier logits on CPU, and selects the next token with argmax.
+- The same surface now also supports batched full-model verification via the existing inference kernels, which made it possible to benchmark speculative control flow honestly.
+
+What is now possible:
+- End-to-end token generation instead of hidden-state replay.
+- Honest measurement of generated-token latency and effective tokens/sec.
+- Speculative draft/full control flow with explicit acceptance accounting.
+- Batched verification over a whole prefix+candidate sequence using the existing full-sequence inference path.
+
+Local asset limitation:
+- There is still no local `stories110M.bin` / `STORIES_MODEL_PATH`, so this session could not run a semantic speculative benchmark on a pretrained model.
+- Instead, I measured a structural upper bound using a synthetic "echo" model on real ANE kernels:
+  - All transformer weights = `0`
+  - RMS weights = `1`
+  - Shared embedding/classifier row `0` = `1`, all other rows = `0`
+  - This forces draft/full agreement to `100%`, which is useful for measuring the best-case overhead of the current speculative implementation independent of model quality.
+
+Benchmark protocol:
+- Command:
+  - `ANE_HARDWARE_TESTS=1 swift test --filter GenerationHarnessHardwareTests`
+- Warmup: `3`
+- Timed iterations: `20`
+- Prompt: `[0]`
+- Generated tokens per sample: `8`
+- Direct generation model: `6` layers
+- Speculative draft/full: `2` draft layers, `6` full layers
+- Candidate counts measured: `k=2`, `k=4`
+
+Measured results on the synthetic upper-bound model:
+- Direct generation harness:
+  - Median: `6.110643 ms/token`
+  - Throughput: `163.65 tok/s`
+- Speculative `k=2`:
+  - Acceptance: `1.0`
+  - Median: `38.032148 ms/token`
+  - Throughput: `26.29 tok/s`
+- Speculative `k=4`:
+  - Acceptance: `1.0`
+  - Median: `28.609625 ms/token`
+  - Throughput: `34.95 tok/s`
+
+Interpretation:
+- This is the strongest negative result available for the current speculative design.
+- Even with forced `100%` agreement, speculative generation is still dramatically slower than direct generation.
+- The bottleneck is not acceptance quality; it is the verifier/state-sync architecture:
+  - Full-sequence verification runs over the fixed `seqLen=256` inference path.
+  - After verification, the full model still has to advance its decode state sequentially for accepted tokens.
+  - The draft model is then reset and re-prefilled from the accepted prefix.
+- That combination makes the current implementation roughly:
+  - `38.03 / 6.11 = 6.22x` slower at `k=2`
+  - `28.61 / 6.11 = 4.68x` slower at `k=4`
+
+Conclusion:
+- Avenue 5 is no longer blocked by missing infrastructure. The infrastructure now exists.
+- Avenue 5 is blocked by measured verifier cost on the current runtime design.
+- More draft tuning is not the right next move. A speculative path is only worth revisiting if the verifier can become radically cheaper and reusable across accepted tokens.
+- The next serious direction should shift to:
+  - RWKV-style recurrent decode, or
+  - a fundamentally different speculative verifier that reuses caches/state instead of replaying and then re-advancing.

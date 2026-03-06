@@ -1,65 +1,64 @@
-# Avenue 3 Follow-On: QKV-Only ANE Split Path (2026-03-06)
+# Generation Harness + Speculative Decode (2026-03-06)
 
 ## Plan
-- [x] Re-read prior Avenue 1-6 findings, project memory, and the current decode/runtime/test code before changes.
-- [x] Prove the dependency graph for `ANE QKV -> Metal SDPA -> ANE FFN` and document whether any real overlap exists across layers.
-- [x] Add failing tests first for the new QKV-only seam:
-  - [x] MIL/spec generation for a QKV-only decode generator.
-  - [x] Runtime wrapper / surface-handle shape and blob expectations.
-  - [x] Hybrid decode harness behavior and timing entry points.
-- [x] Record baseline numbers before implementation:
-  - [x] Current direct ANE decode token median.
-  - [x] Current per-layer ANE attention stage timing.
-  - [x] Existing standalone Metal SDPA timing reference.
-- [x] Implement the split path with minimal surface area:
-  - [x] Add a new ANE QKV-only decode generator that emits `Q`, `K_new`, and `V_new`.
-  - [x] Add a runtime kernel wrapper adjacent to `DecodeKernelSet`.
-  - [x] Add surface handles for Q output, K/V writeback, and Metal attention output.
-  - [x] Add a hybrid decode loop in `DecodeForwardPass.swift` using the existing `MetalAttentionKernel`.
-- [x] Benchmark the implemented path with `mach_absolute_time()`:
-  - [x] 3-5 warmup iterations.
-  - [x] 20+ timed iterations.
-  - [x] Median as primary metric.
-  - [x] Report stage ms and full-token ms.
-- [x] Apply the abandon rule immediately if either is true:
-  - [x] Overlap is structurally impossible.
-  - [x] Naive substitution (`ANE QKV + Metal SDPA + ANE FFN`) is slower than current ANE attention/decode.
-- [x] If abandoned, document the negative result with measured numbers instead of pushing further.
+- [x] Re-read the required docs, project memory, and current decode/bench/runtime code before changing anything.
+- [x] Pressure-test the direction: speculative decoding stays primary; RWKV-style recurrent decode stays secondary until the harness exists or speculative work fails honestly.
+- [x] Record reproducible pre-change baselines and harness prerequisites:
+  - [x] Re-run the current direct ANE decode baseline that will remain the control.
+  - [x] Confirm that no local `stories110M.bin` / `STORIES_MODEL_PATH` is currently available for a semantic real-model benchmark.
+  - [x] Note the existing full-hardware-suite blocker at `ANEInteropTests.test_compile_count_increments`.
+- [x] Add failing tests first for a real token-generation harness:
+  - [x] Token ids -> embedding lookup for decode/prompt seeding.
+  - [x] Autoregressive decode loop advances state and appends generated tokens.
+  - [x] Final RMSNorm + classifier produces last-token logits from decode output.
+  - [x] Argmax selection produces deterministic next-token choices under test fixtures.
+  - [x] Benchmark/accounting surfaces token latency, tokens/sec, and generated token counts.
+- [x] Implement the real generation harness with minimal new surface area:
+  - [x] Load model weights through `ModelWeightLoader` into a reusable generation-weight container.
+  - [x] Build a reusable generation context around the existing decode path.
+  - [x] Accept token ids as input instead of pre-generated hidden states.
+  - [x] Run multiple decode steps autoregressively and surface logits plus chosen token per step.
+  - [x] Support argmax as the first honest selection path.
+- [x] Add failing tests first for speculative decoding control flow and accounting.
+- [x] Implement speculative decoding experiments in priority order:
+  - [x] Draft/full speculative control flow using the same autoregressive model protocol.
+  - [x] Benchmark `k=2` in a hardware-gated upper-bound experiment.
+  - [x] Benchmark `k=4` in a hardware-gated upper-bound experiment.
+  - [ ] Benchmark `k=8` only if earlier results justify it.
+  - [x] Track acceptance rate, accepted-prefix distribution, verifier cost, and end-to-end throughput.
+- [x] Apply kill criteria immediately:
+  - [x] Stop speculative decoding if verification cost erases gains, even under forced perfect acceptance.
+  - [x] Conclude that the current verifier/state-sync design is structurally non-viable for throughput wins.
+- [ ] Only if speculative decoding is structurally blocked or fails the above gates, prototype the RWKV-style recurrent path:
+  - [ ] Minimal single-layer recurrent step: `x_t, state_in -> x_next, state_out`.
+  - [ ] Compile once and benchmark repeated stepping at contexts `32`, `256`, `1024`, and `4096`.
+  - [ ] Continue only if latency stays effectively flat while transformer decode grows with context.
 - [ ] Append findings to `docs/fused-decode-and-next-steps.md`.
-- [ ] Update project memory if new ANE constraints or gotchas are confirmed.
-- [x] Run targeted tests, run `swift test`, and note the existing hardware-suite stall if still present.
-- [ ] Commit the Avenue 3 follow-on work atomically.
+- [ ] Update project memory with durable findings.
+- [ ] Fill this review section with measured results and commit atomically.
 
 ## Review
-- Status: abandoned after implementation and measurement.
-- Dependency graph result:
-  - Layer `N` FFN depends on Metal attention output from layer `N`.
-  - Layer `N+1` QKV depends on FFN output from layer `N`.
-  - Therefore there is no usable ANE/Metal overlap on the critical path for single-token decode.
-- Baseline direct ANE decode:
-  - `espresso-bench --decode --ane-only --layers 6 --warmup 3 --iterations 20 --decode-steps 32 --decode-max-seq 32 --profile-kernels`
-  - Median: `2.872 ms/token`
-  - Attention stage average: `209.383 us/layer`
-  - FFN stage average: `210.511 us/layer`
-- Hybrid split-path benchmark:
-  - Same 6-layer / 32-step decode schedule, 3 warmup sequences, 20 measured sequences.
-  - Direct comparison harness median: `2.864562 ms/token`
-  - Hybrid median: `4.665979 ms/token`
-  - Hybrid stage medians per token:
-    - ANE QKV-only: `1.233083 ms/token` = `205.514 us/layer`
-    - Metal SDPA + Wo + residual: `1.877479 ms/token` = `312.913 us/layer`
-    - ANE FFN: `1.253000 ms/token` = `208.833 us/layer`
-    - IO: `0.086646 ms/token` = `14.441 us/layer`
-- Decision evidence:
-  - Split attention half (`QKV-only + Metal`) = `518.427 us/layer`
-  - Current direct attention stage = `209.383 us/layer`
-  - Hybrid attention half is `309.044 us/layer` slower, projecting to about `1.854 ms/token` worse over 6 layers.
-  - Measured end-to-end delta: `4.665979 - 2.864562 = 1.801417 ms/token` slower.
-- Verification:
-  - `swift test` passed.
-  - Targeted hardware tests passed:
-    - `HybridDecodeKernelSetTests/test_hybrid_decode_kernel_set_compiles_on_hardware`
-    - `HybridDecodeForwardPassTests/test_hybrid_decode_single_step_runs_on_hardware`
-    - `HybridDecodeForwardPassTests/test_hybrid_decode_benchmark_reports_direct_and_hybrid_token_medians`
-  - Full `ANE_HARDWARE_TESTS=1 swift test` was not rerun because of the pre-existing stall at `ANEInteropTests.test_compile_count_increments`.
-- Commit SHA: pending.
+- Status: in progress.
+- Current control numbers:
+  - Direct ANE decode median at session start: `2.872 ms/token`.
+  - Direct ANE decode median on refreshed control run: `2.894 ms/token`.
+  - Direct attention stage: `209.383 us/layer`.
+  - Direct FFN stage: `210.511 us/layer`.
+  - CoreML `.cpuAndNeuralEngine` median: `3.007 ms/token`.
+- New generation-harness results:
+  - Added `AutoregressiveLanguageModel`, `AutoregressiveGenerationHarness`, `SpeculativeGenerationHarness`, `GenerationWeights`, and `ANEDirectGenerationModel`.
+  - Added non-hardware TDD coverage in `GenerationHarnessTests`.
+  - Added hardware-gated integration/benchmark coverage in `GenerationHarnessHardwareTests`.
+  - Real pretrained-weight loading is supported, but there is no local `stories110M.bin` / `STORIES_MODEL_PATH`, so no semantic acceptance benchmark was possible in this session.
+- Best-case speculative upper-bound benchmark (forced `100%` agreement via synthetic echo weights, `ANE_HARDWARE_TESTS=1`, prompt=`[0]`, generate=`8`, warmup=`3`, iterations=`20`):
+  - Direct generation harness, 6-layer full model: `6.110643 ms/token`, `163.65 tok/s`.
+  - Speculative `k=2`, draft=2 layers / full=6 layers: `38.032148 ms/token`, `26.29 tok/s`, acceptance=`1.0`.
+  - Speculative `k=4`, draft=2 layers / full=6 layers: `28.609625 ms/token`, `34.95 tok/s`, acceptance=`1.0`.
+- Confirmed dead ends:
+  - Hybrid ANE+Metal decode is slower (`4.665979 ms/token`) and has no meaningful overlap window.
+  - More private API / async / overlap probing is not the next-best use of time.
+  - The previous speculative avenue was blocked by missing infrastructure; that infrastructure now exists.
+  - The current speculative implementation is still a dead end because full-sequence verification plus sequential full-model state advance is too expensive even with perfect acceptance.
+- Dialectic synthesis:
+  - The generation harness was the correct gating deliverable because it converted speculative decoding from conjecture into measurable throughput.
+  - With the harness in place, the verifier architecture failed an upper-bound test. The next serious path should move to RWKV-style recurrent decode or a fundamentally different verifier/state-reuse design, not more draft tuning on the current speculative stack.
