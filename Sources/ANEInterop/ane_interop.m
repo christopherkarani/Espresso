@@ -1277,3 +1277,327 @@ bool ane_interop_has_perf_stats(ANEHandle *handle) {
     if (!handle) return false;
     return handle->perfStatsRequested && handle->perfStats != NULL;
 }
+
+// --- VirtualClient eval path probe ---
+
+bool ane_interop_runtime_has_virtual_client(void) {
+    ane_interop_init();
+    Class clientCls = NSClassFromString(@"_ANEClient");
+    if (!clientCls) return false;
+    SEL vcSel = @selector(virtualClient);
+    return [clientCls instancesRespondToSelector:vcSel];
+}
+
+bool ane_interop_runtime_has_shared_events_request(void) {
+    ane_interop_init();
+    Class reqCls = NSClassFromString(@"_ANERequest");
+    if (!reqCls) return false;
+    // 8-arg factory with sharedEvents parameter
+    SEL factorySel = NSSelectorFromString(
+        @"requestWithInputs:inputIndices:outputs:outputIndices:"
+        @"perfStats:perfStatsMask:procedureIndex:sharedEvents:");
+    if ([reqCls respondsToSelector:factorySel]) return true;
+    // Fallback: setSharedEvents: setter
+    SEL setSel = @selector(setSharedEvents:);
+    return [reqCls instancesRespondToSelector:setSel];
+}
+
+void ane_interop_probe_virtual_client_eval(ANEHandle *handle,
+                                            const ANEInteropVCProbeOptions *options,
+                                            ANEInteropVCProbeResult *result) {
+    @autoreleasepool {
+        if (!result) return;
+        memset(result, 0, sizeof(*result));
+        result->stage = ANE_INTEROP_VC_STAGE_UNAVAILABLE;
+
+        ANEInteropVCProbeOptions opts = {0};
+        if (options) opts = *options;
+
+        ane_interop_init();
+
+        // --- Class/selector discovery ---
+        Class virtualClientCls = NSClassFromString(@"_ANEVirtualClient");
+        Class sharedEventsCls = NSClassFromString(@"_ANESharedEvents");
+        Class sharedWaitEventCls = NSClassFromString(@"_ANESharedWaitEvent");
+        Class sharedSignalEventCls = NSClassFromString(@"_ANESharedSignalEvent");
+        Class ioSurfaceSharedEventCls = NSClassFromString(@"IOSurfaceSharedEvent");
+        Class clientCls = NSClassFromString(@"_ANEClient");
+
+        SEL vcPropertySel = @selector(virtualClient);
+        SEL sharedEventsFactorySel = NSSelectorFromString(
+            @"sharedEventsWithSignalEvents:waitEvents:");
+        SEL waitEventFactorySel = NSSelectorFromString(
+            @"waitEventWithValue:sharedEvent:eventType:");
+        SEL waitEventSimpleFactorySel = NSSelectorFromString(
+            @"waitEventWithValue:sharedEvent:");
+        SEL signalEventFactorySel = NSSelectorFromString(
+            @"signalEventWithValue:symbolIndex:eventType:sharedEvent:");
+        SEL doEvalCompletionEventSel = NSSelectorFromString(
+            @"doEvaluateWithModel:options:request:qos:completionEvent:error:");
+        SEL standardEvalSel = NSSelectorFromString(
+            @"evaluateWithModel:options:request:qos:error:");
+        SEL mapSurfacesSel = NSSelectorFromString(
+            @"doMapIOSurfacesWithModel:request:cacheInference:error:");
+        SEL loadModelSel = NSSelectorFromString(
+            @"loadModel:options:qos:error:");
+
+        // 8-arg request factory with sharedEvents
+        SEL reqSharedEventsFactorySel = NSSelectorFromString(
+            @"requestWithInputs:inputIndices:outputs:outputIndices:"
+            @"perfStats:perfStatsMask:procedureIndex:sharedEvents:");
+        // 9-arg request factory with sharedEvents + transactionHandle
+        SEL reqSharedEvents9FactorySel = NSSelectorFromString(
+            @"requestWithInputs:inputIndices:outputs:outputIndices:"
+            @"perfStats:perfStatsMask:procedureIndex:sharedEvents:transactionHandle:");
+        SEL setSharedEventsSel = @selector(setSharedEvents:);
+        SEL setCompletionHandlerSel = @selector(setCompletionHandler:);
+
+        // Populate capability booleans
+        result->hasVirtualClientClass = (virtualClientCls != Nil);
+        result->hasVirtualClientProperty = (clientCls != Nil) &&
+            [clientCls instancesRespondToSelector:vcPropertySel];
+        result->hasSharedEventsClass = (sharedEventsCls != Nil) &&
+            [sharedEventsCls respondsToSelector:sharedEventsFactorySel];
+        result->hasSharedWaitEventClass = (sharedWaitEventCls != Nil) &&
+            ([sharedWaitEventCls respondsToSelector:waitEventFactorySel] ||
+             [sharedWaitEventCls respondsToSelector:waitEventSimpleFactorySel]);
+        result->hasSharedSignalEventClass = (sharedSignalEventCls != Nil) &&
+            [sharedSignalEventCls respondsToSelector:signalEventFactorySel];
+        result->hasIOSurfaceSharedEventClass = (ioSurfaceSharedEventCls != Nil);
+        result->hasDoEvaluateCompletionEvent = (virtualClientCls != Nil) &&
+            [virtualClientCls instancesRespondToSelector:doEvalCompletionEventSel];
+        result->hasStandardEvaluate = (virtualClientCls != Nil) &&
+            [virtualClientCls instancesRespondToSelector:standardEvalSel];
+        result->hasMapIOSurfaces = (virtualClientCls != Nil) &&
+            [virtualClientCls instancesRespondToSelector:mapSurfacesSel];
+        result->hasLoadModel = (virtualClientCls != Nil) &&
+            [virtualClientCls instancesRespondToSelector:loadModelSel];
+        result->hasRequestSharedEventsFactory = (g_ANEReq != Nil) &&
+            ([g_ANEReq respondsToSelector:reqSharedEventsFactorySel] ||
+             [g_ANEReq respondsToSelector:reqSharedEvents9FactorySel]);
+        result->hasSetSharedEvents = (g_ANEReq != Nil) &&
+            [g_ANEReq instancesRespondToSelector:setSharedEventsSel];
+        result->hasSetCompletionHandler = (g_ANEReq != Nil) &&
+            [g_ANEReq instancesRespondToSelector:setCompletionHandlerSel];
+
+        if (ane_interop_trace_enabled()) {
+            ane_interop_trace_methods(virtualClientCls, "_ANEVirtualClient");
+            ane_interop_trace_methods(sharedEventsCls, "_ANESharedEvents");
+            ane_interop_trace_methods(sharedWaitEventCls, "_ANESharedWaitEvent");
+        }
+
+        if (!handle || !handle->client || !handle->clientModel) return;
+
+        // --- Acquire VirtualClient ---
+        if (!result->hasVirtualClientProperty) {
+            result->stage = ANE_INTEROP_VC_STAGE_NO_VIRTUAL_CLIENT;
+            return;
+        }
+
+        id client = (__bridge id)handle->client;
+        id modelObj = (__bridge id)handle->clientModel;
+        id evalOptions = handle->evalOptions ? (__bridge id)handle->evalOptions : @{};
+
+        @try {
+            id virtualClient = ((id(*)(id,SEL))objc_msgSend)(client, vcPropertySel);
+            if (!virtualClient) {
+                result->stage = ANE_INTEROP_VC_STAGE_NO_VIRTUAL_CLIENT;
+                return;
+            }
+            result->obtainedVirtualClient = true;
+            if (ane_interop_trace_enabled()) {
+                fprintf(stderr, "ANE VC probe: obtained virtualClient: %s\n",
+                        [NSStringFromClass([virtualClient class]) UTF8String]);
+            }
+
+            // --- Optionally build IOSurfaceSharedEvent + Wait/Signal events + container ---
+            id sharedEventsContainer = nil;
+            id ioSharedEvent = nil;
+            if (opts.useSharedEvents && result->hasIOSurfaceSharedEventClass) {
+                ioSharedEvent = ((id(*)(Class,SEL))objc_msgSend)(
+                    ioSurfaceSharedEventCls, @selector(new));
+                result->builtIOSurfaceSharedEvent = (ioSharedEvent != nil);
+                if (!ioSharedEvent) {
+                    result->stage = ANE_INTEROP_VC_STAGE_SHARED_EVENT_BUILD_FAILED;
+                    return;
+                }
+
+                id waitEvent = nil;
+                if (opts.useWaitEvent && result->hasSharedWaitEventClass) {
+                    if ([sharedWaitEventCls respondsToSelector:waitEventFactorySel]) {
+                        waitEvent = ((id(*)(Class,SEL,unsigned long long,id,unsigned long long))objc_msgSend)(
+                            sharedWaitEventCls, waitEventFactorySel,
+                            opts.waitEventValue, ioSharedEvent, opts.waitEventType);
+                    } else if ([sharedWaitEventCls respondsToSelector:waitEventSimpleFactorySel]) {
+                        waitEvent = ((id(*)(Class,SEL,unsigned long long,id))objc_msgSend)(
+                            sharedWaitEventCls, waitEventSimpleFactorySel,
+                            opts.waitEventValue, ioSharedEvent);
+                    }
+                    result->builtWaitEvent = (waitEvent != nil);
+                    if (!waitEvent) {
+                        result->stage = ANE_INTEROP_VC_STAGE_WAIT_EVENT_BUILD_FAILED;
+                        return;
+                    }
+                }
+
+                id signalEvent = nil;
+                if (result->hasSharedSignalEventClass) {
+                    signalEvent = ((id(*)(Class,SEL,unsigned long long,unsigned int,long long,id))objc_msgSend)(
+                        sharedSignalEventCls, signalEventFactorySel,
+                        1ULL, opts.signalSymbolIndex, 0LL, ioSharedEvent);
+                    result->builtSignalEvent = (signalEvent != nil);
+                }
+
+                if (result->hasSharedEventsClass) {
+                    NSArray *signalArr = signalEvent ? @[signalEvent] : @[];
+                    NSArray *waitArr = waitEvent ? @[waitEvent] : @[];
+                    sharedEventsContainer = ((id(*)(Class,SEL,id,id))objc_msgSend)(
+                        sharedEventsCls, sharedEventsFactorySel, signalArr, waitArr);
+                    result->builtSharedEventsContainer = (sharedEventsContainer != nil);
+                    if (!sharedEventsContainer) {
+                        result->stage = ANE_INTEROP_VC_STAGE_SHARED_EVENTS_BUILD_FAILED;
+                        return;
+                    }
+                }
+            }
+
+            // --- Build request (reuse handle's existing request, or build with sharedEvents) ---
+            id req = (__bridge id)handle->request;
+            if (sharedEventsContainer && result->hasSetSharedEvents) {
+                ((void(*)(id,SEL,id))objc_msgSend)(req, setSharedEventsSel, sharedEventsContainer);
+                result->builtRequest = true;
+            } else {
+                result->builtRequest = (req != nil);
+            }
+            if (!req) {
+                result->stage = ANE_INTEROP_VC_STAGE_REQUEST_BUILD_FAILED;
+                return;
+            }
+
+            // --- Optionally load model on virtual client ---
+            if (opts.loadOnVirtualClient && result->hasLoadModel) {
+                NSError *loadErr = nil;
+                BOOL loadOK = ((BOOL(*)(id,SEL,id,id,unsigned int,NSError**))objc_msgSend)(
+                    virtualClient, loadModelSel, modelObj, evalOptions, 21, &loadErr);
+                result->loadedOnVirtualClient = loadOK ? true : false;
+                if (!loadOK && ane_interop_trace_enabled()) {
+                    fprintf(stderr, "ANE VC probe: loadModel failed: %s\n",
+                            loadErr ? [[loadErr description] UTF8String] : "no error");
+                }
+            }
+
+            // --- Optionally map IOSurfaces ---
+            if (opts.mapSurfaces && result->hasMapIOSurfaces) {
+                NSError *mapErr = nil;
+                BOOL mapOK = ((BOOL(*)(id,SEL,id,id,BOOL,NSError**))objc_msgSend)(
+                    virtualClient, mapSurfacesSel, modelObj, req, YES, &mapErr);
+                result->mappedSurfaces = mapOK ? true : false;
+                if (!mapOK) {
+                    if (ane_interop_trace_enabled()) {
+                        fprintf(stderr, "ANE VC probe: mapIOSurfaces failed: %s\n",
+                                mapErr ? [[mapErr description] UTF8String] : "no error");
+                    }
+                    result->stage = ANE_INTEROP_VC_STAGE_MAP_SURFACES_FAILED;
+                    return;
+                }
+            }
+
+            if (opts.skipEval) {
+                // Construction-only probe; report furthest stage reached
+                if (result->builtSharedEventsContainer) {
+                    result->stage = ANE_INTEROP_VC_STAGE_SHARED_EVENTS_BUILD_FAILED + 1;
+                } else if (result->obtainedVirtualClient) {
+                    result->stage = ANE_INTEROP_VC_STAGE_NO_VIRTUAL_CLIENT + 1;
+                }
+                return;
+            }
+
+            // --- Standard eval on VirtualClient ---
+            if (result->hasStandardEvaluate) {
+                NSError *evalErr = nil;
+                BOOL evalOK = ((BOOL(*)(id,SEL,id,id,id,unsigned int,NSError**))objc_msgSend)(
+                    virtualClient, standardEvalSel, modelObj, evalOptions, req, 21, &evalErr);
+                result->standardEvalSucceeded = evalOK ? true : false;
+                if (evalOK) {
+                    result->stage = ANE_INTEROP_VC_STAGE_EVAL_SUCCEEDED;
+                    if (ane_interop_trace_enabled()) {
+                        fprintf(stderr, "ANE VC probe: standard eval succeeded\n");
+                    }
+                } else {
+                    result->stage = ANE_INTEROP_VC_STAGE_EVAL_FAILED;
+                    if (ane_interop_trace_enabled()) {
+                        fprintf(stderr, "ANE VC probe: standard eval failed: %s\n",
+                                evalErr ? [[evalErr description] UTF8String] : "no error");
+                    }
+                }
+            } else {
+                result->stage = ANE_INTEROP_VC_STAGE_EVAL_FAILED;
+            }
+
+            // --- CompletionEvent eval (doEvaluateWithModel:...completionEvent:...) ---
+            if (opts.useCompletionEvent && result->hasDoEvaluateCompletionEvent) {
+                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+                __block BOOL ceEvalOK = NO;
+                id completionEvent = ioSharedEvent; // may be nil — probe nil first
+                NSError *ceErr = nil;
+                ceEvalOK = ((BOOL(*)(id,SEL,id,id,id,unsigned int,id,NSError**))objc_msgSend)(
+                    virtualClient, doEvalCompletionEventSel,
+                    modelObj, evalOptions, req, 21, completionEvent, &ceErr);
+                // If the call itself returns synchronously, check result
+                if (ceEvalOK) {
+                    result->completionEventEvalSucceeded = true;
+                    result->stage = ANE_INTEROP_VC_STAGE_COMPLETION_EVENT_EVAL_SUCCEEDED;
+                    if (ane_interop_trace_enabled()) {
+                        fprintf(stderr, "ANE VC probe: completionEvent eval succeeded\n");
+                    }
+                } else {
+                    result->stage = ANE_INTEROP_VC_STAGE_COMPLETION_EVENT_EVAL_FAILED;
+                    if (ane_interop_trace_enabled()) {
+                        fprintf(stderr, "ANE VC probe: completionEvent eval failed: %s\n",
+                                ceErr ? [[ceErr description] UTF8String] : "no error");
+                    }
+                }
+                (void)sem; // semaphore available if async path needed in future
+            }
+
+            // --- CompletionHandler on request ---
+            if (opts.useCompletionHandler && result->hasSetCompletionHandler) {
+                dispatch_semaphore_t handlerSem = dispatch_semaphore_create(0);
+                __block BOOL handlerFired = NO;
+                // Set block on request
+                ((void(*)(id,SEL,id))objc_msgSend)(req, setCompletionHandlerSel,
+                    ^{
+                        handlerFired = YES;
+                        dispatch_semaphore_signal(handlerSem);
+                    });
+                // Re-eval via standard path to trigger handler
+                if (result->hasStandardEvaluate) {
+                    NSError *chErr = nil;
+                    ((BOOL(*)(id,SEL,id,id,id,unsigned int,NSError**))objc_msgSend)(
+                        virtualClient, standardEvalSel, modelObj, evalOptions, req, 21, &chErr);
+                }
+                long waited = dispatch_semaphore_wait(handlerSem,
+                    dispatch_time(DISPATCH_TIME_NOW, 5LL * NSEC_PER_SEC));
+                result->completionHandlerFired = (waited == 0 && handlerFired) ? true : false;
+                if (result->completionHandlerFired) {
+                    result->stage = ANE_INTEROP_VC_STAGE_COMPLETION_HANDLER_EVAL_SUCCEEDED;
+                    if (ane_interop_trace_enabled()) {
+                        fprintf(stderr, "ANE VC probe: completionHandler fired\n");
+                    }
+                } else {
+                    result->stage = ANE_INTEROP_VC_STAGE_COMPLETION_HANDLER_EVAL_FAILED;
+                    if (ane_interop_trace_enabled()) {
+                        fprintf(stderr, "ANE VC probe: completionHandler did not fire (timeout=%s)\n",
+                                waited != 0 ? "yes" : "no");
+                    }
+                }
+            }
+        } @catch (NSException *exception) {
+            if (ane_interop_trace_enabled()) {
+                fprintf(stderr, "ANE VC probe exception: %s\n",
+                        [[exception description] UTF8String]);
+            }
+            result->stage = ANE_INTEROP_VC_STAGE_EXCEPTION;
+        }
+    }
+}
