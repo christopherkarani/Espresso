@@ -1,94 +1,65 @@
-# ANE Decode Throughput Campaign (2026-03-06)
+# Avenue 3 Follow-On: QKV-Only ANE Split Path (2026-03-06)
 
 ## Plan
-- [x] Avenue 1: Multi-layer kernel fusion
-  - [x] Re-read prior findings and current fused decode implementation before edits
-  - [x] Add failing MIL generation + hardware-gated timing tests for 2-layer packed-cache fusion
-  - [x] Record fused single-layer baseline measurement
-  - [x] Implement `FusedTwoLayerDecodeGenerator`, `FusedTwoLayerDecodeKernelSet`, and decode-loop support
-  - [x] Record post-change measurement and compute per-token delta
-  - [x] If 2-layer fusion works, probe 3-layer fusion and document weight-streaming behavior
-  - [x] Commit Avenue 1 atomically and append findings to docs
-- [ ] Avenue 2: Metal SharedEvent on standard eval path
-  - [ ] Re-read VC/shared-event findings before edits
-  - [ ] Add failing probe tests for Metal-created shared event attachment and signaling
-  - [ ] Record baseline standard-eval behavior
-  - [ ] Implement `ane_interop_probe_metal_shared_event()` and Swift wrappers/tests
-  - [ ] Record post-probe behavior, measure any pipeline overlap benefit, or abandon on dead-end criteria
-  - [ ] Commit or document abandonment atomically
-- [ ] Avenue 3: Metal + ANE hybrid decode
-  - [ ] Re-read prior decode/runtime findings before edits
-  - [ ] Add failing correctness/latency tests for standalone Metal SDPA over IOSurface FP16
-  - [ ] Record ANE-only decode baseline for comparison
-  - [ ] Implement staged hybrid path: standalone Metal SDPA, decode integration, then attempted overlap
-  - [ ] Record post-change latency/effective overlap or abandon on dead-end criteria
-  - [ ] Commit or document abandonment atomically
-- [ ] Avenue 4: CoreML baseline benchmark
-  - [ ] Re-read benchmarking findings before edits
-  - [ ] Add/export benchmark harness and model export script tests first where practical
-  - [ ] Measure 100+ iteration CoreML decode baseline on `.cpuAndNeuralEngine`
-  - [ ] Commit benchmark harness and append denominator numbers to docs
-- [ ] Avenue 5: Speculative decoding
-  - [ ] Re-read decode + prefill findings before edits
-  - [ ] Add failing tests for draft/verify acceptance accounting and benchmark harness
-  - [ ] Record direct decode baseline measurement
-  - [ ] Implement draft model path, batched verification, and acceptance logic for N=2/4/8
-  - [ ] Record effective tokens/sec, acceptance rate, and abandon if accept rate < 50% at N=4
-  - [ ] Commit or document abandonment atomically
-- [ ] Avenue 6: GCD pipeline with completion handler
-  - [ ] Re-read completion-handler findings before edits
-  - [ ] Add failing benchmark test for pipelined decode loop
-  - [ ] Record sequential fused baseline measurement
-  - [ ] Implement `runFusedDecodePipelined()` and benchmark it
-  - [ ] Record post-change delta and abandon if savings < 10µs/token
-  - [ ] Commit or document abandonment atomically
-- [ ] Final validation and reporting
-  - [ ] Append results summary table to `docs/fused-decode-and-next-steps.md`
-  - [ ] Update project MEMORY with any new ANE facts/gotchas
-  - [ ] Run `swift test`
-  - [ ] Run hardware-gated tests with `ANE_HARDWARE_TESTS=1 swift test`
-  - [ ] Report direct ANE vs CoreML final speedup
+- [x] Re-read prior Avenue 1-6 findings, project memory, and the current decode/runtime/test code before changes.
+- [x] Prove the dependency graph for `ANE QKV -> Metal SDPA -> ANE FFN` and document whether any real overlap exists across layers.
+- [x] Add failing tests first for the new QKV-only seam:
+  - [x] MIL/spec generation for a QKV-only decode generator.
+  - [x] Runtime wrapper / surface-handle shape and blob expectations.
+  - [x] Hybrid decode harness behavior and timing entry points.
+- [x] Record baseline numbers before implementation:
+  - [x] Current direct ANE decode token median.
+  - [x] Current per-layer ANE attention stage timing.
+  - [x] Existing standalone Metal SDPA timing reference.
+- [x] Implement the split path with minimal surface area:
+  - [x] Add a new ANE QKV-only decode generator that emits `Q`, `K_new`, and `V_new`.
+  - [x] Add a runtime kernel wrapper adjacent to `DecodeKernelSet`.
+  - [x] Add surface handles for Q output, K/V writeback, and Metal attention output.
+  - [x] Add a hybrid decode loop in `DecodeForwardPass.swift` using the existing `MetalAttentionKernel`.
+- [x] Benchmark the implemented path with `mach_absolute_time()`:
+  - [x] 3-5 warmup iterations.
+  - [x] 20+ timed iterations.
+  - [x] Median as primary metric.
+  - [x] Report stage ms and full-token ms.
+- [x] Apply the abandon rule immediately if either is true:
+  - [x] Overlap is structurally impossible.
+  - [x] Naive substitution (`ANE QKV + Metal SDPA + ANE FFN`) is slower than current ANE attention/decode.
+- [x] If abandoned, document the negative result with measured numbers instead of pushing further.
+- [ ] Append findings to `docs/fused-decode-and-next-steps.md`.
+- [ ] Update project memory if new ANE constraints or gotchas are confirmed.
+- [x] Run targeted tests, run `swift test`, and note the existing hardware-suite stall if still present.
+- [ ] Commit the Avenue 3 follow-on work atomically.
 
 ## Review
-- Avenue 1 review:
-  - Built and tested the full packed-cache two-layer candidate first.
-  - Hardware compile failed immediately with `_ANECompiler : ANECCompile() FAILED` and `InvalidMILProgram`.
-  - Retried with the documented fallback: K/V-only packing plus separate mask inputs.
-  - Fallback hit the same `InvalidMILProgram` at compile time.
-  - Result: abandoned without a post-change latency measurement; cumulative savings unchanged at `0.000ms/token`.
-- Pending. Fill in the remaining avenues with baseline, post-change numbers, dead-end evidence, and commit SHAs.
-
-### Avenue 2 review
-- Status: abandoned
-- Failure mode: attaching a Metal-backed shared event through `setSharedEvents:` causes the standard eval path to hang on hardware before completion or event value advancement.
-- Baseline/post benchmark: not recorded because the path never reached a measurable steady-state eval.
-- Savings: +0.000ms/token.
-- Cumulative savings after Avenue 2: 0.000ms/token.
-
-### Avenue 3 review
-- Status: abandoned for now
-- Positive result: zero-copy IOSurface-backed `MTLBuffer` binding works, and standalone Metal SDPA runs correctly.
-- Measured standalone Metal attention: mean `0.395252 ms/eval`, median `0.217437 ms/eval` at `heads=12`, `headDim=64`, `seqLen=32` with `mach_absolute_time()` timing.
-- Baseline ANE attention on the decode path: `201.516 us/layer` average from the 6-layer decode kernel profile.
-- Integration blocker: `DecodeKernelSet.decodeAttnQKV` already performs attention math internally, so a real hybrid path requires a new ANE QKV-only kernel before Metal can be inserted.
-- Net effect for this pass: no landed decode savings.
-
-### Avenue 4 review
-- Status: measured
-- Exporter fix: `scripts/generate_coreml_model.py` now supports `--layers` and `--output`, and produced `benchmarks/models/transformer_6layer.mlpackage`.
-- Direct ANE decode median: `2.875 ms/token`.
-- CoreML `.cpuAndNeuralEngine` median: `3.007 ms/token`.
-- Speedup vs CoreML `.cpuAndNeuralEngine`: `1.05x`.
-- Strict fastest-CoreML speedup observed in the same run: `1.04x`.
-
-### Avenue 5 review
-- Status: abandoned
-- Blocker: the current benchmark/runtime path is hidden-state based and does not provide a token-level generation + batched verification loop for speculative decoding.
-- Existing training code has embeddings/classifier math, but there is no ready-made inference path for meaningful accept-rate measurement.
-- Net effect for this pass: no benchmark and no landed decode savings.
-
-### Avenue 6 review
-- Status: abandoned
-- Reason: the fused decode loop is dependency-bound, with nearly all useful host I/O occurring after eval and therefore not overlapable with a background GCD queue.
-- Prior probe result also showed the completion handler is synchronous, not a true async completion signal.
-- Net effect for this pass: no benchmark and no landed decode savings.
+- Status: abandoned after implementation and measurement.
+- Dependency graph result:
+  - Layer `N` FFN depends on Metal attention output from layer `N`.
+  - Layer `N+1` QKV depends on FFN output from layer `N`.
+  - Therefore there is no usable ANE/Metal overlap on the critical path for single-token decode.
+- Baseline direct ANE decode:
+  - `espresso-bench --decode --ane-only --layers 6 --warmup 3 --iterations 20 --decode-steps 32 --decode-max-seq 32 --profile-kernels`
+  - Median: `2.872 ms/token`
+  - Attention stage average: `209.383 us/layer`
+  - FFN stage average: `210.511 us/layer`
+- Hybrid split-path benchmark:
+  - Same 6-layer / 32-step decode schedule, 3 warmup sequences, 20 measured sequences.
+  - Direct comparison harness median: `2.864562 ms/token`
+  - Hybrid median: `4.665979 ms/token`
+  - Hybrid stage medians per token:
+    - ANE QKV-only: `1.233083 ms/token` = `205.514 us/layer`
+    - Metal SDPA + Wo + residual: `1.877479 ms/token` = `312.913 us/layer`
+    - ANE FFN: `1.253000 ms/token` = `208.833 us/layer`
+    - IO: `0.086646 ms/token` = `14.441 us/layer`
+- Decision evidence:
+  - Split attention half (`QKV-only + Metal`) = `518.427 us/layer`
+  - Current direct attention stage = `209.383 us/layer`
+  - Hybrid attention half is `309.044 us/layer` slower, projecting to about `1.854 ms/token` worse over 6 layers.
+  - Measured end-to-end delta: `4.665979 - 2.864562 = 1.801417 ms/token` slower.
+- Verification:
+  - `swift test` passed.
+  - Targeted hardware tests passed:
+    - `HybridDecodeKernelSetTests/test_hybrid_decode_kernel_set_compiles_on_hardware`
+    - `HybridDecodeForwardPassTests/test_hybrid_decode_single_step_runs_on_hardware`
+    - `HybridDecodeForwardPassTests/test_hybrid_decode_benchmark_reports_direct_and_hybrid_token_medians`
+  - Full `ANE_HARDWARE_TESTS=1 swift test` was not rerun because of the pre-existing stall at `ANEInteropTests.test_compile_count_increments`.
+- Commit SHA: pending.

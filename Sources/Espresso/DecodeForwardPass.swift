@@ -262,6 +262,66 @@ public final class DecodeKernelProfiler: @unchecked Sendable {
     }
 }
 
+public struct HybridDecodeTimingBreakdown: Sendable {
+    public var tAneQKV: Double
+    public var tMetal: Double
+    public var tAneFFN: Double
+    public var tIO: Double
+
+    public init(
+        tAneQKV: Double = 0,
+        tMetal: Double = 0,
+        tAneFFN: Double = 0,
+        tIO: Double = 0
+    ) {
+        self.tAneQKV = tAneQKV
+        self.tMetal = tMetal
+        self.tAneFFN = tAneFFN
+        self.tIO = tIO
+    }
+}
+
+/// Decode surfaces for the split hybrid path:
+/// ANE QKV-only -> Metal attention/projection -> ANE FFN.
+public struct HybridDecodeSurfaceHandles {
+    public let qkvIn: IOSurfaceRef
+    public let qOut: IOSurfaceRef
+    public let kOut: IOSurfaceRef
+    public let vOut: IOSurfaceRef
+    public let ffnIn: IOSurfaceRef
+    public let ffnOut: IOSurfaceRef
+    public let kCacheFull: IOSurfaceRef
+    public let vCacheFull: IOSurfaceRef
+    public let zeroLane: IOSurfaceRef
+    public let maxSeq: Int
+    public let laneSpatial: Int
+
+    public init(kernels: borrowing HybridDecodeKernelSet, logicalMaxSeq: Int? = nil) throws(ANEError) {
+        self.qkvIn = try kernels.decodeQKVOnly.inputSurface(at: 0)
+        self.qOut = try kernels.decodeQKVOnly.outputSurface(at: 0)
+        self.kOut = try kernels.decodeQKVOnly.outputSurface(at: 1)
+        self.vOut = try kernels.decodeQKVOnly.outputSurface(at: 2)
+        self.ffnIn = try kernels.decodeFFN.inputSurface(at: 0)
+        self.ffnOut = try kernels.decodeFFN.outputSurface(at: 0)
+        self.maxSeq = logicalMaxSeq ?? kernels.maxSeq
+        self.laneSpatial = kernels.laneSpatial
+
+        guard let kCacheFull = ane_interop_create_surface(ModelConfig.dim * self.maxSeq * 2),
+              let vCacheFull = ane_interop_create_surface(ModelConfig.dim * self.maxSeq * 2),
+              let zeroLane = ane_interop_create_surface(ModelConfig.dim * kernels.laneSpatial * 2) else {
+            throw .surfaceAllocationFailed
+        }
+        self.kCacheFull = kCacheFull
+        self.vCacheFull = vCacheFull
+        self.zeroLane = zeroLane
+
+        let zeroLaneValues = Array(repeating: Float(0), count: ModelConfig.dim * kernels.laneSpatial)
+        zeroLaneValues.withUnsafeBufferPointer { src in
+            SurfaceIO.writeFP16(to: zeroLane, data: src, channels: ModelConfig.dim, spatial: kernels.laneSpatial)
+        }
+    }
+}
+
 /// Decode surfaces for one layer using the fused (attn + FFN) kernel.
 ///
 /// The fused kernel has 4 inputs and 3 outputs:
@@ -551,6 +611,205 @@ public extension ForwardPass {
                 preconditionFailure("decode lane zero-init failed: \(error)")
             }
         }
+    }
+
+    static func initializeHybridDecodeCaches(
+        surfaceHandles: [HybridDecodeSurfaceHandles],
+        dim: Int = ModelConfig.dim
+    ) {
+        precondition(dim > 0)
+        guard let first = surfaceHandles.first else { return }
+        let maxSeq = first.maxSeq
+        precondition(maxSeq > 0)
+
+        let zeroCache = Array(repeating: Float(0), count: dim * maxSeq)
+        for handles in surfaceHandles {
+            precondition(handles.maxSeq == maxSeq)
+            zeroCache.withUnsafeBufferPointer { src in
+                SurfaceIO.writeFP16(to: handles.kCacheFull, data: src, channels: dim, spatial: maxSeq)
+                SurfaceIO.writeFP16(to: handles.vCacheFull, data: src, channels: dim, spatial: maxSeq)
+            }
+            do {
+                try SurfaceIO.copyFP16(
+                    dst: handles.qkvIn,
+                    dstChannelOffset: 0,
+                    src: handles.zeroLane,
+                    srcChannelOffset: 0,
+                    channels: dim,
+                    spatial: handles.laneSpatial
+                )
+                try SurfaceIO.copyFP16(
+                    dst: handles.ffnIn,
+                    dstChannelOffset: 0,
+                    src: handles.zeroLane,
+                    srcChannelOffset: 0,
+                    channels: dim,
+                    spatial: handles.laneSpatial
+                )
+            } catch {
+                preconditionFailure("hybrid decode lane zero-init failed: \(error)")
+            }
+        }
+    }
+
+    static func runHybridDecodeTimed(
+        xCur: borrowing TensorBuffer,
+        kernels: borrowing LayerStorage<HybridDecodeKernelSet>,
+        surfaceHandles: [HybridDecodeSurfaceHandles],
+        metalAttention: MetalAttentionKernel,
+        decodeState: inout DecodeState,
+        dim: Int = ModelConfig.dim,
+        timings: inout HybridDecodeTimingBreakdown
+    ) throws(ANEError) {
+        precondition(kernels.count > 0)
+        precondition(surfaceHandles.count == kernels.count)
+        precondition(dim > 0)
+        precondition(xCur.count == dim)
+
+        let maxSeq = decodeState.maxSeq
+        for handles in surfaceHandles {
+            precondition(handles.maxSeq == maxSeq)
+        }
+
+        let tokenIndex = try decodeState.beginTokenStep()
+        let visibleTokens = tokenIndex + 1
+        let laneSpatial = surfaceHandles[0].laneSpatial
+        precondition(laneSpatial > 0)
+
+        var t0 = RuntimeClock.now()
+        do {
+            try xCur.withUnsafeBufferPointer { xBuf in
+                try SurfaceIO.writeFP16SpatialSlice(
+                    to: surfaceHandles[0].qkvIn,
+                    channelOffset: 0,
+                    spatialIndex: 0,
+                    spatial: laneSpatial,
+                    data: xBuf,
+                    channels: dim
+                )
+            }
+        } catch {
+            throw .invalidArguments("hybrid decode token lane write failed: \(error)")
+        }
+        timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
+
+        for layerIndex in 0..<kernels.count {
+            let handles = surfaceHandles[layerIndex]
+
+            t0 = RuntimeClock.now()
+            do {
+                try kernels[layerIndex].decodeQKVOnly.eval()
+            } catch {
+                throw .invalidArguments("decodeQKVOnly eval failed at layer \(layerIndex), token \(tokenIndex): \(error)")
+            }
+            timings.tAneQKV += RuntimeClock.ms(RuntimeClock.now() - t0)
+
+            t0 = RuntimeClock.now()
+            do {
+                try SurfaceIO.copyFP16SpatialSlice(
+                    dst: handles.kCacheFull,
+                    dstChannelOffset: 0,
+                    dstSpatialIndex: tokenIndex,
+                    dstSpatial: maxSeq,
+                    src: handles.kOut,
+                    srcChannelOffset: 0,
+                    srcSpatialIndex: 0,
+                    srcSpatial: laneSpatial,
+                    channels: dim
+                )
+                try SurfaceIO.copyFP16SpatialSlice(
+                    dst: handles.vCacheFull,
+                    dstChannelOffset: 0,
+                    dstSpatialIndex: tokenIndex,
+                    dstSpatial: maxSeq,
+                    src: handles.vOut,
+                    srcChannelOffset: 0,
+                    srcSpatialIndex: 0,
+                    srcSpatial: laneSpatial,
+                    channels: dim
+                )
+            } catch {
+                throw .invalidArguments("hybrid KV cache update failed: \(error)")
+            }
+            timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
+
+            let metalShape: MetalDecodeAttentionShape
+            do {
+                metalShape = try MetalDecodeAttentionShape(
+                    heads: ModelConfig.heads,
+                    headDim: ModelConfig.headDim,
+                    visibleTokens: visibleTokens,
+                    cacheStride: maxSeq,
+                    laneStride: laneSpatial
+                )
+            } catch {
+                throw .invalidArguments("hybrid metal shape invalid: \(error)")
+            }
+
+            t0 = RuntimeClock.now()
+            do {
+                try metalAttention.runDecode(
+                    qSurface: handles.qOut,
+                    kCacheSurface: handles.kCacheFull,
+                    vCacheSurface: handles.vCacheFull,
+                    residualSurface: handles.qkvIn,
+                    outputSurface: handles.ffnIn,
+                    shape: metalShape,
+                    projection: kernels[layerIndex].outputProjection
+                )
+            } catch {
+                throw .invalidArguments("hybrid metal attention failed at layer \(layerIndex), token \(tokenIndex): \(error)")
+            }
+            timings.tMetal += RuntimeClock.ms(RuntimeClock.now() - t0)
+
+            t0 = RuntimeClock.now()
+            do {
+                try kernels[layerIndex].decodeFFN.eval()
+            } catch {
+                throw .invalidArguments("hybrid decodeFFN eval failed at layer \(layerIndex), token \(tokenIndex): \(error)")
+            }
+            timings.tAneFFN += RuntimeClock.ms(RuntimeClock.now() - t0)
+
+            if layerIndex + 1 < kernels.count {
+                t0 = RuntimeClock.now()
+                do {
+                    try SurfaceIO.copyFP16SpatialSlice(
+                        dst: surfaceHandles[layerIndex + 1].qkvIn,
+                        dstChannelOffset: 0,
+                        dstSpatialIndex: 0,
+                        dstSpatial: laneSpatial,
+                        src: handles.ffnOut,
+                        srcChannelOffset: 0,
+                        srcSpatialIndex: 0,
+                        srcSpatial: laneSpatial,
+                        channels: dim
+                    )
+                } catch {
+                    throw .invalidArguments("hybrid ffn->next-qkv lane pack failed: \(error)")
+                }
+                timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
+            }
+        }
+
+        let finalHandles = surfaceHandles[kernels.count - 1]
+        t0 = RuntimeClock.now()
+        do {
+            try xCur.withUnsafeMutableBufferPointer { out in
+                try SurfaceIO.readFP16SpatialSlice(
+                    from: finalHandles.ffnOut,
+                    channelOffset: 0,
+                    spatialIndex: 0,
+                    spatial: laneSpatial,
+                    into: out,
+                    channels: dim
+                )
+            }
+        } catch {
+            throw .invalidArguments("hybrid final decode lane unpack failed: \(error)")
+        }
+        timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
+
+        try decodeState.commitTokenStep(expectedIndex: tokenIndex)
     }
 
     static func runDecodeTimed(

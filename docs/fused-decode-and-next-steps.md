@@ -308,7 +308,7 @@ budget (which is capped at ~100 per process) and surface memory.
 |--------|--------|----------------|------------|
 | 1. Multi-layer fusion | abandoned (`InvalidMILProgram` on full pack and K/V-only fallback) | +0.000ms | 0.000ms |
 | 2. Metal SharedEvent | abandoned | +0.000ms | 0.000ms |
-| 3. Metal+ANE hybrid | abandoned | +0.000ms | 0.000ms |
+| 3. Metal+ANE hybrid | abandoned after QKV-only split-path benchmark | +0.000ms | 0.000ms |
 | 4. CoreML baseline | measured | N/A | 0.000ms |
 | 5. Speculative decode | abandoned | +0.000ms | 0.000ms |
 | 6. GCD pipeline | abandoned | +0.000ms | 0.000ms |
@@ -379,48 +379,69 @@ Timing:
 - Delta: +0.000ms/token.
 - Cumulative savings after Avenue 2: 0.000ms/token.
 
-## 9. Avenue 3 Result — Metal + ANE Hybrid Decode (ABANDONED FOR NOW)
+## 9. Avenue 3 Result — Metal + ANE Hybrid Decode Follow-On (ABANDONED)
 
 Date: 2026-03-06
 
 What I built:
-- Added `MetalAttentionKernel` as a standalone Metal SDPA stage using three compute kernels (`logits`, `softmax`, `output`).
-- Bound IOSurface memory into Metal via `MTLDevice.makeBuffer(bytesNoCopy:...)` so Q/K/V/mask/output all stay zero-copy.
-- Added correctness and benchmark tests around the standalone Metal path.
+- `DecodeQKVOnlyGenerator` — ANE decode kernel that performs `RMSNorm -> Wq/Wk/Wv` only and emits `Q`, `K_new`, `V_new`.
+- `HybridDecodeKernelSet` — split runtime wrapper holding the QKV-only ANE kernel, the existing ANE FFN kernel, and cached `Wo` weights for Metal output projection.
+- `HybridDecodeSurfaceHandles` + `ForwardPass.runHybridDecodeTimed(...)` — split decode loop:
+  - ANE `QKV-only`
+  - K/V cache writeback
+  - Metal SDPA + `Wo` projection + residual add
+  - ANE FFN
+- `MetalAttentionKernel` follow-on path that reads ANE-layout IOSurfaces zero-copy and writes the projected attention output directly into `ffnIn`.
 
-TDD:
-- Wrote `MetalAttentionKernelTests` first.
-- Initial test run failed at compile time because `MetalAttentionShape` / `MetalAttentionKernel` did not exist.
-- After implementation, correctness matched the CPU reference and the benchmark probe passed.
+TDD / verification:
+- Added failing tests first for:
+  - `DecodeQKVOnlyGenerator`
+  - `HybridDecodeKernelSet`
+  - hybrid forward-pass step + comparison harness
+- Verified:
+  - `swift test`
+  - `ANE_HARDWARE_TESTS=1 swift test --filter HybridDecodeKernelSetTests/test_hybrid_decode_kernel_set_compiles_on_hardware`
+  - `ANE_HARDWARE_TESTS=1 swift test --filter HybridDecodeForwardPassTests/test_hybrid_decode_single_step_runs_on_hardware`
+  - `ANE_HARDWARE_TESTS=1 swift test --filter HybridDecodeForwardPassTests/test_hybrid_decode_benchmark_reports_direct_and_hybrid_token_medians`
+
+Dependency-graph proof:
+- For a single decode token, layer `N` FFN cannot start until Metal attention for layer `N` finishes.
+- Layer `N+1` QKV cannot start until FFN for layer `N` finishes, because it consumes layer `N`'s FFN output.
+- Therefore the hoped-for ANE/Metal overlap does **not** exist on the critical path for this decode graph. The hybrid path is necessarily a serial substitution, not a pipelined one.
 
 Baseline before changes:
-- Direct ANE decode benchmark, 6 layers, `steps=32`, `maxSeq=32`, `warmup=3`, `iterations=20`:
-  - Median: `2.860 ms/token`
-  - Mean: `2.840 ms/token`
-  - ANE kernel time: `2.525 ms/token`
+- Direct ANE decode benchmark (`espresso-bench`, 6 layers, `steps=32`, `maxSeq=32`, `warmup=3`, `iterations=20`):
+  - Median: `2.872 ms/token`
 - Per-layer decode profile on the same run:
-  - Average ANE attention eval: `201.516 us/layer`
-  - Average ANE FFN eval: approximately `219-221 us/layer`
-
-Post measurement:
-- Standalone Metal attention benchmark, `heads=12`, `headDim=64`, `seqLen=32`, `warmup=3`, `iterations=20`, timed with `mach_absolute_time()`:
+  - Average ANE attention eval: `209.383 us/layer`
+  - Average ANE FFN eval: `210.511 us/layer`
+- Prior standalone Metal SDPA probe (unchanged code path):
   - Mean: `0.395252 ms/eval`
   - Median: `0.217437 ms/eval`
-  - Zero-copy IOSurface bindings: `true`
+
+Post measurement:
+- Same 6-layer / 32-step decode schedule, using the new split path and timing each token with `mach_absolute_time()`:
+  - Direct comparison-harness median: `2.864562 ms/token`
+  - Hybrid median: `4.665979 ms/token`
+- Hybrid stage medians per token:
+  - ANE QKV-only: `1.233083 ms/token` = `205.514 us/layer`
+  - Metal SDPA + `Wo` + residual: `1.877479 ms/token` = `312.913 us/layer`
+  - ANE FFN: `1.253000 ms/token` = `208.833 us/layer`
+  - IO: `0.086646 ms/token` = `14.441 us/layer`
 
 Delta:
-- Naive stage substitution comparison:
-  - Current ANE attention: `0.201516 ms/layer`
-  - Metal attention: `0.217437 ms/layer`
-  - Savings: `0.201516 - 0.217437 = -0.015921 ms/layer` (`-7.9%`)
-- Extrapolated over a full 6-layer decode with no overlap: `-0.095526 ms/token` regression.
+- Split attention half (`ANE QKV-only + Metal attention/projection`) = `518.427 us/layer`
+- Current direct attention stage = `209.383 us/layer`
+- Regression vs direct attention stage = `309.044 us/layer`
+- Projected regression over 6 layers = `1.854264 ms/token`
+- Measured end-to-end regression from the comparison harness:
+  - `4.665979 - 2.864562 = 1.801417 ms/token`
+  - Relative slowdown: `4.665979 / 2.864562 = 1.63x`
 
-Why this avenue is abandoned for now:
-- The zero-copy gate passed, which is useful.
-- But the current decode path cannot actually swap ANE attention math for Metal attention math in place.
-- `DecodeKernelSet.decodeAttnQKV` already performs attention internally and only exposes post-attention `attnX2Out` plus K/V outputs.
-- A real hybrid decode needs a new ANE QKV-only stage before Metal can own `Q@K^T -> softmax -> @V`.
-- That kernel split is a larger follow-on effort, so this avenue is documented as promising but abandoned in this pass.
+Conclusion:
+- The QKV-only seam works and zero-copy Metal interop works on live ANE surfaces.
+- But the dependency graph prevents meaningful overlap, and the naive serial substitution is materially slower than the existing direct ANE attention stage.
+- This avenue should be treated as a dead end for decode throughput on the current runtime/model shape.
 
 Timing impact recorded for this pass:
 - Landed decode savings: `+0.000 ms/token`

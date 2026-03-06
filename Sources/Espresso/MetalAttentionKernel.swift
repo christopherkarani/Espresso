@@ -3,6 +3,7 @@ import Darwin
 import Metal
 import IOSurface
 import ANETypes
+import ANERuntime
 
 public enum MetalAttentionError: Error, Equatable {
     case invalidShape(String)
@@ -48,6 +49,43 @@ public struct MetalAttentionBenchmarkResult: Sendable, Equatable {
     public let warmup: Int
     public let iterations: Int
     public let zeroCopyBindings: Bool
+}
+
+public struct MetalDecodeAttentionShape: Sendable, Equatable {
+    public let heads: Int
+    public let headDim: Int
+    public let visibleTokens: Int
+    public let cacheStride: Int
+    public let laneStride: Int
+
+    public init(
+        heads: Int,
+        headDim: Int,
+        visibleTokens: Int,
+        cacheStride: Int,
+        laneStride: Int
+    ) throws(MetalAttentionError) {
+        guard heads > 0 else {
+            throw .invalidShape("heads must be > 0")
+        }
+        guard headDim > 0 else {
+            throw .invalidShape("headDim must be > 0")
+        }
+        guard visibleTokens > 0 else {
+            throw .invalidShape("visibleTokens must be > 0")
+        }
+        guard cacheStride >= visibleTokens else {
+            throw .invalidShape("cacheStride must be >= visibleTokens")
+        }
+        guard laneStride > 0 else {
+            throw .invalidShape("laneStride must be > 0")
+        }
+        self.heads = heads
+        self.headDim = headDim
+        self.visibleTokens = visibleTokens
+        self.cacheStride = cacheStride
+        self.laneStride = laneStride
+    }
 }
 
 public final class MetalAttentionKernel {
@@ -165,11 +203,46 @@ public final class MetalAttentionKernel {
         }
     }
 
+    private struct DecodeParams {
+        var heads: UInt32
+        var headDim: UInt32
+        var visibleTokens: UInt32
+        var cacheStride: UInt32
+        var laneStride: UInt32
+        var pad0: UInt32 = 0
+        var scale: Float
+        var pad1: Float = 0
+    }
+
+    private final class DecodeScratch {
+        let scoresBuffer: MTLBuffer
+        let weightsBuffer: MTLBuffer
+        let contextBuffer: MTLBuffer
+
+        init(device: MTLDevice, heads: Int, cacheStride: Int, dim: Int) throws(MetalAttentionError) {
+            let scoreLength = heads * cacheStride * MemoryLayout<Float>.stride
+            let contextLength = dim * MemoryLayout<Float>.stride
+            guard let scoresBuffer = device.makeBuffer(length: scoreLength, options: .storageModeShared),
+                  let weightsBuffer = device.makeBuffer(length: scoreLength, options: .storageModeShared),
+                  let contextBuffer = device.makeBuffer(length: contextLength, options: .storageModeShared) else {
+                throw .temporaryBufferAllocationFailed
+            }
+            self.scoresBuffer = scoresBuffer
+            self.weightsBuffer = weightsBuffer
+            self.contextBuffer = contextBuffer
+        }
+    }
+
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
     private let logitsPipeline: MTLComputePipelineState
     private let softmaxPipeline: MTLComputePipelineState
     private let outputPipeline: MTLComputePipelineState
+    private let decodeLogitsPipeline: MTLComputePipelineState
+    private let decodeOutputPipeline: MTLComputePipelineState
+    private let decodeProjectionPipeline: MTLComputePipelineState
+    private var decodeScratchBuffers: [Int: DecodeScratch] = [:]
+    private var projectionBuffers: [String: MTLBuffer] = [:]
 
     public init() throws(MetalAttentionError) {
         guard let device = MTLCreateSystemDefaultDevice() else {
@@ -195,11 +268,23 @@ public final class MetalAttentionKernel {
         guard let outputFunction = library.makeFunction(name: "attention_output") else {
             throw .libraryBuildFailed("missing attention_output")
         }
+        guard let decodeLogitsFunction = library.makeFunction(name: "decode_attention_logits") else {
+            throw .libraryBuildFailed("missing decode_attention_logits")
+        }
+        guard let decodeOutputFunction = library.makeFunction(name: "decode_attention_output") else {
+            throw .libraryBuildFailed("missing decode_attention_output")
+        }
+        guard let decodeProjectionFunction = library.makeFunction(name: "decode_output_projection") else {
+            throw .libraryBuildFailed("missing decode_output_projection")
+        }
 
         do {
             logitsPipeline = try device.makeComputePipelineState(function: logitsFunction)
             softmaxPipeline = try device.makeComputePipelineState(function: softmaxFunction)
             outputPipeline = try device.makeComputePipelineState(function: outputFunction)
+            decodeLogitsPipeline = try device.makeComputePipelineState(function: decodeLogitsFunction)
+            decodeOutputPipeline = try device.makeComputePipelineState(function: decodeOutputFunction)
+            decodeProjectionPipeline = try device.makeComputePipelineState(function: decodeProjectionFunction)
         } catch {
             throw .pipelineBuildFailed(String(describing: error))
         }
@@ -271,6 +356,43 @@ public final class MetalAttentionKernel {
         )
     }
 
+    public func runDecode(
+        qSurface: IOSurfaceRef,
+        kCacheSurface: IOSurfaceRef,
+        vCacheSurface: IOSurfaceRef,
+        residualSurface: IOSurfaceRef,
+        outputSurface: IOSurfaceRef,
+        shape: MetalDecodeAttentionShape,
+        projection: HybridOutputProjectionWeights
+    ) throws(MetalAttentionError) {
+        let dim = shape.heads * shape.headDim
+        guard projection.rowMajorWeights.count == dim * dim else {
+            throw .invalidInputCount(
+                "output projection count \(projection.rowMajorWeights.count) != expected \(dim * dim)"
+            )
+        }
+
+        let laneElementCount = dim * shape.laneStride
+        let cacheElementCount = dim * shape.cacheStride
+        let qBinding = try SurfaceBinding(surface: qSurface, elementCount: laneElementCount, device: device)
+        let kBinding = try SurfaceBinding(surface: kCacheSurface, elementCount: cacheElementCount, device: device)
+        let vBinding = try SurfaceBinding(surface: vCacheSurface, elementCount: cacheElementCount, device: device)
+        let residualBinding = try SurfaceBinding(surface: residualSurface, elementCount: laneElementCount, device: device)
+        let outputBinding = try SurfaceBinding(surface: outputSurface, elementCount: laneElementCount, device: device)
+        let scratch = try decodeScratch(for: shape, dim: dim)
+        let projectionBuffer = try decodeProjectionBuffer(for: projection)
+        try encodeDecodeAndWait(
+            qBinding: qBinding,
+            kBinding: kBinding,
+            vBinding: vBinding,
+            residualBinding: residualBinding,
+            outputBinding: outputBinding,
+            scratch: scratch,
+            projectionBuffer: projectionBuffer,
+            shape: shape
+        )
+    }
+
     private func validateInputCounts(
         q: [Float],
         k: [Float],
@@ -339,6 +461,31 @@ public final class MetalAttentionKernel {
             )
         }
         return output
+    }
+
+    private func decodeScratch(for shape: MetalDecodeAttentionShape, dim: Int) throws(MetalAttentionError) -> DecodeScratch {
+        let key = shape.heads << 20 ^ shape.cacheStride << 8 ^ shape.laneStride
+        if let scratch = decodeScratchBuffers[key] {
+            return scratch
+        }
+        let scratch = try DecodeScratch(device: device, heads: shape.heads, cacheStride: shape.cacheStride, dim: dim)
+        decodeScratchBuffers[key] = scratch
+        return scratch
+    }
+
+    private func decodeProjectionBuffer(for projection: HybridOutputProjectionWeights) throws(MetalAttentionError) -> MTLBuffer {
+        if let buffer = projectionBuffers[projection.cacheKey] {
+            return buffer
+        }
+        let length = projection.rowMajorWeights.count * MemoryLayout<Float>.stride
+        let buffer = projection.rowMajorWeights.withUnsafeBytes { rawBytes -> MTLBuffer? in
+            device.makeBuffer(bytes: rawBytes.baseAddress!, length: length, options: .storageModeShared)
+        }
+        guard let buffer else {
+            throw .bufferBindingFailed
+        }
+        projectionBuffers[projection.cacheKey] = buffer
+        return buffer
     }
 
     private func encodeAndWait(resources: RunResources, shape: MetalAttentionShape) throws(MetalAttentionError) {
@@ -419,6 +566,122 @@ public final class MetalAttentionKernel {
         }
     }
 
+    private func encodeDecodeAndWait(
+        qBinding: SurfaceBinding,
+        kBinding: SurfaceBinding,
+        vBinding: SurfaceBinding,
+        residualBinding: SurfaceBinding,
+        outputBinding: SurfaceBinding,
+        scratch: DecodeScratch,
+        projectionBuffer: MTLBuffer,
+        shape: MetalDecodeAttentionShape
+    ) throws(MetalAttentionError) {
+        guard let commandBuffer = commandQueue.makeCommandBuffer() else {
+            throw .commandBufferUnavailable
+        }
+
+        let decodeParams = DecodeParams(
+            heads: UInt32(shape.heads),
+            headDim: UInt32(shape.headDim),
+            visibleTokens: UInt32(shape.visibleTokens),
+            cacheStride: UInt32(shape.cacheStride),
+            laneStride: UInt32(shape.laneStride),
+            scale: 1.0 / sqrt(Float(shape.headDim))
+        )
+        let softmaxParams = AttentionParams(
+            heads: UInt32(shape.heads),
+            headDim: UInt32(shape.headDim),
+            seqLen: UInt32(shape.visibleTokens),
+            scale: 1.0 / sqrt(Float(shape.headDim))
+        )
+
+        guard let logitsEncoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw .commandEncoderUnavailable
+        }
+        logitsEncoder.setComputePipelineState(decodeLogitsPipeline)
+        logitsEncoder.setBuffer(qBinding.buffer, offset: 0, index: 0)
+        logitsEncoder.setBuffer(kBinding.buffer, offset: 0, index: 1)
+        logitsEncoder.setBuffer(scratch.scoresBuffer, offset: 0, index: 2)
+        withUnsafeBytes(of: decodeParams) { rawBytes in
+            logitsEncoder.setBytes(rawBytes.baseAddress!, length: rawBytes.count, index: 3)
+        }
+        logitsEncoder.dispatchThreads(
+            MTLSize(width: shape.visibleTokens, height: shape.heads, depth: 1),
+            threadsPerThreadgroup: MTLSize(
+                width: max(1, min(decodeLogitsPipeline.threadExecutionWidth, shape.visibleTokens)),
+                height: 1,
+                depth: 1
+            )
+        )
+        logitsEncoder.endEncoding()
+
+        guard let softmaxEncoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw .commandEncoderUnavailable
+        }
+        softmaxEncoder.setComputePipelineState(softmaxPipeline)
+        softmaxEncoder.setBuffer(scratch.scoresBuffer, offset: 0, index: 0)
+        softmaxEncoder.setBuffer(scratch.weightsBuffer, offset: 0, index: 1)
+        withUnsafeBytes(of: softmaxParams) { rawBytes in
+            softmaxEncoder.setBytes(rawBytes.baseAddress!, length: rawBytes.count, index: 2)
+        }
+        softmaxEncoder.dispatchThreads(
+            MTLSize(width: shape.heads, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(
+                width: max(1, min(softmaxPipeline.maxTotalThreadsPerThreadgroup, shape.heads)),
+                height: 1,
+                depth: 1
+            )
+        )
+        softmaxEncoder.endEncoding()
+
+        guard let outputEncoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw .commandEncoderUnavailable
+        }
+        outputEncoder.setComputePipelineState(decodeOutputPipeline)
+        outputEncoder.setBuffer(scratch.weightsBuffer, offset: 0, index: 0)
+        outputEncoder.setBuffer(vBinding.buffer, offset: 0, index: 1)
+        outputEncoder.setBuffer(scratch.contextBuffer, offset: 0, index: 2)
+        withUnsafeBytes(of: decodeParams) { rawBytes in
+            outputEncoder.setBytes(rawBytes.baseAddress!, length: rawBytes.count, index: 3)
+        }
+        outputEncoder.dispatchThreads(
+            MTLSize(width: shape.headDim, height: shape.heads, depth: 1),
+            threadsPerThreadgroup: MTLSize(
+                width: max(1, min(decodeOutputPipeline.threadExecutionWidth, shape.headDim)),
+                height: 1,
+                depth: 1
+            )
+        )
+        outputEncoder.endEncoding()
+
+        guard let projectionEncoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw .commandEncoderUnavailable
+        }
+        projectionEncoder.setComputePipelineState(decodeProjectionPipeline)
+        projectionEncoder.setBuffer(scratch.contextBuffer, offset: 0, index: 0)
+        projectionEncoder.setBuffer(projectionBuffer, offset: 0, index: 1)
+        projectionEncoder.setBuffer(residualBinding.buffer, offset: 0, index: 2)
+        projectionEncoder.setBuffer(outputBinding.buffer, offset: 0, index: 3)
+        withUnsafeBytes(of: decodeParams) { rawBytes in
+            projectionEncoder.setBytes(rawBytes.baseAddress!, length: rawBytes.count, index: 4)
+        }
+        projectionEncoder.dispatchThreads(
+            MTLSize(width: shape.heads * shape.headDim, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(
+                width: max(1, min(decodeProjectionPipeline.threadExecutionWidth, shape.heads * shape.headDim)),
+                height: 1,
+                depth: 1
+            )
+        )
+        projectionEncoder.endEncoding()
+
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        if commandBuffer.status != .completed {
+            throw .commandExecutionFailed(commandBuffer.error?.localizedDescription ?? "status=\(commandBuffer.status.rawValue)")
+        }
+    }
+
     private static func makeInput(count: Int, seed: UInt64) -> [Float] {
         var values = [Float](repeating: 0, count: count)
         for i in 0..<count {
@@ -464,6 +727,17 @@ public final class MetalAttentionKernel {
         float pad1;
         float pad2;
         float pad3;
+    };
+
+    struct DecodeParams {
+        uint heads;
+        uint headDim;
+        uint visibleTokens;
+        uint cacheStride;
+        uint laneStride;
+        uint pad0;
+        float scale;
+        float pad1;
     };
 
     kernel void attention_logits(
@@ -542,6 +816,78 @@ public final class MetalAttentionKernel {
         }
 
         output[head * params.headDim + dim] = half(accum);
+    }
+
+    kernel void decode_attention_logits(
+        const device half *q [[buffer(0)]],
+        const device half *kCache [[buffer(1)]],
+        device float *scores [[buffer(2)]],
+        constant DecodeParams &params [[buffer(3)]],
+        uint2 gid [[thread_position_in_grid]]
+    ) {
+        uint token = gid.x;
+        uint head = gid.y;
+        if (head >= params.heads || token >= params.visibleTokens) {
+            return;
+        }
+
+        float dot = 0.0f;
+        uint headOffset = head * params.headDim;
+        for (uint dim = 0; dim < params.headDim; ++dim) {
+            uint channel = headOffset + dim;
+            uint qIndex = channel * params.laneStride;
+            uint kIndex = channel * params.cacheStride + token;
+            dot += float(q[qIndex]) * float(kCache[kIndex]);
+        }
+
+        scores[head * params.visibleTokens + token] = dot * params.scale;
+    }
+
+    kernel void decode_attention_output(
+        const device float *weights [[buffer(0)]],
+        const device half *vCache [[buffer(1)]],
+        device float *context [[buffer(2)]],
+        constant DecodeParams &params [[buffer(3)]],
+        uint2 gid [[thread_position_in_grid]]
+    ) {
+        uint dim = gid.x;
+        uint head = gid.y;
+        if (head >= params.heads || dim >= params.headDim) {
+            return;
+        }
+
+        uint channel = head * params.headDim + dim;
+        float accum = 0.0f;
+        uint weightBase = head * params.visibleTokens;
+        uint valueBase = channel * params.cacheStride;
+        for (uint token = 0; token < params.visibleTokens; ++token) {
+            accum += weights[weightBase + token] * float(vCache[valueBase + token]);
+        }
+        context[channel] = accum;
+    }
+
+    kernel void decode_output_projection(
+        const device float *context [[buffer(0)]],
+        const device float *projection [[buffer(1)]],
+        const device half *residual [[buffer(2)]],
+        device half *output [[buffer(3)]],
+        constant DecodeParams &params [[buffer(4)]],
+        uint gid [[thread_position_in_grid]]
+    ) {
+        uint dim = gid;
+        uint totalDim = params.heads * params.headDim;
+        if (dim >= totalDim) {
+            return;
+        }
+
+        float accum = 0.0f;
+        uint rowBase = dim * totalDim;
+        for (uint col = 0; col < totalDim; ++col) {
+            accum += projection[rowBase + col] * context[col];
+        }
+
+        uint laneIndex = dim * params.laneStride;
+        output[laneIndex] = half(accum + float(residual[laneIndex]));
     }
     """
 }
