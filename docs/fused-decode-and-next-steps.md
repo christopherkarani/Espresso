@@ -1154,3 +1154,62 @@ Conclusion:
 - So the honest call is:
   - this branch reached an optimized near-`3x` state
   - but did not produce a stable, repeatable `>=3x` claim on the current benchmark harness
+
+## 13. Concurrent Multistream Generation Benchmark (2026-03-08)
+
+What was built:
+- A true concurrent multistream generation benchmark in `GenerationHarnessHardwareTests`.
+- ANE path: recurrent fused-triplet direct-select with fused ANE RMSNorm + classifier head.
+- CoreML path: separate `CoreMLGenerationBenchmarkModel` instance per stream.
+- Each stream owns isolated state, model/runtime setup, and a dedicated host queue.
+- Each timed round launches one full generation request per stream concurrently and measures wall-clock round time.
+- Reporting normalizes by `streams * maxNewTokens` so throughput stays honest.
+
+Benchmark contract:
+- Prompt: `[0]`
+- Decode length: `8` new tokens
+- Warmup: `3` rounds
+- Timed: `20` rounds
+- Stream counts: `1`, `2`, `3`, `4`
+- Timing: `mach_absolute_time()` via the existing generation clock path
+
+Single-stream control rerun before the new benchmark:
+- Best ANE direct-select control: `2.211003 ms/token`, `452.28 tok/s`
+- Standing CoreML generation control: `7.044784 ms/token`, `141.95 tok/s`
+
+Repeated matched concurrent runs:
+
+| Streams | ANE ms/token (run 1) | ANE tok/s (run 1) | ANE ms/token (run 2) | ANE tok/s (run 2) | CoreML ms/token (run 1) | CoreML tok/s (run 1) | CoreML ms/token (run 2) | CoreML tok/s (run 2) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 2.294083 | 435.90 | 2.195065 | 455.57 | 15.377154 | 65.03 | 15.450174 | 64.72 |
+| 2 | 1.183065 | 845.26 | 1.196073 | 836.07 | 8.187806 | 122.13 | 8.299697 | 120.49 |
+| 3 | 0.885752 | 1128.98 | 0.874269 | 1143.81 | 5.583365 | 179.10 | 5.537411 | 180.59 |
+| 4 | 0.808975 | 1236.13 | 0.814136 | 1228.30 | 4.637305 | 215.64 | 4.643027 | 215.38 |
+
+Scaling analysis against each path's own matched 1-stream concurrent baseline:
+- ANE aggregate scaling (run 2):
+  - `2 streams`: `1.84x`
+  - `3 streams`: `2.51x`
+  - `4 streams`: `2.70x`
+- CoreML aggregate scaling (run 2):
+  - `2 streams`: `1.86x`
+  - `3 streams`: `2.79x`
+  - `4 streams`: `3.33x`
+- Concurrency-scaling ratio gate (`ANE scaling / CoreML scaling > 1.34`) failed:
+  - `2 streams`: about `0.99`
+  - `3 streams`: about `0.90`
+  - `4 streams`: about `0.81`
+
+Interpretation:
+- Absolute ANE serving throughput increased substantially with stream count, reaching about `1.23k tok/s` at `4` streams.
+- The matched concurrent benchmark also shows ANE above `4x` CoreML in absolute throughput at every stream count.
+- However, this is **not** evidence that true multistream concurrency is the unlocking lever toward `4x`.
+- The key reason is methodological: the matched concurrent CoreML setup regressed sharply already at `1` stream (`~15.4 ms/token`) relative to the standing single-stream CoreML control (`~7.04 ms/token`), while ANE's `1`-stream concurrent measurement stayed close to its prior control.
+- Inference: the queue-isolated concurrent serving harness changes CoreML's single-stream behavior materially, so the >`4x` absolute ratio here comes mostly from the changed serving contract rather than from ANE gaining a superior concurrency scaling factor.
+- The primary hypothesis therefore fails: ANE does **not** scale materially better than CoreML under this benchmark. CoreML scales similarly or better from its own matched concurrent baseline.
+
+Decision:
+- Status: implemented, measured, and stopped.
+- Keep the benchmark as a serving-path measurement tool.
+- Do **not** use this avenue as the main causal explanation for a credible `4x over CoreML` claim.
+- Next best move returns to the fallback plan: reduce remaining direct-select host overhead on the ANE path, and treat the queue-induced CoreML regression as a separate measurement artifact to characterize if a serving claim is needed later.

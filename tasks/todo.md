@@ -1,119 +1,105 @@
-# ANE 3x Gate — Fused Recurrent Pair Experiment (2026-03-07)
+# ANE 4x Gate — Concurrent Multistream Benchmarking (2026-03-08)
 
 ## Plan
-- [x] Re-read the latest recurrent-generation findings, the reduced-readback breakthrough, and the current recurrent runtime/generation seams before choosing the next path.
-- [x] Record the last stable control and the 3x target:
-  - [x] last CoreML generation baseline: `6.582224 ms/token`, `151.93 tok/s`
-  - [x] current best ANE path: recurrent `6` layers + fused ANE RMSNorm/classifier head + direct surface argmax
-    - [x] replicated at `2.467362 ms/token`, `405.29 tok/s`
-    - [x] replication runs also observed `2.454737` and `2.451047 ms/token`
-  - [x] `3x` target: `<= 2.194075 ms/token` or `>= 455.80 tok/s`
-  - [x] remaining gap from the stable control: about `0.273287 ms/token` or `50.51 tok/s`
-- [x] Record the abandoned micro-paths so they do not distract this branch:
-  - [x] output-head one-time-zero initialization was directionally positive but non-material
-  - [x] recurrent per-step `xIn` zero-elision regressed or destabilized the direct-select path and is abandoned
-- [x] State the new breakthrough hypothesis up front:
-  - [x] the next credible way to close the remaining `3x` gap is to cut recurrent dispatch count and recurrent surface traffic in the trunk, not to do more tiny head-side cleanup
-  - [x] fusing two recurrent layers into one ANE eval should remove three recurrent eval boundaries from the current `6`-layer path and reduce per-token host-side copy/scheduling overhead enough to produce a material end-to-end gain
-- [x] State the decisive metric and stop condition up front:
-  - [x] decisive metric: end-to-end recurrent `6`-layer direct-select generation median `ms/token`
-  - [x] material-gain gate for this avenue: `>= 0.20 ms/token` improvement over the current best direct-select recurrent control
-  - [x] success gate for the branch milestone: `<= 2.194075 ms/token` or `>= 455.80 tok/s`
-  - [x] stop quickly if:
-    - [x] fused-pair MIL compile hits `InvalidMILProgram`, `statusType=0x9`, or similar structural failure
-    - [x] compile time balloons without a realistic path to recover the remaining `3x` gap
-    - [x] parity is wrong, or end-to-end savings are below the material gate
-- [x] Rewrite the work around the next honest probe:
-  - [x] keep the current recurrent `6`-layer + fused ANE head + direct-select path as the control
-  - [x] add a fused two-layer recurrent step generator and runtime
-  - [x] integrate it into generation with the smallest write set possible, preserving the current direct-select output-head path
-  - [x] benchmark `6` logical recurrent layers as three fused-pair steps against the existing six single-layer steps
-- [x] Re-benchmark the current best control before the new fused-pair benchmark:
-  - [x] recurrent `6`-layer direct-select fused-head generation control
+- [x] Re-read the required docs, task log, lessons, memory, and benchmark/runtime files before choosing the next avenue.
+- [x] Re-state the standing matched single-stream controls:
+  - [x] current best ANE path: recurrent fused-triplet direct-select generation
+    - [x] `2.204732 ms/token`
+    - [x] `453.57 tok/s`
+  - [x] standing CoreML generation baseline (`.cpuAndNeuralEngine`)
+    - [x] `6.582224 ms/token`
+    - [x] `151.93 tok/s`
+  - [x] current ratio: about `2.99x`
+  - [x] honest `4x` target against the standing CoreML baseline:
+    - [x] `<= 1.645556 ms/token`
+    - [x] `>= 607.72 tok/s`
+- [x] Record the active hypothesis and the decisive ratio gate:
+  - [x] strongest remaining path is true concurrent multistream on top of the recurrent fused-triplet direct-select path
+  - [x] decisive question: whether ANE scales materially better than CoreML at `2-4` concurrent streams
+  - [x] ratio improvement gate: `ANE concurrency scaling / CoreML concurrency scaling > 1.34`
+- [x] Record the already-known blockers so this session does not drift:
+  - [x] smaller recurrent trunk lane widths are blocked by `statusType=0x9`
+  - [x] smaller output-head lane widths (`16/8/1`) fail eval
+  - [x] speculative verifier substrate is structurally too slow
+  - [x] transformer direct path is already near its ceiling
+  - [x] `_ANEVirtualClient`, `_ANEChainingRequest`, real-time eval, shared-events async path, and hybrid Metal attention are blocked / not competitive on this branch
+- [x] Rewrite the work around the current benchmark contract:
+  - [x] build a true concurrent multistream ANE benchmark on the recurrent fused-triplet direct-select path
+  - [x] build a matched concurrent CoreML benchmark with the same prompt length, decode length, and synchronization model
+  - [x] measure stream counts `1`, `2`, `3`, `4`
+  - [x] separate compile/init time from steady-state runtime
+  - [x] normalize runtime by `streams * steps` and report aggregate `tok/s`
+- [ ] Baseline before changes:
+  - [x] re-run the current ANE single-stream recurrent fused-triplet direct-select benchmark under the current harness and record compile/init split separately from steady-state decode
+  - [x] re-run the current CoreML single-stream generation baseline under the current harness and record compile/init split separately from steady-state decode
+  - [x] keep the exact prompt length, decode length, warmup count, and timed iteration count fixed for the later multistream comparison
 - [ ] Add failing tests first:
-  - [x] MIL generator contract tests for a fused two-layer recurrent step:
-    - [x] three inputs / three outputs
-    - [x] byte-size contracts
-    - [x] both layers' weight blobs are present
-    - [x] op subset stays within the proven recurrent pattern
-  - [x] ANERuntime compile-spec test for the fused two-layer kernel set:
-    - [x] exactly one fused kernel spec
-    - [x] expected weight blob names for both layers
-    - [x] correct input/output sizes
-  - [x] generation-model test coverage for the fused backend:
-    - [x] a fused-pair recurrent model preserves the same deterministic echo-token behavior as the existing single-layer-stack model
-    - [x] direct token selection still matches the materialized logits path
-  - [x] hardware test coverage:
-    - [x] token-parity check between single-layer-stack recurrent generation and fused-pair recurrent generation
-    - [x] benchmark compare between the two paths using the current fused-head direct-select harness
-- [x] Implement the fused recurrent pair path:
-  - [x] `Sources/MILGenerator/RWKVStyleFusedTwoLayerStepGenerator.swift`
-  - [x] `Sources/ANERuntime/RWKVStyleFusedTwoLayerKernelSet.swift`
-  - [x] fused-pair surface handles / session runtime in `Sources/Espresso/RWKVStyleRecurrentDecode.swift`
-  - [x] generation integration with the smallest stable API seam:
-    - [x] backend seam inside `ANERecurrentGenerationModel`
-  - [x] preserve the existing best path unchanged so the control remains available
-- [x] Verify in order:
-  - [x] focused non-hardware tests for MIL generator + kernel set + generation parity
+  - [ ] benchmark-plumbing tests for multistream orchestration:
+    - [x] isolated state is created per stream
+    - [x] synchronized rounds wait for all streams before advancing
+    - [x] aggregate token accounting uses `streams * steps`
+    - [x] compile/init metrics remain separated from timed runtime metrics
+  - [ ] hardware-gated tests for matched multistream generation:
+    - [x] ANE recurrent direct-select benchmark reports valid metrics for stream counts `1/2/3/4`
+    - [x] CoreML concurrent benchmark reports valid metrics for stream counts `1/2/3/4`
+    - [x] fairness check: both paths use the same prompt length, decode length, warmup count, and timed iteration count
+- [ ] Implement the multistream benchmark support with the smallest stable write set:
+  - [x] add benchmark result types for per-stream-count scaling reports
+  - [ ] add true concurrent ANE multistream generation orchestration:
+    - [x] one isolated model/runtime per stream
+    - [x] one isolated decode state / surfaces / buffers per stream
+    - [x] one host queue per stream
+    - [x] synchronized round timing across streams
+    - [x] preserve the current best path: recurrent fused-triplet direct-select with fused ANE RMSNorm + classifier head
+  - [ ] add matched concurrent CoreML generation orchestration:
+    - [x] separate `MLModel` instance per stream
+    - [x] separate queue per stream
+    - [x] same prompt/decode/synchronization contract as ANE
+  - [x] expose the benchmark through the existing hardware-test harness or bench entry point without regressing current single-stream paths
+- [ ] Verify in order:
+  - [x] focused non-hardware multistream benchmark tests
   - [x] `swift test`
-  - [x] targeted hardware parity test
-  - [x] targeted hardware benchmark compare against the current best recurrent control
-- [x] Report:
-  - [x] `ms/token`
-  - [x] `tok/s`
-  - [x] compile time
-  - [x] trunk time vs head time
-  - [x] remaining distance to `3x`
-- [ ] If fused pairs are real but still short of `3x`, run one bounded follow-up before declaring the branch ceiling:
-  - [x] keep the fused-pair trunk topology
-  - [x] reduce recurrent trunk `laneSpatial` first (`32 -> 16 -> 8 -> 1`) while keeping the ANE fused output head at the proven lane-32 setting
-  - [x] stop immediately if lower trunk lane widths fail to compile, produce parity drift, or do not buy a material chunk toward `3x`
-  - [x] lane-reduction outcome:
-    - [x] fused-pair lane-32 baseline still ran (`2.530901 ms/token`, `395.14 tok/s` in the sweep setup)
-    - [x] the first smaller trunk lane width hit `statusType=0x9`
-    - [x] decision: abandon smaller recurrent trunk lane widths for now
-  - [x] move to the next higher-upside trunk path:
-    - [x] fused three-layer recurrent step for a 6-layer trunk (`2` fused evals instead of `3`)
-    - [x] parity first, then direct-select hardware benchmark against the fused-pair control
-- [ ] Apply the gate immediately after results:
-  - [ ] if `>=3x` over the standing CoreML generation baseline is reached, record it as a branch optimization milestone and commit immediately
-  - [x] if the fused-pair path yields a material gain but still misses `3x`, decide whether one final bounded follow-up is justified before committing
-  - [x] if the gain is not material, document the ceiling and stop pushing this avenue
+  - [x] targeted hardware benchmark runs for ANE streams `1/2/3/4`
+  - [x] targeted hardware benchmark runs for CoreML streams `1/2/3/4`
+  - [x] repeat noisy runs and record repeated medians if needed
+- [ ] Apply the stop conditions immediately after measurement:
+  - [x] if ANE and CoreML scale by similar factors, document that this path does not move the relative claim enough
+  - [x] if `2` streams is the knee and `3`/`4` regress, stop scaling work there
+  - [x] if true concurrency does not materially improve aggregate ANE throughput, stop the avenue and document it
+  - [x] if the matched results honestly show `>=4x` aggregate throughput, record the breakthrough and stop
 - [x] Append findings to `docs/fused-decode-and-next-steps.md`.
-- [x] Update project memory with durable findings.
+- [ ] Update durable memory with confirmed findings.
+- [ ] Flush Wax memory before finishing.
 - [ ] Fill in this review section and commit atomically.
 
 ## Review
-- Status: complete pending atomic commit.
-- Standing control:
-  - CoreML generation baseline: `6.582224 ms/token`, `151.93 tok/s`
-  - current best ANE path: recurrent `6` layers + fused ANE RMSNorm/classifier head + direct surface argmax
-    - stable best run: `2.467362 ms/token`, `405.29 tok/s`
-    - replicated around `2.45-2.47 ms/token`
-- Why this pivot exists:
-  - reduced-readback direct argmax was the actual breakthrough
-  - smaller head-side cleanup after that was not enough to close the final `~0.27 ms/token` gap to `3x`
-  - recurrent per-step zero-elision did not hold up under hardware measurement and is not the right branch to continue
-- Active hypothesis:
-  - fused recurrent pairs can still improve end-to-end latency because the remaining gap is small enough that removing recurrent eval boundaries and recurrent per-layer host IO has a plausible payoff
-- Immediate go/no-go:
-  - if fused recurrent pairs cannot buy at least `~0.20 ms/token`, this branch is probably near its local ceiling without a more radical algorithm or runtime change
-- Current evidence:
-  - fused recurrent-pair direct-select hardware replications are noisy in absolute terms but consistently faster than the current single-layer recurrent trunk
-  - observed compare runs:
-    - single `6.0231` vs fused-pair `3.7812`
-    - single `3.4296` vs fused-pair `2.3074`
-    - single `4.5684` vs fused-pair `2.5795`
-  - best fused-pair run is now close enough to `3x` that a smaller follow-up on recurrent trunk lane width is justified before attempting 3-layer fusion
-- Lane-width follow-up outcome:
-  - the smaller-lane trunk probe hit the predefined abandon condition immediately with `statusType=0x9`
-  - that means the next honest avenue is deeper recurrent fusion, not more lane packing work
-- Triplet-fusion outcome:
-  - fused triplets are the best branch result so far
-  - strongest repeated triplet runs landed around `2.212 ms/token`, `~452 tok/s`
-  - the output-head-lane follow-up got even closer at `2.204732 ms/token`, `453.57 tok/s`
-  - this is an honest near-`3x` result (`~2.98x-2.99x` over the standing CoreML generation baseline), but not a stable `>=3x` claim
-- Final call:
-  - this branch is materially optimized and worth committing
-  - multi-layer recurrent fusion was the right path; smaller lane-width follow-ups were blocked
-  - the current honest headline is “near-`3x` over CoreML”, not “stable `3x+` over CoreML”
+- Status: measured.
+- Branch: `feat/vc-eval-probe`
+- Starting commit for this avenue: `771e3aa`
+- Current hypothesis:
+  - multistream concurrency is the highest-probability remaining path because the single-stream recurrent fused-triplet direct-select path is already near a local ceiling and only about `34%` more throughput is needed for `4x`
+- Immediate execution order:
+  - rewrite task log
+  - re-run matched single-stream baselines
+  - add failing multistream benchmark tests
+  - implement true concurrent ANE and matched CoreML multistream runners
+  - measure `1/2/3/4` streams and stop at the knee if higher counts regress
+- Evidence loaded before implementation:
+  - current best ANE single-stream result and standing CoreML baseline
+  - known dead ends for virtual client, shared events, real-time eval, hybrid Metal split, speculative verifier, and lane-width sweeps
+  - current benchmark/runtime seam has no true concurrency primitives yet, so the clean extension point is additive multistream orchestration with isolated per-stream model instances
+- Completion gate for this avenue:
+  - either produce a matched ANE/CoreML multistream benchmark that honestly reaches `>=4x`, or produce a strong negative result that shows why concurrency does not close the gap and identifies the next best move with evidence
+- Outcome:
+  - a matched concurrent serving benchmark was implemented and repeatedly measured
+  - absolute throughput exceeded `4x` against the matched concurrent CoreML path, but the primary hypothesis failed because ANE did not scale better than CoreML from their own concurrent baselines
+  - the relative concurrency-scaling gate (`ANE scaling / CoreML scaling > 1.34`) failed at every tested stream count
+- Key measurements:
+  - single-stream control rerun:
+    - ANE fused-triplet direct-select: `2.211003 ms/token`, `452.28 tok/s`
+    - CoreML baseline: `7.044784 ms/token`, `141.95 tok/s`
+  - matched concurrent rerun (`streams=1/2/3/4`, second pass):
+    - ANE aggregate tok/s: `455.57`, `836.07`, `1143.81`, `1228.30`
+    - CoreML aggregate tok/s: `64.72`, `120.49`, `180.59`, `215.38`
+  - inference:
+    - the matched concurrent CoreML path regressed sharply already at `1` stream, so the `>4x` absolute ratio is not evidence that concurrency is the unlock

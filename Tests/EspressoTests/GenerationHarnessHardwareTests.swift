@@ -1087,6 +1087,604 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         }
     }
 
+    func test_concurrent_generation_scaling_sample_normalizes_round_time_by_stream_and_token_count() {
+        let sample = ConcurrentGenerationScalingSample(
+            streamCount: 4,
+            tokensPerStream: 8,
+            compileTimeMs: 123.0,
+            roundLatenciesMs: [96.0, 80.0, 88.0]
+        )
+
+        XCTAssertEqual(sample.medianRoundLatencyMs, 88.0, accuracy: 0.0001)
+        XCTAssertEqual(sample.medianMsPerToken, 2.75, accuracy: 0.0001)
+        XCTAssertEqual(sample.aggregateTokensPerSecond, 363.6363636, accuracy: 0.0001)
+        XCTAssertEqual(sample.perStreamTokensPerSecond, 90.9090909, accuracy: 0.0001)
+        XCTAssertEqual(sample.compileTimeMs, 123.0, accuracy: 0.0001)
+    }
+
+    func test_concurrent_generation_synthetic_runner_builds_isolated_workers_and_synchronizes_rounds() throws {
+        let sample = try runSyntheticConcurrentRoundBenchmark(
+            streamCount: 3,
+            warmup: 1,
+            iterations: 2,
+            tokensPerStream: 4
+        )
+
+        XCTAssertEqual(sample.streamCount, 3)
+        XCTAssertEqual(sample.builderStreamIndices, [0, 1, 2])
+        XCTAssertTrue(sample.roundOrderIsSynchronized)
+        XCTAssertEqual(sample.completedRoundsByStream, [2, 2, 2])
+        XCTAssertGreaterThan(sample.compileTimeMs, 0)
+        XCTAssertEqual(sample.roundLatenciesMs.count, 2)
+    }
+
+    func test_recurrent_generation_concurrent_multistream_scaling_reports_matched_ane_and_coreml_baselines_on_hardware() throws {
+        try requireGenerationHardware()
+
+        let prompt: [UInt16] = [0]
+        let warmup = 3
+        let iterations = 20
+        let maxNewTokens = 8
+        let streamCounts = [1, 2, 3, 4]
+        let modelPath = "benchmarks/models/transformer_6layer.mlpackage"
+
+        let ane = try benchmarkConcurrentRecurrentEchoGeneration(
+            layerCount: 6,
+            promptTokens: prompt,
+            maxNewTokens: maxNewTokens,
+            warmup: warmup,
+            iterations: iterations,
+            streamCounts: streamCounts,
+            outputHeadBackend: .aneRMSNormClassifier,
+            trunkBackend: .fusedThreeLayerTriplets,
+            useDirectTokenSelection: true
+        )
+        let coreml = try benchmarkConcurrentCoreMLGeneration(
+            modelPath: modelPath,
+            promptTokens: prompt,
+            maxNewTokens: maxNewTokens,
+            warmup: warmup,
+            iterations: iterations,
+            streamCounts: streamCounts
+        )
+
+        XCTAssertEqual(ane.promptLength, prompt.count)
+        XCTAssertEqual(coreml.promptLength, prompt.count)
+        XCTAssertEqual(ane.maxNewTokens, maxNewTokens)
+        XCTAssertEqual(coreml.maxNewTokens, maxNewTokens)
+        XCTAssertEqual(ane.warmupCount, warmup)
+        XCTAssertEqual(coreml.warmupCount, warmup)
+        XCTAssertEqual(ane.iterationCount, iterations)
+        XCTAssertEqual(coreml.iterationCount, iterations)
+        XCTAssertEqual(ane.samples.map(\.streamCount), streamCounts)
+        XCTAssertEqual(coreml.samples.map(\.streamCount), streamCounts)
+        XCTAssertTrue(ane.samples.allSatisfy { $0.medianMsPerToken > 0 })
+        XCTAssertTrue(coreml.samples.allSatisfy { $0.medianMsPerToken > 0 })
+
+        for idx in 0..<streamCounts.count {
+            let aneSample = ane.samples[idx]
+            let coremlSample = coreml.samples[idx]
+            print(
+                """
+                concurrent ane streams=\(aneSample.streamCount) median_ms_token=\(aneSample.medianMsPerToken) aggregate_tps=\(aneSample.aggregateTokensPerSecond) per_stream_tps=\(aneSample.perStreamTokensPerSecond) compile=\(aneSample.compileTimeMs) round_ms=\(aneSample.medianRoundLatencyMs)
+                concurrent coreml streams=\(coremlSample.streamCount) median_ms_token=\(coremlSample.medianMsPerToken) aggregate_tps=\(coremlSample.aggregateTokensPerSecond) per_stream_tps=\(coremlSample.perStreamTokensPerSecond) compile=\(coremlSample.compileTimeMs) round_ms=\(coremlSample.medianRoundLatencyMs)
+                """
+            )
+        }
+    }
+
+    private func machMilliseconds(_ deltaTicks: UInt64) -> Double {
+        var info = mach_timebase_info_data_t()
+        mach_timebase_info(&info)
+        let nanos = Double(deltaTicks) * Double(info.numer) / Double(info.denom)
+        return nanos / 1_000_000.0
+    }
+
+    private final class LockedBox<Value>: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value: Value
+
+        init(_ value: Value) {
+            self.value = value
+        }
+
+        func get() -> Value {
+            lock.lock()
+            defer { lock.unlock() }
+            return value
+        }
+
+        func set(_ newValue: Value) {
+            lock.lock()
+            value = newValue
+            lock.unlock()
+        }
+
+        func withValue<R>(_ body: (inout Value) -> R) -> R {
+            lock.lock()
+            defer { lock.unlock() }
+            return body(&value)
+        }
+    }
+
+    private struct ConcurrentGenerationScalingSample {
+        let streamCount: Int
+        let tokensPerStream: Int
+        let compileTimeMs: Double
+        let roundLatenciesMs: [Double]
+
+        var medianRoundLatencyMs: Double {
+            median(roundLatenciesMs)
+        }
+
+        var medianMsPerToken: Double {
+            let totalTokens = streamCount * tokensPerStream
+            guard totalTokens > 0 else { return 0 }
+            return medianRoundLatencyMs / Double(totalTokens)
+        }
+
+        var aggregateTokensPerSecond: Double {
+            guard medianRoundLatencyMs > 0 else { return 0 }
+            return Double(streamCount * tokensPerStream) * 1000.0 / medianRoundLatencyMs
+        }
+
+        var perStreamTokensPerSecond: Double {
+            guard streamCount > 0 else { return 0 }
+            return aggregateTokensPerSecond / Double(streamCount)
+        }
+    }
+
+    private struct ConcurrentGenerationScalingReport {
+        let label: String
+        let promptLength: Int
+        let maxNewTokens: Int
+        let warmupCount: Int
+        let iterationCount: Int
+        let samples: [ConcurrentGenerationScalingSample]
+    }
+
+    private struct SyntheticConcurrentRoundBenchmarkSample {
+        let streamCount: Int
+        let tokensPerStream: Int
+        let compileTimeMs: Double
+        let roundLatenciesMs: [Double]
+        let builderStreamIndices: [Int]
+        let completedRoundsByStream: [Int]
+        let roundOrderIsSynchronized: Bool
+    }
+
+    private func runSyntheticConcurrentRoundBenchmark(
+        streamCount: Int,
+        warmup: Int,
+        iterations: Int,
+        tokensPerStream: Int
+    ) throws -> SyntheticConcurrentRoundBenchmarkSample {
+        let builderStreamIndices = Array(0..<streamCount)
+        let compileStart = GenerationClock.now()
+        let startSignals = (0..<streamCount).map { _ in DispatchSemaphore(value: 0) }
+        let doneSignals = (0..<streamCount).map { _ in DispatchSemaphore(value: 0) }
+        let readySignals = (0..<streamCount).map { _ in DispatchSemaphore(value: 0) }
+        let shutdown = LockedBox(false)
+        let activeRound = LockedBox(0)
+        let completedRounds = LockedBox([Int](repeating: 0, count: streamCount))
+        let roundOrderIsSynchronized = LockedBox(true)
+        let exitGroup = DispatchGroup()
+
+        for streamIndex in builderStreamIndices {
+            let startSignal = startSignals[streamIndex]
+            let doneSignal = doneSignals[streamIndex]
+            let readySignal = readySignals[streamIndex]
+            let queue = DispatchQueue(label: "com.espresso.synthetic.stream.\(streamIndex)")
+            exitGroup.enter()
+            queue.async {
+                defer { exitGroup.leave() }
+                readySignal.signal()
+
+                while true {
+                    startSignal.wait()
+                    if shutdown.get() {
+                        return
+                    }
+
+                    let round = activeRound.get()
+                    let minimumCompleted = completedRounds.get().min() ?? 0
+                    if minimumCompleted < round {
+                        roundOrderIsSynchronized.set(false)
+                    }
+
+                    usleep(useconds_t(500 * (streamIndex + 1)))
+                    completedRounds.withValue { values in
+                        values[streamIndex] += 1
+                    }
+                    doneSignal.signal()
+                }
+            }
+        }
+
+        for readySignal in readySignals {
+            readySignal.wait()
+        }
+        let compileTimeMs = machMilliseconds(GenerationClock.now() - compileStart)
+
+        for round in 0..<warmup {
+            activeRound.set(round)
+            for startSignal in startSignals {
+                startSignal.signal()
+            }
+            for doneSignal in doneSignals {
+                doneSignal.wait()
+            }
+        }
+        completedRounds.set([Int](repeating: 0, count: streamCount))
+
+        var roundLatenciesMs: [Double] = []
+        roundLatenciesMs.reserveCapacity(iterations)
+        for round in 0..<iterations {
+            activeRound.set(round)
+            let start = GenerationClock.now()
+            for startSignal in startSignals {
+                startSignal.signal()
+            }
+            for doneSignal in doneSignals {
+                doneSignal.wait()
+            }
+            roundLatenciesMs.append(machMilliseconds(GenerationClock.now() - start))
+        }
+
+        shutdown.set(true)
+        for startSignal in startSignals {
+            startSignal.signal()
+        }
+        exitGroup.wait()
+
+        return SyntheticConcurrentRoundBenchmarkSample(
+            streamCount: streamCount,
+            tokensPerStream: tokensPerStream,
+            compileTimeMs: compileTimeMs,
+            roundLatenciesMs: roundLatenciesMs,
+            builderStreamIndices: builderStreamIndices,
+            completedRoundsByStream: completedRounds.get(),
+            roundOrderIsSynchronized: roundOrderIsSynchronized.get()
+        )
+    }
+
+    private func benchmarkConcurrentRecurrentEchoGeneration(
+        layerCount: Int,
+        promptTokens: [UInt16],
+        maxNewTokens: Int,
+        warmup: Int,
+        iterations: Int,
+        streamCounts: [Int],
+        outputHeadBackend: GenerationOutputHeadBackend = .cpu,
+        trunkBackend: RecurrentGenerationTrunkBackend = .singleLayer,
+        useDirectTokenSelection: Bool = false,
+        trunkLaneSpatial: Int = 32,
+        outputHeadLaneSpatial: Int = 32
+    ) throws -> ConcurrentGenerationScalingReport {
+        var samples: [ConcurrentGenerationScalingSample] = []
+        samples.reserveCapacity(streamCounts.count)
+
+        for streamCount in streamCounts {
+            let compileStart = GenerationClock.now()
+            let startSignals = (0..<streamCount).map { _ in DispatchSemaphore(value: 0) }
+            let doneSignals = (0..<streamCount).map { _ in DispatchSemaphore(value: 0) }
+            let readySignals = (0..<streamCount).map { _ in DispatchSemaphore(value: 0) }
+            let shutdown = LockedBox(false)
+            let firstError = LockedBox<Error?>(nil)
+            let exitGroup = DispatchGroup()
+
+            for streamIndex in 0..<streamCount {
+                let startSignal = startSignals[streamIndex]
+                let doneSignal = doneSignals[streamIndex]
+                let readySignal = readySignals[streamIndex]
+                let queue = DispatchQueue(label: "com.espresso.concurrent.ane.stream.\(streamIndex)")
+                exitGroup.enter()
+                queue.async {
+                    defer { exitGroup.leave() }
+                    do {
+                        let weights = makeEchoRecurrentGenerationWeights(layerCount: layerCount)
+                        let model = try ANERecurrentGenerationModel(
+                            weights: weights,
+                            layerCount: layerCount,
+                            maxSequenceTokens: 32,
+                            outputHeadBackend: outputHeadBackend,
+                            trunkBackend: trunkBackend,
+                            trunkLaneSpatial: trunkLaneSpatial,
+                            outputHeadLaneSpatial: outputHeadLaneSpatial
+                        )
+
+                        if useDirectTokenSelection {
+                            var harness = DirectTokenSelectionGenerationHarness(
+                                model: model,
+                                strategy: .argmax
+                            )
+                            readySignal.signal()
+                            while true {
+                                startSignal.wait()
+                                if shutdown.get() {
+                                    return
+                                }
+                                do {
+                                    _ = try harness.generate(
+                                        promptTokens: promptTokens,
+                                        maxNewTokens: maxNewTokens
+                                    )
+                                } catch {
+                                    firstError.withValue { current in
+                                        if current == nil { current = error }
+                                    }
+                                }
+                                doneSignal.signal()
+                            }
+                        } else {
+                            var harness = AutoregressiveGenerationHarness(
+                                model: model,
+                                strategy: .argmax
+                            )
+                            readySignal.signal()
+                            while true {
+                                startSignal.wait()
+                                if shutdown.get() {
+                                    return
+                                }
+                                do {
+                                    _ = try harness.generate(
+                                        promptTokens: promptTokens,
+                                        maxNewTokens: maxNewTokens
+                                    )
+                                } catch {
+                                    firstError.withValue { current in
+                                        if current == nil { current = error }
+                                    }
+                                }
+                                doneSignal.signal()
+                            }
+                        }
+                    } catch {
+                        firstError.withValue { current in
+                            if current == nil { current = error }
+                        }
+                        readySignal.signal()
+                        while true {
+                            startSignal.wait()
+                            if shutdown.get() {
+                                return
+                            }
+                            doneSignal.signal()
+                        }
+                    }
+                }
+            }
+
+            for readySignal in readySignals {
+                readySignal.wait()
+            }
+            let compileTimeMs = machMilliseconds(GenerationClock.now() - compileStart)
+
+            if let error = firstError.get() {
+                shutdown.set(true)
+                for startSignal in startSignals {
+                    startSignal.signal()
+                }
+                exitGroup.wait()
+                throw error
+            }
+
+            for _ in 0..<warmup {
+                for startSignal in startSignals {
+                    startSignal.signal()
+                }
+                for doneSignal in doneSignals {
+                    doneSignal.wait()
+                }
+                if let error = firstError.get() {
+                    shutdown.set(true)
+                    for startSignal in startSignals {
+                        startSignal.signal()
+                    }
+                    exitGroup.wait()
+                    throw error
+                }
+            }
+
+            var roundLatenciesMs: [Double] = []
+            roundLatenciesMs.reserveCapacity(iterations)
+            for _ in 0..<iterations {
+                let start = GenerationClock.now()
+                for startSignal in startSignals {
+                    startSignal.signal()
+                }
+                for doneSignal in doneSignals {
+                    doneSignal.wait()
+                }
+                if let error = firstError.get() {
+                    shutdown.set(true)
+                    for startSignal in startSignals {
+                        startSignal.signal()
+                    }
+                    exitGroup.wait()
+                    throw error
+                }
+                roundLatenciesMs.append(machMilliseconds(GenerationClock.now() - start))
+            }
+
+            shutdown.set(true)
+            for startSignal in startSignals {
+                startSignal.signal()
+            }
+            exitGroup.wait()
+
+            samples.append(
+                ConcurrentGenerationScalingSample(
+                    streamCount: streamCount,
+                    tokensPerStream: maxNewTokens,
+                    compileTimeMs: compileTimeMs,
+                    roundLatenciesMs: roundLatenciesMs
+                )
+            )
+        }
+
+        return ConcurrentGenerationScalingReport(
+            label: "ANE Recurrent Concurrent",
+            promptLength: promptTokens.count,
+            maxNewTokens: maxNewTokens,
+            warmupCount: warmup,
+            iterationCount: iterations,
+            samples: samples
+        )
+    }
+
+    private func benchmarkConcurrentCoreMLGeneration(
+        modelPath: String,
+        promptTokens: [UInt16],
+        maxNewTokens: Int,
+        warmup: Int,
+        iterations: Int,
+        streamCounts: [Int]
+    ) throws -> ConcurrentGenerationScalingReport {
+        var samples: [ConcurrentGenerationScalingSample] = []
+        samples.reserveCapacity(streamCounts.count)
+
+        for streamCount in streamCounts {
+            let compileStart = GenerationClock.now()
+            let startSignals = (0..<streamCount).map { _ in DispatchSemaphore(value: 0) }
+            let doneSignals = (0..<streamCount).map { _ in DispatchSemaphore(value: 0) }
+            let readySignals = (0..<streamCount).map { _ in DispatchSemaphore(value: 0) }
+            let shutdown = LockedBox(false)
+            let firstError = LockedBox<Error?>(nil)
+            let exitGroup = DispatchGroup()
+
+            for streamIndex in 0..<streamCount {
+                let startSignal = startSignals[streamIndex]
+                let doneSignal = doneSignals[streamIndex]
+                let readySignal = readySignals[streamIndex]
+                let queue = DispatchQueue(label: "com.espresso.concurrent.coreml.stream.\(streamIndex)")
+                exitGroup.enter()
+                queue.async {
+                    defer { exitGroup.leave() }
+                    do {
+                        let headWeights = makeEchoGenerationWeights(layerCount: 1)
+                        let model = try CoreMLGenerationBenchmarkModel(
+                            modelPath: modelPath,
+                            headWeights: headWeights,
+                            maxSequenceTokens: 32
+                        )
+                        var harness = AutoregressiveGenerationHarness(
+                            model: model,
+                            strategy: .argmax
+                        )
+                        readySignal.signal()
+                        while true {
+                            startSignal.wait()
+                            if shutdown.get() {
+                                return
+                            }
+                            do {
+                                _ = try harness.generate(
+                                    promptTokens: promptTokens,
+                                    maxNewTokens: maxNewTokens
+                                )
+                            } catch {
+                                firstError.withValue { current in
+                                    if current == nil { current = error }
+                                }
+                            }
+                            doneSignal.signal()
+                        }
+                    } catch {
+                        firstError.withValue { current in
+                            if current == nil { current = error }
+                        }
+                        readySignal.signal()
+                        while true {
+                            startSignal.wait()
+                            if shutdown.get() {
+                                return
+                            }
+                            doneSignal.signal()
+                        }
+                    }
+                }
+            }
+
+            for readySignal in readySignals {
+                readySignal.wait()
+            }
+            let compileTimeMs = machMilliseconds(GenerationClock.now() - compileStart)
+
+            if let error = firstError.get() {
+                shutdown.set(true)
+                for startSignal in startSignals {
+                    startSignal.signal()
+                }
+                exitGroup.wait()
+                throw error
+            }
+
+            for _ in 0..<warmup {
+                for startSignal in startSignals {
+                    startSignal.signal()
+                }
+                for doneSignal in doneSignals {
+                    doneSignal.wait()
+                }
+                if let error = firstError.get() {
+                    shutdown.set(true)
+                    for startSignal in startSignals {
+                        startSignal.signal()
+                    }
+                    exitGroup.wait()
+                    throw error
+                }
+            }
+
+            var roundLatenciesMs: [Double] = []
+            roundLatenciesMs.reserveCapacity(iterations)
+            for _ in 0..<iterations {
+                let start = GenerationClock.now()
+                for startSignal in startSignals {
+                    startSignal.signal()
+                }
+                for doneSignal in doneSignals {
+                    doneSignal.wait()
+                }
+                if let error = firstError.get() {
+                    shutdown.set(true)
+                    for startSignal in startSignals {
+                        startSignal.signal()
+                    }
+                    exitGroup.wait()
+                    throw error
+                }
+                roundLatenciesMs.append(machMilliseconds(GenerationClock.now() - start))
+            }
+
+            shutdown.set(true)
+            for startSignal in startSignals {
+                startSignal.signal()
+            }
+            exitGroup.wait()
+
+            samples.append(
+                ConcurrentGenerationScalingSample(
+                    streamCount: streamCount,
+                    tokensPerStream: maxNewTokens,
+                    compileTimeMs: compileTimeMs,
+                    roundLatenciesMs: roundLatenciesMs
+                )
+            )
+        }
+
+        return ConcurrentGenerationScalingReport(
+            label: "CoreML Concurrent",
+            promptLength: promptTokens.count,
+            maxNewTokens: maxNewTokens,
+            warmupCount: warmup,
+            iterationCount: iterations,
+            samples: samples
+        )
+    }
+
     private func benchmarkDirectEchoGeneration(
         layerCount: Int,
         promptTokens: [UInt16],
