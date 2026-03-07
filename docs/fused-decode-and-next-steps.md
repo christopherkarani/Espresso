@@ -1018,3 +1018,139 @@ Decision:
   - reuse one read lock and stream chunked reads if another small gain remains
   - or move token selection further toward minimal-return / on-device selection
 - Recurrent multi-layer fusion still matters, but it is no longer the automatic next step after the fused head.
+
+## Recurrent Multi-Layer Fusion Follow-up (March 7, 2026)
+
+Goal:
+- Push the recurrent direct-select path from the reduced-readback breakthrough (`~2.45-2.47 ms/token`) to a real `3x`-over-CoreML result by removing more recurrent eval boundaries.
+
+### Fused Two-Layer Recurrent Step
+
+Implementation:
+- Added:
+  - `RWKVStyleFusedTwoLayerStepGenerator`
+  - `RWKVStyleFusedTwoLayerKernelSet`
+  - `RWKVStyleFusedTwoLayerSession`
+- Extended `ANERecurrentGenerationModel` with `RecurrentGenerationTrunkBackend` and a `.fusedTwoLayerPairs` mode.
+- Kept the output-head breakthrough intact:
+  - fused ANE `RMSNorm + classifier`
+  - direct surface argmax / direct token selection
+
+Correctness:
+- New generator and kernel compile-spec tests pass.
+- Hardware parity test confirms fused-pair direct-select emits the same echo tokens as the single-layer-stack recurrent control.
+
+Hardware compare:
+- Fused-pair runs were noisy in absolute terms but directionally consistent.
+- Observed direct-select compare runs:
+  - single-layer recurrent control `6.0231 ms/token` vs fused-pair `3.7812 ms/token`
+  - single-layer recurrent control `3.4296 ms/token` vs fused-pair `2.3074 ms/token`
+  - single-layer recurrent control `4.5684 ms/token` vs fused-pair `2.5795 ms/token`
+
+Interpretation:
+- The absolute harness is still noisy enough that single-run claims would be dishonest.
+- The direction is clear: fused recurrent pairs materially reduce both trunk time and end-to-end token latency.
+- This passed the material-gain gate and justified one more bounded push.
+
+### Smaller Trunk Lane Widths
+
+Hypothesis:
+- The recurrent trunk still runs lane-packed surfaces with `laneSpatial=32` while only lane `0` carries live token data, so reducing trunk lane width might recover the remaining `~0.11-0.39 ms/token`.
+
+Result:
+- The lane-32 fused-pair baseline still ran in the sweep harness:
+  - `2.530901 ms/token`
+  - `395.14 tok/s`
+- The first smaller trunk lane width immediately hit:
+  - `statusType=0x9`
+
+Decision:
+- Treat smaller recurrent trunk lane widths as structurally blocked for this MIL shape/runtime.
+- Do not spend more time on trunk lane packing reduction unless the graph changes materially.
+
+### Fused Three-Layer Recurrent Step
+
+Implementation:
+- Added:
+  - `RWKVStyleFusedThreeLayerStepGenerator`
+  - `RWKVStyleFusedThreeLayerKernelSet`
+  - `RWKVStyleFusedThreeLayerSession`
+- Extended `ANERecurrentGenerationModel` with `.fusedThreeLayerTriplets`.
+- For a `6`-layer recurrent trunk, this reduces the direct-select recurrent hot path to `2` fused evals instead of `3`.
+
+Correctness:
+- New generator and kernel compile-spec tests pass.
+- Non-hardware validation rejects non-multiples of `3`.
+- Hardware parity test confirms fused-triplet direct-select matches fused-pair direct-select token outputs.
+
+Hardware compare:
+- Fused pair direct-select:
+  - `2.640195 ms/token`
+  - `378.76 tok/s`
+  - compile `523.39 ms`
+  - trunk `1.447555 ms/token`
+  - logits `1.140951 ms/token`
+- Fused triplet direct-select:
+  - `2.211750 ms/token`
+  - `452.13 tok/s`
+  - compile `560.54 ms`
+  - trunk `1.139904 ms/token`
+  - logits `1.090958 ms/token`
+
+Replication:
+- second run:
+  - fused pair `2.474672 ms/token`
+  - fused triplet `2.211995 ms/token`
+- a noisier third run still preserved direction:
+  - fused pair `3.316388 ms/token`
+  - fused triplet `2.468479 ms/token`
+
+Interpretation:
+- Fused triplets are the best recurrent result on this branch so far.
+- The strongest repeated fused-triplet runs are clustered around:
+  - `2.212 ms/token`
+  - `~452 tok/s`
+- Against the standing CoreML generation baseline (`6.582224 ms/token`, `151.93 tok/s`), that is about:
+  - `2.98x` faster
+- This is an honest near-`3x` result, but not a stable `>=3x` claim yet.
+
+### Output-Head Lane Width Follow-up on Fused Triplets
+
+Hypothesis:
+- After triplet fusion, the remaining gap to `3x` is tiny enough that a smaller fused ANE output-head lane width might close it.
+
+Result:
+- Baseline fused-triplet direct-select with output-head lane `32` in the sweep harness:
+  - `2.204732 ms/token`
+  - `453.57 tok/s`
+  - compile `614.12 ms`
+  - trunk `1.159018 ms/token`
+  - logits `1.051698 ms/token`
+- Smaller fused output-head lane widths were all unsupported on hardware:
+  - lane `16`: ANE fused output-head eval failed
+  - lane `8`: ANE fused output-head eval failed
+  - lane `1`: ANE fused output-head eval failed
+
+Decision:
+- Keep output-head lane width at `32`.
+- Treat smaller fused output-head lanes as blocked for this graph/runtime.
+
+### Current Honest Status
+
+- Best branch result:
+  - fused-triplet recurrent direct-select around `2.205-2.212 ms/token`
+  - `~452-454 tok/s`
+- Relative to CoreML generation baseline:
+  - roughly `2.98x-2.99x`
+- Relative to the older direct transformer generation harness (`6.558745 ms/token`):
+  - roughly `2.97x`
+
+Conclusion:
+- Multi-layer recurrent fusion is the first path on this branch that gets genuinely close to a `3x` ANE-over-CoreML generation result.
+- The remaining gap is now small enough that further work would be micro-optimization territory, not another large architectural unlock.
+- The bounded micro-paths tested after triplet fusion were both blocked:
+  - smaller recurrent trunk lane widths -> `statusType=0x9`
+  - smaller fused output-head lane widths -> ANE eval failure / `statusType=0x9`
+- So the honest call is:
+  - this branch reached an optimized near-`3x` state
+  - but did not produce a stable, repeatable `>=3x` claim on the current benchmark harness

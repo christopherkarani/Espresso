@@ -1,5 +1,44 @@
 import XCTest
+import ANETypes
 @testable import Espresso
+
+private func fillGenerationTestBuffer(_ buffer: borrowing TensorBuffer, value: Float) {
+    buffer.withUnsafeMutableBufferPointer { ptr in
+        for idx in ptr.indices {
+            ptr[idx] = value
+        }
+    }
+}
+
+private func makeGenerationTestRecurrentWeights(layerCount: Int) -> RecurrentGenerationWeights {
+    let layers = LayerStorage<RWKVStyleRecurrentWeights>(count: layerCount) { _ in
+        let weights = RWKVStyleRecurrentWeights()
+        fillGenerationTestBuffer(weights.rms, value: 1)
+        fillGenerationTestBuffer(weights.Wx, value: 0)
+        fillGenerationTestBuffer(weights.Ws, value: 0)
+        fillGenerationTestBuffer(weights.Wd, value: 0)
+        fillGenerationTestBuffer(weights.Wo, value: 0)
+        return weights
+    }
+
+    let rmsFinal = TensorBuffer(count: ModelConfig.dim, zeroed: false)
+    fillGenerationTestBuffer(rmsFinal, value: 1)
+
+    let embedding = TensorBuffer(count: ModelConfig.vocab * ModelConfig.dim, zeroed: true)
+    embedding.withUnsafeMutablePointer { ptr in
+        for dimIdx in 0..<ModelConfig.dim {
+            ptr[dimIdx] = 1
+        }
+    }
+
+    return RecurrentGenerationWeights(
+        layers: layers,
+        rmsFinal: rmsFinal,
+        embedding: embedding,
+        classifier: TensorBuffer(count: 0, zeroed: true),
+        sharedClassifier: true
+    )
+}
 
 private struct FakeVerifyResponse: Equatable {
     let sequenceTokens: [UInt16]
@@ -237,5 +276,84 @@ final class GenerationHarnessTests: XCTestCase {
         XCTAssertEqual(harness.model.decodeCalls, [1, 0])
         XCTAssertTrue(harness.model.prefillSelectedCalls.isEmpty)
         XCTAssertTrue(harness.model.decodeSelectedCalls.isEmpty)
+    }
+
+    func test_recurrent_generation_rejects_odd_layer_count_for_fused_pair_backend() {
+        let weights = makeGenerationTestRecurrentWeights(layerCount: 3)
+
+        do {
+            _ = try ANERecurrentGenerationModel(
+                weights: weights,
+                layerCount: 3,
+                maxSequenceTokens: 32,
+                outputHeadBackend: .cpu,
+                trunkBackend: .fusedTwoLayerPairs
+            )
+            XCTFail("Expected odd fused-pair layer count to throw")
+        } catch {
+            XCTAssertEqual(error, .invalidArguments("fused recurrent trunk backend requires an even layerCount"))
+        }
+    }
+
+    func test_recurrent_generation_rejects_non_positive_trunk_lane_spatial() {
+        let weights = makeGenerationTestRecurrentWeights(layerCount: 2)
+
+        do {
+            _ = try ANERecurrentGenerationModel(
+                weights: weights,
+                layerCount: 2,
+                maxSequenceTokens: 32,
+                outputHeadBackend: .cpu,
+                trunkBackend: .fusedTwoLayerPairs,
+                trunkLaneSpatial: 0
+            )
+            XCTFail("Expected non-positive trunk laneSpatial to throw")
+        } catch {
+            XCTAssertEqual(
+                error,
+                .invalidArguments("recurrent trunk laneSpatial must be > 0")
+            )
+        }
+    }
+
+    func test_recurrent_generation_rejects_non_multiple_of_three_for_fused_triplet_backend() {
+        let weights = makeGenerationTestRecurrentWeights(layerCount: 5)
+
+        do {
+            _ = try ANERecurrentGenerationModel(
+                weights: weights,
+                layerCount: 5,
+                maxSequenceTokens: 32,
+                outputHeadBackend: .cpu,
+                trunkBackend: .fusedThreeLayerTriplets
+            )
+            XCTFail("Expected non-multiple-of-three fused-triplet layer count to throw")
+        } catch {
+            XCTAssertEqual(
+                error,
+                .invalidArguments("fused three-layer recurrent trunk backend requires a layerCount that is a multiple of 3")
+            )
+        }
+    }
+
+    func test_recurrent_generation_rejects_non_positive_output_head_lane_spatial() {
+        let weights = makeGenerationTestRecurrentWeights(layerCount: 3)
+
+        do {
+            _ = try ANERecurrentGenerationModel(
+                weights: weights,
+                layerCount: 3,
+                maxSequenceTokens: 32,
+                outputHeadBackend: .aneRMSNormClassifier,
+                trunkBackend: .fusedThreeLayerTriplets,
+                outputHeadLaneSpatial: 0
+            )
+            XCTFail("Expected non-positive output-head laneSpatial to throw")
+        } catch {
+            XCTAssertEqual(
+                error,
+                .invalidArguments("generation output-head laneSpatial must be > 0")
+            )
+        }
     }
 }

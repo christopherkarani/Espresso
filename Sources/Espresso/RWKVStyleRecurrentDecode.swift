@@ -16,6 +16,19 @@ public struct RWKVStyleRecurrentScalingReport: Sendable {
     public let skippedTransformerContexts: [Int]
 }
 
+@inline(__always)
+private func makeRWKVZeroLaneSurface(laneSpatial: Int) throws(ANEError) -> IOSurfaceRef {
+    guard let zeroLane = ane_interop_create_surface(ModelConfig.dim * laneSpatial * 2) else {
+        throw .surfaceAllocationFailed
+    }
+
+    let zeroValues = Array(repeating: Float(0), count: ModelConfig.dim * laneSpatial)
+    zeroValues.withUnsafeBufferPointer { src in
+        SurfaceIO.writeFP16(to: zeroLane, data: src, channels: ModelConfig.dim, spatial: laneSpatial)
+    }
+    return zeroLane
+}
+
 public struct RWKVStyleRecurrentSurfaceHandles {
     public let xIn: IOSurfaceRef
     public let stateIn: IOSurfaceRef
@@ -30,16 +43,7 @@ public struct RWKVStyleRecurrentSurfaceHandles {
         self.xOut = try kernels.step.outputSurface(at: 0)
         self.stateOut = try kernels.step.outputSurface(at: 1)
         self.laneSpatial = kernels.laneSpatial
-
-        guard let zeroLane = ane_interop_create_surface(ModelConfig.dim * kernels.laneSpatial * 2) else {
-            throw .surfaceAllocationFailed
-        }
-        self.zeroLane = zeroLane
-
-        let zeroValues = Array(repeating: Float(0), count: ModelConfig.dim * kernels.laneSpatial)
-        zeroValues.withUnsafeBufferPointer { src in
-            SurfaceIO.writeFP16(to: zeroLane, data: src, channels: ModelConfig.dim, spatial: kernels.laneSpatial)
-        }
+        self.zeroLane = try makeRWKVZeroLaneSurface(laneSpatial: kernels.laneSpatial)
     }
 }
 
@@ -146,6 +150,332 @@ public struct RWKVStyleRecurrentSession: ~Copyable {
             }
         } catch {
             throw .invalidArguments("recurrent output readback failed: \(error)")
+        }
+        timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
+        self.stepCount += 1
+    }
+}
+
+public struct RWKVStyleFusedTwoLayerSurfaceHandles {
+    public let xIn: IOSurfaceRef
+    public let stateIn0: IOSurfaceRef
+    public let stateIn1: IOSurfaceRef
+    public let xOut: IOSurfaceRef
+    public let stateOut0: IOSurfaceRef
+    public let stateOut1: IOSurfaceRef
+    public let zeroLane: IOSurfaceRef
+    public let laneSpatial: Int
+
+    public init(kernels: borrowing RWKVStyleFusedTwoLayerKernelSet) throws(ANEError) {
+        self.xIn = try kernels.step.inputSurface(at: 0)
+        self.stateIn0 = try kernels.step.inputSurface(at: 1)
+        self.stateIn1 = try kernels.step.inputSurface(at: 2)
+        self.xOut = try kernels.step.outputSurface(at: 0)
+        self.stateOut0 = try kernels.step.outputSurface(at: 1)
+        self.stateOut1 = try kernels.step.outputSurface(at: 2)
+        self.laneSpatial = kernels.laneSpatial
+        self.zeroLane = try makeRWKVZeroLaneSurface(laneSpatial: kernels.laneSpatial)
+    }
+}
+
+public struct RWKVStyleFusedTwoLayerSession: ~Copyable {
+    public let kernels: RWKVStyleFusedTwoLayerKernelSet
+    public let handles: RWKVStyleFusedTwoLayerSurfaceHandles
+    public private(set) var stepCount: Int
+
+    public init(
+        weights0: borrowing RWKVStyleRecurrentWeights,
+        weights1: borrowing RWKVStyleRecurrentWeights,
+        laneSpatial: Int = RWKVStyleFusedTwoLayerKernelSet.defaultLaneSpatial
+    ) throws(ANEError) {
+        let kernels = try RWKVStyleFusedTwoLayerKernelSet(
+            weights0: weights0,
+            weights1: weights1,
+            laneSpatial: laneSpatial
+        )
+        let handles = try RWKVStyleFusedTwoLayerSurfaceHandles(kernels: kernels)
+        self.kernels = kernels
+        self.handles = handles
+        self.stepCount = 0
+    }
+
+    public mutating func reset() throws(ANEError) {
+        do {
+            try SurfaceIO.copyFP16(
+                dst: handles.xIn,
+                dstChannelOffset: 0,
+                src: handles.zeroLane,
+                srcChannelOffset: 0,
+                channels: ModelConfig.dim,
+                spatial: handles.laneSpatial
+            )
+            try SurfaceIO.copyFP16(
+                dst: handles.stateIn0,
+                dstChannelOffset: 0,
+                src: handles.zeroLane,
+                srcChannelOffset: 0,
+                channels: ModelConfig.dim,
+                spatial: handles.laneSpatial
+            )
+            try SurfaceIO.copyFP16(
+                dst: handles.stateIn1,
+                dstChannelOffset: 0,
+                src: handles.zeroLane,
+                srcChannelOffset: 0,
+                channels: ModelConfig.dim,
+                spatial: handles.laneSpatial
+            )
+        } catch {
+            throw .invalidArguments("fused recurrent zero reset failed: \(error)")
+        }
+        self.stepCount = 0
+    }
+
+    public mutating func step(
+        tokenInput: borrowing TensorBuffer,
+        output: borrowing TensorBuffer,
+        timings: inout StepTimingBreakdown
+    ) throws(ANEError) {
+        precondition(tokenInput.count == ModelConfig.dim)
+        precondition(output.count == ModelConfig.dim)
+
+        var t0 = RuntimeClock.now()
+        do {
+            try SurfaceIO.copyFP16(
+                dst: handles.xIn,
+                dstChannelOffset: 0,
+                src: handles.zeroLane,
+                srcChannelOffset: 0,
+                channels: ModelConfig.dim,
+                spatial: handles.laneSpatial
+            )
+            try tokenInput.withUnsafeBufferPointer { tokenBuf in
+                try SurfaceIO.writeFP16SpatialSlice(
+                    to: handles.xIn,
+                    channelOffset: 0,
+                    spatialIndex: 0,
+                    spatial: handles.laneSpatial,
+                    data: tokenBuf,
+                    channels: ModelConfig.dim
+                )
+            }
+        } catch {
+            throw .invalidArguments("fused recurrent input write failed: \(error)")
+        }
+        timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
+
+        t0 = RuntimeClock.now()
+        do {
+            try kernels.step.eval()
+        } catch {
+            throw .invalidArguments("fused recurrent step eval failed at step \(stepCount): \(error)")
+        }
+        timings.tAne += RuntimeClock.ms(RuntimeClock.now() - t0)
+
+        t0 = RuntimeClock.now()
+        do {
+            try SurfaceIO.copyFP16(
+                dst: handles.stateIn0,
+                dstChannelOffset: 0,
+                src: handles.stateOut0,
+                srcChannelOffset: 0,
+                channels: ModelConfig.dim,
+                spatial: handles.laneSpatial
+            )
+            try SurfaceIO.copyFP16(
+                dst: handles.stateIn1,
+                dstChannelOffset: 0,
+                src: handles.stateOut1,
+                srcChannelOffset: 0,
+                channels: ModelConfig.dim,
+                spatial: handles.laneSpatial
+            )
+            try output.withUnsafeMutableBufferPointer { outBuf in
+                try SurfaceIO.readFP16SpatialSlice(
+                    from: handles.xOut,
+                    channelOffset: 0,
+                    spatialIndex: 0,
+                    spatial: handles.laneSpatial,
+                    into: outBuf,
+                    channels: ModelConfig.dim
+                )
+            }
+        } catch {
+            throw .invalidArguments("fused recurrent output readback failed: \(error)")
+        }
+        timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
+        self.stepCount += 1
+    }
+}
+
+public struct RWKVStyleFusedThreeLayerSurfaceHandles {
+    public let xIn: IOSurfaceRef
+    public let stateIn0: IOSurfaceRef
+    public let stateIn1: IOSurfaceRef
+    public let stateIn2: IOSurfaceRef
+    public let xOut: IOSurfaceRef
+    public let stateOut0: IOSurfaceRef
+    public let stateOut1: IOSurfaceRef
+    public let stateOut2: IOSurfaceRef
+    public let zeroLane: IOSurfaceRef
+    public let laneSpatial: Int
+
+    public init(kernels: borrowing RWKVStyleFusedThreeLayerKernelSet) throws(ANEError) {
+        self.xIn = try kernels.step.inputSurface(at: 0)
+        self.stateIn0 = try kernels.step.inputSurface(at: 1)
+        self.stateIn1 = try kernels.step.inputSurface(at: 2)
+        self.stateIn2 = try kernels.step.inputSurface(at: 3)
+        self.xOut = try kernels.step.outputSurface(at: 0)
+        self.stateOut0 = try kernels.step.outputSurface(at: 1)
+        self.stateOut1 = try kernels.step.outputSurface(at: 2)
+        self.stateOut2 = try kernels.step.outputSurface(at: 3)
+        self.laneSpatial = kernels.laneSpatial
+        self.zeroLane = try makeRWKVZeroLaneSurface(laneSpatial: kernels.laneSpatial)
+    }
+}
+
+public struct RWKVStyleFusedThreeLayerSession: ~Copyable {
+    public let kernels: RWKVStyleFusedThreeLayerKernelSet
+    public let handles: RWKVStyleFusedThreeLayerSurfaceHandles
+    public private(set) var stepCount: Int
+
+    public init(
+        weights0: borrowing RWKVStyleRecurrentWeights,
+        weights1: borrowing RWKVStyleRecurrentWeights,
+        weights2: borrowing RWKVStyleRecurrentWeights,
+        laneSpatial: Int = RWKVStyleFusedThreeLayerKernelSet.defaultLaneSpatial
+    ) throws(ANEError) {
+        let kernels = try RWKVStyleFusedThreeLayerKernelSet(
+            weights0: weights0,
+            weights1: weights1,
+            weights2: weights2,
+            laneSpatial: laneSpatial
+        )
+        let handles = try RWKVStyleFusedThreeLayerSurfaceHandles(kernels: kernels)
+        self.kernels = kernels
+        self.handles = handles
+        self.stepCount = 0
+    }
+
+    public mutating func reset() throws(ANEError) {
+        do {
+            try SurfaceIO.copyFP16(
+                dst: handles.xIn,
+                dstChannelOffset: 0,
+                src: handles.zeroLane,
+                srcChannelOffset: 0,
+                channels: ModelConfig.dim,
+                spatial: handles.laneSpatial
+            )
+            try SurfaceIO.copyFP16(
+                dst: handles.stateIn0,
+                dstChannelOffset: 0,
+                src: handles.zeroLane,
+                srcChannelOffset: 0,
+                channels: ModelConfig.dim,
+                spatial: handles.laneSpatial
+            )
+            try SurfaceIO.copyFP16(
+                dst: handles.stateIn1,
+                dstChannelOffset: 0,
+                src: handles.zeroLane,
+                srcChannelOffset: 0,
+                channels: ModelConfig.dim,
+                spatial: handles.laneSpatial
+            )
+            try SurfaceIO.copyFP16(
+                dst: handles.stateIn2,
+                dstChannelOffset: 0,
+                src: handles.zeroLane,
+                srcChannelOffset: 0,
+                channels: ModelConfig.dim,
+                spatial: handles.laneSpatial
+            )
+        } catch {
+            throw .invalidArguments("fused three-layer recurrent zero reset failed: \(error)")
+        }
+        self.stepCount = 0
+    }
+
+    public mutating func step(
+        tokenInput: borrowing TensorBuffer,
+        output: borrowing TensorBuffer,
+        timings: inout StepTimingBreakdown
+    ) throws(ANEError) {
+        precondition(tokenInput.count == ModelConfig.dim)
+        precondition(output.count == ModelConfig.dim)
+
+        var t0 = RuntimeClock.now()
+        do {
+            try SurfaceIO.copyFP16(
+                dst: handles.xIn,
+                dstChannelOffset: 0,
+                src: handles.zeroLane,
+                srcChannelOffset: 0,
+                channels: ModelConfig.dim,
+                spatial: handles.laneSpatial
+            )
+            try tokenInput.withUnsafeBufferPointer { tokenBuf in
+                try SurfaceIO.writeFP16SpatialSlice(
+                    to: handles.xIn,
+                    channelOffset: 0,
+                    spatialIndex: 0,
+                    spatial: handles.laneSpatial,
+                    data: tokenBuf,
+                    channels: ModelConfig.dim
+                )
+            }
+        } catch {
+            throw .invalidArguments("fused three-layer recurrent input write failed: \(error)")
+        }
+        timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
+
+        t0 = RuntimeClock.now()
+        do {
+            try kernels.step.eval()
+        } catch {
+            throw .invalidArguments("fused three-layer recurrent step eval failed at step \(stepCount): \(error)")
+        }
+        timings.tAne += RuntimeClock.ms(RuntimeClock.now() - t0)
+
+        t0 = RuntimeClock.now()
+        do {
+            try SurfaceIO.copyFP16(
+                dst: handles.stateIn0,
+                dstChannelOffset: 0,
+                src: handles.stateOut0,
+                srcChannelOffset: 0,
+                channels: ModelConfig.dim,
+                spatial: handles.laneSpatial
+            )
+            try SurfaceIO.copyFP16(
+                dst: handles.stateIn1,
+                dstChannelOffset: 0,
+                src: handles.stateOut1,
+                srcChannelOffset: 0,
+                channels: ModelConfig.dim,
+                spatial: handles.laneSpatial
+            )
+            try SurfaceIO.copyFP16(
+                dst: handles.stateIn2,
+                dstChannelOffset: 0,
+                src: handles.stateOut2,
+                srcChannelOffset: 0,
+                channels: ModelConfig.dim,
+                spatial: handles.laneSpatial
+            )
+            try output.withUnsafeMutableBufferPointer { outBuf in
+                try SurfaceIO.readFP16SpatialSlice(
+                    from: handles.xOut,
+                    channelOffset: 0,
+                    spatialIndex: 0,
+                    spatial: handles.laneSpatial,
+                    into: outBuf,
+                    channels: ModelConfig.dim
+                )
+            }
+        } catch {
+            throw .invalidArguments("fused three-layer recurrent output readback failed: \(error)")
         }
         timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
         self.stepCount += 1

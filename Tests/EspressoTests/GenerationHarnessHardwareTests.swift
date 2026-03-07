@@ -791,6 +791,302 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         XCTAssertGreaterThan(directSelect.compileTimeMs, 0)
     }
 
+    func test_recurrent_generation_fused_pair_direct_select_reports_comparison_on_hardware() throws {
+        try requireGenerationHardware()
+
+        let prompt: [UInt16] = [0]
+        let warmup = 3
+        let iterations = 20
+        let maxNewTokens = 8
+
+        let parityWeights = makeEchoRecurrentGenerationWeights(layerCount: 6)
+        let singleModel = try ANERecurrentGenerationModel(
+            weights: parityWeights,
+            layerCount: 6,
+            maxSequenceTokens: 32,
+            outputHeadBackend: .aneRMSNormClassifier,
+            trunkBackend: .singleLayer
+        )
+        let fusedModel = try ANERecurrentGenerationModel(
+            weights: parityWeights,
+            layerCount: 6,
+            maxSequenceTokens: 32,
+            outputHeadBackend: .aneRMSNormClassifier,
+            trunkBackend: .fusedTwoLayerPairs
+        )
+        var singleHarness = DirectTokenSelectionGenerationHarness(
+            model: singleModel,
+            strategy: .argmax
+        )
+        var fusedHarness = DirectTokenSelectionGenerationHarness(
+            model: fusedModel,
+            strategy: .argmax
+        )
+        let singleTrace = try singleHarness.generate(
+            promptTokens: prompt,
+            maxNewTokens: maxNewTokens
+        )
+        let fusedTrace = try fusedHarness.generate(
+            promptTokens: prompt,
+            maxNewTokens: maxNewTokens
+        )
+        XCTAssertEqual(fusedTrace.generatedTokens, singleTrace.generatedTokens)
+
+        let single = try benchmarkRecurrentEchoGeneration(
+            layerCount: 6,
+            promptTokens: prompt,
+            maxNewTokens: maxNewTokens,
+            warmup: warmup,
+            iterations: iterations,
+            outputHeadBackend: .aneRMSNormClassifier,
+            useDirectTokenSelection: true,
+            trunkBackend: .singleLayer
+        )
+        let fused = try benchmarkRecurrentEchoGeneration(
+            layerCount: 6,
+            promptTokens: prompt,
+            maxNewTokens: maxNewTokens,
+            warmup: warmup,
+            iterations: iterations,
+            outputHeadBackend: .aneRMSNormClassifier,
+            useDirectTokenSelection: true,
+            trunkBackend: .fusedTwoLayerPairs
+        )
+
+        print(
+            """
+            recurrent generation single-layer direct-select median=\(single.medianTokenMs) ms/token tps=\(single.medianTokensPerSecond) compile=\(single.compileTimeMs) trunk=\(single.medianTrunkMsPerToken) logits=\(single.medianLogitsMsPerToken)
+            recurrent generation fused-pair direct-select median=\(fused.medianTokenMs) ms/token tps=\(fused.medianTokensPerSecond) compile=\(fused.compileTimeMs) trunk=\(fused.medianTrunkMsPerToken) logits=\(fused.medianLogitsMsPerToken)
+            """
+        )
+
+        XCTAssertGreaterThan(single.medianTokenMs, 0)
+        XCTAssertGreaterThan(fused.medianTokenMs, 0)
+        XCTAssertGreaterThan(single.compileTimeMs, 0)
+        XCTAssertGreaterThan(fused.compileTimeMs, 0)
+    }
+
+    func test_recurrent_generation_fused_pair_direct_select_trunk_lane_spatial_sweep_on_hardware() throws {
+        try requireGenerationHardware()
+
+        let prompt: [UInt16] = [0]
+        let warmup = 3
+        let iterations = 20
+        let maxNewTokens = 8
+        let laneCandidates = [32, 16, 8, 1]
+
+        let referenceWeights = makeEchoRecurrentGenerationWeights(layerCount: 6)
+        let referenceModel = try ANERecurrentGenerationModel(
+            weights: referenceWeights,
+            layerCount: 6,
+            maxSequenceTokens: 32,
+            outputHeadBackend: .aneRMSNormClassifier,
+            trunkBackend: .fusedTwoLayerPairs,
+            trunkLaneSpatial: 32
+        )
+        var referenceHarness = DirectTokenSelectionGenerationHarness(
+            model: referenceModel,
+            strategy: .argmax
+        )
+        let referenceTrace = try referenceHarness.generate(
+            promptTokens: prompt,
+            maxNewTokens: maxNewTokens
+        )
+
+        for laneSpatial in laneCandidates {
+            do {
+                let parityWeights = makeEchoRecurrentGenerationWeights(layerCount: 6)
+                let candidateModel = try ANERecurrentGenerationModel(
+                    weights: parityWeights,
+                    layerCount: 6,
+                    maxSequenceTokens: 32,
+                    outputHeadBackend: .aneRMSNormClassifier,
+                    trunkBackend: .fusedTwoLayerPairs,
+                    trunkLaneSpatial: laneSpatial
+                )
+                var candidateHarness = DirectTokenSelectionGenerationHarness(
+                    model: candidateModel,
+                    strategy: .argmax
+                )
+                let candidateTrace = try candidateHarness.generate(
+                    promptTokens: prompt,
+                    maxNewTokens: maxNewTokens
+                )
+                XCTAssertEqual(candidateTrace.generatedTokens, referenceTrace.generatedTokens)
+
+                let sample = try benchmarkRecurrentEchoGeneration(
+                    layerCount: 6,
+                    promptTokens: prompt,
+                    maxNewTokens: maxNewTokens,
+                    warmup: warmup,
+                    iterations: iterations,
+                    outputHeadBackend: .aneRMSNormClassifier,
+                    useDirectTokenSelection: true,
+                    trunkBackend: .fusedTwoLayerPairs,
+                    trunkLaneSpatial: laneSpatial
+                )
+                print(
+                    "recurrent generation fused-pair direct-select lane=\(laneSpatial) median=\(sample.medianTokenMs) ms/token tps=\(sample.medianTokensPerSecond) compile=\(sample.compileTimeMs) trunk=\(sample.medianTrunkMsPerToken) logits=\(sample.medianLogitsMsPerToken)"
+                )
+                XCTAssertGreaterThan(sample.medianTokenMs, 0)
+                XCTAssertGreaterThan(sample.compileTimeMs, 0)
+            } catch {
+                if laneSpatial == 32 {
+                    throw error
+                }
+                print("recurrent generation fused-pair direct-select lane=\(laneSpatial) unsupported: \(error)")
+            }
+        }
+    }
+
+    func test_recurrent_generation_fused_triplet_direct_select_reports_comparison_on_hardware() throws {
+        try requireGenerationHardware()
+
+        let prompt: [UInt16] = [0]
+        let warmup = 3
+        let iterations = 20
+        let maxNewTokens = 8
+
+        let parityWeights = makeEchoRecurrentGenerationWeights(layerCount: 6)
+        let pairModel = try ANERecurrentGenerationModel(
+            weights: parityWeights,
+            layerCount: 6,
+            maxSequenceTokens: 32,
+            outputHeadBackend: .aneRMSNormClassifier,
+            trunkBackend: .fusedTwoLayerPairs
+        )
+        let tripletModel = try ANERecurrentGenerationModel(
+            weights: parityWeights,
+            layerCount: 6,
+            maxSequenceTokens: 32,
+            outputHeadBackend: .aneRMSNormClassifier,
+            trunkBackend: .fusedThreeLayerTriplets
+        )
+        var pairHarness = DirectTokenSelectionGenerationHarness(
+            model: pairModel,
+            strategy: .argmax
+        )
+        var tripletHarness = DirectTokenSelectionGenerationHarness(
+            model: tripletModel,
+            strategy: .argmax
+        )
+        let pairTrace = try pairHarness.generate(
+            promptTokens: prompt,
+            maxNewTokens: maxNewTokens
+        )
+        let tripletTrace = try tripletHarness.generate(
+            promptTokens: prompt,
+            maxNewTokens: maxNewTokens
+        )
+        XCTAssertEqual(tripletTrace.generatedTokens, pairTrace.generatedTokens)
+
+        let pair = try benchmarkRecurrentEchoGeneration(
+            layerCount: 6,
+            promptTokens: prompt,
+            maxNewTokens: maxNewTokens,
+            warmup: warmup,
+            iterations: iterations,
+            outputHeadBackend: .aneRMSNormClassifier,
+            useDirectTokenSelection: true,
+            trunkBackend: .fusedTwoLayerPairs
+        )
+        let triplet = try benchmarkRecurrentEchoGeneration(
+            layerCount: 6,
+            promptTokens: prompt,
+            maxNewTokens: maxNewTokens,
+            warmup: warmup,
+            iterations: iterations,
+            outputHeadBackend: .aneRMSNormClassifier,
+            useDirectTokenSelection: true,
+            trunkBackend: .fusedThreeLayerTriplets
+        )
+
+        print(
+            """
+            recurrent generation fused-pair direct-select median=\(pair.medianTokenMs) ms/token tps=\(pair.medianTokensPerSecond) compile=\(pair.compileTimeMs) trunk=\(pair.medianTrunkMsPerToken) logits=\(pair.medianLogitsMsPerToken)
+            recurrent generation fused-triplet direct-select median=\(triplet.medianTokenMs) ms/token tps=\(triplet.medianTokensPerSecond) compile=\(triplet.compileTimeMs) trunk=\(triplet.medianTrunkMsPerToken) logits=\(triplet.medianLogitsMsPerToken)
+            """
+        )
+
+        XCTAssertGreaterThan(pair.medianTokenMs, 0)
+        XCTAssertGreaterThan(triplet.medianTokenMs, 0)
+        XCTAssertGreaterThan(pair.compileTimeMs, 0)
+        XCTAssertGreaterThan(triplet.compileTimeMs, 0)
+    }
+
+    func test_recurrent_generation_fused_triplet_direct_select_output_head_lane_sweep_on_hardware() throws {
+        try requireGenerationHardware()
+
+        let prompt: [UInt16] = [0]
+        let warmup = 3
+        let iterations = 20
+        let maxNewTokens = 8
+        let headLaneCandidates = [32, 16, 8, 1]
+
+        let referenceWeights = makeEchoRecurrentGenerationWeights(layerCount: 6)
+        let referenceModel = try ANERecurrentGenerationModel(
+            weights: referenceWeights,
+            layerCount: 6,
+            maxSequenceTokens: 32,
+            outputHeadBackend: .aneRMSNormClassifier,
+            trunkBackend: .fusedThreeLayerTriplets,
+            outputHeadLaneSpatial: 32
+        )
+        var referenceHarness = DirectTokenSelectionGenerationHarness(
+            model: referenceModel,
+            strategy: .argmax
+        )
+        let referenceTrace = try referenceHarness.generate(
+            promptTokens: prompt,
+            maxNewTokens: maxNewTokens
+        )
+
+        for outputHeadLaneSpatial in headLaneCandidates {
+            do {
+                let parityWeights = makeEchoRecurrentGenerationWeights(layerCount: 6)
+                let candidateModel = try ANERecurrentGenerationModel(
+                    weights: parityWeights,
+                    layerCount: 6,
+                    maxSequenceTokens: 32,
+                    outputHeadBackend: .aneRMSNormClassifier,
+                    trunkBackend: .fusedThreeLayerTriplets,
+                    outputHeadLaneSpatial: outputHeadLaneSpatial
+                )
+                var candidateHarness = DirectTokenSelectionGenerationHarness(
+                    model: candidateModel,
+                    strategy: .argmax
+                )
+                let candidateTrace = try candidateHarness.generate(
+                    promptTokens: prompt,
+                    maxNewTokens: maxNewTokens
+                )
+                XCTAssertEqual(candidateTrace.generatedTokens, referenceTrace.generatedTokens)
+
+                let sample = try benchmarkRecurrentEchoGeneration(
+                    layerCount: 6,
+                    promptTokens: prompt,
+                    maxNewTokens: maxNewTokens,
+                    warmup: warmup,
+                    iterations: iterations,
+                    outputHeadBackend: .aneRMSNormClassifier,
+                    useDirectTokenSelection: true,
+                    trunkBackend: .fusedThreeLayerTriplets,
+                    outputHeadLaneSpatial: outputHeadLaneSpatial
+                )
+                print(
+                    "recurrent generation fused-triplet direct-select output-head-lane=\(outputHeadLaneSpatial) median=\(sample.medianTokenMs) ms/token tps=\(sample.medianTokensPerSecond) compile=\(sample.compileTimeMs) trunk=\(sample.medianTrunkMsPerToken) logits=\(sample.medianLogitsMsPerToken)"
+                )
+                XCTAssertGreaterThan(sample.medianTokenMs, 0)
+                XCTAssertGreaterThan(sample.compileTimeMs, 0)
+            } catch {
+                if outputHeadLaneSpatial == 32 {
+                    throw error
+                }
+                print("recurrent generation fused-triplet direct-select output-head-lane=\(outputHeadLaneSpatial) unsupported: \(error)")
+            }
+        }
+    }
+
     private func benchmarkDirectEchoGeneration(
         layerCount: Int,
         promptTokens: [UInt16],
@@ -868,14 +1164,20 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         warmup: Int,
         iterations: Int,
         outputHeadBackend: GenerationOutputHeadBackend = .cpu,
-        useDirectTokenSelection: Bool = false
+        useDirectTokenSelection: Bool = false,
+        trunkBackend: RecurrentGenerationTrunkBackend = .singleLayer,
+        trunkLaneSpatial: Int = 32,
+        outputHeadLaneSpatial: Int = 32
     ) throws -> GenerationBenchmarkSample {
         let weights = makeEchoRecurrentGenerationWeights(layerCount: layerCount)
         let model = try ANERecurrentGenerationModel(
             weights: weights,
             layerCount: layerCount,
             maxSequenceTokens: 32,
-            outputHeadBackend: outputHeadBackend
+            outputHeadBackend: outputHeadBackend,
+            trunkBackend: trunkBackend,
+            trunkLaneSpatial: trunkLaneSpatial,
+            outputHeadLaneSpatial: outputHeadLaneSpatial
         )
         if useDirectTokenSelection {
             var harness = DirectTokenSelectionGenerationHarness(model: model, strategy: .argmax)

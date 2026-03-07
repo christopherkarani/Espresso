@@ -1,110 +1,119 @@
-# ANE Reduced-Readback Argmax Gate (2026-03-07)
+# ANE 3x Gate — Fused Recurrent Pair Experiment (2026-03-07)
 
 ## Plan
-- [x] Re-read the current fused output-head findings, lessons, and generation harness before continuing.
-- [x] State the breakthrough hypothesis up front:
-  - [x] The fused ANE `RMSNorm + classifier` head is now good enough that full-vocab logits materialization and host-side token selection are a plausible next limiter.
-  - [x] A host-side direct scan of the ANE output IOSurface can test the reduced-readback idea without depending on unsupported MIL `argmax` / `topk`.
+- [x] Re-read the latest recurrent-generation findings, the reduced-readback breakthrough, and the current recurrent runtime/generation seams before choosing the next path.
+- [x] Record the last stable control and the 3x target:
+  - [x] last CoreML generation baseline: `6.582224 ms/token`, `151.93 tok/s`
+  - [x] current best ANE path: recurrent `6` layers + fused ANE RMSNorm/classifier head + direct surface argmax
+    - [x] replicated at `2.467362 ms/token`, `405.29 tok/s`
+    - [x] replication runs also observed `2.454737` and `2.451047 ms/token`
+  - [x] `3x` target: `<= 2.194075 ms/token` or `>= 455.80 tok/s`
+  - [x] remaining gap from the stable control: about `0.273287 ms/token` or `50.51 tok/s`
+- [x] Record the abandoned micro-paths so they do not distract this branch:
+  - [x] output-head one-time-zero initialization was directionally positive but non-material
+  - [x] recurrent per-step `xIn` zero-elision regressed or destabilized the direct-select path and is abandoned
+- [x] State the new breakthrough hypothesis up front:
+  - [x] the next credible way to close the remaining `3x` gap is to cut recurrent dispatch count and recurrent surface traffic in the trunk, not to do more tiny head-side cleanup
+  - [x] fusing two recurrent layers into one ANE eval should remove three recurrent eval boundaries from the current `6`-layer path and reduce per-token host-side copy/scheduling overhead enough to produce a material end-to-end gain
 - [x] State the decisive metric and stop condition up front:
-  - [x] Current recurrent `6`-layer fused ANE head baseline: `3.564776 ms/token`, `280.54 tok/s`, head `0.936549 ms/token`
-  - [x] To clear the old `>=2x`-over-direct-transformer gate (`6.558745 ms/token`), recurrent generation still needs to get under `3.279373 ms/token`
-  - [x] This follow-up should save a clearly material chunk over the current fused head:
-    - [x] target: about `>=0.15-0.20 ms/token` end-to-end, or
-    - [x] enough head-bucket reduction to justify a second reduced-readback step
-  - [x] Stop quickly if:
-    - [x] direct surface argmax is not measurably better than materialized logits
-    - [x] correctness diverges from the existing argmax path
-    - [x] interop/surface changes become larger than a bounded helper
-- [x] Record the current baselines before implementation:
-  - [x] direct transformer generation, `6` layers: `6.558745 ms/token`, `152.47 tok/s`
-  - [x] recurrent generation, `6` layers, fused ANE head: `3.564776 ms/token`, `280.54 tok/s`, compile `612.15 ms`, trunk `2.615005`, head `0.936549`
+  - [x] decisive metric: end-to-end recurrent `6`-layer direct-select generation median `ms/token`
+  - [x] material-gain gate for this avenue: `>= 0.20 ms/token` improvement over the current best direct-select recurrent control
+  - [x] success gate for the branch milestone: `<= 2.194075 ms/token` or `>= 455.80 tok/s`
+  - [x] stop quickly if:
+    - [x] fused-pair MIL compile hits `InvalidMILProgram`, `statusType=0x9`, or similar structural failure
+    - [x] compile time balloons without a realistic path to recover the remaining `3x` gap
+    - [x] parity is wrong, or end-to-end savings are below the material gate
 - [x] Rewrite the work around the next honest probe:
-  - [x] keep the existing fused ANE head exactly as the compute control
-  - [x] add a host-side argmax path that scans the output surface directly
-  - [x] keep the old logits-materializing path as the control inside the same benchmark
-  - [x] limit the optimization to `TokenSelectionStrategy.argmax`
-- [x] Add failing tests first:
-  - [x] `SurfaceIO` / output-head test for direct FP16-slice argmax parity vs materialized logits argmax
-  - [x] generation harness test proving the fast-selection path preserves token outputs
-  - [x] hardware benchmark comparing:
-    - [x] fused ANE head with materialized logits
-    - [x] fused ANE head with direct surface argmax
-- [x] Implement the bounded reduced-readback path:
-  - [x] add a small interop/helper that scans an FP16 IOSurface spatial slice for argmax
-  - [x] expose it through `SurfaceIO`
-  - [x] add output-head helpers that can return a selected token without materializing full logits
-  - [x] add generation-model fast paths for argmax selection while preserving the old logits API
-- [x] Integrate with generation:
-  - [x] keep `AutoregressiveLanguageModel` compatibility for existing callers
-  - [x] add an explicit direct-selection harness so the benchmark can compare both paths honestly
-  - [x] keep speculative verify on logits arrays; do not widen this experiment
-- [x] Benchmark in order:
-  - [x] recurrent `6`-layer fused ANE head with materialized logits control
-  - [x] recurrent `6`-layer fused ANE head with direct surface argmax
+  - [x] keep the current recurrent `6`-layer + fused ANE head + direct-select path as the control
+  - [x] add a fused two-layer recurrent step generator and runtime
+  - [x] integrate it into generation with the smallest write set possible, preserving the current direct-select output-head path
+  - [x] benchmark `6` logical recurrent layers as three fused-pair steps against the existing six single-layer steps
+- [x] Re-benchmark the current best control before the new fused-pair benchmark:
+  - [x] recurrent `6`-layer direct-select fused-head generation control
+- [ ] Add failing tests first:
+  - [x] MIL generator contract tests for a fused two-layer recurrent step:
+    - [x] three inputs / three outputs
+    - [x] byte-size contracts
+    - [x] both layers' weight blobs are present
+    - [x] op subset stays within the proven recurrent pattern
+  - [x] ANERuntime compile-spec test for the fused two-layer kernel set:
+    - [x] exactly one fused kernel spec
+    - [x] expected weight blob names for both layers
+    - [x] correct input/output sizes
+  - [x] generation-model test coverage for the fused backend:
+    - [x] a fused-pair recurrent model preserves the same deterministic echo-token behavior as the existing single-layer-stack model
+    - [x] direct token selection still matches the materialized logits path
+  - [x] hardware test coverage:
+    - [x] token-parity check between single-layer-stack recurrent generation and fused-pair recurrent generation
+    - [x] benchmark compare between the two paths using the current fused-head direct-select harness
+- [x] Implement the fused recurrent pair path:
+  - [x] `Sources/MILGenerator/RWKVStyleFusedTwoLayerStepGenerator.swift`
+  - [x] `Sources/ANERuntime/RWKVStyleFusedTwoLayerKernelSet.swift`
+  - [x] fused-pair surface handles / session runtime in `Sources/Espresso/RWKVStyleRecurrentDecode.swift`
+  - [x] generation integration with the smallest stable API seam:
+    - [x] backend seam inside `ANERecurrentGenerationModel`
+  - [x] preserve the existing best path unchanged so the control remains available
+- [x] Verify in order:
+  - [x] focused non-hardware tests for MIL generator + kernel set + generation parity
+  - [x] `swift test`
+  - [x] targeted hardware parity test
+  - [x] targeted hardware benchmark compare against the current best recurrent control
 - [x] Report:
   - [x] `ms/token`
   - [x] `tok/s`
   - [x] compile time
   - [x] trunk time vs head time
-  - [x] delta vs the current fused-head baseline
-- [x] Apply the gate immediately after results:
-  - [x] continue because reduced readback saved far more than the material gate
-  - [x] do not move to recurrent multi-layer fusion yet; there is still credible head-side upside
+  - [x] remaining distance to `3x`
+- [ ] If fused pairs are real but still short of `3x`, run one bounded follow-up before declaring the branch ceiling:
+  - [x] keep the fused-pair trunk topology
+  - [x] reduce recurrent trunk `laneSpatial` first (`32 -> 16 -> 8 -> 1`) while keeping the ANE fused output head at the proven lane-32 setting
+  - [x] stop immediately if lower trunk lane widths fail to compile, produce parity drift, or do not buy a material chunk toward `3x`
+  - [x] lane-reduction outcome:
+    - [x] fused-pair lane-32 baseline still ran (`2.530901 ms/token`, `395.14 tok/s` in the sweep setup)
+    - [x] the first smaller trunk lane width hit `statusType=0x9`
+    - [x] decision: abandon smaller recurrent trunk lane widths for now
+  - [x] move to the next higher-upside trunk path:
+    - [x] fused three-layer recurrent step for a 6-layer trunk (`2` fused evals instead of `3`)
+    - [x] parity first, then direct-select hardware benchmark against the fused-pair control
+- [ ] Apply the gate immediately after results:
+  - [ ] if `>=3x` over the standing CoreML generation baseline is reached, record it as a branch optimization milestone and commit immediately
+  - [x] if the fused-pair path yields a material gain but still misses `3x`, decide whether one final bounded follow-up is justified before committing
+  - [x] if the gain is not material, document the ceiling and stop pushing this avenue
 - [x] Append findings to `docs/fused-decode-and-next-steps.md`.
 - [x] Update project memory with durable findings.
-- [x] Fill in this review section and commit atomically.
+- [ ] Fill in this review section and commit atomically.
 
 ## Review
-- Status: completed.
-- Starting point:
-  - recurrent generation, `6` layers, fused ANE head: `3.564776 ms/token`, `280.54 tok/s`
-  - direct transformer generation, `6` layers: `6.558745 ms/token`, `152.47 tok/s`
-- Most important current constraint:
-  - the fused head already reduced the head bucket to about `0.936549 ms/token`
-  - but the generation API still materializes the entire vocab logits vector and then computes `argmax` on CPU
-  - the next bounded probe is to reduce that readback/materialization cost without changing the ANE compute graph
-- What changed:
-  - added `ane_interop_io_argmax_fp16_spatial_slice` in C interop
-  - added `SurfaceIO.argmaxFP16SpatialSlice(...)`
-  - added direct-token-selection helpers to the ANE generation output heads
-  - added `DirectTokenSelectionGenerationHarness`
-  - kept the old materialized-logits harness as the benchmark control
-- Correctness checks:
-  - `SurfaceIO` direct argmax matches materialized-lane argmax in unit tests
-  - the direct-selection harness preserves token outputs in unit tests
-  - on hardware, direct-selection and materialized fused-head generation produced the same echo tokens before benchmarking
-- Results on recurrent generation, `6` layers, fused ANE head:
-  - hardware parity+benchmark run:
-    - materialized logits:
-      - `3.568122 ms/token`
-      - `280.26 tok/s`
-      - compile `663.66 ms`
-      - trunk `2.614922`
-      - head `0.946177`
-    - direct surface argmax:
-      - `2.467362 ms/token`
-      - `405.29 tok/s`
-      - compile `659.94 ms`
-      - trunk `1.700138`
-      - head `0.768669`
-  - replication runs:
-    - `3.620622 -> 2.454737 ms/token`
-    - `3.637203 -> 2.451047 ms/token`
-- Deltas from the parity+benchmark run:
-  - direct surface argmax vs materialized logits:
-    - `1.100760 ms/token` faster (`30.85%`)
-    - `125.03 tok/s` faster (`44.61%`)
-    - head bucket down by `0.177508 ms/token`
-    - trunk bucket down by `0.914784 ms/token`
-- Interpretation:
-  - the direct argmax helper clearly removed real head-side cost
-  - the much larger end-to-end gain is bigger than the head-bucket reduction alone
-  - inference from the measurements:
-    - reducing readback/selection also appears to reduce host-side delay enough to improve the observed recurrent trunk cadence in this harness
-- Decision:
-  - this probe decisively passed the continuation gate
-  - reduced-readback head work is still live
-  - the next honest head-side follow-up is:
-    - reuse one read lock and stream chunked reads if more improvement remains, or
-    - push token selection further toward on-device / minimal-return paths
-  - recurrent multi-layer fusion remains a strong parallel avenue, but it is no longer the automatic next step after the fused head
+- Status: complete pending atomic commit.
+- Standing control:
+  - CoreML generation baseline: `6.582224 ms/token`, `151.93 tok/s`
+  - current best ANE path: recurrent `6` layers + fused ANE RMSNorm/classifier head + direct surface argmax
+    - stable best run: `2.467362 ms/token`, `405.29 tok/s`
+    - replicated around `2.45-2.47 ms/token`
+- Why this pivot exists:
+  - reduced-readback direct argmax was the actual breakthrough
+  - smaller head-side cleanup after that was not enough to close the final `~0.27 ms/token` gap to `3x`
+  - recurrent per-step zero-elision did not hold up under hardware measurement and is not the right branch to continue
+- Active hypothesis:
+  - fused recurrent pairs can still improve end-to-end latency because the remaining gap is small enough that removing recurrent eval boundaries and recurrent per-layer host IO has a plausible payoff
+- Immediate go/no-go:
+  - if fused recurrent pairs cannot buy at least `~0.20 ms/token`, this branch is probably near its local ceiling without a more radical algorithm or runtime change
+- Current evidence:
+  - fused recurrent-pair direct-select hardware replications are noisy in absolute terms but consistently faster than the current single-layer recurrent trunk
+  - observed compare runs:
+    - single `6.0231` vs fused-pair `3.7812`
+    - single `3.4296` vs fused-pair `2.3074`
+    - single `4.5684` vs fused-pair `2.5795`
+  - best fused-pair run is now close enough to `3x` that a smaller follow-up on recurrent trunk lane width is justified before attempting 3-layer fusion
+- Lane-width follow-up outcome:
+  - the smaller-lane trunk probe hit the predefined abandon condition immediately with `statusType=0x9`
+  - that means the next honest avenue is deeper recurrent fusion, not more lane packing work
+- Triplet-fusion outcome:
+  - fused triplets are the best branch result so far
+  - strongest repeated triplet runs landed around `2.212 ms/token`, `~452 tok/s`
+  - the output-head-lane follow-up got even closer at `2.204732 ms/token`, `453.57 tok/s`
+  - this is an honest near-`3x` result (`~2.98x-2.99x` over the standing CoreML generation baseline), but not a stable `>=3x` claim
+- Final call:
+  - this branch is materially optimized and worth committing
+  - multi-layer recurrent fusion was the right path; smaller lane-width follow-ups were blocked
+  - the current honest headline is “near-`3x` over CoreML”, not “stable `3x+` over CoreML”

@@ -14,6 +14,12 @@ public enum TokenSelectionStrategy: Sendable {
     case argmax
 }
 
+public enum RecurrentGenerationTrunkBackend: Sendable {
+    case singleLayer
+    case fusedTwoLayerPairs
+    case fusedThreeLayerTriplets
+}
+
 public struct GenerationPerformanceSnapshot: Sendable, Equatable {
     public let compileTimeMs: Double
     public let trunkLatencyMs: Double
@@ -1165,7 +1171,10 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
     private let embedding: TensorBuffer
     private let classifier: TensorBuffer
     private let sharedClassifier: Bool
-    private var sessions: LayerStorage<RWKVStyleRecurrentSession>
+    private let trunkBackend: RecurrentGenerationTrunkBackend
+    private var singleLayerSessions: LayerStorage<RWKVStyleRecurrentSession>
+    private var fusedPairSessions: LayerStorage<RWKVStyleFusedTwoLayerSession>
+    private var fusedTripletSessions: LayerStorage<RWKVStyleFusedThreeLayerSession>
     private let stepNorm: TensorBuffer
     private let stepLogits: TensorBuffer
     private let stepRMSWorkspace: RMSNorm.Workspace
@@ -1192,13 +1201,28 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
         weights: borrowing RecurrentGenerationWeights,
         layerCount: Int,
         maxSequenceTokens: Int = ModelConfig.seqLen,
-        outputHeadBackend: GenerationOutputHeadBackend = .cpu
+        outputHeadBackend: GenerationOutputHeadBackend = .cpu,
+        trunkBackend: RecurrentGenerationTrunkBackend = .singleLayer,
+        trunkLaneSpatial: Int = RWKVStyleRecurrentKernelSet.defaultLaneSpatial,
+        outputHeadLaneSpatial: Int = 32
     ) throws(GenerationError) {
         guard layerCount > 0 else {
             throw .invalidArguments("layerCount must be > 0")
         }
         guard layerCount <= weights.layers.count else {
             throw .invalidArguments("layerCount \(layerCount) exceeds available recurrent layers \(weights.layers.count)")
+        }
+        if trunkBackend == .fusedTwoLayerPairs, !layerCount.isMultiple(of: 2) {
+            throw .invalidArguments("fused recurrent trunk backend requires an even layerCount")
+        }
+        if trunkBackend == .fusedThreeLayerTriplets, !layerCount.isMultiple(of: 3) {
+            throw .invalidArguments("fused three-layer recurrent trunk backend requires a layerCount that is a multiple of 3")
+        }
+        guard trunkLaneSpatial > 0 else {
+            throw .invalidArguments("recurrent trunk laneSpatial must be > 0")
+        }
+        guard outputHeadLaneSpatial > 0 else {
+            throw .invalidArguments("generation output-head laneSpatial must be > 0")
         }
         guard maxSequenceTokens > 0 else {
             throw .invalidArguments("maxSequenceTokens must be > 0")
@@ -1210,7 +1234,24 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
         }
 
         let compileStart = GenerationClock.now()
-        let sessions = try Self.compileSessions(weights: weights, layerCount: layerCount)
+        let singleLayerSessions = try Self.compileSingleLayerSessions(
+            weights: weights,
+            layerCount: layerCount,
+            trunkBackend: trunkBackend,
+            laneSpatial: trunkLaneSpatial
+        )
+        let fusedPairSessions = try Self.compileFusedPairSessions(
+            weights: weights,
+            layerCount: layerCount,
+            trunkBackend: trunkBackend,
+            laneSpatial: trunkLaneSpatial
+        )
+        let fusedTripletSessions = try Self.compileFusedTripletSessions(
+            weights: weights,
+            layerCount: layerCount,
+            trunkBackend: trunkBackend,
+            laneSpatial: trunkLaneSpatial
+        )
         let rmsFinal = GenerationWeightCloner.cloneTensor(weights.rmsFinal)
         let embedding = GenerationWeightCloner.cloneTensor(weights.embedding)
         let classifier = sharedClassifier
@@ -1221,7 +1262,8 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
             vocabSize: vocabSize,
             sharedClassifier: sharedClassifier,
             embedding: embedding,
-            classifier: classifier
+            classifier: classifier,
+            laneSpatial: outputHeadLaneSpatial
         )
         let aneRMSNormClassifierHead = try Self.makeANERMSNormClassifierHead(
             outputHeadBackend: outputHeadBackend,
@@ -1229,7 +1271,8 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
             sharedClassifier: sharedClassifier,
             rmsFinal: rmsFinal,
             embedding: embedding,
-            classifier: classifier
+            classifier: classifier,
+            laneSpatial: outputHeadLaneSpatial
         )
         let compileTimeMs = GenerationClock.milliseconds(start: compileStart, end: GenerationClock.now())
 
@@ -1240,7 +1283,10 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
         self.embedding = embedding
         self.classifier = classifier
         self.sharedClassifier = sharedClassifier
-        self.sessions = sessions
+        self.trunkBackend = trunkBackend
+        self.singleLayerSessions = singleLayerSessions
+        self.fusedPairSessions = fusedPairSessions
+        self.fusedTripletSessions = fusedTripletSessions
         self.stepNorm = TensorBuffer(count: ModelConfig.dim, zeroed: true)
         self.stepLogits = TensorBuffer(count: vocabSize, zeroed: true)
         self.stepRMSWorkspace = RMSNorm.Workspace(seqLen: 1)
@@ -1256,16 +1302,80 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
         self.logitsLatencyMs = 0
     }
 
-    private static func compileSessions(
+    private static func emptyLayerStorage<Element: ~Copyable>(_: Element.Type = Element.self) -> LayerStorage<Element> {
+        LayerStorage<Element>(count: 0) { _ in
+            fatalError("unreachable empty layer storage initializer")
+        }
+    }
+
+    private static func compileSingleLayerSessions(
         weights: borrowing RecurrentGenerationWeights,
-        layerCount: Int
+        layerCount: Int,
+        trunkBackend: RecurrentGenerationTrunkBackend,
+        laneSpatial: Int
     ) throws(GenerationError) -> LayerStorage<RWKVStyleRecurrentSession> {
+        guard trunkBackend == .singleLayer else {
+            return emptyLayerStorage(RWKVStyleRecurrentSession.self)
+        }
         do {
             return try LayerStorage<RWKVStyleRecurrentSession>(count: layerCount, throwingInitializer: { idx in
-                try RWKVStyleRecurrentSession(weights: weights.layers[idx])
+                try RWKVStyleRecurrentSession(weights: weights.layers[idx], laneSpatial: laneSpatial)
             })
         } catch {
             throw .runtimeFailure("recurrent kernel/session setup failed: \(error)")
+        }
+    }
+
+    private static func compileFusedPairSessions(
+        weights: borrowing RecurrentGenerationWeights,
+        layerCount: Int,
+        trunkBackend: RecurrentGenerationTrunkBackend,
+        laneSpatial: Int
+    ) throws(GenerationError) -> LayerStorage<RWKVStyleFusedTwoLayerSession> {
+        guard trunkBackend == .fusedTwoLayerPairs else {
+            return emptyLayerStorage(RWKVStyleFusedTwoLayerSession.self)
+        }
+        do {
+            return try LayerStorage<RWKVStyleFusedTwoLayerSession>(
+                count: layerCount / 2,
+                throwingInitializer: { pairIdx in
+                    let base = pairIdx * 2
+                    return try RWKVStyleFusedTwoLayerSession(
+                        weights0: weights.layers[base],
+                        weights1: weights.layers[base + 1],
+                        laneSpatial: laneSpatial
+                    )
+                }
+            )
+        } catch {
+            throw .runtimeFailure("fused recurrent kernel/session setup failed: \(error)")
+        }
+    }
+
+    private static func compileFusedTripletSessions(
+        weights: borrowing RecurrentGenerationWeights,
+        layerCount: Int,
+        trunkBackend: RecurrentGenerationTrunkBackend,
+        laneSpatial: Int
+    ) throws(GenerationError) -> LayerStorage<RWKVStyleFusedThreeLayerSession> {
+        guard trunkBackend == .fusedThreeLayerTriplets else {
+            return emptyLayerStorage(RWKVStyleFusedThreeLayerSession.self)
+        }
+        do {
+            return try LayerStorage<RWKVStyleFusedThreeLayerSession>(
+                count: layerCount / 3,
+                throwingInitializer: { tripletIdx in
+                    let base = tripletIdx * 3
+                    return try RWKVStyleFusedThreeLayerSession(
+                        weights0: weights.layers[base],
+                        weights1: weights.layers[base + 1],
+                        weights2: weights.layers[base + 2],
+                        laneSpatial: laneSpatial
+                    )
+                }
+            )
+        } catch {
+            throw .runtimeFailure("fused three-layer recurrent kernel/session setup failed: \(error)")
         }
     }
 
@@ -1274,16 +1384,25 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
         vocabSize: Int,
         sharedClassifier: Bool,
         embedding: borrowing TensorBuffer,
-        classifier: borrowing TensorBuffer
+        classifier: borrowing TensorBuffer,
+        laneSpatial: Int
     ) throws(GenerationError) -> ANEGenerationClassifierHead? {
         switch outputHeadBackend {
         case .cpu:
             return nil
         case .aneClassifier:
             if sharedClassifier {
-                return try ANEGenerationClassifierHead(classifierWeights: embedding, vocabSize: vocabSize)
+                return try ANEGenerationClassifierHead(
+                    classifierWeights: embedding,
+                    vocabSize: vocabSize,
+                    laneSpatial: laneSpatial
+                )
             }
-            return try ANEGenerationClassifierHead(classifierWeights: classifier, vocabSize: vocabSize)
+            return try ANEGenerationClassifierHead(
+                classifierWeights: classifier,
+                vocabSize: vocabSize,
+                laneSpatial: laneSpatial
+            )
         case .aneRMSNormClassifier:
             return nil
         }
@@ -1295,7 +1414,8 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
         sharedClassifier: Bool,
         rmsFinal: borrowing TensorBuffer,
         embedding: borrowing TensorBuffer,
-        classifier: borrowing TensorBuffer
+        classifier: borrowing TensorBuffer,
+        laneSpatial: Int
     ) throws(GenerationError) -> ANEGenerationRMSNormClassifierHead? {
         switch outputHeadBackend {
         case .cpu, .aneClassifier:
@@ -1305,23 +1425,44 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
                 return try ANEGenerationRMSNormClassifierHead(
                     rmsFinal: rmsFinal,
                     classifierWeights: embedding,
-                    vocabSize: vocabSize
+                    vocabSize: vocabSize,
+                    laneSpatial: laneSpatial
                 )
             }
             return try ANEGenerationRMSNormClassifierHead(
                 rmsFinal: rmsFinal,
                 classifierWeights: classifier,
-                vocabSize: vocabSize
+                vocabSize: vocabSize,
+                laneSpatial: laneSpatial
             )
         }
     }
 
     public mutating func reset() throws(GenerationError) {
-        for idx in 0..<sessions.count {
-            do {
-                try sessions[idx].reset()
-            } catch {
-                throw .runtimeFailure("recurrent reset failed at layer \(idx): \(error)")
+        switch trunkBackend {
+        case .singleLayer:
+            for idx in 0..<singleLayerSessions.count {
+                do {
+                    try singleLayerSessions[idx].reset()
+                } catch {
+                    throw .runtimeFailure("recurrent reset failed at layer \(idx): \(error)")
+                }
+            }
+        case .fusedTwoLayerPairs:
+            for idx in 0..<fusedPairSessions.count {
+                do {
+                    try fusedPairSessions[idx].reset()
+                } catch {
+                    throw .runtimeFailure("fused recurrent reset failed at pair \(idx): \(error)")
+                }
+            }
+        case .fusedThreeLayerTriplets:
+            for idx in 0..<fusedTripletSessions.count {
+                do {
+                    try fusedTripletSessions[idx].reset()
+                } catch {
+                    throw .runtimeFailure("fused three-layer recurrent reset failed at triplet \(idx): \(error)")
+                }
             }
         }
         activationA.zero()
@@ -1412,18 +1553,49 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
         }
 
         var sourceIsA = true
-        for idx in 0..<sessions.count {
-            var timings = StepTimingBreakdown()
-            do {
-                if sourceIsA {
-                    try sessions[idx].step(tokenInput: activationA, output: activationB, timings: &timings)
-                } else {
-                    try sessions[idx].step(tokenInput: activationB, output: activationA, timings: &timings)
+        switch trunkBackend {
+        case .singleLayer:
+            for idx in 0..<singleLayerSessions.count {
+                var timings = StepTimingBreakdown()
+                do {
+                    if sourceIsA {
+                        try singleLayerSessions[idx].step(tokenInput: activationA, output: activationB, timings: &timings)
+                    } else {
+                        try singleLayerSessions[idx].step(tokenInput: activationB, output: activationA, timings: &timings)
+                    }
+                } catch {
+                    throw .runtimeFailure("recurrent step failed at layer \(idx): \(error)")
                 }
-            } catch {
-                throw .runtimeFailure("recurrent step failed at layer \(idx): \(error)")
+                sourceIsA.toggle()
             }
-            sourceIsA.toggle()
+        case .fusedTwoLayerPairs:
+            for idx in 0..<fusedPairSessions.count {
+                var timings = StepTimingBreakdown()
+                do {
+                    if sourceIsA {
+                        try fusedPairSessions[idx].step(tokenInput: activationA, output: activationB, timings: &timings)
+                    } else {
+                        try fusedPairSessions[idx].step(tokenInput: activationB, output: activationA, timings: &timings)
+                    }
+                } catch {
+                    throw .runtimeFailure("fused recurrent step failed at pair \(idx): \(error)")
+                }
+                sourceIsA.toggle()
+            }
+        case .fusedThreeLayerTriplets:
+            for idx in 0..<fusedTripletSessions.count {
+                var timings = StepTimingBreakdown()
+                do {
+                    if sourceIsA {
+                        try fusedTripletSessions[idx].step(tokenInput: activationA, output: activationB, timings: &timings)
+                    } else {
+                        try fusedTripletSessions[idx].step(tokenInput: activationB, output: activationA, timings: &timings)
+                    }
+                } catch {
+                    throw .runtimeFailure("fused three-layer recurrent step failed at triplet \(idx): \(error)")
+                }
+                sourceIsA.toggle()
+            }
         }
 
         currentActivationIsA = sourceIsA

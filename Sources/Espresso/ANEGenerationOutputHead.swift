@@ -10,11 +10,26 @@ public enum GenerationOutputHeadBackend: Sendable {
 }
 
 private enum ANEGenerationOutputHeadIO {
+    static func initializeInputSurface(
+        _ surface: IOSurfaceRef,
+        laneSpatial: Int
+    ) throws(GenerationError) {
+        guard laneSpatial > 1 else { return }
+        let zeroInput = TensorBuffer(count: ModelConfig.dim * laneSpatial, zeroed: true)
+        zeroInput.withUnsafeBufferPointer { zeroPtr in
+            SurfaceIO.writeFP16(
+                to: surface,
+                data: zeroPtr,
+                channels: ModelConfig.dim,
+                spatial: laneSpatial
+            )
+        }
+    }
+
     static func writeSingleToken(
         _ input: borrowing TensorBuffer,
         to surface: IOSurfaceRef,
-        laneSpatial: Int,
-        zeroInput: borrowing TensorBuffer
+        laneSpatial: Int
     ) throws(GenerationError) {
         precondition(input.count == ModelConfig.dim)
         if laneSpatial == 1 {
@@ -25,14 +40,6 @@ private enum ANEGenerationOutputHeadIO {
         }
 
         do {
-            zeroInput.withUnsafeBufferPointer { zeroPtr in
-                SurfaceIO.writeFP16(
-                    to: surface,
-                    data: zeroPtr,
-                    channels: ModelConfig.dim,
-                    spatial: laneSpatial
-                )
-            }
             try input.withUnsafeBufferPointer { src in
                 try SurfaceIO.writeFP16SpatialSlice(
                     to: surface,
@@ -118,7 +125,6 @@ final class ANEGenerationClassifierHead {
     let outputSurface: IOSurfaceRef
     let vocabSize: Int
     let laneSpatial: Int
-    let zeroInput: TensorBuffer
 
     init(
         classifierWeights: borrowing TensorBuffer,
@@ -136,7 +142,7 @@ final class ANEGenerationClassifierHead {
             self.kernelSet = kernelSet
             self.vocabSize = vocabSize
             self.laneSpatial = laneSpatial
-            self.zeroInput = TensorBuffer(count: ModelConfig.dim * laneSpatial, zeroed: true)
+            try ANEGenerationOutputHeadIO.initializeInputSurface(self.inputSurface, laneSpatial: laneSpatial)
         } catch {
             throw .runtimeFailure("ANE classifier setup failed: \(error)")
         }
@@ -152,8 +158,7 @@ final class ANEGenerationClassifierHead {
         try ANEGenerationOutputHeadIO.writeSingleToken(
             normalizedInput,
             to: inputSurface,
-            laneSpatial: laneSpatial,
-            zeroInput: zeroInput
+            laneSpatial: laneSpatial
         )
 
         do {
@@ -178,8 +183,7 @@ final class ANEGenerationClassifierHead {
         try ANEGenerationOutputHeadIO.writeSingleToken(
             normalizedInput,
             to: inputSurface,
-            laneSpatial: laneSpatial,
-            zeroInput: zeroInput
+            laneSpatial: laneSpatial
         )
 
         do {
@@ -204,7 +208,6 @@ final class ANEGenerationRMSNormClassifierHead {
     let outputSurface: IOSurfaceRef
     let vocabSize: Int
     let laneSpatial: Int
-    let zeroInput: TensorBuffer
 
     init(
         rmsFinal: borrowing TensorBuffer,
@@ -224,7 +227,7 @@ final class ANEGenerationRMSNormClassifierHead {
             self.kernelSet = kernelSet
             self.vocabSize = vocabSize
             self.laneSpatial = laneSpatial
-            self.zeroInput = TensorBuffer(count: ModelConfig.dim * laneSpatial, zeroed: true)
+            try ANEGenerationOutputHeadIO.initializeInputSurface(self.inputSurface, laneSpatial: laneSpatial)
         } catch {
             throw .runtimeFailure("ANE fused output-head setup failed: \(error)")
         }
@@ -240,8 +243,7 @@ final class ANEGenerationRMSNormClassifierHead {
         try ANEGenerationOutputHeadIO.writeSingleToken(
             rawInput,
             to: inputSurface,
-            laneSpatial: laneSpatial,
-            zeroInput: zeroInput
+            laneSpatial: laneSpatial
         )
 
         do {
@@ -266,8 +268,7 @@ final class ANEGenerationRMSNormClassifierHead {
         try ANEGenerationOutputHeadIO.writeSingleToken(
             rawInput,
             to: inputSurface,
-            laneSpatial: laneSpatial,
-            zeroInput: zeroInput
+            laneSpatial: laneSpatial
         )
 
         do {
