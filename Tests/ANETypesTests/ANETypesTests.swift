@@ -633,6 +633,59 @@ final class ANETypesTests: XCTestCase {
         XCTAssertEqual(argmax.value, expectedValue, accuracy: 1e-2)
     }
 
+    func test_surface_argmax_fp16_spatial_slice_respects_channel_offset_and_tail() throws {
+        let totalChannels = 9
+        let channelOffset = 2
+        let channels = 5
+        let spatial = 3
+        let surface = makeSurface(bytes: totalChannels * spatial * 2)
+
+        let input: [Float] = [
+            -9.0, -8.0, -7.0,
+            -6.0, -5.0, -4.0,
+            0.0, 1.0, 2.0,
+            -3.0, -2.0, -1.0,
+            4.0, 4.5, 5.0,
+            6.0, 7.0, 8.0,
+            2.0, 7.0, 3.0,
+            -4.0, -3.0, -2.0,
+            1.0, 0.5, 0.25,
+        ]
+        input.withUnsafeBufferPointer { src in
+            SurfaceIO.writeFP16(to: surface, data: src, channels: totalChannels, spatial: spatial)
+        }
+
+        var lane = Array(repeating: Float.nan, count: channels)
+        try lane.withUnsafeMutableBufferPointer { dst in
+            try SurfaceIO.readFP16SpatialSlice(
+                from: surface,
+                channelOffset: channelOffset,
+                spatialIndex: 1,
+                spatial: spatial,
+                into: dst,
+                channels: channels
+            )
+        }
+
+        var expectedIndex = 0
+        var expectedValue = lane[0]
+        for idx in 1..<lane.count where lane[idx] > expectedValue {
+            expectedIndex = idx
+            expectedValue = lane[idx]
+        }
+
+        let argmax = try SurfaceIO.argmaxFP16SpatialSlice(
+            from: surface,
+            channelOffset: channelOffset,
+            spatialIndex: 1,
+            spatial: spatial,
+            channels: channels
+        )
+
+        XCTAssertEqual(argmax.index, expectedIndex)
+        XCTAssertEqual(argmax.value, expectedValue, accuracy: 1e-2)
+    }
+
     func test_surface_write_fp16_spatial_slice_can_overwrite_lane_without_rezeroing_full_surface() throws {
         let channels = 4
         let spatial = 3
