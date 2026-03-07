@@ -1014,6 +1014,53 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         XCTAssertGreaterThan(triplet.compileTimeMs, 0)
     }
 
+    func test_recurrent_generation_fused_triplet_direct_select_vs_autoregressive_materialized_on_hardware() throws {
+        try requireGenerationHardware()
+
+        let prompt: [UInt16] = [0]
+        let maxNewTokens = 8
+        let weights = makeEchoRecurrentGenerationWeights(layerCount: 6)
+
+        let materializedModel = try ANERecurrentGenerationModel(
+            weights: weights,
+            layerCount: 6,
+            maxSequenceTokens: 32,
+            outputHeadBackend: .aneRMSNormClassifier,
+            trunkBackend: .fusedThreeLayerTriplets,
+            trunkLaneSpatial: 32,
+            outputHeadLaneSpatial: 32
+        )
+        let directModel = try ANERecurrentGenerationModel(
+            weights: weights,
+            layerCount: 6,
+            maxSequenceTokens: 32,
+            outputHeadBackend: .aneRMSNormClassifier,
+            trunkBackend: .fusedThreeLayerTriplets,
+            trunkLaneSpatial: 32,
+            outputHeadLaneSpatial: 32
+        )
+
+        var materializedHarness = AutoregressiveGenerationHarness(
+            model: materializedModel,
+            strategy: .argmax
+        )
+        var directHarness = DirectTokenSelectionGenerationHarness(
+            model: directModel,
+            strategy: .argmax
+        )
+
+        let materializedTrace = try materializedHarness.generate(
+            promptTokens: prompt,
+            maxNewTokens: maxNewTokens
+        )
+        let directTrace = try directHarness.generate(
+            promptTokens: prompt,
+            maxNewTokens: maxNewTokens
+        )
+
+        XCTAssertEqual(directTrace.generatedTokens, materializedTrace.generatedTokens)
+    }
+
     func test_recurrent_generation_fused_triplet_direct_select_output_head_lane_sweep_on_hardware() throws {
         try requireGenerationHardware()
 
