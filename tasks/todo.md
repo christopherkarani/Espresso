@@ -217,3 +217,26 @@
 - [ ] If larger trunk fusion dead-ends on compiler/runtime walls, move to the next exact architecture step with the smallest testable slice.
 - [x] Try a 4+2 recurrent trunk fusion backend with the current direct-select head.
 - [x] Reject 4+2 recurrent trunk fusion: generator/kernel contracts passed, but the first hardware compile failed with `InvalidMILProgram`.
+
+## Next Probe - 2026-03-08 full six-layer recurrent fusion
+- [ ] Re-baseline the saved fused-triplet direct-select path immediately before the full-six attempt.
+- [ ] Add failing unit coverage for a fused six-layer recurrent generator, kernelset, and harness backend contract.
+- [ ] Implement a fused six-layer recurrent kernelset/session that keeps the current direct-select head unchanged.
+- [ ] Run targeted unit tests, then a hardware parity + benchmark probe.
+- [ ] Keep the path only if compile/eval succeeds and runtime beats the current saved best; otherwise revert code and retain docs.
+
+## Review - 2026-03-08 blocked full six-layer recurrent fusion
+- Tried:
+  - full six-layer recurrent fusion with the current direct-select output head unchanged
+  - added generator/kernelset/session/backend contracts and a hardware comparison hook
+- Why:
+  - next materially different trunk-side attempt after blocked `4+2` fusion
+- Result:
+  - unit contracts passed
+  - hardware compile failed immediately with `InvalidMILProgram`
+  - no runtime measurement, because the kernel never compiled
+- Baseline before probe:
+  - fused-triplet direct-select `2.2336927083333333 ms/token`, `447.6892970440778 tok/s`
+- Conclusion:
+  - revert the six-layer code/tests
+  - move to a materially different path instead of larger recurrent-fusion compile archaeology

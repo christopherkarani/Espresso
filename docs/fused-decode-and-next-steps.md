@@ -1428,3 +1428,28 @@ Interpretation:
 - Strong structural negative result.
 - Inference: extending recurrent trunk fusion beyond current triplets hits the same compiler wall seen in other larger-fusion attempts on this branch.
 - Reverted the implementation after the first blocked hardware attempt.
+
+## 2026-03-08 - Blocked full six-layer recurrent fusion
+
+What was tried:
+- Fused all six recurrent RWKV-style layers into one MIL program while keeping the current direct-select output head unchanged.
+- Added a dedicated fused-six generator, kernelset, session, harness backend, unit contracts, and a hardware comparison test against the saved fused-triplet direct-select path.
+
+Why:
+- After the blocked `4+2` and triplet+head fusion attempts, full-six fusion was the next materially different trunk-side probe that could still remove one more inter-session boundary if the compiler accepted it.
+
+Baseline before the probe:
+- fused-triplet direct-select: `2.2336927083333333 ms/token`, `447.6892970440778 tok/s`
+- compile: `559.7429583333334 ms`
+- trunk: `1.1575755208333334 ms/token`
+- logits: `1.0688463541666668 ms/token`
+
+Measured result:
+- Unit contracts passed.
+- First hardware compile failed immediately with `_ANECompiler : ANECCompile() FAILED` and `InvalidMILProgram`.
+- No steady-state runtime measurement exists because the fused-six kernel never compiled.
+
+Interpretation:
+- Inference: extending recurrent trunk fusion from triplets to a single six-layer block hits the same compiler wall as other larger-fusion attempts on this branch.
+- This materially lowers confidence in any further monolithic recurrent-fusion path that keeps the same op family and lane geometry.
+- The right next move is a materially different route, not more compile archaeology on larger recurrent blocks.
