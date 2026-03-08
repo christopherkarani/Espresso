@@ -1453,3 +1453,25 @@ Interpretation:
 - Inference: extending recurrent trunk fusion from triplets to a single six-layer block hits the same compiler wall as other larger-fusion attempts on this branch.
 - This materially lowers confidence in any further monolithic recurrent-fusion path that keeps the same op family and lane geometry.
 - The right next move is a materially different route, not more compile archaeology on larger recurrent blocks.
+
+## 2026-03-08 - Larger fused output-head lanes regress
+
+What was tried:
+- Extended the fused-triplet direct-select output-head lane sweep upward from the existing `32/16/8/1` set to include larger lane widths: `64`, `96`, and `128`.
+- Kept the recurrent fused-triplet trunk unchanged and benchmarked each lane in the same hardware sweep harness.
+
+Why:
+- Smaller output-head lanes were already known to fail or regress.
+- The remaining exact question was whether a larger lane geometry might fit the ANE RMSNorm+classifier head better and reduce the current logits/selection budget.
+
+Measured results:
+- `32`: `2.3151614583333333 ms/token`, `431.9358005780449 tok/s`, trunk `1.1927395833333332`, logits `1.0936614583333333`
+- `64`: `2.369515625 ms/token`, `422.0303773646739 tok/s`, trunk `1.1407473958333334`, logits `1.2184114583333332`
+- `96`: `2.4335859375 ms/token`, `410.91627704100335 tok/s`, trunk `1.1276119791666668`, logits `1.3105260416666669`
+- `128`: `2.3958515625000003 ms/token`, `417.3982080300975 tok/s`, trunk `1.1098619791666666`, logits `1.3032057291666665`
+- `16`, `8`, and `1` remain unsupported at eval with `statusType=0x9`.
+
+Interpretation:
+- Larger head lanes reduce trunk time slightly but increase logits time more, so end-to-end throughput regresses.
+- Inference: the current fused ANE RMSNorm+classifier head is already near its best lane geometry at `32` for this branch.
+- Further lane-width sweeps are low-value unless the head architecture changes materially.

@@ -240,3 +240,21 @@
 - Conclusion:
   - revert the six-layer code/tests
   - move to a materially different path instead of larger recurrent-fusion compile archaeology
+
+## Next Probe - 2026-03-08 larger output-head lanes on fused-triplet direct-select
+- [ ] Extend the fused-triplet output-head lane sweep to larger lane widths above `32`.
+- [ ] Benchmark each supported larger lane against the current `32`-lane baseline in the same sweep harness.
+- [ ] Keep only a measured runtime win; otherwise revert the test-only probe and retain docs.
+
+## Review - 2026-03-08 larger fused output-head lanes regress
+- Tried:
+  - extended fused-triplet direct-select output-head lane sweep to `64`, `96`, and `128`
+- Why:
+  - smaller lanes already failed; larger lanes were still unmeasured
+- Result:
+  - `32` remained best in the sweep at `2.3151614583333333 ms/token`
+  - `64`, `96`, and `128` all regressed end-to-end
+  - `16`, `8`, and `1` still failed at eval with `statusType=0x9`
+- Conclusion:
+  - revert the test-only sweep extension
+  - treat `32` as the best current lane geometry for the existing fused RMSNorm+classifier head
