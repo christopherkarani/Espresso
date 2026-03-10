@@ -1,126 +1,20 @@
-# ANE Exact Single-Stream Gate — Output-Head Architecture (2026-03-10)
+# TODO
 
-## Plan
-- [x] Re-read the mandatory docs, task log, lessons, project memory, and generation/output-head runtime files before choosing the next avenue.
-- [x] Re-state the standing controls and exact gates:
-  - [x] standing CoreML single-stream baseline (`.cpuAndNeuralEngine`):
-    - [x] `6.582224 ms/token`
-    - [x] `151.93 tok/s`
-  - [x] current saved best exact ANE single-stream path:
-    - [x] recurrent fused-triplet direct-select
-    - [x] `2.129125 ms/token`
-    - [x] `469.68 tok/s`
-  - [x] exact targets against the standing CoreML baseline:
-    - [x] `4x` => `<= 1.645556 ms/token`
-    - [x] `5x` => `<= 1.316445 ms/token`
-    - [x] `6x` => `<= 1.097037 ms/token`
-- [x] Record the known blockers so this session stays on the real frontier:
-  - [x] full triplet+head fusion is blocked
-  - [x] direct-select-only triplet+head fusion is blocked
-  - [x] `4+2` and `6`-layer larger trunk fusions are blocked with `InvalidMILProgram`
-  - [x] packed-state triplet compiles and fails at eval with `statusType=0x9`
-  - [x] smaller recurrent trunk lanes are blocked
-  - [x] smaller fused output-head lanes (`16/8/1`) are blocked
-  - [x] larger lane settings regress
-  - [x] Metal argmax, unlocked argmax, and brute-force exact sharded head all regressed
-  - [x] the current speculative verifier stack is structurally too slow
-- [x] Choose the first exact cheaper-head seam:
-  - [x] bound-driven staged exact head over contiguous vocab shards
-  - [x] stage 1 computes exact shard upper bounds using precomputed shard centers + radii on normalized activations
-  - [x] stage 2 runs exact block scoring only for shards whose bound can still beat the current best exact score
-  - [x] first runtime probe is CPU-routed for direct-select only; do not add more ANE shard dispatches until this cheaper control is measured
-  - [x] this is materially different from the rejected brute-force sharded head because it is branch-and-bound, not “run every shard every token”
-- [ ] Baseline before major changes:
-  - [ ] re-run the current saved exact ANE single-stream recurrent fused-triplet direct-select benchmark
-  - [ ] re-run the standing CoreML single-stream generation baseline
-  - [ ] keep warmup `>= 3`, timed iterations `>= 20`, and report medians
-  - [ ] separate compile/init from steady-state runtime
-  - [ ] separate trunk vs head/logits time where possible
-- [ ] Avenue 1 — exact cheaper output head:
-  - [x] add failing non-hardware tests for shard summary exactness and bound-driven pruning
-  - [x] implement shard summary builder:
-    - [x] contiguous vocab shards
-    - [x] per-shard center vector
-    - [x] per-shard radius giving a valid exact upper bound
-  - [x] implement exact bound search:
-    - [x] visit shards in descending upper-bound order
-    - [x] stop only when the current best exact score safely beats every remaining shard bound
-    - [x] preserve exact global argmax token selection
-  - [x] implement staged exact CPU direct-select runtime:
-    - [x] compute the normalized token vector once
-    - [x] score block bounds cheaply on CPU
-    - [x] run exact BLAS scoring only on surviving blocks
-    - [x] keep full-logits materialization unchanged for non-direct-select paths
-  - [x] benchmark the staged exact head against the saved exact control:
-    - [x] median `ms/token`
-    - [x] `tok/s`
-    - [x] compile/init overhead
-    - [x] head/logits `ms/token`
-    - [ ] median evaluated blocks per token if the runtime surface exposes it cheaply
-  - [x] reject the contiguous-shard staged exact CPU head:
-    - [x] exact token parity held on the hardware echo test
-    - [x] runtime regressed catastrophically (`28.1385625 ms/token` vs `2.3946458333333336 ms/token` control)
-    - [x] compile/init regressed (`5176.693166666667 ms` vs `542.6085 ms`)
-    - [x] treat contiguous shard geometry as a dead end
-  - [x] try materially better clustered block geometry
-  - [x] reject clustered exact CPU staged head:
-    - [x] geometry improved runtime materially versus contiguous shards (`7.072252604166667 ms/token` vs `28.1385625 ms/token`)
-    - [x] but it still lost badly to the same-run fused-triplet control (`2.7799114583333333 ms/token`)
-    - [x] head/logits still regressed (`5.315468750000001 ms/token` vs `1.3099739583333334 ms/token`)
-    - [x] deprioritize this whole CPU staged exact-head family
-  - [ ] stop the avenue immediately if:
-    - [ ] the shard bound cannot be defended as exact
-    - [ ] most shards still need evaluation in steady state
-    - [ ] compile/runtime overhead erases the head-side savings
-    - [ ] median runtime regresses materially versus `2.129125 ms/token`
-- [ ] Avenue 2 — new multi-token recurrent generation architecture:
-  - [x] only proceed after Avenue 1 is measured honestly
-  - [x] require exact prefix acceptance and real state reuse
-  - [x] do not reuse the current speculative verifier design
-  - [x] choose the first bounded design: `k=2` recurrent branch/commit verification
-  - [x] add and pass unit tests for branch/commit state reuse semantics
-  - [x] add a generic `k=2` branch/commit harness seam that commits accepted tokens without draft reset+prefill replay
-  - [ ] implement a dedicated recurrent-native verifier substrate:
-    - [ ] draft `2`-layer recurrent proposer
-    - [ ] full `6`-layer fused-triplet verifier with direct state checkpoints for step-1 / step-2
-    - [ ] commit accepted checkpoint directly with no prefix replay and no draft re-prefill
-  - [ ] measure:
-    - [ ] `proposer_ms/pass`
-    - [ ] `verifier_trunk_ms/pass`
-    - [ ] `verifier_head_ms/pass`
-    - [ ] `checkpoint_copy_ms/pass`
-    - [ ] `accepted_exact_tokens/pass`
-    - [ ] `net_ms/token`
-    - [ ] `tok/s`
-  - [ ] stop if accepted exact tokens/pass saturates near `1.0-1.1`
-- [ ] Verification order:
-  - [ ] focused non-hardware tests for the staged exact-head seam
-  - [ ] targeted hardware generation benchmark runs for the current control
-  - [ ] targeted hardware generation benchmark runs for the staged exact head if the seam compiles cleanly
-  - [ ] rerun noisy benchmarks and keep the median only
-- [ ] Append findings to `docs/fused-decode-and-next-steps.md`.
-- [ ] Update durable Wax memory with confirmed findings.
-- [ ] Flush Wax memory before finishing.
-- [ ] Fill in this review section and commit atomically if the avenue yields a real win or a strong architectural negative result.
+- [x] Reject contiguous exact staged CPU head with measured hardware regression.
+- [x] Reject clustered exact staged CPU head with measured hardware regression.
+- [x] Implement and measure the `k=2` recurrent branch/commit verifier substrate.
+- [x] Use a `2`-layer recurrent proposer against the `6`-layer fused-triplet verifier path.
+- [x] Measure `accepted_exact_tokens/pass`, proposer, verifier trunk/logits, checkpoint-copy, and net `ms/token`.
+- [x] Kill the avenue when amortization still regresses materially versus fused-triplet direct-select.
+- [ ] Next avenue: only pursue a materially different multi-token architecture with real verifier amortization beyond one exact recurrent step per committed token.
+- [ ] If exact-head work is revisited, require a materially different admissible geometry, not more contiguous/clustered CPU staging.
+- [x] Append all attempted Avenue 2 findings to `docs/fused-decode-and-next-steps.md`.
+- [x] Update Wax session memory with confirmed findings.
+- [ ] Update durable Wax memory if the local long-term `waxmcp remember` path is responsive.
 
-## Review
-- Status: in progress.
-- Branch: `feat/vc-eval-probe`
-- Current hypothesis:
-  - the best remaining exact single-stream opportunity is not another lane sweep or brute-force sharding pass
-  - the smallest materially new exact head is a bound-driven staged exact shard search that can skip whole vocab shards without sacrificing exactness
-- Evidence loaded before implementation:
-  - the recurrent fused-triplet direct-select path remains the saved exact control
-  - full fused head attachment is compile-blocked
-  - brute-force exact sharded head regressed badly
-  - extra ANE-side staging is therefore a poor first probe; the cheaper first control is CPU-routed exact block pruning on the direct-select path
-  - output-head cost remains large enough that a structurally cheaper exact head is still the highest-upside exact path
-- Outcome so far:
-  - contiguous-shard staged exact CPU head is a strong negative result, not a win
-  - the path preserved exact token parity but regressed to `28.1385625 ms/token`
-  - the rejection is architectural: contiguous shard bounds are too loose to make branch-and-bound useful here
-  - clustered exact CPU staged head improved the geometry but still lost badly at `7.072252604166667 ms/token`
-  - the next best move is a recurrent-native `k=2` branch/commit verifier, not more staged exact-head tuning
-  - the `k=2` branch/commit path now has a passing unit-test seam proving direct commit semantics without draft replay
-- Completion gate for this avenue:
-  - either produce a new exact single-stream best over `2.129125 ms/token`, or produce a strong measured negative result showing the shard bounds are too loose or too expensive to help
+# Review
+
+- Avenue 1 is closed: both contiguous and clustered exact CPU staged heads regressed.
+- Avenue 2 current `k=2` branch/commit architecture is closed.
+- Measurement on echo recurrent weights reached the acceptance ceiling (`accepted_exact_tokens/pass = 2.0`) and still regressed to `4.1569722222222225 ms/token` versus the same-run fused-triplet direct-select control at `2.382458333333333 ms/token`.
+- Interpretation: the current branch/commit design remains structurally too sequential; even perfect acceptance does not amortize the proposer + verifier cost enough to beat the exact single-stream control.

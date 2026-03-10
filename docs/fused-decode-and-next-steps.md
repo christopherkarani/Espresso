@@ -1646,3 +1646,33 @@ Interpretation:
   - the ANE/CoreML ratio drops below `6x` at `5+` streams
 - This is a serving-throughput breakthrough, not a single-stream decode breakthrough.
 - Caveat: the concurrent CoreML `1`-stream result remains much slower than the standing single-stream CoreML control, so any external claim should explicitly say this is the matched concurrent serving harness.
+
+## 2026-03-10 — Rejected: current `k=2` recurrent branch/commit verifier substrate
+
+Implemented and measured a real `k=2` recurrent branch/commit probe, then reverted the code path after the hardware result regressed.
+
+What was built before reversion:
+- `2`-layer recurrent proposer.
+- `6`-layer fused-triplet verifier.
+- exact branch/commit harness metrics for proposer, verifier trunk/logits, and checkpoint-copy work.
+- checkpointed draft realignment with no reset+prefill replay.
+- exact verifier commit with direct recurrent-state advancement and measured checkpoint copies.
+
+Hardware measurement on `ANE_HARDWARE_TESTS=1`:
+- same-run fused-triplet direct-select control: `2.382458333333333 ms/token`, `419.7345203281317 tok/s`, compile/init `909.5152083333334 ms`, trunk `1.241546296296296 ms/token`, logits `1.1471412037037036 ms/token`
+- `k=2` branch/commit: `4.1569722222222225 ms/token`, `301.48904858211085 tok/s`, compile/init `939.3453333333334 ms`, `accepted_exact_tokens/pass = 2.0`, proposer `3.003859375 ms/pass`, verifier trunk `2.2390208333333335 ms/pass`, verifier logits `1.9957916666666664 ms/pass`, checkpoint copy `0.26928125 ms/pass`
+
+Against the standing CoreML single-stream baseline (`6.582224 ms/token`), this avenue reaches only about `1.58x`, far below the current saved exact ANE best (`2.129125 ms/token`, about `3.09x`).
+
+Important limitation:
+- this probe used the existing recurrent echo-weight hardware path, so `accepted_exact_tokens/pass = 2.0` is an upper-bound plumbing result, not evidence that a real model would accept that often.
+
+Interpretation:
+- Even at the acceptance ceiling, the current architecture still loses badly to fused-triplet direct-select.
+- The proposer alone is too expensive, and the verifier still pays too much sequential exact work per committed token.
+- This is a strong architectural negative result for the current `k=2` branch/commit design.
+
+Decision:
+- Kill the current `k=2` branch/commit architecture as a single-stream performance path.
+- Keep only the measured result and docs; revert the implementation.
+- If multi-token work continues, it needs a materially different verifier/state-reuse architecture, not this substrate with more tuning.
