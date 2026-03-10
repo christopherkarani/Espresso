@@ -830,6 +830,44 @@ Inference:
 - downgrade the public claim from `4x` to a reproducible exact `3.70x` matched same-session result on the echo family
 - do not publish a broader `4x over CoreML` claim from this branch without new evidence that survives the same-session harness
 
+## 2026-03-10 — Real-checkpoint rerun blocked by missing recurrent artifact
+
+### Attempt
+
+Tried to move the same-harness rerun from the synthetic `echo` family to a real checkpoint.
+
+Grounded checks performed in this session:
+
+- searched the worktree and repo for local model/checkpoint artifacts
+- checked the standard `assets/models` locations referenced by `EspressoTrain`
+- checked `STORIES_MODEL_PATH`
+- audited the codebase for an existing transformer-to-recurrent conversion/export path
+
+### Findings
+
+- no local `stories110M.bin` was present in the repo, the worktree, or the standard `assets/models` paths
+- `STORIES_MODEL_PATH` was unset
+- no local `ane_stories110M_ckpt.bin` or recurrent probe-weight artifact was present either
+- the branch does **not** contain a principled transformer-to-recurrent exporter:
+  - `GenerationWeights.load(modelPath:)` loads transformer inference weights
+  - `Checkpoint` loads and saves transformer training state
+  - `RecurrentGenerationWeightStore` only loads and saves already-recurrent `RWKVStyleRecurrentWeights`
+
+### Interpretation
+
+Measured blocker:
+
+- the same-harness real-checkpoint rerun is blocked by artifact availability, not by benchmark plumbing
+
+Inference:
+
+- until a real recurrent artifact exists, or a validated transformer-to-recurrent export contract is implemented, any “real-checkpoint rerun” number would be fabricated rather than measured
+
+### Decision
+
+- do not quote a real-checkpoint throughput number from this branch yet
+- keep the harness ready and rerun immediately once a real recurrent artifact plus matching transformer generation model path are available
+
 ## 2026-03-10 — Rejected clustered exact CPU staged head
 
 ### Attempt
