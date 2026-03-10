@@ -356,4 +356,89 @@ final class GenerationHarnessTests: XCTestCase {
             )
         }
     }
+
+    func test_exact_output_head_shard_summaries_bound_true_logits_per_shard() throws {
+        let classifierRows: [[Float]] = [
+            [1.0, 0.0],
+            [0.6, 0.8],
+            [-0.2, 1.1],
+            [-0.8, 0.4],
+        ]
+        let normalizedInput: [Float] = [0.8, 0.6]
+
+        let summaries = try ExactGenerationOutputHeadShardSummary.makeContiguousShards(
+            classifierRows: classifierRows,
+            shardSize: 2
+        )
+
+        XCTAssertEqual(summaries.count, 2)
+        XCTAssertEqual(summaries[0].tokenOffset, 0)
+        XCTAssertEqual(summaries[1].tokenOffset, 2)
+
+        for summary in summaries {
+            let bound = summary.upperBound(forNormalizedInput: normalizedInput)
+            let end = summary.tokenOffset + summary.tokenCount
+            for tokenIndex in summary.tokenOffset..<end {
+                let row = classifierRows[tokenIndex]
+                let logit = zip(row, normalizedInput).reduce(Float.zero) { partial, pair in
+                    partial + pair.0 * pair.1
+                }
+                XCTAssertGreaterThanOrEqual(
+                    bound + 1e-5,
+                    logit,
+                    "shard bound must dominate every true logit in shard \(summary.tokenOffset)"
+                )
+            }
+        }
+    }
+
+    func test_exact_output_head_bound_search_prunes_only_safe_shards() throws {
+        let normalizedInput: [Float] = [1.0, 0.0]
+        let summaries = [
+            ExactGenerationOutputHeadShardSummary(
+                tokenOffset: 0,
+                tokenCount: 2,
+                center: [0.93, 0.00],
+                radius: 0.04
+            ),
+            ExactGenerationOutputHeadShardSummary(
+                tokenOffset: 2,
+                tokenCount: 2,
+                center: [0.98, 0.00],
+                radius: 0.03
+            ),
+            ExactGenerationOutputHeadShardSummary(
+                tokenOffset: 4,
+                tokenCount: 2,
+                center: [0.20, 0.00],
+                radius: 0.10
+            ),
+        ]
+
+        var evaluatedShardOffsets: [Int] = []
+        let result = try ExactGenerationOutputHeadBoundSearch.selectGlobalBest(
+            normalizedInput: normalizedInput,
+            shardSummaries: summaries
+        ) { summary in
+            evaluatedShardOffsets.append(summary.tokenOffset)
+            switch summary.tokenOffset {
+            case 0:
+                return (token: 1, score: 0.91)
+            case 2:
+                return (token: 2, score: 0.96)
+            case 4:
+                XCTFail("search should prune shard 4 once the exact best score beats its bound")
+                return (token: 4, score: 0.20)
+            default:
+                XCTFail("unexpected shard offset \(summary.tokenOffset)")
+                return (token: 0, score: -.infinity)
+            }
+        }
+
+        XCTAssertEqual(result.token, 2)
+        XCTAssertEqual(result.score, 0.96, accuracy: 1e-6)
+        XCTAssertEqual(evaluatedShardOffsets, [2, 0])
+        XCTAssertEqual(result.evaluatedShardOffsets, [2, 0])
+        XCTAssertEqual(result.prunedShardOffsets, [4])
+    }
 }

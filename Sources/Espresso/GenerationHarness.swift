@@ -594,6 +594,7 @@ public struct ANEDirectGenerationModel: ~Copyable, DirectTokenSelectingLanguageM
     private let stepRMSWorkspace: RMSNorm.Workspace
     private let verifyRMSWorkspace: RMSNorm.Workspace
     private let outputHeadBackend: GenerationOutputHeadBackend
+    private let cpuExactStagedHead: CPUStagedExactGenerationOutputHead?
     private let aneClassifierHead: ANEGenerationClassifierHead?
     private let aneRMSNormClassifierHead: ANEGenerationRMSNormClassifierHead?
     private var decodeHandles: [DecodeSurfaceHandles]
@@ -655,6 +656,13 @@ public struct ANEDirectGenerationModel: ~Copyable, DirectTokenSelectingLanguageM
             embedding: embedding,
             classifier: classifier
         )
+        let cpuExactStagedHead = try Self.makeCPUExactStagedHead(
+            outputHeadBackend: outputHeadBackend,
+            vocabSize: vocabSize,
+            sharedClassifier: sharedClassifier,
+            embedding: embedding,
+            classifier: classifier
+        )
         let aneRMSNormClassifierHead = try Self.makeANERMSNormClassifierHead(
             outputHeadBackend: outputHeadBackend,
             vocabSize: vocabSize,
@@ -692,6 +700,7 @@ public struct ANEDirectGenerationModel: ~Copyable, DirectTokenSelectingLanguageM
         self.stepRMSWorkspace = RMSNorm.Workspace(seqLen: 1)
         self.verifyRMSWorkspace = RMSNorm.Workspace(seqLen: ModelConfig.seqLen)
         self.outputHeadBackend = outputHeadBackend
+        self.cpuExactStagedHead = cpuExactStagedHead
         self.aneClassifierHead = aneClassifierHead
         self.aneRMSNormClassifierHead = aneRMSNormClassifierHead
         self.decodeHandles = decodeHandles
@@ -794,7 +803,7 @@ public struct ANEDirectGenerationModel: ~Copyable, DirectTokenSelectingLanguageM
         classifier: borrowing TensorBuffer
     ) throws(GenerationError) -> ANEGenerationClassifierHead? {
         switch outputHeadBackend {
-        case .cpu:
+        case .cpu, .cpuExactStaged:
             return nil
         case .aneClassifier:
             if sharedClassifier {
@@ -803,6 +812,30 @@ public struct ANEDirectGenerationModel: ~Copyable, DirectTokenSelectingLanguageM
             return try ANEGenerationClassifierHead(classifierWeights: classifier, vocabSize: vocabSize)
         case .aneRMSNormClassifier:
             return nil
+        }
+    }
+
+    private static func makeCPUExactStagedHead(
+        outputHeadBackend: GenerationOutputHeadBackend,
+        vocabSize: Int,
+        sharedClassifier: Bool,
+        embedding: borrowing TensorBuffer,
+        classifier: borrowing TensorBuffer
+    ) throws(GenerationError) -> CPUStagedExactGenerationOutputHead? {
+        switch outputHeadBackend {
+        case .cpu, .aneClassifier, .aneRMSNormClassifier:
+            return nil
+        case .cpuExactStaged:
+            if sharedClassifier {
+                return try CPUStagedExactGenerationOutputHead(
+                    classifierWeights: embedding,
+                    vocabSize: vocabSize
+                )
+            }
+            return try CPUStagedExactGenerationOutputHead(
+                classifierWeights: classifier,
+                vocabSize: vocabSize
+            )
         }
     }
 
@@ -815,7 +848,7 @@ public struct ANEDirectGenerationModel: ~Copyable, DirectTokenSelectingLanguageM
         classifier: borrowing TensorBuffer
     ) throws(GenerationError) -> ANEGenerationRMSNormClassifierHead? {
         switch outputHeadBackend {
-        case .cpu, .aneClassifier:
+        case .cpu, .cpuExactStaged, .aneClassifier:
             return nil
         case .aneRMSNormClassifier:
             if sharedClassifier {
@@ -996,7 +1029,7 @@ public struct ANEDirectGenerationModel: ~Copyable, DirectTokenSelectingLanguageM
 
         stepLogits.zero()
         switch outputHeadBackend {
-        case .cpu:
+        case .cpu, .cpuExactStaged:
             stepLogits.withUnsafeMutablePointer { logitsPtr in
                 classifierPointer { clsPtr in
                     stepNorm.withUnsafePointer { normPtr in
@@ -1083,6 +1116,11 @@ public struct ANEDirectGenerationModel: ~Copyable, DirectTokenSelectingLanguageM
                 }
             }
             token = try selectToken(from: stepLogits, strategy: strategy)
+        case .cpuExactStaged:
+            guard let cpuExactStagedHead else {
+                throw .runtimeFailure("staged exact CPU output head requested without staged head")
+            }
+            token = try cpuExactStagedHead.selectArgmax(normalizedInput: stepNorm)
         case .aneClassifier:
             guard let aneClassifierHead else {
                 throw .runtimeFailure("ANE classifier backend requested without compiled head")
@@ -1179,6 +1217,7 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
     private let stepLogits: TensorBuffer
     private let stepRMSWorkspace: RMSNorm.Workspace
     private let outputHeadBackend: GenerationOutputHeadBackend
+    private let cpuExactStagedHead: CPUStagedExactGenerationOutputHead?
     private let aneClassifierHead: ANEGenerationClassifierHead?
     private let aneRMSNormClassifierHead: ANEGenerationRMSNormClassifierHead?
     private var activationA: TensorBuffer
@@ -1265,6 +1304,13 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
             classifier: classifier,
             laneSpatial: outputHeadLaneSpatial
         )
+        let cpuExactStagedHead = try Self.makeCPUExactStagedHead(
+            outputHeadBackend: outputHeadBackend,
+            vocabSize: vocabSize,
+            sharedClassifier: sharedClassifier,
+            embedding: embedding,
+            classifier: classifier
+        )
         let aneRMSNormClassifierHead = try Self.makeANERMSNormClassifierHead(
             outputHeadBackend: outputHeadBackend,
             vocabSize: vocabSize,
@@ -1291,6 +1337,7 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
         self.stepLogits = TensorBuffer(count: vocabSize, zeroed: true)
         self.stepRMSWorkspace = RMSNorm.Workspace(seqLen: 1)
         self.outputHeadBackend = outputHeadBackend
+        self.cpuExactStagedHead = cpuExactStagedHead
         self.aneClassifierHead = aneClassifierHead
         self.aneRMSNormClassifierHead = aneRMSNormClassifierHead
         self.activationA = TensorBuffer(count: ModelConfig.dim, zeroed: true)
@@ -1388,7 +1435,7 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
         laneSpatial: Int
     ) throws(GenerationError) -> ANEGenerationClassifierHead? {
         switch outputHeadBackend {
-        case .cpu:
+        case .cpu, .cpuExactStaged:
             return nil
         case .aneClassifier:
             if sharedClassifier {
@@ -1408,6 +1455,30 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
         }
     }
 
+    private static func makeCPUExactStagedHead(
+        outputHeadBackend: GenerationOutputHeadBackend,
+        vocabSize: Int,
+        sharedClassifier: Bool,
+        embedding: borrowing TensorBuffer,
+        classifier: borrowing TensorBuffer
+    ) throws(GenerationError) -> CPUStagedExactGenerationOutputHead? {
+        switch outputHeadBackend {
+        case .cpu, .aneClassifier, .aneRMSNormClassifier:
+            return nil
+        case .cpuExactStaged:
+            if sharedClassifier {
+                return try CPUStagedExactGenerationOutputHead(
+                    classifierWeights: embedding,
+                    vocabSize: vocabSize
+                )
+            }
+            return try CPUStagedExactGenerationOutputHead(
+                classifierWeights: classifier,
+                vocabSize: vocabSize
+            )
+        }
+    }
+
     private static func makeANERMSNormClassifierHead(
         outputHeadBackend: GenerationOutputHeadBackend,
         vocabSize: Int,
@@ -1418,7 +1489,7 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
         laneSpatial: Int
     ) throws(GenerationError) -> ANEGenerationRMSNormClassifierHead? {
         switch outputHeadBackend {
-        case .cpu, .aneClassifier:
+        case .cpu, .cpuExactStaged, .aneClassifier:
             return nil
         case .aneRMSNormClassifier:
             if sharedClassifier {
@@ -1641,7 +1712,7 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
 
         stepLogits.zero()
         switch outputHeadBackend {
-        case .cpu:
+        case .cpu, .cpuExactStaged:
             stepLogits.withUnsafeMutablePointer { logitsPtr in
                 classifierPointer { clsPtr in
                     stepNorm.withUnsafePointer { normPtr in
@@ -1749,6 +1820,11 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
                 }
             }
             token = try selectToken(from: stepLogits, strategy: strategy)
+        case .cpuExactStaged:
+            guard let cpuExactStagedHead else {
+                throw .runtimeFailure("staged exact CPU output head requested without staged head")
+            }
+            token = try cpuExactStagedHead.selectArgmax(normalizedInput: stepNorm)
         case .aneClassifier:
             guard let aneClassifierHead else {
                 throw .runtimeFailure("ANE classifier backend requested without compiled head")

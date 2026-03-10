@@ -58,3 +58,7 @@
 - When the user allows more tuning time, treat that as conditional, not open-ended: spend extra cycles only when the current evidence suggests a real architectural or scaling breakthrough rather than local noise.
 - Before extending an experiment, state the breakthrough hypothesis, the concrete metric that would validate it, and the stop condition that ends the tuning loop.
 - Use a scientific-critique frame for performance claims: reject time sinks driven by anecdote, uncontrolled comparisons, or metrics that cannot distinguish a real scaling advantage from benchmark variance.
+
+## 2026-03-10 — Commit Cadence
+- When the user asks for frequent commits, checkpoint smaller validated milestones instead of batching multiple tuning steps into one large uncommitted change.
+- For ANE performance work, prefer commits at green boundaries: tests passing, baseline captured, or one measured avenue wired end-to-end.

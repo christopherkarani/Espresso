@@ -1,339 +1,94 @@
-# ANE 4x Gate — Concurrent Multistream Benchmarking (2026-03-08)
+# ANE Exact Single-Stream Gate — Output-Head Architecture (2026-03-10)
 
 ## Plan
-- [x] Re-read the required docs, task log, lessons, memory, and benchmark/runtime files before choosing the next avenue.
-- [x] Re-state the standing matched single-stream controls:
-  - [x] current best ANE path: recurrent fused-triplet direct-select generation
-    - [x] `2.204732 ms/token`
-    - [x] `453.57 tok/s`
-  - [x] standing CoreML generation baseline (`.cpuAndNeuralEngine`)
+- [x] Re-read the mandatory docs, task log, lessons, project memory, and generation/output-head runtime files before choosing the next avenue.
+- [x] Re-state the standing controls and exact gates:
+  - [x] standing CoreML single-stream baseline (`.cpuAndNeuralEngine`):
     - [x] `6.582224 ms/token`
     - [x] `151.93 tok/s`
-  - [x] current ratio: about `2.99x`
-  - [x] honest `4x` target against the standing CoreML baseline:
-    - [x] `<= 1.645556 ms/token`
-    - [x] `>= 607.72 tok/s`
-- [x] Record the active hypothesis and the decisive ratio gate:
-  - [x] strongest remaining path is true concurrent multistream on top of the recurrent fused-triplet direct-select path
-  - [x] decisive question: whether ANE scales materially better than CoreML at `2-4` concurrent streams
-  - [x] ratio improvement gate: `ANE concurrency scaling / CoreML concurrency scaling > 1.34`
-- [x] Record the already-known blockers so this session does not drift:
-  - [x] smaller recurrent trunk lane widths are blocked by `statusType=0x9`
-  - [x] smaller output-head lane widths (`16/8/1`) fail eval
-  - [x] speculative verifier substrate is structurally too slow
-  - [x] transformer direct path is already near its ceiling
-  - [x] `_ANEVirtualClient`, `_ANEChainingRequest`, real-time eval, shared-events async path, and hybrid Metal attention are blocked / not competitive on this branch
-- [x] Rewrite the work around the current benchmark contract:
-  - [x] build a true concurrent multistream ANE benchmark on the recurrent fused-triplet direct-select path
-  - [x] build a matched concurrent CoreML benchmark with the same prompt length, decode length, and synchronization model
-  - [x] measure stream counts `1`, `2`, `3`, `4`
-  - [x] separate compile/init time from steady-state runtime
-  - [x] normalize runtime by `streams * steps` and report aggregate `tok/s`
-- [ ] Baseline before changes:
-  - [x] re-run the current ANE single-stream recurrent fused-triplet direct-select benchmark under the current harness and record compile/init split separately from steady-state decode
-  - [x] re-run the current CoreML single-stream generation baseline under the current harness and record compile/init split separately from steady-state decode
-  - [x] keep the exact prompt length, decode length, warmup count, and timed iteration count fixed for the later multistream comparison
-- [ ] Add failing tests first:
-  - [ ] benchmark-plumbing tests for multistream orchestration:
-    - [x] isolated state is created per stream
-    - [x] synchronized rounds wait for all streams before advancing
-    - [x] aggregate token accounting uses `streams * steps`
-    - [x] compile/init metrics remain separated from timed runtime metrics
-  - [ ] hardware-gated tests for matched multistream generation:
-    - [x] ANE recurrent direct-select benchmark reports valid metrics for stream counts `1/2/3/4`
-    - [x] CoreML concurrent benchmark reports valid metrics for stream counts `1/2/3/4`
-    - [x] fairness check: both paths use the same prompt length, decode length, warmup count, and timed iteration count
-- [ ] Implement the multistream benchmark support with the smallest stable write set:
-  - [x] add benchmark result types for per-stream-count scaling reports
-  - [ ] add true concurrent ANE multistream generation orchestration:
-    - [x] one isolated model/runtime per stream
-    - [x] one isolated decode state / surfaces / buffers per stream
-    - [x] one host queue per stream
-    - [x] synchronized round timing across streams
-    - [x] preserve the current best path: recurrent fused-triplet direct-select with fused ANE RMSNorm + classifier head
-  - [ ] add matched concurrent CoreML generation orchestration:
-    - [x] separate `MLModel` instance per stream
-    - [x] separate queue per stream
-    - [x] same prompt/decode/synchronization contract as ANE
-  - [x] expose the benchmark through the existing hardware-test harness or bench entry point without regressing current single-stream paths
-- [ ] Verify in order:
-  - [x] focused non-hardware multistream benchmark tests
-  - [x] `swift test`
-  - [x] targeted hardware benchmark runs for ANE streams `1/2/3/4`
-  - [x] targeted hardware benchmark runs for CoreML streams `1/2/3/4`
-  - [x] repeat noisy runs and record repeated medians if needed
-- [ ] Apply the stop conditions immediately after measurement:
-  - [x] if ANE and CoreML scale by similar factors, document that this path does not move the relative claim enough
-  - [x] if `2` streams is the knee and `3`/`4` regress, stop scaling work there
-  - [x] if true concurrency does not materially improve aggregate ANE throughput, stop the avenue and document it
-  - [x] if the matched results honestly show `>=4x` aggregate throughput, record the breakthrough and stop
-- [x] Append findings to `docs/fused-decode-and-next-steps.md`.
-- [ ] Update durable memory with confirmed findings.
+  - [x] current saved best exact ANE single-stream path:
+    - [x] recurrent fused-triplet direct-select
+    - [x] `2.129125 ms/token`
+    - [x] `469.68 tok/s`
+  - [x] exact targets against the standing CoreML baseline:
+    - [x] `4x` => `<= 1.645556 ms/token`
+    - [x] `5x` => `<= 1.316445 ms/token`
+    - [x] `6x` => `<= 1.097037 ms/token`
+- [x] Record the known blockers so this session stays on the real frontier:
+  - [x] full triplet+head fusion is blocked
+  - [x] direct-select-only triplet+head fusion is blocked
+  - [x] `4+2` and `6`-layer larger trunk fusions are blocked with `InvalidMILProgram`
+  - [x] packed-state triplet compiles and fails at eval with `statusType=0x9`
+  - [x] smaller recurrent trunk lanes are blocked
+  - [x] smaller fused output-head lanes (`16/8/1`) are blocked
+  - [x] larger lane settings regress
+  - [x] Metal argmax, unlocked argmax, and brute-force exact sharded head all regressed
+  - [x] the current speculative verifier stack is structurally too slow
+- [x] Choose the first exact cheaper-head seam:
+  - [x] bound-driven staged exact head over contiguous vocab shards
+  - [x] stage 1 computes exact shard upper bounds using precomputed shard centers + radii on normalized activations
+  - [x] stage 2 runs exact block scoring only for shards whose bound can still beat the current best exact score
+  - [x] first runtime probe is CPU-routed for direct-select only; do not add more ANE shard dispatches until this cheaper control is measured
+  - [x] this is materially different from the rejected brute-force sharded head because it is branch-and-bound, not “run every shard every token”
+- [ ] Baseline before major changes:
+  - [ ] re-run the current saved exact ANE single-stream recurrent fused-triplet direct-select benchmark
+  - [ ] re-run the standing CoreML single-stream generation baseline
+  - [ ] keep warmup `>= 3`, timed iterations `>= 20`, and report medians
+  - [ ] separate compile/init from steady-state runtime
+  - [ ] separate trunk vs head/logits time where possible
+- [ ] Avenue 1 — exact cheaper output head:
+  - [x] add failing non-hardware tests for shard summary exactness and bound-driven pruning
+  - [x] implement shard summary builder:
+    - [x] contiguous vocab shards
+    - [x] per-shard center vector
+    - [x] per-shard radius giving a valid exact upper bound
+  - [x] implement exact bound search:
+    - [x] visit shards in descending upper-bound order
+    - [x] stop only when the current best exact score safely beats every remaining shard bound
+    - [x] preserve exact global argmax token selection
+  - [ ] implement staged exact CPU direct-select runtime:
+    - [ ] compute the normalized token vector once
+    - [ ] score block bounds cheaply on CPU
+    - [ ] run exact BLAS scoring only on surviving blocks
+    - [ ] keep full-logits materialization unchanged for non-direct-select paths
+  - [ ] benchmark the staged exact head against the saved exact control:
+    - [ ] median `ms/token`
+    - [ ] `tok/s`
+    - [ ] compile/init overhead
+    - [ ] head/logits `ms/token`
+    - [ ] median evaluated blocks per token if the runtime surface exposes it cheaply
+  - [ ] stop the avenue immediately if:
+    - [ ] the shard bound cannot be defended as exact
+    - [ ] most shards still need evaluation in steady state
+    - [ ] compile/runtime overhead erases the head-side savings
+    - [ ] median runtime regresses materially versus `2.129125 ms/token`
+- [ ] Avenue 2 — new multi-token recurrent generation architecture:
+  - [ ] only proceed after Avenue 1 is measured honestly
+  - [ ] require exact prefix acceptance and real state reuse
+  - [ ] do not reuse the current speculative verifier design
+  - [ ] measure proposer latency, verifier latency, accepted exact tokens/pass, and net `ms/token`
+  - [ ] stop if accepted exact tokens/pass saturates near `1`
+- [ ] Verification order:
+  - [ ] focused non-hardware tests for the staged exact-head seam
+  - [ ] targeted hardware generation benchmark runs for the current control
+  - [ ] targeted hardware generation benchmark runs for the staged exact head if the seam compiles cleanly
+  - [ ] rerun noisy benchmarks and keep the median only
+- [ ] Append findings to `docs/fused-decode-and-next-steps.md`.
+- [ ] Update durable Wax memory with confirmed findings.
 - [ ] Flush Wax memory before finishing.
-- [ ] Fill in this review section and commit atomically.
+- [ ] Fill in this review section and commit atomically if the avenue yields a real win or a strong architectural negative result.
 
 ## Review
-- Status: measured.
+- Status: in progress.
 - Branch: `feat/vc-eval-probe`
-- Starting commit for this avenue: `771e3aa`
 - Current hypothesis:
-  - multistream concurrency is the highest-probability remaining path because the single-stream recurrent fused-triplet direct-select path is already near a local ceiling and only about `34%` more throughput is needed for `4x`
-- Immediate execution order:
-  - rewrite task log
-  - re-run matched single-stream baselines
-  - add failing multistream benchmark tests
-  - implement true concurrent ANE and matched CoreML multistream runners
-  - measure `1/2/3/4` streams and stop at the knee if higher counts regress
+  - the best remaining exact single-stream opportunity is not another lane sweep or brute-force sharding pass
+  - the smallest materially new exact head is a bound-driven staged exact shard search that can skip whole vocab shards without sacrificing exactness
 - Evidence loaded before implementation:
-  - current best ANE single-stream result and standing CoreML baseline
-  - known dead ends for virtual client, shared events, real-time eval, hybrid Metal split, speculative verifier, and lane-width sweeps
-  - current benchmark/runtime seam has no true concurrency primitives yet, so the clean extension point is additive multistream orchestration with isolated per-stream model instances
+  - the recurrent fused-triplet direct-select path remains the saved exact control
+  - full fused head attachment is compile-blocked
+  - brute-force exact sharded head regressed badly
+  - extra ANE-side staging is therefore a poor first probe; the cheaper first control is CPU-routed exact block pruning on the direct-select path
+  - output-head cost remains large enough that a structurally cheaper exact head is still the highest-upside exact path
 - Completion gate for this avenue:
-  - either produce a matched ANE/CoreML multistream benchmark that honestly reaches `>=4x`, or produce a strong negative result that shows why concurrency does not close the gap and identifies the next best move with evidence
-- Outcome:
-  - a matched concurrent serving benchmark was implemented and repeatedly measured
-  - absolute throughput exceeded `4x` against the matched concurrent CoreML path, but the primary hypothesis failed because ANE did not scale better than CoreML from their own concurrent baselines
-  - the relative concurrency-scaling gate (`ANE scaling / CoreML scaling > 1.34`) failed at every tested stream count
-- Key measurements:
-  - single-stream control rerun:
-    - ANE fused-triplet direct-select: `2.211003 ms/token`, `452.28 tok/s`
-    - CoreML baseline: `7.044784 ms/token`, `141.95 tok/s`
-  - matched concurrent rerun (`streams=1/2/3/4`, second pass):
-    - ANE aggregate tok/s: `455.57`, `836.07`, `1143.81`, `1228.30`
-    - CoreML aggregate tok/s: `64.72`, `120.49`, `180.59`, `215.38`
-  - inference:
-    - the matched concurrent CoreML path regressed sharply already at `1` stream, so the `>4x` absolute ratio is not evidence that concurrency is the unlock
-- Current optimization cycle toward `6x`:
-  - exact `6x` target against the standing CoreML baseline:
-    - `<= 1.097037 ms/token`
-    - `>= 911.58 tok/s`
-  - current exact greedy single-stream best remains:
-    - `2.204732 ms/token`
-    - `453.57 tok/s`
-  - gap still to close:
-    - `0.559 ms/token`
-    - about `2.01x` more throughput than the current best single-stream path
-  - ranked active probes for this cycle:
-    - end-to-end ANE fusion of recurrent fused-triplet trunk with fused ANE RMSNorm/classifier head
-    - direct-select host-path reduction beyond the current IOSurface argmax path
-    - only after those: more invasive exact-head redesign or learned multi-token heads
-## Review - 2026-03-08 direct-select argmax avenue
-
-- Added guard test: `ANETypesTests/test_surface_argmax_fp16_spatial_slice_respects_channel_offset_and_tail`
-- Kept implementation win:
-  - `perf(ane): speed up fp16 spatial-slice argmax`
-  - fresh baseline: `2.2018489583333336 ms/token`
-  - repeated post-change runs: `2.2109479166666666`, `2.154953125`, `2.159026041666667 ms/token`
-  - post-change median: `2.159026041666667 ms/token`
-  - saved: `0.04282291666666665 ms/token` (`~1.94%`)
-- Verification:
-  - `swift test --filter ANETypesTests/test_surface_argmax_fp16_spatial_slice_matches_materialized_argmax`
-  - `swift test --filter ANETypesTests/test_surface_argmax_fp16_spatial_slice_respects_channel_offset_and_tail`
-  - `ANE_HARDWARE_TESTS=1 swift test --filter GenerationHarnessHardwareTests/test_recurrent_generation_fused_triplet_direct_select_reports_comparison_on_hardware`
-  - `ANE_HARDWARE_TESTS=1 swift test --filter GenerationHarnessHardwareTests/test_recurrent_generation_6layer_and_coreml_generation_baseline_if_gate_passes`
-- Next:
-  - probe explicit lock-amortized or unlocked direct-select path to remove per-token IOSurface lock overhead
-  - if that stalls, move to fused recurrent-triplet + output-head compile path
-## Review - 2026-03-08 direct-select argmax ILP widening
-
-- Added guard test: `ANETypesTests/test_surface_argmax_fp16_spatial_slice_prefers_first_max_across_unrolled_groups`
-- Kept implementation win:
-  - `perf(ane): widen fp16 argmax reduction`
-  - prior control median: `2.159026041666667 ms/token`
-  - repeated post-change runs: `2.129125`, `2.1766796875`, `2.1179270833333335 ms/token`
-  - post-change median: `2.129125 ms/token`
-  - saved: `0.02990104166666683 ms/token` (`~1.38%`)
-- Cumulative direct-select argmax savings on 2026-03-08:
-  - fresh pre-optimization baseline: `2.2018489583333336 ms/token`
-  - current best after two saved argmax changes: `2.129125 ms/token`
-  - total saved: `0.07272395833333361 ms/token` (`~3.30%`)
-- Verification:
-  - `swift test --filter ANETypesTests`
-  - `ANE_HARDWARE_TESTS=1 swift test --filter GenerationHarnessHardwareTests/test_recurrent_generation_fused_triplet_direct_select_reports_comparison_on_hardware`
-- Next:
-  - move off pure argmax ILP unless a more layout-specific specialization appears
-  - inspect recurrent-step state/input synchronization for batched or unlocked copy reductions
-## Review - 2026-03-08 rejected lane-0-only recurrent copy path
-
-- Kept only the guard:
-  - `test(ane): guard fused-triplet lane0 parity`
-- Rejected implementation idea:
-  - remove per-token full `xIn` clear
-  - replace full `stateOut -> stateIn` copies with lane-`0` `copyFP16SpatialSlice`
-- Evidence:
-  - parity test stayed green
-  - performance regressed
-  - control: `2.129125 ms/token`
-  - post-change runs: `2.243302083333333`, `2.1020781250000002`, `2.1712968750000003 ms/token`
-  - post-change median: `2.1712968750000003 ms/token`
-  - regression: `~1.98%`
-- Decision:
-  - implementation removed
-  - do not retry this exact lane-`0` narrowing path without a materially different copy primitive or stronger locality evidence
-## Review - 2026-03-08 blocked full fused triplet+head session
-
-- Attempted:
-  - full fused final-triplet + RMSNorm+classifier session returning `xNext + 3 states + logits`
-- Built:
-  - committed generator and kernelset scaffolding
-  - temporary hardware smoke test and session/runtime wiring
-- Findings:
-  - shared-classifier recurrent weights required using `embedding` as classifier weights, matching the existing `.aneRMSNormClassifier` path
-  - after fixing that contract, ANE compile still failed with `InvalidMILProgram`
-  - a second, hand-built MIL tail variant still failed the same way
-- Decision:
-  - runtime/session attempt removed
-  - smoke test reverted
-  - keep committed scaffolding as reference only
-  - pivot to a narrower direct-select-only final-triplet fusion
-## Review - 2026-03-08 blocked direct-select-only final-triplet fusion
-
-- Attempted:
-  - narrower final-triplet fusion for direct-select only
-  - outputs `stateOut0/stateOut1/stateOut2/logits`
-  - no `xNext` output on the final fused block
-- Findings:
-  - contract tests passed
-  - hardware compile smoke still failed with `InvalidMILProgram`
-- Decision:
-  - treat this as the same compiler wall class as the blocked full fused session
-  - revert the direct-select-only fusion scaffolding
-  - pivot away from classifier-attached recurrent-triplet fusion for now
-
-## 2026-03-08 - Exact sharded head avenue
-- [ ] Add contract tests for an exact sharded ANE RMSNorm+classifier head that preserves current token parity.
-- [ ] Implement a phase-1 sharded head by reusing `GenerationRMSNormClassifierKernelSet` per shard and merging top-1 by score.
-- [ ] Keep weight schema unchanged in phase 1 by deriving classifier source from `embedding` when `sharedClassifier == true`.
-- [ ] Benchmark sharded head against current saved best `2.129125 ms/token` with the existing fused-triplet direct-select harness.
-- [ ] Revert immediately if median latency regresses or parity breaks.
-- [ ] Append attempt rationale and measured result to `docs/fused-decode-and-next-steps.md`.
-- [x] Measure exact sharded ANE RMSNorm+classifier head (`16384/8192/4096`) against the saved best path.
-- [x] Reject the sharded-head avenue: all measured shard sizes regressed and the regression worsened with shard count.
-- [ ] Probe hot-path surface I/O reductions on fused-triplet direct-select: lock/unlock elimination, batched writes, or direct unlocked slice ops if parity holds.
-- [ ] If surface I/O work stalls, move to the next trunk-side exact experiment with the current direct-select head.
-- [x] Probe unlocked direct-select argmax on the fused-triplet path and rerun for stability.
-- [x] Reject unlocked argmax: parity held, but runtime was flat-to-slower across repeated hardware runs.
-- [ ] Design and try the next trunk-side fusion beyond fused triplets, keeping the current direct-select head unchanged.
-- [ ] If larger trunk fusion dead-ends on compiler/runtime walls, move to the next exact architecture step with the smallest testable slice.
-- [x] Try a 4+2 recurrent trunk fusion backend with the current direct-select head.
-- [x] Reject 4+2 recurrent trunk fusion: generator/kernel contracts passed, but the first hardware compile failed with `InvalidMILProgram`.
-
-## Next Probe - 2026-03-08 full six-layer recurrent fusion
-- [ ] Re-baseline the saved fused-triplet direct-select path immediately before the full-six attempt.
-- [ ] Add failing unit coverage for a fused six-layer recurrent generator, kernelset, and harness backend contract.
-- [ ] Implement a fused six-layer recurrent kernelset/session that keeps the current direct-select head unchanged.
-- [ ] Run targeted unit tests, then a hardware parity + benchmark probe.
-- [ ] Keep the path only if compile/eval succeeds and runtime beats the current saved best; otherwise revert code and retain docs.
-
-## Review - 2026-03-08 blocked full six-layer recurrent fusion
-- Tried:
-  - full six-layer recurrent fusion with the current direct-select output head unchanged
-  - added generator/kernelset/session/backend contracts and a hardware comparison hook
-- Why:
-  - next materially different trunk-side attempt after blocked `4+2` fusion
-- Result:
-  - unit contracts passed
-  - hardware compile failed immediately with `InvalidMILProgram`
-  - no runtime measurement, because the kernel never compiled
-- Baseline before probe:
-  - fused-triplet direct-select `2.2336927083333333 ms/token`, `447.6892970440778 tok/s`
-- Conclusion:
-  - revert the six-layer code/tests
-  - move to a materially different path instead of larger recurrent-fusion compile archaeology
-
-## Next Probe - 2026-03-08 larger output-head lanes on fused-triplet direct-select
-- [ ] Extend the fused-triplet output-head lane sweep to larger lane widths above `32`.
-- [ ] Benchmark each supported larger lane against the current `32`-lane baseline in the same sweep harness.
-- [ ] Keep only a measured runtime win; otherwise revert the test-only probe and retain docs.
-
-## Review - 2026-03-08 larger fused output-head lanes regress
-- Tried:
-  - extended fused-triplet direct-select output-head lane sweep to `64`, `96`, and `128`
-- Why:
-  - smaller lanes already failed; larger lanes were still unmeasured
-- Result:
-  - `32` remained best in the sweep at `2.3151614583333333 ms/token`
-  - `64`, `96`, and `128` all regressed end-to-end
-  - `16`, `8`, and `1` still failed at eval with `statusType=0x9`
-- Conclusion:
-  - revert the test-only sweep extension
-  - treat `32` as the best current lane geometry for the existing fused RMSNorm+classifier head
-
-## Next Probe - 2026-03-08 larger recurrent trunk lanes on fused-triplet direct-select
-- [ ] Add a fused-triplet recurrent lane sweep above `32` using the existing direct-select hardware harness.
-- [ ] Benchmark supported larger trunk lanes against the same-test `32`-lane baseline.
-- [ ] Keep only a measured runtime win; otherwise revert the probe and retain docs.
-
-## Review - 2026-03-08 larger fused-triplet trunk lanes regress
-- Tried:
-  - fused-triplet direct-select recurrent trunk lane sweep at `64`, `96`, and `128`
-- Why:
-  - larger recurrent lane geometries were still unmeasured on the best backend
-- Result:
-  - `32` remained best at `2.231127604166667 ms/token`
-  - `64`, `96`, and `128` all regressed
-  - `16`, `8`, and `1` still failed at eval
-- Conclusion:
-  - revert the test-only sweep
-  - treat `32` as the best lane geometry for the existing fused-triplet recurrent trunk
-
-## Next Probe - 2026-03-08 Metal argmax over ANE output-head IOSurface
-- [ ] Add failing parity tests for a Metal FP16 argmax reducer over an IOSurface lane slice.
-- [ ] Add a hardware benchmark comparing current direct-select argmax vs env-gated Metal argmax on fused-triplet direct-select.
-- [ ] Implement the Metal reducer and wire it behind an opt-in output-head selection path.
-- [ ] Keep only a stable runtime win; otherwise revert code/tests and retain docs.
-
-## Review - 2026-03-08 Metal argmax over ANE output-head surface regresses
-- Tried:
-  - exact Metal FP16 argmax reducer over the ANE output-head IOSurface
-  - env-gated direct-select integration on fused-triplet direct-select
-- Why:
-  - materially different exact selection path after geometry and fusion avenues stalled
-- Result:
-  - synthetic parity passed and hardware token parity held
-  - runtime regressed from `2.2768203125` to `2.7085859374999997 ms/token`
-  - logits/selection time regressed from `1.1085625000000001` to `1.6178229166666667 ms/token`
-- Conclusion:
-  - revert the Metal reducer and tests
-  - do not spend more time on standalone GPU argmax for this branch
-
-## Next Probe - 2026-03-08 batched IOSurface copy/write on fused-triplet path
-- [ ] Check existing batched SurfaceIO primitives and current triplet session I/O shape.
-- [ ] Replace per-state copy operations with batched copies where the surfaces and regions line up cleanly.
-- [ ] Benchmark on the fused-triplet direct-select harness and keep only a measured win.
-
-## Next Probe - 2026-03-08 packed-state fused-triplet recurrent session
-- [ ] Add failing contracts for a fused-triplet generator/kernelset that takes one packed recurrent-state surface instead of three separate state surfaces.
-- [ ] Implement a packed-state fused-triplet session using `slice_by_size` and packed state copy/reset.
-- [ ] Benchmark it against the current fused-triplet direct-select path and keep only a measured win.
-
-## Review - 2026-03-08 packed-state fused-triplet blocked at eval
-- Tried:
-  - packed the fused-triplet recurrent state into one input/output surface using `slice_by_size` and `concat`
-- Why:
-  - reduce triplet session surface count and collapse three state copy/reset operations into one
-- Result:
-  - unit contracts passed
-  - MIL compiled on ANE
-  - first hardware eval failed immediately with `statusType=0x9`
-- Conclusion:
-  - revert the packed-state generator/kernelset/session/backend
-  - treat the current packed-state topology as blocked
-
-## Next Probe - 2026-03-08 extend matched concurrent serving beyond 4 streams
-- [ ] Extend the matched concurrent ANE/CoreML serving benchmark beyond `4` streams.
-- [ ] Measure whether the matched aggregate ratio crosses `6x` at `5+` streams.
-- [ ] Keep only benchmark/doc updates unless the harness itself needs correction.
-
-## Review - 2026-03-08 matched concurrent serving crosses 6x
-- Tried:
-  - extended the matched concurrent ANE/CoreML serving benchmark from `1/2/3/4` to `1/2/3/4/5/6` streams
-  - repeated the benchmark twice for stability
-- Result:
-  - run 1 cleared `6x` at `1/2/3` streams and reached `5.77x` at `4`
-  - run 2 cleared `6x` at `1/2/3/4` streams
-  - ratio fell below `6x` at `5` and `6` streams in both runs
-- Conclusion:
-  - matched concurrent serving has now produced a repeated `6x` breakthrough on this branch
-  - best operating range is `2-4` streams, with the strongest aggregate ratio around `2-4`
-  - keep the extended concurrent benchmark coverage
+  - either produce a new exact single-stream best over `2.129125 ms/token`, or produce a strong measured negative result showing the shard bounds are too loose or too expensive to help
