@@ -72,3 +72,7 @@
 - Promote any confirmed result immediately into durable Wax memory with the same five-field format; do not leave confirmed findings in session-only notes.
 - Before any pause or handoff point, write a Wax handoff for project `Espresso`, include pending tasks, then flush right away.
 - Make the branch marker recoverable from Wax by always starting the note with the exact `branch:` line and flushing immediately after the write.
+
+## 2026-03-10 — Verification Plumbing
+- Keep SwiftPM test-target dependencies aligned with actual test imports; stale dependency lists can create false `no such module` failures and block focused verification of unrelated ANE work.
+- For hardware-gated generation tests, run the committed XCTest seam with `ANE_HARDWARE_TESTS=1` before trusting any disposable probe; if the run stalls, sample the test process and record the exact compile stack instead of inferring the blocker.

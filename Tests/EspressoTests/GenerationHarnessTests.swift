@@ -578,6 +578,38 @@ final class GenerationHarnessTests: XCTestCase {
         XCTAssertEqual(trace.acceptedFutureTokensPerPass, 0.0, accuracy: 1e-9)
     }
 
+    func test_exact_two_token_branch_promotion_plan_accepts_matching_future_token() {
+        let plan = ExactTwoTokenBranchPromotionPlan.make(
+            currentToken: 5,
+            proposedFutureToken: 6,
+            exactNextToken: 6,
+            exactFutureToken: 7,
+            remainingTokenBudget: 2
+        )
+
+        XCTAssertEqual(plan.committedTokens, [5, 6])
+        XCTAssertEqual(plan.nextCurrentToken, 7)
+        XCTAssertEqual(plan.committedExactTokenCount, 2)
+        XCTAssertEqual(plan.acceptedFutureTokenCount, 1)
+        XCTAssertEqual(plan.promotedStepCount, 2)
+    }
+
+    func test_exact_two_token_branch_promotion_plan_rejects_mismatched_future_token() {
+        let plan = ExactTwoTokenBranchPromotionPlan.make(
+            currentToken: 5,
+            proposedFutureToken: 9,
+            exactNextToken: 6,
+            exactFutureToken: 7,
+            remainingTokenBudget: 2
+        )
+
+        XCTAssertEqual(plan.committedTokens, [5])
+        XCTAssertEqual(plan.nextCurrentToken, 6)
+        XCTAssertEqual(plan.committedExactTokenCount, 1)
+        XCTAssertEqual(plan.acceptedFutureTokenCount, 0)
+        XCTAssertEqual(plan.promotedStepCount, 1)
+    }
+
     func test_recurrent_generation_rejects_odd_layer_count_for_fused_pair_backend() {
         let weights = makeGenerationTestRecurrentWeights(layerCount: 3)
 

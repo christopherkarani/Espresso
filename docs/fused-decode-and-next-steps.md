@@ -324,6 +324,62 @@ Reject this live Stage 1 path as the next 6x avenue.
 - rerun the hardware comparison only after the fused-triplet control benchmark is healthy in the same serialized session
 - otherwise move to the next architecture class rather than spending more time tuning this path
 
+## 2026-03-10 — Implemented two-step branch-state-promotion architecture; same-session measurement still blocked
+
+### Attempt
+
+Implemented a materially different recurrent-native `k=2` path that prepares two sequential recurrent states in one trunk pass:
+
+- new MIL generator: `RWKVStyleTwoStepRecurrentGenerator`
+- new runtime kernel set: `RWKVStyleTwoStepRecurrentKernelSet`
+- new session type: `RWKVStyleTwoStepRecurrentSession`
+- new exact model path: `ANEExactTwoTokenBranchStatePromotionModel`
+
+The contract is:
+
+- token `t` activation and proposed token `t+1` activation enter one two-step recurrent pass
+- each layer exposes `stateMid` after step 1 and `stateOut` after step 2
+- on exact prefix commit, the harness promotes `stateMid` for a one-token commit or `stateOut` for a two-token commit
+- accepted token 2 no longer triggers a second `decodeSelectedToken` call in the model path
+
+This is an implementation result, not yet a throughput result.
+
+### Verification
+
+Verified the architecture and seams in the package test runner:
+
+- `swift build --build-tests`
+- `swift test --skip-build --filter GenerationHarnessTests`
+- `swift test --skip-build --filter RWKVStyleTwoStepRecurrentGeneratorTests`
+
+The package build required correcting stale SwiftPM test-target dependencies so the existing test imports matched declared modules:
+
+- `MILGeneratorTests` now depends on `ANERuntime`
+- `ANERuntimeTests` now depends on `Espresso`
+
+### Current measurement blocker
+
+The committed hardware seam was rerun with the hardware gate enabled:
+
+- command: `ANE_HARDWARE_TESTS=1 swift test --skip-build --filter GenerationHarnessHardwareTests/test_recurrent_exact_two_token_branch_state_promotion_reports_pass_breakdown_on_hardware`
+- matched settings inside the test: `warmup=3`, `iterations=20`, `prompt=[0]`, `maxNewTokens=8`
+
+No valid medians were produced. The run stalled before timed iterations while compiling the single-layer recurrent control, and a live sample showed the stack inside:
+
+- `ANERecurrentGenerationModel.compileSingleLayerSessions`
+- `RWKVStyleRecurrentKernelSet.compileStep`
+- `ANEKernel.init`
+- `_ANEClient compileModel`
+
+### Interpretation
+
+Inference from the implemented code path:
+
+- this avenue now satisfies the required structural property that accepted work can promote prepared recurrent state instead of paying a second recurrent decode in the model path
+- the remaining blocker is measurement on this host/session, not the old replay-heavy verifier design
+
+No throughput claim is made until the same-session exact control and the new branch-state-promotion seam both complete with comparable medians.
+
 ## 2026-03-10 — Rejected clustered exact CPU staged head
 
 ### Attempt

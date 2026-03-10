@@ -145,6 +145,40 @@ public struct ExactTwoTokenPassResult: Sendable, Equatable {
     }
 }
 
+struct ExactTwoTokenBranchPromotionPlan: Sendable, Equatable {
+    let committedTokens: [UInt16]
+    let nextCurrentToken: UInt16
+    let committedExactTokenCount: Int
+    let acceptedFutureTokenCount: Int
+    let promotedStepCount: Int
+
+    static func make(
+        currentToken: UInt16,
+        proposedFutureToken: UInt16,
+        exactNextToken: UInt16,
+        exactFutureToken: UInt16,
+        remainingTokenBudget: Int
+    ) -> ExactTwoTokenBranchPromotionPlan {
+        if remainingTokenBudget > 1, proposedFutureToken == exactNextToken {
+            return ExactTwoTokenBranchPromotionPlan(
+                committedTokens: [currentToken, exactNextToken],
+                nextCurrentToken: exactFutureToken,
+                committedExactTokenCount: 2,
+                acceptedFutureTokenCount: 1,
+                promotedStepCount: 2
+            )
+        }
+
+        return ExactTwoTokenBranchPromotionPlan(
+            committedTokens: [currentToken],
+            nextCurrentToken: exactNextToken,
+            committedExactTokenCount: 1,
+            acceptedFutureTokenCount: 0,
+            promotedStepCount: 1
+        )
+    }
+}
+
 public struct ExactTwoTokenGenerationTrace: Sendable, Equatable {
     public let promptTokens: [UInt16]
     public let generatedTokens: [UInt16]
@@ -781,6 +815,553 @@ public struct ANEExactTwoTokenUpperBoundGenerationModel: ~Copyable, ExactTwoToke
                 committedExactTokenCount: committedTokens.count
             )
         )
+    }
+}
+
+public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoTokenGeneratingLanguageModel {
+    public let vocabSize: Int
+    public let layerCount: Int
+    public let maxSequenceTokens: Int
+
+    private let rmsFinal: TensorBuffer
+    private let embedding: TensorBuffer
+    private let classifier: TensorBuffer
+    private let sharedClassifier: Bool
+    private let stepNorm: TensorBuffer
+    private let stepLogits: TensorBuffer
+    private let zeroActivation: TensorBuffer
+    private let pair0ActivationA: TensorBuffer
+    private let pair1ActivationA: TensorBuffer
+    private let pair0ActivationB: TensorBuffer
+    private let pair1ActivationB: TensorBuffer
+    private let stepRMSWorkspace: RMSNorm.Workspace
+    private let outputHeadBackend: GenerationOutputHeadBackend
+    private let aneClassifierHead: ANEGenerationClassifierHead?
+    private let aneRMSNormClassifierHead: ANEGenerationRMSNormClassifierHead?
+    private var twoStepSessions: LayerStorage<RWKVStyleTwoStepRecurrentSession>
+    private var consumedTokens: Int
+    public private(set) var compileTimeMs: Double
+    private var trunkLatencyMs: Double
+    private var logitsLatencyMs: Double
+    private var lastSingleTokenTrunkLatencyMs: Double
+    private var lastSingleTokenLogitsLatencyMs: Double
+
+    public var performanceSnapshot: GenerationPerformanceSnapshot {
+        GenerationPerformanceSnapshot(
+            compileTimeMs: compileTimeMs,
+            trunkLatencyMs: trunkLatencyMs,
+            logitsLatencyMs: logitsLatencyMs
+        )
+    }
+
+    public init(
+        weights: borrowing RecurrentGenerationWeights,
+        layerCount: Int,
+        maxSequenceTokens: Int = ModelConfig.seqLen,
+        outputHeadBackend: GenerationOutputHeadBackend = .aneRMSNormClassifier,
+        trunkLaneSpatial: Int = RWKVStyleTwoStepRecurrentKernelSet.defaultLaneSpatial,
+        outputHeadLaneSpatial: Int = 32
+    ) throws(GenerationError) {
+        guard layerCount > 0 else {
+            throw .invalidArguments("layerCount must be > 0")
+        }
+        guard layerCount <= weights.layers.count else {
+            throw .invalidArguments("layerCount \(layerCount) exceeds available recurrent layers \(weights.layers.count)")
+        }
+        guard maxSequenceTokens > 0 else {
+            throw .invalidArguments("maxSequenceTokens must be > 0")
+        }
+        guard trunkLaneSpatial > 0 else {
+            throw .invalidArguments("two-step recurrent trunk laneSpatial must be > 0")
+        }
+        guard outputHeadLaneSpatial > 0 else {
+            throw .invalidArguments("generation output-head laneSpatial must be > 0")
+        }
+        if outputHeadBackend == .cpuExactStaged || outputHeadBackend == .cpuExactClustered {
+            throw .invalidArguments("two-step branch-state promotion model does not support staged CPU output heads")
+        }
+
+        let compileStart = GenerationClock.now()
+        let twoStepSessions: LayerStorage<RWKVStyleTwoStepRecurrentSession>
+        do {
+            twoStepSessions = try LayerStorage<RWKVStyleTwoStepRecurrentSession>(
+                count: layerCount,
+                throwingInitializer: { idx in
+                    try RWKVStyleTwoStepRecurrentSession(
+                        weights: weights.layers[idx],
+                        laneSpatial: trunkLaneSpatial
+                    )
+                }
+            )
+        } catch {
+            throw .runtimeFailure("two-step recurrent kernel/session setup failed: \(error)")
+        }
+
+        let vocabSize = weights.vocabSize
+        let sharedClassifier = weights.sharedClassifier
+        guard vocabSize > 0 else {
+            throw .invalidArguments("vocabSize must be > 0")
+        }
+
+        let rmsFinal = GenerationWeightCloner.cloneTensor(weights.rmsFinal)
+        let embedding = GenerationWeightCloner.cloneTensor(weights.embedding)
+        let classifier = sharedClassifier
+            ? TensorBuffer(count: 0, zeroed: true)
+            : GenerationWeightCloner.cloneTensor(weights.classifier)
+
+        let aneClassifierHead: ANEGenerationClassifierHead?
+        switch outputHeadBackend {
+        case .aneClassifier:
+            do {
+                if sharedClassifier {
+                    aneClassifierHead = try ANEGenerationClassifierHead(
+                        classifierWeights: embedding,
+                        vocabSize: vocabSize,
+                        laneSpatial: outputHeadLaneSpatial
+                    )
+                } else {
+                    aneClassifierHead = try ANEGenerationClassifierHead(
+                        classifierWeights: classifier,
+                        vocabSize: vocabSize,
+                        laneSpatial: outputHeadLaneSpatial
+                    )
+                }
+            } catch {
+                throw .runtimeFailure("two-step ANE classifier setup failed: \(error)")
+            }
+        default:
+            aneClassifierHead = nil
+        }
+
+        let aneRMSNormClassifierHead: ANEGenerationRMSNormClassifierHead?
+        switch outputHeadBackend {
+        case .aneRMSNormClassifier:
+            do {
+                if sharedClassifier {
+                    aneRMSNormClassifierHead = try ANEGenerationRMSNormClassifierHead(
+                        rmsFinal: rmsFinal,
+                        classifierWeights: embedding,
+                        vocabSize: vocabSize,
+                        laneSpatial: outputHeadLaneSpatial
+                    )
+                } else {
+                    aneRMSNormClassifierHead = try ANEGenerationRMSNormClassifierHead(
+                        rmsFinal: rmsFinal,
+                        classifierWeights: classifier,
+                        vocabSize: vocabSize,
+                        laneSpatial: outputHeadLaneSpatial
+                    )
+                }
+            } catch {
+                throw .runtimeFailure("two-step ANE fused output-head setup failed: \(error)")
+            }
+        default:
+            aneRMSNormClassifierHead = nil
+        }
+
+        self.vocabSize = vocabSize
+        self.layerCount = layerCount
+        self.maxSequenceTokens = maxSequenceTokens
+        self.rmsFinal = rmsFinal
+        self.embedding = embedding
+        self.classifier = classifier
+        self.sharedClassifier = sharedClassifier
+        self.stepNorm = TensorBuffer(count: ModelConfig.dim, zeroed: true)
+        self.stepLogits = TensorBuffer(count: vocabSize, zeroed: true)
+        self.zeroActivation = TensorBuffer(count: ModelConfig.dim, zeroed: true)
+        self.pair0ActivationA = TensorBuffer(count: ModelConfig.dim, zeroed: true)
+        self.pair1ActivationA = TensorBuffer(count: ModelConfig.dim, zeroed: true)
+        self.pair0ActivationB = TensorBuffer(count: ModelConfig.dim, zeroed: true)
+        self.pair1ActivationB = TensorBuffer(count: ModelConfig.dim, zeroed: true)
+        self.stepRMSWorkspace = RMSNorm.Workspace(seqLen: 1)
+        self.outputHeadBackend = outputHeadBackend
+        self.aneClassifierHead = aneClassifierHead
+        self.aneRMSNormClassifierHead = aneRMSNormClassifierHead
+        self.twoStepSessions = twoStepSessions
+        self.consumedTokens = 0
+        self.compileTimeMs = GenerationClock.milliseconds(start: compileStart, end: GenerationClock.now())
+        self.trunkLatencyMs = 0
+        self.logitsLatencyMs = 0
+        self.lastSingleTokenTrunkLatencyMs = 0
+        self.lastSingleTokenLogitsLatencyMs = 0
+    }
+
+    public mutating func reset() throws(GenerationError) {
+        for idx in 0..<twoStepSessions.count {
+            do {
+                try twoStepSessions[idx].reset()
+            } catch {
+                throw .runtimeFailure("two-step recurrent reset failed at layer \(idx): \(error)")
+            }
+        }
+        pair0ActivationA.zero()
+        pair1ActivationA.zero()
+        pair0ActivationB.zero()
+        pair1ActivationB.zero()
+        consumedTokens = 0
+        trunkLatencyMs = 0
+        logitsLatencyMs = 0
+        lastSingleTokenTrunkLatencyMs = 0
+        lastSingleTokenLogitsLatencyMs = 0
+    }
+
+    public mutating func prefillSelectedToken(
+        promptTokens: [UInt16],
+        strategy: TokenSelectionStrategy
+    ) throws(GenerationError) -> UInt16 {
+        guard !promptTokens.isEmpty else {
+            throw .invalidArguments("promptTokens must not be empty")
+        }
+        guard promptTokens.count <= maxSequenceTokens else {
+            throw .invalidArguments("prompt length \(promptTokens.count) exceeds maxSequenceTokens \(maxSequenceTokens)")
+        }
+
+        var selectedToken: UInt16 = 0
+        for token in promptTokens {
+            selectedToken = try runCommittedSingleToken(token: token, strategy: strategy)
+        }
+        return selectedToken
+    }
+
+    public mutating func performExactTwoTokenPass(
+        currentToken: UInt16,
+        remainingTokenBudget: Int,
+        strategy: TokenSelectionStrategy
+    ) throws(GenerationError) -> ExactTwoTokenPassResult {
+        guard remainingTokenBudget > 0 else {
+            throw .invalidArguments("remainingTokenBudget must be > 0")
+        }
+
+        let proposerStart = GenerationClock.now()
+        // Upper-bound proposer on the echo checkpoint family: the future token reuses the
+        // current exact token so acceptance probes the state-promotion ceiling, not model quality.
+        let proposedFutureToken = currentToken
+        let proposerLatencyMs = GenerationClock.milliseconds(start: proposerStart, end: GenerationClock.now())
+
+        if remainingTokenBudget == 1 {
+            let exactNextToken = try runCommittedSingleToken(token: currentToken, strategy: strategy)
+            return ExactTwoTokenPassResult(
+                committedTokens: [currentToken],
+                nextCurrentToken: exactNextToken,
+                metrics: ExactTwoTokenPassMetrics(
+                    proposerLatencyMs: proposerLatencyMs,
+                    verifierTrunkLatencyMs: lastSingleTokenTrunkLatencyMs,
+                    verifierLogitsLatencyMs: lastSingleTokenLogitsLatencyMs,
+                    stateAdvanceLatencyMs: 0,
+                    acceptedFutureTokenCount: 0,
+                    committedExactTokenCount: 1
+                )
+            )
+        }
+
+        let prepared = try prepareExactTwoTokenPair(
+            currentToken: currentToken,
+            proposedFutureToken: proposedFutureToken,
+            strategy: strategy
+        )
+        let plan = ExactTwoTokenBranchPromotionPlan.make(
+            currentToken: currentToken,
+            proposedFutureToken: proposedFutureToken,
+            exactNextToken: prepared.exactNextToken,
+            exactFutureToken: prepared.exactFutureToken,
+            remainingTokenBudget: remainingTokenBudget
+        )
+        let stateAdvanceLatencyMs = try promotePreparedPair(stepCount: plan.promotedStepCount)
+        consumedTokens += plan.promotedStepCount
+
+        return ExactTwoTokenPassResult(
+            committedTokens: plan.committedTokens,
+            nextCurrentToken: plan.nextCurrentToken,
+            metrics: ExactTwoTokenPassMetrics(
+                proposerLatencyMs: proposerLatencyMs,
+                verifierTrunkLatencyMs: prepared.trunkLatencyMs,
+                verifierLogitsLatencyMs: prepared.logitsLatencyMs,
+                stateAdvanceLatencyMs: stateAdvanceLatencyMs,
+                acceptedFutureTokenCount: plan.acceptedFutureTokenCount,
+                committedExactTokenCount: plan.committedExactTokenCount
+            )
+        )
+    }
+
+    private mutating func runCommittedSingleToken(
+        token: UInt16,
+        strategy: TokenSelectionStrategy
+    ) throws(GenerationError) -> UInt16 {
+        guard Int(token) < vocabSize else {
+            throw .invalidArguments("token \(token) exceeds vocab size \(vocabSize)")
+        }
+        guard consumedTokens < maxSequenceTokens else {
+            throw .invalidArguments("two-step recurrent generation overflow at maxSequenceTokens \(maxSequenceTokens)")
+        }
+
+        try Self.writeTokenEmbedding(token, embedding: embedding, into: pair0ActivationA)
+        pair1ActivationA.zero()
+        let prepared = try prepareActivationPair(strategy: strategy)
+        let stateAdvanceLatencyMs = try promotePreparedPair(stepCount: 1)
+        consumedTokens += 1
+        lastSingleTokenTrunkLatencyMs = prepared.trunkLatencyMs + stateAdvanceLatencyMs
+        lastSingleTokenLogitsLatencyMs = prepared.logitsLatencyMs
+        return prepared.exactNextToken
+    }
+
+    private struct PreparedExactTwoTokenPair {
+        let exactNextToken: UInt16
+        let exactFutureToken: UInt16
+        let trunkLatencyMs: Double
+        let logitsLatencyMs: Double
+    }
+
+    private mutating func prepareExactTwoTokenPair(
+        currentToken: UInt16,
+        proposedFutureToken: UInt16,
+        strategy: TokenSelectionStrategy
+    ) throws(GenerationError) -> PreparedExactTwoTokenPair {
+        guard Int(currentToken) < vocabSize else {
+            throw .invalidArguments("token \(currentToken) exceeds vocab size \(vocabSize)")
+        }
+        guard Int(proposedFutureToken) < vocabSize else {
+            throw .invalidArguments("proposedFutureToken \(proposedFutureToken) exceeds vocab size \(vocabSize)")
+        }
+        guard consumedTokens + 1 < maxSequenceTokens else {
+            throw .invalidArguments("two-step recurrent generation overflow at maxSequenceTokens \(maxSequenceTokens)")
+        }
+
+        try Self.writeTokenEmbedding(currentToken, embedding: embedding, into: pair0ActivationA)
+        try Self.writeTokenEmbedding(proposedFutureToken, embedding: embedding, into: pair1ActivationA)
+        return try prepareActivationPair(strategy: strategy)
+    }
+
+    private mutating func prepareActivationPair(
+        strategy: TokenSelectionStrategy
+    ) throws(GenerationError) -> PreparedExactTwoTokenPair {
+        let trunkStart = GenerationClock.now()
+        var sourcePairIsA = true
+
+        for idx in 0..<twoStepSessions.count {
+            var timings = StepTimingBreakdown()
+            do {
+                if sourcePairIsA {
+                    try twoStepSessions[idx].prepare(
+                        tokenInput0: pair0ActivationA,
+                        tokenInput1: pair1ActivationA,
+                        output0: pair0ActivationB,
+                        output1: pair1ActivationB,
+                        timings: &timings
+                    )
+                } else {
+                    try twoStepSessions[idx].prepare(
+                        tokenInput0: pair0ActivationB,
+                        tokenInput1: pair1ActivationB,
+                        output0: pair0ActivationA,
+                        output1: pair1ActivationA,
+                        timings: &timings
+                    )
+                }
+            } catch {
+                throw .runtimeFailure("two-step recurrent prepare failed at layer \(idx): \(error)")
+            }
+            sourcePairIsA.toggle()
+        }
+
+        let trunkLatencyMs = GenerationClock.milliseconds(start: trunkStart, end: GenerationClock.now())
+        self.trunkLatencyMs += trunkLatencyMs
+
+        let logitsStart = GenerationClock.now()
+        let exactNextToken: UInt16
+        let exactFutureToken: UInt16
+        if sourcePairIsA {
+            exactNextToken = try Self.selectTokenFromActivation(
+                pair0ActivationA,
+                strategy: strategy,
+                outputHeadBackend: outputHeadBackend,
+                rmsFinal: rmsFinal,
+                stepNorm: stepNorm,
+                stepLogits: stepLogits,
+                embedding: embedding,
+                classifier: classifier,
+                sharedClassifier: sharedClassifier,
+                aneClassifierHead: aneClassifierHead,
+                aneRMSNormClassifierHead: aneRMSNormClassifierHead,
+                vocabSize: vocabSize,
+                stepRMSWorkspace: stepRMSWorkspace
+            )
+            exactFutureToken = try Self.selectTokenFromActivation(
+                pair1ActivationA,
+                strategy: strategy,
+                outputHeadBackend: outputHeadBackend,
+                rmsFinal: rmsFinal,
+                stepNorm: stepNorm,
+                stepLogits: stepLogits,
+                embedding: embedding,
+                classifier: classifier,
+                sharedClassifier: sharedClassifier,
+                aneClassifierHead: aneClassifierHead,
+                aneRMSNormClassifierHead: aneRMSNormClassifierHead,
+                vocabSize: vocabSize,
+                stepRMSWorkspace: stepRMSWorkspace
+            )
+        } else {
+            exactNextToken = try Self.selectTokenFromActivation(
+                pair0ActivationB,
+                strategy: strategy,
+                outputHeadBackend: outputHeadBackend,
+                rmsFinal: rmsFinal,
+                stepNorm: stepNorm,
+                stepLogits: stepLogits,
+                embedding: embedding,
+                classifier: classifier,
+                sharedClassifier: sharedClassifier,
+                aneClassifierHead: aneClassifierHead,
+                aneRMSNormClassifierHead: aneRMSNormClassifierHead,
+                vocabSize: vocabSize,
+                stepRMSWorkspace: stepRMSWorkspace
+            )
+            exactFutureToken = try Self.selectTokenFromActivation(
+                pair1ActivationB,
+                strategy: strategy,
+                outputHeadBackend: outputHeadBackend,
+                rmsFinal: rmsFinal,
+                stepNorm: stepNorm,
+                stepLogits: stepLogits,
+                embedding: embedding,
+                classifier: classifier,
+                sharedClassifier: sharedClassifier,
+                aneClassifierHead: aneClassifierHead,
+                aneRMSNormClassifierHead: aneRMSNormClassifierHead,
+                vocabSize: vocabSize,
+                stepRMSWorkspace: stepRMSWorkspace
+            )
+        }
+        let logitsLatencyMs = GenerationClock.milliseconds(start: logitsStart, end: GenerationClock.now())
+        self.logitsLatencyMs += logitsLatencyMs
+
+        return PreparedExactTwoTokenPair(
+            exactNextToken: exactNextToken,
+            exactFutureToken: exactFutureToken,
+            trunkLatencyMs: trunkLatencyMs,
+            logitsLatencyMs: logitsLatencyMs
+        )
+    }
+
+    private mutating func promotePreparedPair(stepCount: Int) throws(GenerationError) -> Double {
+        let start = GenerationClock.now()
+        for idx in 0..<twoStepSessions.count {
+            do {
+                try twoStepSessions[idx].promotePreparedState(commitCount: stepCount)
+            } catch {
+                throw .runtimeFailure("two-step recurrent state promotion failed at layer \(idx): \(error)")
+            }
+        }
+        return GenerationClock.milliseconds(start: start, end: GenerationClock.now())
+    }
+
+    private static func writeTokenEmbedding(
+        _ token: UInt16,
+        embedding: borrowing TensorBuffer,
+        into activation: borrowing TensorBuffer
+    ) throws(GenerationError) {
+        activation.withUnsafeMutablePointer { dst in
+            embedding.withUnsafePointer { embeddingPtr in
+                let base = Int(token) * ModelConfig.dim
+                for dimIdx in 0..<ModelConfig.dim {
+                    dst[dimIdx] = embeddingPtr[base + dimIdx]
+                }
+            }
+        }
+    }
+
+    @inline(__always)
+    private static func classifierPointer<R>(
+        sharedClassifier: Bool,
+        embedding: borrowing TensorBuffer,
+        classifier: borrowing TensorBuffer,
+        body: (UnsafePointer<Float>) throws -> R
+    ) rethrows -> R {
+        if sharedClassifier {
+            return try embedding.withUnsafePointer(body)
+        }
+        return try classifier.withUnsafePointer(body)
+    }
+
+    private static func selectTokenFromActivation(
+        _ activation: borrowing TensorBuffer,
+        strategy: TokenSelectionStrategy
+        ,
+        outputHeadBackend: GenerationOutputHeadBackend,
+        rmsFinal: borrowing TensorBuffer,
+        stepNorm: borrowing TensorBuffer,
+        stepLogits: borrowing TensorBuffer,
+        embedding: borrowing TensorBuffer,
+        classifier: borrowing TensorBuffer,
+        sharedClassifier: Bool,
+        aneClassifierHead: ANEGenerationClassifierHead?,
+        aneRMSNormClassifierHead: ANEGenerationRMSNormClassifierHead?,
+        vocabSize: Int,
+        stepRMSWorkspace: borrowing RMSNorm.Workspace
+    ) throws(GenerationError) -> UInt16 {
+        if outputHeadBackend != .aneRMSNormClassifier {
+            activation.withUnsafePointer { xPtr in
+                stepNorm.withUnsafeMutablePointer { normPtr in
+                    rmsFinal.withUnsafePointer { rmsPtr in
+                        RMSNorm.forward(
+                            output: normPtr,
+                            input: xPtr,
+                            weights: rmsPtr,
+                            dim: ModelConfig.dim,
+                            seqLen: 1,
+                            workspace: stepRMSWorkspace
+                        )
+                    }
+                }
+            }
+        }
+
+        let token: UInt16
+        switch outputHeadBackend {
+        case .cpu:
+            stepLogits.zero()
+            stepLogits.withUnsafeMutablePointer { logitsPtr in
+                classifierPointer(
+                    sharedClassifier: sharedClassifier,
+                    embedding: embedding,
+                    classifier: classifier
+                ) { clsPtr in
+                    stepNorm.withUnsafePointer { normPtr in
+                        BLAS.sgemm(
+                            CblasRowMajor,
+                            CblasNoTrans,
+                            CblasNoTrans,
+                            m: Int32(vocabSize),
+                            n: 1,
+                            k: Int32(ModelConfig.dim),
+                            alpha: 1.0,
+                            a: clsPtr,
+                            lda: Int32(ModelConfig.dim),
+                            b: normPtr,
+                            ldb: 1,
+                            beta: 0.0,
+                            c: logitsPtr,
+                            ldc: 1
+                        )
+                    }
+                }
+            }
+            token = try selectToken(from: stepLogits, strategy: strategy)
+        case .aneClassifier:
+            guard let aneClassifierHead else {
+                throw .runtimeFailure("two-step ANE classifier backend requested without compiled head")
+            }
+            token = try aneClassifierHead.selectArgmax(normalizedInput: stepNorm)
+        case .aneRMSNormClassifier:
+            guard let aneRMSNormClassifierHead else {
+                throw .runtimeFailure("two-step ANE fused output-head backend requested without compiled head")
+            }
+            token = try aneRMSNormClassifierHead.selectArgmax(rawInput: activation)
+        case .cpuExactStaged, .cpuExactClustered:
+            throw .runtimeFailure("two-step branch-state promotion model does not support staged CPU output heads")
+        }
+
+        return token
     }
 }
 

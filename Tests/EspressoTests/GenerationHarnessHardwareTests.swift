@@ -628,6 +628,47 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(upperBound.medianAcceptedFutureTokensPerPass, 0.0)
     }
 
+    func test_recurrent_exact_two_token_branch_state_promotion_reports_pass_breakdown_on_hardware() throws {
+        try requireGenerationHardware()
+
+        let prompt: [UInt16] = [0]
+        let warmup = 3
+        let iterations = 20
+        let maxNewTokens = 8
+
+        let control = try benchmarkRecurrentEchoGeneration(
+            layerCount: 1,
+            promptTokens: prompt,
+            maxNewTokens: maxNewTokens,
+            warmup: warmup,
+            iterations: iterations,
+            outputHeadBackend: .aneRMSNormClassifier,
+            useDirectTokenSelection: true,
+            trunkBackend: .singleLayer
+        )
+        let promoted = try benchmarkRecurrentExactTwoTokenBranchStatePromotionGeneration(
+            layerCount: 1,
+            promptTokens: prompt,
+            maxNewTokens: maxNewTokens,
+            warmup: warmup,
+            iterations: iterations,
+            outputHeadBackend: .aneRMSNormClassifier
+        )
+
+        print(
+            """
+            recurrent single-layer exact control median=\(control.medianTokenMs) ms/token tps=\(control.medianTokensPerSecond) compile=\(control.compileTimeMs) trunk=\(control.medianTrunkMsPerToken) logits=\(control.medianLogitsMsPerToken)
+            recurrent single-layer exact two-token branch-state-promotion median=\(promoted.medianTokenMs) ms/token tps=\(promoted.medianTokensPerSecond) compile=\(promoted.compileTimeMs) committed_exact_tokens_per_pass=\(promoted.medianCommittedExactTokensPerPass) accepted_future_tokens_per_pass=\(promoted.medianAcceptedFutureTokensPerPass) proposer=\(promoted.medianProposerMsPerPass) verifier_trunk=\(promoted.medianVerifierTrunkMsPerPass) verifier_logits=\(promoted.medianVerifierLogitsMsPerPass) state_advance=\(promoted.medianStateAdvanceMsPerPass)
+            """
+        )
+
+        XCTAssertGreaterThan(control.medianTokenMs, 0)
+        XCTAssertGreaterThan(promoted.medianTokenMs, 0)
+        XCTAssertGreaterThan(promoted.compileTimeMs, 0)
+        XCTAssertGreaterThan(promoted.medianCommittedExactTokensPerPass, 1.0)
+        XCTAssertGreaterThanOrEqual(promoted.medianAcceptedFutureTokensPerPass, 0.0)
+    }
+
     func test_recurrent_generation_reports_compile_and_runtime_breakdown_on_hardware() throws {
         try requireGenerationHardware()
 
@@ -1917,6 +1958,74 @@ final class GenerationHarnessHardwareTests: XCTestCase {
             maxSequenceTokens: 32,
             outputHeadBackend: outputHeadBackend,
             trunkBackend: trunkBackend,
+            trunkLaneSpatial: trunkLaneSpatial,
+            outputHeadLaneSpatial: outputHeadLaneSpatial
+        )
+        var harness = ExactTwoTokenGenerationHarness(model: model, strategy: .argmax)
+
+        var tokenLatencies: [Double] = []
+        var throughput: [Double] = []
+        var committedExactTokensPerPass: [Double] = []
+        var acceptedFutureTokensPerPass: [Double] = []
+        var proposerMsPerPass: [Double] = []
+        var verifierTrunkMsPerPass: [Double] = []
+        var verifierLogitsMsPerPass: [Double] = []
+        var stateAdvanceMsPerPass: [Double] = []
+
+        tokenLatencies.reserveCapacity(iterations)
+        throughput.reserveCapacity(iterations)
+        committedExactTokensPerPass.reserveCapacity(iterations)
+        acceptedFutureTokensPerPass.reserveCapacity(iterations)
+        proposerMsPerPass.reserveCapacity(iterations)
+        verifierTrunkMsPerPass.reserveCapacity(iterations)
+        verifierLogitsMsPerPass.reserveCapacity(iterations)
+        stateAdvanceMsPerPass.reserveCapacity(iterations)
+
+        let compileTimeMs = harness.model.performanceSnapshot.compileTimeMs
+
+        for iter in 0..<(warmup + iterations) {
+            let trace = try harness.generate(promptTokens: promptTokens, maxNewTokens: maxNewTokens)
+            if iter >= warmup {
+                tokenLatencies.append(trace.totalLatencyMs / Double(maxNewTokens))
+                throughput.append(trace.effectiveTokensPerSecond)
+                committedExactTokensPerPass.append(trace.committedExactTokensPerPass)
+                acceptedFutureTokensPerPass.append(trace.acceptedFutureTokensPerPass)
+                proposerMsPerPass.append(trace.proposerLatencyMsPerPass)
+                verifierTrunkMsPerPass.append(trace.verifierTrunkLatencyMsPerPass)
+                verifierLogitsMsPerPass.append(trace.verifierLogitsLatencyMsPerPass)
+                stateAdvanceMsPerPass.append(trace.stateAdvanceLatencyMsPerPass)
+            }
+        }
+
+        return ExactTwoTokenBenchmarkSample(
+            medianTokenMs: median(tokenLatencies),
+            medianTokensPerSecond: median(throughput),
+            compileTimeMs: compileTimeMs,
+            medianCommittedExactTokensPerPass: median(committedExactTokensPerPass),
+            medianAcceptedFutureTokensPerPass: median(acceptedFutureTokensPerPass),
+            medianProposerMsPerPass: median(proposerMsPerPass),
+            medianVerifierTrunkMsPerPass: median(verifierTrunkMsPerPass),
+            medianVerifierLogitsMsPerPass: median(verifierLogitsMsPerPass),
+            medianStateAdvanceMsPerPass: median(stateAdvanceMsPerPass)
+        )
+    }
+
+    private func benchmarkRecurrentExactTwoTokenBranchStatePromotionGeneration(
+        layerCount: Int,
+        promptTokens: [UInt16],
+        maxNewTokens: Int,
+        warmup: Int,
+        iterations: Int,
+        outputHeadBackend: GenerationOutputHeadBackend = .aneRMSNormClassifier,
+        trunkLaneSpatial: Int = 32,
+        outputHeadLaneSpatial: Int = 32
+    ) throws -> ExactTwoTokenBenchmarkSample {
+        let weights = makeEchoRecurrentGenerationWeights(layerCount: layerCount)
+        let model = try ANEExactTwoTokenBranchStatePromotionModel(
+            weights: weights,
+            layerCount: layerCount,
+            maxSequenceTokens: 32,
+            outputHeadBackend: outputHeadBackend,
             trunkLaneSpatial: trunkLaneSpatial,
             outputHeadLaneSpatial: outputHeadLaneSpatial
         )

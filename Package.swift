@@ -84,7 +84,7 @@ let package = Package(
         .testTarget(name: "ANETypesTests", dependencies: ["ANETypes"], swiftSettings: [.swiftLanguageMode(.v6)]),
         .testTarget(
             name: "MILGeneratorTests",
-            dependencies: ["MILGenerator"],
+            dependencies: ["MILGenerator", "ANERuntime"],
             path: "Tests/MILGeneratorTests",
             resources: [.process("Fixtures")],
             swiftSettings: [.swiftLanguageMode(.v6)]
@@ -92,7 +92,7 @@ let package = Package(
         .testTarget(name: "CPUOpsTests", dependencies: ["CPUOps"], swiftSettings: [.swiftLanguageMode(.v6)]),
         .testTarget(
             name: "ANERuntimeTests",
-            dependencies: ["ANERuntime", "ANEInterop", "MILGenerator", "ANETypes"],
+            dependencies: ["ANERuntime", "ANEInterop", "MILGenerator", "ANETypes", "Espresso"],
             path: "Tests/ANERuntimeTests",
             resources: [.copy("Fixtures")],
             swiftSettings: [.swiftLanguageMode(.v6)]
