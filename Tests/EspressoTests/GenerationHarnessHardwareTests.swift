@@ -20,6 +20,18 @@ private struct GenerationBenchmarkSample {
     let medianLogitsMsPerToken: Double
 }
 
+private struct ExactTwoTokenBenchmarkSample {
+    let medianTokenMs: Double
+    let medianTokensPerSecond: Double
+    let compileTimeMs: Double
+    let medianCommittedExactTokensPerPass: Double
+    let medianAcceptedFutureTokensPerPass: Double
+    let medianProposerMsPerPass: Double
+    let medianVerifierTrunkMsPerPass: Double
+    let medianVerifierLogitsMsPerPass: Double
+    let medianStateAdvanceMsPerPass: Double
+}
+
 private func fill(_ buffer: borrowing TensorBuffer, value: Float) {
     buffer.withUnsafeMutableBufferPointer { ptr in
         for idx in ptr.indices {
@@ -572,6 +584,48 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         XCTAssertGreaterThan(direct.medianTokenMs, 0)
         XCTAssertEqual(speculativeK2.acceptanceRate ?? -1, 1.0, accuracy: 1e-6)
         XCTAssertEqual(speculativeK4.acceptanceRate ?? -1, 1.0, accuracy: 1e-6)
+    }
+
+    func test_recurrent_exact_two_token_upper_bound_reports_pass_breakdown_on_hardware() throws {
+        try requireGenerationHardware()
+
+        let prompt: [UInt16] = [0]
+        let warmup = 3
+        let iterations = 20
+        let maxNewTokens = 8
+
+        let control = try benchmarkRecurrentEchoGeneration(
+            layerCount: 6,
+            promptTokens: prompt,
+            maxNewTokens: maxNewTokens,
+            warmup: warmup,
+            iterations: iterations,
+            outputHeadBackend: .aneRMSNormClassifier,
+            useDirectTokenSelection: true,
+            trunkBackend: .fusedThreeLayerTriplets
+        )
+        let upperBound = try benchmarkRecurrentExactTwoTokenUpperBoundGeneration(
+            layerCount: 6,
+            promptTokens: prompt,
+            maxNewTokens: maxNewTokens,
+            warmup: warmup,
+            iterations: iterations,
+            outputHeadBackend: .aneRMSNormClassifier,
+            trunkBackend: .fusedThreeLayerTriplets
+        )
+
+        print(
+            """
+            recurrent exact control median=\(control.medianTokenMs) ms/token tps=\(control.medianTokensPerSecond) compile=\(control.compileTimeMs) trunk=\(control.medianTrunkMsPerToken) logits=\(control.medianLogitsMsPerToken)
+            recurrent exact two-token upper-bound median=\(upperBound.medianTokenMs) ms/token tps=\(upperBound.medianTokensPerSecond) compile=\(upperBound.compileTimeMs) committed_exact_tokens_per_pass=\(upperBound.medianCommittedExactTokensPerPass) accepted_future_tokens_per_pass=\(upperBound.medianAcceptedFutureTokensPerPass) proposer=\(upperBound.medianProposerMsPerPass) verifier_trunk=\(upperBound.medianVerifierTrunkMsPerPass) verifier_logits=\(upperBound.medianVerifierLogitsMsPerPass) state_advance=\(upperBound.medianStateAdvanceMsPerPass)
+            """
+        )
+
+        XCTAssertGreaterThan(control.medianTokenMs, 0)
+        XCTAssertGreaterThan(upperBound.medianTokenMs, 0)
+        XCTAssertGreaterThan(upperBound.compileTimeMs, 0)
+        XCTAssertGreaterThan(upperBound.medianCommittedExactTokensPerPass, 1.0)
+        XCTAssertGreaterThanOrEqual(upperBound.medianAcceptedFutureTokensPerPass, 0.0)
     }
 
     func test_recurrent_generation_reports_compile_and_runtime_breakdown_on_hardware() throws {
@@ -1843,6 +1897,76 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                 iterations: iterations
             )
         }
+    }
+
+    private func benchmarkRecurrentExactTwoTokenUpperBoundGeneration(
+        layerCount: Int,
+        promptTokens: [UInt16],
+        maxNewTokens: Int,
+        warmup: Int,
+        iterations: Int,
+        outputHeadBackend: GenerationOutputHeadBackend = .aneRMSNormClassifier,
+        trunkBackend: RecurrentGenerationTrunkBackend = .fusedThreeLayerTriplets,
+        trunkLaneSpatial: Int = 32,
+        outputHeadLaneSpatial: Int = 32
+    ) throws -> ExactTwoTokenBenchmarkSample {
+        let weights = makeEchoRecurrentGenerationWeights(layerCount: layerCount)
+        let model = try ANEExactTwoTokenUpperBoundGenerationModel(
+            weights: weights,
+            layerCount: layerCount,
+            maxSequenceTokens: 32,
+            outputHeadBackend: outputHeadBackend,
+            trunkBackend: trunkBackend,
+            trunkLaneSpatial: trunkLaneSpatial,
+            outputHeadLaneSpatial: outputHeadLaneSpatial
+        )
+        var harness = ExactTwoTokenGenerationHarness(model: model, strategy: .argmax)
+
+        var tokenLatencies: [Double] = []
+        var throughput: [Double] = []
+        var committedExactTokensPerPass: [Double] = []
+        var acceptedFutureTokensPerPass: [Double] = []
+        var proposerMsPerPass: [Double] = []
+        var verifierTrunkMsPerPass: [Double] = []
+        var verifierLogitsMsPerPass: [Double] = []
+        var stateAdvanceMsPerPass: [Double] = []
+
+        tokenLatencies.reserveCapacity(iterations)
+        throughput.reserveCapacity(iterations)
+        committedExactTokensPerPass.reserveCapacity(iterations)
+        acceptedFutureTokensPerPass.reserveCapacity(iterations)
+        proposerMsPerPass.reserveCapacity(iterations)
+        verifierTrunkMsPerPass.reserveCapacity(iterations)
+        verifierLogitsMsPerPass.reserveCapacity(iterations)
+        stateAdvanceMsPerPass.reserveCapacity(iterations)
+
+        let compileTimeMs = harness.model.performanceSnapshot.compileTimeMs
+
+        for iter in 0..<(warmup + iterations) {
+            let trace = try harness.generate(promptTokens: promptTokens, maxNewTokens: maxNewTokens)
+            if iter >= warmup {
+                tokenLatencies.append(trace.totalLatencyMs / Double(maxNewTokens))
+                throughput.append(trace.effectiveTokensPerSecond)
+                committedExactTokensPerPass.append(trace.committedExactTokensPerPass)
+                acceptedFutureTokensPerPass.append(trace.acceptedFutureTokensPerPass)
+                proposerMsPerPass.append(trace.proposerLatencyMsPerPass)
+                verifierTrunkMsPerPass.append(trace.verifierTrunkLatencyMsPerPass)
+                verifierLogitsMsPerPass.append(trace.verifierLogitsLatencyMsPerPass)
+                stateAdvanceMsPerPass.append(trace.stateAdvanceLatencyMsPerPass)
+            }
+        }
+
+        return ExactTwoTokenBenchmarkSample(
+            medianTokenMs: median(tokenLatencies),
+            medianTokensPerSecond: median(throughput),
+            compileTimeMs: compileTimeMs,
+            medianCommittedExactTokensPerPass: median(committedExactTokensPerPass),
+            medianAcceptedFutureTokensPerPass: median(acceptedFutureTokensPerPass),
+            medianProposerMsPerPass: median(proposerMsPerPass),
+            medianVerifierTrunkMsPerPass: median(verifierTrunkMsPerPass),
+            medianVerifierLogitsMsPerPass: median(verifierLogitsMsPerPass),
+            medianStateAdvanceMsPerPass: median(stateAdvanceMsPerPass)
+        )
     }
 
     private func benchmarkCoreMLGeneration(

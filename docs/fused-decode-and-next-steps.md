@@ -258,6 +258,70 @@ This avenue is rejected in its contiguous-shard form.
 - keep the exact branch-and-bound seam and tests as reference infrastructure
 - reject contiguous-shard CPU staged exact head as a throughput path
 - if exact head work continues, it must use materially better block geometry (for example clustered blocks with admissible bounds), not contiguous shards
+
+## 2026-03-10 — Rejected live `k=2` recurrent exact upper-bound path as a 6x route
+
+### Attempt
+
+Added a recurrent-native exact `k=2` seam instead of reviving the old speculative stack:
+
+- `ExactTwoTokenGeneratingLanguageModel`
+- `ExactTwoTokenGenerationHarness`
+- `ANEExactTwoTokenUpperBoundGenerationModel`
+
+The Stage 1 probe uses the proven recurrent control and forces an upper-bound future-token contract on the echo checkpoint family:
+
+- one exact committed token is already selected at the live recurrent cursor
+- the future-token proposal is wired through the recurrent harness
+- if that proposal matches the exact next token, the harness commits a second exact token only by paying a second live `decodeSelectedToken` call
+- proposer, verifier trunk, verifier logits, and state-advance costs are recorded separately per pass
+
+This is an upper-bound structural probe, not a trained future-head result.
+
+### Verification
+
+Implementation and accounting were verified in the package test runner:
+
+- `swift build --build-tests`
+- `swift test --skip-build --filter GenerationHarnessTests`
+
+The new tests cover:
+
+- exact committed-token accounting
+- accepted future-token accounting
+- state-advance cost being zeroed on future-token rejection
+- prefix-only commit behavior for the exact `k=2` pass seam
+
+### Structural result
+
+The current Stage 1 path does not escape one expensive recurrent step per committed token.
+
+Direct evidence from the implementation:
+
+- `performExactTwoTokenPass` first calls `baseModel.decodeSelectedToken(nextToken: currentToken, ...)` to obtain the exact next token
+- when the future proposal is accepted, it then calls `baseModel.decodeSelectedToken(nextToken: exactNext, ...)` again to advance live recurrent state and expose the next current token
+- that second recurrent call is reported as `stateAdvanceLatencyMs`, not hidden inside proposer cost
+
+Because the accepted second token still requires a second live recurrent decode, this seam does not create the reusable state-advance mechanism required for a believable `6x` exact single-stream path.
+
+### Hardware benchmark blocker
+
+Same-session hardware benchmarking on `feat/ane-multitoken` did not complete cleanly enough to report throughput:
+
+- filtered target: `GenerationHarnessHardwareTests/test_recurrent_exact_two_token_upper_bound_reports_pass_breakdown_on_hardware`
+- matched settings: `warmup=3`, `iterations=20`, `prompt=[0]`, `maxNewTokens=8`
+- observed failure mode: the run stalled for more than three minutes while compiling the fused-triplet recurrent control before any measured iterations completed
+- sampled stack showed the control path inside `ANERecurrentGenerationModel.compileFusedTripletSessions` -> `ANEKernel.init` -> `_ANEClient compileModel`
+
+No throughput claim is made from that blocked run.
+
+### Decision
+
+Reject this live Stage 1 path as the next 6x avenue.
+
+- do not train or tune real `k=2` future heads on top of this seam
+- first solve reusable multi-token state advancement, snapshot/restore, or branch-state promotion so that an accepted second token does not require a second full recurrent decode
+- rerun the hardware comparison only after the fused-triplet control benchmark is healthy in the same serialized session
 - otherwise move to the next architecture class rather than spending more time tuning this path
 
 ## 2026-03-10 — Rejected clustered exact CPU staged head

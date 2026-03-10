@@ -1,20 +1,16 @@
 # TODO
 
-- [x] Reject contiguous exact staged CPU head with measured hardware regression.
-- [x] Reject clustered exact staged CPU head with measured hardware regression.
-- [x] Implement and measure the `k=2` recurrent branch/commit verifier substrate.
-- [x] Use a `2`-layer recurrent proposer against the `6`-layer fused-triplet verifier path.
-- [x] Measure `accepted_exact_tokens/pass`, proposer, verifier trunk/logits, checkpoint-copy, and net `ms/token`.
-- [x] Kill the avenue when amortization still regresses materially versus fused-triplet direct-select.
-- [ ] Next avenue: only pursue a materially different multi-token architecture with real verifier amortization beyond one exact recurrent step per committed token.
-- [ ] If exact-head work is revisited, require a materially different admissible geometry, not more contiguous/clustered CPU staging.
-- [x] Append all attempted Avenue 2 findings to `docs/fused-decode-and-next-steps.md`.
-- [x] Update Wax session memory with confirmed findings.
-- [ ] Update durable Wax memory if the local long-term `waxmcp remember` path is responsive.
+- [ ] Re-establish the exact single-stream control on this worktree: fused-triplet recurrent direct-select with fused ANE RMSNorm+classifier head, lane `32`, and matched hardware benchmark settings (`warmup=3`, `iterations=20`, `maxNewTokens=8`).
+- [x] Add failing unit tests for the recurrent-native `k=2` exact pass contract: prefix-only acceptance, exact committed-token accounting, verifier correction without replay/prefill reset, reusable state-snapshot reporting, and state-discard on rejection.
+- [x] Add a failing hardware benchmark seam that reports per-pass medians for proposer, verifier trunk, verifier logits, state advance, `accepted_exact_tokens/pass`, `committed_exact_tokens/pass`, and net effective `ms/token`.
+- [x] Implement the Stage 1 upper-bound exact `k=2` architecture using the proven recurrent control plus a materially different verifier/state-reuse contract; stop immediately if the same-run control still wins or committed exact tokens per pass stay near `1`.
+- [ ] Implement the Stage 2 real recurrent future-token proposer only if Stage 1 materially beats the same-run exact control; keep exactness prefix-only and do not present upper-bound acceptance as real-model acceptance.
+- [x] Append findings to `docs/fused-decode-and-next-steps.md`, capture review notes below, flush/update Wax memory, and revert any dead-end code before finalizing.
 
 # Review
 
-- Avenue 1 is closed: both contiguous and clustered exact CPU staged heads regressed.
-- Avenue 2 current `k=2` branch/commit architecture is closed.
-- Measurement on echo recurrent weights reached the acceptance ceiling (`accepted_exact_tokens/pass = 2.0`) and still regressed to `4.1569722222222225 ms/token` versus the same-run fused-triplet direct-select control at `2.382458333333333 ms/token`.
-- Interpretation: the current branch/commit design remains structurally too sequential; even perfect acceptance does not amortize the proposer + verifier cost enough to beat the exact single-stream control.
+- `swift build --build-tests` succeeded and unblocked filtered package test execution in this worktree.
+- `swift test --skip-build --filter GenerationHarnessTests` passed, including the new exact `k=2` accounting/state-cost tests.
+- The Stage 1 upper-bound implementation is intentionally honest: a second committed exact token is only obtained by paying a second `decodeSelectedToken` call, recorded as `stateAdvanceLatencyMs`.
+- Same-session hardware benchmarking did not produce throughput numbers. The run stalled for more than three minutes while compiling the fused-triplet recurrent control inside `_ANEClient compileModel`, so the exact control could not be re-established on this worktree.
+- Stage 2 was not started. Without reusable multi-token state advancement, the current Stage 1 seam does not raise the credible ceiling beyond one expensive recurrent step per committed token.

@@ -100,6 +100,122 @@ public struct TwoTokenBranchCommitTrace: Sendable, Equatable {
     public let acceptedPrefixLengths: [Int]
 }
 
+public struct ExactTwoTokenPassMetrics: Sendable, Equatable {
+    public let proposerLatencyMs: Double
+    public let verifierTrunkLatencyMs: Double
+    public let verifierLogitsLatencyMs: Double
+    public let stateAdvanceLatencyMs: Double
+    public let acceptedFutureTokenCount: Int
+    public let committedExactTokenCount: Int
+
+    public init(
+        proposerLatencyMs: Double,
+        verifierTrunkLatencyMs: Double,
+        verifierLogitsLatencyMs: Double,
+        stateAdvanceLatencyMs: Double,
+        acceptedFutureTokenCount: Int,
+        committedExactTokenCount: Int
+    ) {
+        self.proposerLatencyMs = proposerLatencyMs
+        self.verifierTrunkLatencyMs = verifierTrunkLatencyMs
+        self.verifierLogitsLatencyMs = verifierLogitsLatencyMs
+        self.stateAdvanceLatencyMs = stateAdvanceLatencyMs
+        self.acceptedFutureTokenCount = acceptedFutureTokenCount
+        self.committedExactTokenCount = committedExactTokenCount
+    }
+
+    public var totalLatencyMs: Double {
+        proposerLatencyMs + verifierTrunkLatencyMs + verifierLogitsLatencyMs + stateAdvanceLatencyMs
+    }
+}
+
+public struct ExactTwoTokenPassResult: Sendable, Equatable {
+    public let committedTokens: [UInt16]
+    public let nextCurrentToken: UInt16
+    public let metrics: ExactTwoTokenPassMetrics
+
+    public init(
+        committedTokens: [UInt16],
+        nextCurrentToken: UInt16,
+        metrics: ExactTwoTokenPassMetrics
+    ) {
+        self.committedTokens = committedTokens
+        self.nextCurrentToken = nextCurrentToken
+        self.metrics = metrics
+    }
+}
+
+public struct ExactTwoTokenGenerationTrace: Sendable, Equatable {
+    public let promptTokens: [UInt16]
+    public let generatedTokens: [UInt16]
+    public let prefillLatencyMs: Double
+    public let passMetrics: [ExactTwoTokenPassMetrics]
+
+    public var acceptedFutureTokenCounts: [Int] {
+        passMetrics.map(\.acceptedFutureTokenCount)
+    }
+
+    public var committedExactTokenCounts: [Int] {
+        passMetrics.map(\.committedExactTokenCount)
+    }
+
+    public var totalLatencyMs: Double {
+        prefillLatencyMs + passMetrics.reduce(0) { $0 + $1.totalLatencyMs }
+    }
+
+    public var committedExactTokensPerPass: Double {
+        guard !passMetrics.isEmpty else { return 0 }
+        let total = passMetrics.reduce(0) { $0 + Double($1.committedExactTokenCount) }
+        return total / Double(passMetrics.count)
+    }
+
+    public var acceptedFutureTokensPerPass: Double {
+        guard !passMetrics.isEmpty else { return 0 }
+        let total = passMetrics.reduce(0) { $0 + Double($1.acceptedFutureTokenCount) }
+        return total / Double(passMetrics.count)
+    }
+
+    public var proposerLatencyMsPerPass: Double {
+        guard !passMetrics.isEmpty else { return 0 }
+        return passMetrics.reduce(0) { $0 + $1.proposerLatencyMs } / Double(passMetrics.count)
+    }
+
+    public var verifierTrunkLatencyMsPerPass: Double {
+        guard !passMetrics.isEmpty else { return 0 }
+        return passMetrics.reduce(0) { $0 + $1.verifierTrunkLatencyMs } / Double(passMetrics.count)
+    }
+
+    public var verifierLogitsLatencyMsPerPass: Double {
+        guard !passMetrics.isEmpty else { return 0 }
+        return passMetrics.reduce(0) { $0 + $1.verifierLogitsLatencyMs } / Double(passMetrics.count)
+    }
+
+    public var stateAdvanceLatencyMsPerPass: Double {
+        guard !passMetrics.isEmpty else { return 0 }
+        return passMetrics.reduce(0) { $0 + $1.stateAdvanceLatencyMs } / Double(passMetrics.count)
+    }
+
+    public var effectiveTokensPerSecond: Double {
+        guard totalLatencyMs > 0 else { return 0 }
+        return Double(generatedTokens.count) * 1000.0 / totalLatencyMs
+    }
+}
+
+public protocol ExactTwoTokenGeneratingLanguageModel: ~Copyable, GenerationPerformanceTrackable {
+    var vocabSize: Int { get }
+
+    mutating func reset() throws(GenerationError)
+    mutating func prefillSelectedToken(
+        promptTokens: [UInt16],
+        strategy: TokenSelectionStrategy
+    ) throws(GenerationError) -> UInt16
+    mutating func performExactTwoTokenPass(
+        currentToken: UInt16,
+        remainingTokenBudget: Int,
+        strategy: TokenSelectionStrategy
+    ) throws(GenerationError) -> ExactTwoTokenPassResult
+}
+
 public protocol TwoTokenDraftingLanguageModel: ~Copyable {
     mutating func reset() throws(GenerationError)
     mutating func prefillSelectedToken(
@@ -398,6 +514,96 @@ where Model: ~Copyable {
     }
 }
 
+public struct ExactTwoTokenGenerationHarness<Model: ExactTwoTokenGeneratingLanguageModel>: ~Copyable
+where Model: ~Copyable {
+    public var model: Model
+    public let strategy: TokenSelectionStrategy
+
+    public init(
+        model: consuming Model,
+        strategy: TokenSelectionStrategy = .argmax
+    ) {
+        self.model = model
+        self.strategy = strategy
+    }
+
+    public mutating func generate(
+        promptTokens: [UInt16],
+        maxNewTokens: Int
+    ) throws(GenerationError) -> ExactTwoTokenGenerationTrace {
+        guard !promptTokens.isEmpty else {
+            throw .invalidArguments("promptTokens must not be empty")
+        }
+        guard maxNewTokens > 0 else {
+            throw .invalidArguments("maxNewTokens must be > 0")
+        }
+
+        try model.reset()
+        let prefillStart = GenerationClock.now()
+        var currentToken = try model.prefillSelectedToken(
+            promptTokens: promptTokens,
+            strategy: strategy
+        )
+        let prefillLatencyMs = GenerationClock.milliseconds(start: prefillStart, end: GenerationClock.now())
+
+        var generatedTokens: [UInt16] = []
+        var passMetrics: [ExactTwoTokenPassMetrics] = []
+        generatedTokens.reserveCapacity(maxNewTokens)
+        passMetrics.reserveCapacity(maxNewTokens)
+
+        while generatedTokens.count < maxNewTokens {
+            let remainingTokenBudget = maxNewTokens - generatedTokens.count
+            let result = try model.performExactTwoTokenPass(
+                currentToken: currentToken,
+                remainingTokenBudget: remainingTokenBudget,
+                strategy: strategy
+            )
+            guard !result.committedTokens.isEmpty else {
+                throw .runtimeFailure("exact two-token pass must commit at least one token")
+            }
+            guard result.committedTokens[0] == currentToken else {
+                throw .runtimeFailure("exact two-token pass must commit current token first")
+            }
+            guard (1...min(2, remainingTokenBudget)).contains(result.committedTokens.count) else {
+                throw .runtimeFailure(
+                    "exact two-token pass committed \(result.committedTokens.count) tokens with remaining budget \(remainingTokenBudget)"
+                )
+            }
+            guard (0...1).contains(result.metrics.acceptedFutureTokenCount) else {
+                throw .runtimeFailure(
+                    "acceptedFutureTokenCount \(result.metrics.acceptedFutureTokenCount) must be in 0...1"
+                )
+            }
+            guard result.metrics.committedExactTokenCount == result.committedTokens.count else {
+                throw .runtimeFailure(
+                    "committedExactTokenCount \(result.metrics.committedExactTokenCount) must equal committed token count \(result.committedTokens.count)"
+                )
+            }
+            if result.metrics.acceptedFutureTokenCount == 1 {
+                guard result.committedTokens.count == 2 else {
+                    throw .runtimeFailure("accepted future token requires exactly two committed tokens")
+                }
+                guard remainingTokenBudget > 1 else {
+                    throw .runtimeFailure("accepted future token requires remaining token budget > 1")
+                }
+            } else if result.metrics.stateAdvanceLatencyMs != 0 {
+                throw .runtimeFailure("stateAdvanceLatencyMs must be zero when no future token is accepted")
+            }
+
+            generatedTokens.append(contentsOf: result.committedTokens)
+            passMetrics.append(result.metrics)
+            currentToken = result.nextCurrentToken
+        }
+
+        return ExactTwoTokenGenerationTrace(
+            promptTokens: promptTokens,
+            generatedTokens: generatedTokens,
+            prefillLatencyMs: prefillLatencyMs,
+            passMetrics: passMetrics
+        )
+    }
+}
+
 public struct TwoTokenBranchCommitGenerationHarness<
     DraftModel: TwoTokenDraftingLanguageModel,
     FullModel: TwoTokenBranchVerifyingLanguageModel
@@ -476,6 +682,104 @@ public struct TwoTokenBranchCommitGenerationHarness<
             promptTokens: promptTokens,
             generatedTokens: generatedTokens,
             acceptedPrefixLengths: acceptedPrefixLengths
+        )
+    }
+}
+
+public struct ANEExactTwoTokenUpperBoundGenerationModel: ~Copyable, ExactTwoTokenGeneratingLanguageModel {
+    public let vocabSize: Int
+    public let layerCount: Int
+    public let maxSequenceTokens: Int
+
+    private var baseModel: ANERecurrentGenerationModel
+
+    public var performanceSnapshot: GenerationPerformanceSnapshot {
+        baseModel.performanceSnapshot
+    }
+
+    public init(
+        weights: borrowing RecurrentGenerationWeights,
+        layerCount: Int,
+        maxSequenceTokens: Int = ModelConfig.seqLen,
+        outputHeadBackend: GenerationOutputHeadBackend = .aneRMSNormClassifier,
+        trunkBackend: RecurrentGenerationTrunkBackend = .fusedThreeLayerTriplets,
+        trunkLaneSpatial: Int = RWKVStyleRecurrentKernelSet.defaultLaneSpatial,
+        outputHeadLaneSpatial: Int = 32
+    ) throws(GenerationError) {
+        let baseModel = try ANERecurrentGenerationModel(
+            weights: weights,
+            layerCount: layerCount,
+            maxSequenceTokens: maxSequenceTokens,
+            outputHeadBackend: outputHeadBackend,
+            trunkBackend: trunkBackend,
+            trunkLaneSpatial: trunkLaneSpatial,
+            outputHeadLaneSpatial: outputHeadLaneSpatial
+        )
+        self.vocabSize = baseModel.vocabSize
+        self.layerCount = layerCount
+        self.maxSequenceTokens = maxSequenceTokens
+        self.baseModel = baseModel
+    }
+
+    public mutating func reset() throws(GenerationError) {
+        try baseModel.reset()
+    }
+
+    public mutating func prefillSelectedToken(
+        promptTokens: [UInt16],
+        strategy: TokenSelectionStrategy
+    ) throws(GenerationError) -> UInt16 {
+        try baseModel.prefillSelectedToken(promptTokens: promptTokens, strategy: strategy)
+    }
+
+    public mutating func performExactTwoTokenPass(
+        currentToken: UInt16,
+        remainingTokenBudget: Int,
+        strategy: TokenSelectionStrategy
+    ) throws(GenerationError) -> ExactTwoTokenPassResult {
+        guard remainingTokenBudget > 0 else {
+            throw .invalidArguments("remainingTokenBudget must be > 0")
+        }
+
+        let proposerStart = GenerationClock.now()
+        // Upper-bound plumbing on the echo recurrent path: the second-token proposer reuses the current exact token.
+        let futureProposal = currentToken
+        let proposerLatencyMs = GenerationClock.milliseconds(start: proposerStart, end: GenerationClock.now())
+
+        let verifierBefore = baseModel.performanceSnapshot
+        let exactNext = try baseModel.decodeSelectedToken(nextToken: currentToken, strategy: strategy)
+        let verifierAfter = baseModel.performanceSnapshot
+        let verifierTrunkLatencyMs = verifierAfter.trunkLatencyMs - verifierBefore.trunkLatencyMs
+        let verifierLogitsLatencyMs = verifierAfter.logitsLatencyMs - verifierBefore.logitsLatencyMs
+
+        var committedTokens: [UInt16] = [currentToken]
+        var acceptedFutureTokenCount = 0
+        var stateAdvanceLatencyMs = 0.0
+        var nextCurrentToken = exactNext
+
+        if remainingTokenBudget > 1, futureProposal == exactNext {
+            acceptedFutureTokenCount = 1
+            committedTokens.append(exactNext)
+
+            let stateAdvanceBefore = baseModel.performanceSnapshot
+            nextCurrentToken = try baseModel.decodeSelectedToken(nextToken: exactNext, strategy: strategy)
+            let stateAdvanceAfter = baseModel.performanceSnapshot
+            stateAdvanceLatencyMs =
+                (stateAdvanceAfter.trunkLatencyMs - stateAdvanceBefore.trunkLatencyMs)
+                + (stateAdvanceAfter.logitsLatencyMs - stateAdvanceBefore.logitsLatencyMs)
+        }
+
+        return ExactTwoTokenPassResult(
+            committedTokens: committedTokens,
+            nextCurrentToken: nextCurrentToken,
+            metrics: ExactTwoTokenPassMetrics(
+                proposerLatencyMs: proposerLatencyMs,
+                verifierTrunkLatencyMs: verifierTrunkLatencyMs,
+                verifierLogitsLatencyMs: verifierLogitsLatencyMs,
+                stateAdvanceLatencyMs: stateAdvanceLatencyMs,
+                acceptedFutureTokenCount: acceptedFutureTokenCount,
+                committedExactTokenCount: committedTokens.count
+            )
         )
     }
 }

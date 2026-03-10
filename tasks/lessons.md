@@ -49,6 +49,10 @@
 - Treat Wax memory as part of the performance workflow, not an optional afterthought; if the user corrects memory/experiment tracking behavior, update both Wax and `tasks/lessons.md` immediately.
 - When a build, test, or benchmark run hits a blocker, record the failure mode, current hypothesis, and next action in Wax session memory before continuing. The issue trail matters as much as the winning runs.
 
+## 2026-03-10 — Wax Checkpoint Discipline
+- At every major phase boundary, do all four Wax actions together: remember the key finding, write a handoff checkpoint, flush immediately, and keep a final promotion step reserved for durable confirmed results.
+- Do not wait until the end of the session to create handoffs; phase checkpoints are part of the execution loop for long-running ANE experiments.
+
 ## 2026-03-06 — Performance Reporting Discipline
 - Every tuning cycle must document three things explicitly: what was tried, what worked, and what did not work.
 - Always explain why a change is believed to have helped, regressed, or failed to confirm; artifact-backed attribution is part of the deliverable, not optional commentary.
@@ -62,3 +66,9 @@
 ## 2026-03-10 — Commit Cadence
 - When the user asks for frequent commits, checkpoint smaller validated milestones instead of batching multiple tuning steps into one large uncommitted change.
 - For ANE performance work, prefer commits at green boundaries: tests passing, baseline captured, or one measured avenue wired end-to-end.
+
+## 2026-03-10 — Wax Note Format
+- After every major phase, write the session note with the exact branch name and avenue name using the format: `branch`, `avenue`, `outcome`, `measurements`, `next`.
+- Promote any confirmed result immediately into durable Wax memory with the same five-field format; do not leave confirmed findings in session-only notes.
+- Before any pause or handoff point, write a Wax handoff for project `Espresso`, include pending tasks, then flush right away.
+- Make the branch marker recoverable from Wax by always starting the note with the exact `branch:` line and flushing immediately after the write.

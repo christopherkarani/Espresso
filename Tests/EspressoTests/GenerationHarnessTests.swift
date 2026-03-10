@@ -214,6 +214,53 @@ private struct FakeTwoTokenVerifierModel: TwoTokenBranchVerifyingLanguageModel {
     }
 }
 
+private struct FakeExactTwoTokenPassResponse: Equatable {
+    let currentToken: UInt16
+    let remainingTokenBudget: Int
+    let result: ExactTwoTokenPassResult
+}
+
+private struct FakeExactTwoTokenModel: ExactTwoTokenGeneratingLanguageModel {
+    let vocabSize: Int
+    var selectedPrefillToken: UInt16
+    var passQueue: [FakeExactTwoTokenPassResponse]
+
+    var performanceSnapshot: GenerationPerformanceSnapshot {
+        GenerationPerformanceSnapshot()
+    }
+
+    private(set) var resetCount: Int = 0
+    private(set) var prefillSelectedCalls: [[UInt16]] = []
+    private(set) var passCalls: [(currentToken: UInt16, remainingTokenBudget: Int)] = []
+
+    mutating func reset() throws(GenerationError) {
+        resetCount += 1
+    }
+
+    mutating func prefillSelectedToken(
+        promptTokens: [UInt16],
+        strategy: TokenSelectionStrategy
+    ) throws(GenerationError) -> UInt16 {
+        prefillSelectedCalls.append(promptTokens)
+        return selectedPrefillToken
+    }
+
+    mutating func performExactTwoTokenPass(
+        currentToken: UInt16,
+        remainingTokenBudget: Int,
+        strategy: TokenSelectionStrategy
+    ) throws(GenerationError) -> ExactTwoTokenPassResult {
+        passCalls.append((currentToken, remainingTokenBudget))
+        guard !passQueue.isEmpty else {
+            throw .invalidArguments("missing fake exact two-token pass response")
+        }
+        let next = passQueue.removeFirst()
+        XCTAssertEqual(next.currentToken, currentToken)
+        XCTAssertEqual(next.remainingTokenBudget, remainingTokenBudget)
+        return next.result
+    }
+}
+
 final class GenerationHarnessTests: XCTestCase {
     func test_generation_performance_snapshot_reports_total_runtime() {
         let snapshot = GenerationPerformanceSnapshot(
@@ -422,6 +469,113 @@ final class GenerationHarnessTests: XCTestCase {
         XCTAssertEqual(trace.acceptedPrefixLengths, [2])
         XCTAssertEqual(harness.draftModel.commitCalls, [[7], [8, 9]])
         XCTAssertEqual(harness.fullModel.verifyCalls, [[8, 9]])
+    }
+
+    func test_exact_two_token_harness_tracks_pass_metrics_and_future_acceptance() throws {
+        let model = FakeExactTwoTokenModel(
+            vocabSize: 32,
+            selectedPrefillToken: 5,
+            passQueue: [
+                FakeExactTwoTokenPassResponse(
+                    currentToken: 5,
+                    remainingTokenBudget: 3,
+                    result: ExactTwoTokenPassResult(
+                        committedTokens: [5, 6],
+                        nextCurrentToken: 7,
+                        metrics: ExactTwoTokenPassMetrics(
+                            proposerLatencyMs: 0.05,
+                            verifierTrunkLatencyMs: 1.10,
+                            verifierLogitsLatencyMs: 0.90,
+                            stateAdvanceLatencyMs: 1.15,
+                            acceptedFutureTokenCount: 1,
+                            committedExactTokenCount: 2
+                        )
+                    )
+                ),
+                FakeExactTwoTokenPassResponse(
+                    currentToken: 7,
+                    remainingTokenBudget: 1,
+                    result: ExactTwoTokenPassResult(
+                        committedTokens: [7],
+                        nextCurrentToken: 8,
+                        metrics: ExactTwoTokenPassMetrics(
+                            proposerLatencyMs: 0.02,
+                            verifierTrunkLatencyMs: 1.05,
+                            verifierLogitsLatencyMs: 0.88,
+                            stateAdvanceLatencyMs: 0,
+                            acceptedFutureTokenCount: 0,
+                            committedExactTokenCount: 1
+                        )
+                    )
+                ),
+            ]
+        )
+
+        var harness = ExactTwoTokenGenerationHarness(model: model, strategy: .argmax)
+
+        let trace = try harness.generate(promptTokens: [9], maxNewTokens: 3)
+
+        XCTAssertEqual(trace.generatedTokens, [5, 6, 7])
+        XCTAssertEqual(trace.acceptedFutureTokenCounts, [1, 0])
+        XCTAssertEqual(trace.committedExactTokenCounts, [2, 1])
+        XCTAssertEqual(harness.model.resetCount, 1)
+        XCTAssertEqual(harness.model.prefillSelectedCalls, [[9]])
+        XCTAssertEqual(harness.model.passCalls.map { $0.currentToken }, [5, 7])
+        XCTAssertEqual(harness.model.passCalls.map { $0.remainingTokenBudget }, [3, 1])
+        XCTAssertEqual(trace.committedExactTokensPerPass, 1.5, accuracy: 1e-9)
+        XCTAssertEqual(trace.acceptedFutureTokensPerPass, 0.5, accuracy: 1e-9)
+    }
+
+    func test_exact_two_token_harness_discards_state_advance_cost_on_future_rejection() throws {
+        let model = FakeExactTwoTokenModel(
+            vocabSize: 16,
+            selectedPrefillToken: 2,
+            passQueue: [
+                FakeExactTwoTokenPassResponse(
+                    currentToken: 2,
+                    remainingTokenBudget: 2,
+                    result: ExactTwoTokenPassResult(
+                        committedTokens: [2],
+                        nextCurrentToken: 4,
+                        metrics: ExactTwoTokenPassMetrics(
+                            proposerLatencyMs: 0.01,
+                            verifierTrunkLatencyMs: 1.20,
+                            verifierLogitsLatencyMs: 0.70,
+                            stateAdvanceLatencyMs: 0,
+                            acceptedFutureTokenCount: 0,
+                            committedExactTokenCount: 1
+                        )
+                    )
+                ),
+                FakeExactTwoTokenPassResponse(
+                    currentToken: 4,
+                    remainingTokenBudget: 1,
+                    result: ExactTwoTokenPassResult(
+                        committedTokens: [4],
+                        nextCurrentToken: 6,
+                        metrics: ExactTwoTokenPassMetrics(
+                            proposerLatencyMs: 0.01,
+                            verifierTrunkLatencyMs: 1.25,
+                            verifierLogitsLatencyMs: 0.75,
+                            stateAdvanceLatencyMs: 0,
+                            acceptedFutureTokenCount: 0,
+                            committedExactTokenCount: 1
+                        )
+                    )
+                ),
+            ]
+        )
+
+        var harness = ExactTwoTokenGenerationHarness(model: model, strategy: .argmax)
+
+        let trace = try harness.generate(promptTokens: [1], maxNewTokens: 2)
+
+        XCTAssertEqual(trace.generatedTokens, [2, 4])
+        XCTAssertEqual(trace.acceptedFutureTokenCounts, [0, 0])
+        XCTAssertEqual(trace.committedExactTokenCounts, [1, 1])
+        XCTAssertEqual(trace.passMetrics.map { $0.stateAdvanceLatencyMs }, [0, 0])
+        XCTAssertEqual(trace.committedExactTokensPerPass, 1.0, accuracy: 1e-9)
+        XCTAssertEqual(trace.acceptedFutureTokensPerPass, 0.0, accuracy: 1e-9)
     }
 
     func test_recurrent_generation_rejects_odd_layer_count_for_fused_pair_backend() {
