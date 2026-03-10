@@ -6,6 +6,7 @@ import ANETypes
 public enum GenerationOutputHeadBackend: Sendable {
     case cpu
     case cpuExactStaged
+    case cpuExactClustered
     case aneClassifier
     case aneRMSNormClassifier
 }

@@ -106,6 +106,44 @@ final class GenerationStagedHeadHardwareTests: XCTestCase {
         XCTAssertGreaterThan(staged.medianLogitsMsPerToken, 0)
     }
 
+    func test_recurrent_generation_cpu_exact_clustered_head_reports_hardware_comparison() throws {
+        try requireStagedHeadHardware()
+
+        let prompt: [UInt16] = [0]
+        let warmup = 3
+        let iterations = 20
+        let maxNewTokens = 8
+
+        let control = try benchmarkRecurrentEchoGeneration(
+            layerCount: 6,
+            promptTokens: prompt,
+            maxNewTokens: maxNewTokens,
+            warmup: warmup,
+            iterations: iterations,
+            outputHeadBackend: .aneRMSNormClassifier
+        )
+        let clustered = try benchmarkRecurrentEchoGeneration(
+            layerCount: 6,
+            promptTokens: prompt,
+            maxNewTokens: maxNewTokens,
+            warmup: warmup,
+            iterations: iterations,
+            outputHeadBackend: .cpuExactClustered
+        )
+
+        print(
+            """
+            recurrent generation fused-triplet control median=\(control.medianTokenMs) ms/token tps=\(control.medianTokensPerSecond) compile=\(control.compileTimeMs) trunk=\(control.medianTrunkMsPerToken) logits=\(control.medianLogitsMsPerToken)
+            recurrent generation fused-triplet cpu-clustered-exact median=\(clustered.medianTokenMs) ms/token tps=\(clustered.medianTokensPerSecond) compile=\(clustered.compileTimeMs) trunk=\(clustered.medianTrunkMsPerToken) logits=\(clustered.medianLogitsMsPerToken)
+            """
+        )
+
+        XCTAssertEqual(control.generatedTokens, clustered.generatedTokens)
+        XCTAssertEqual(control.generatedTokens, Array(repeating: 0, count: maxNewTokens))
+        XCTAssertGreaterThan(control.medianTokenMs, 0)
+        XCTAssertGreaterThan(clustered.medianTokenMs, 0)
+    }
+
     private func benchmarkRecurrentEchoGeneration(
         layerCount: Int,
         promptTokens: [UInt16],

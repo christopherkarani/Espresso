@@ -259,6 +259,39 @@ This avenue is rejected in its contiguous-shard form.
 - reject contiguous-shard CPU staged exact head as a throughput path
 - if exact head work continues, it must use materially better block geometry (for example clustered blocks with admissible bounds), not contiguous shards
 - otherwise move to the next architecture class rather than spending more time tuning this path
+
+## 2026-03-10 — Rejected clustered exact CPU staged head
+
+### Attempt
+
+Replaced contiguous token blocks with deterministic non-contiguous clustered blocks:
+
+- projected clustering over classifier rows
+- exact full-dimension center/radius summaries per cluster
+- exact block scoring only on clusters whose upper bound could still beat the current best score
+
+This preserved exact argmax semantics while materially improving the geometry over contiguous shards.
+
+### Hardware measurement
+
+Matched recurrent fused-triplet direct-select comparison (`warmup=3`, `iterations=20`, `maxNewTokens=8`, echo weights):
+
+| Path | Median ms/token | tok/s | Compile/init ms | Trunk ms/token | Head/logits ms/token |
+|---|---:|---:|---:|---:|---:|
+| Control: fused-triplet + `.aneRMSNormClassifier` | `2.7799114583333333` | `359.72` | `32466.812541666666` | `1.46640625` | `1.3099739583333334` |
+| Clustered exact CPU staged head | `7.072252604166667` | `141.40` | `10454.488791666667` | `1.738265625` | `5.315468750000001` |
+
+### Interpretation
+
+- Better geometry helped a lot relative to contiguous shards (`7.07` vs `28.14 ms/token`).
+- It still lost badly to the current exact control.
+- The head/logits bucket remained the dominant regression, so the family is still not competitive for single-stream decode.
+
+### Decision
+
+- reject clustered exact CPU staged head as the next performance path
+- keep the clustered implementation only as evidence that geometry mattered but did not change the ranking
+- move to a recurrent-native multi-token architecture instead of spending more time on this CPU staged exact-head family
 | IOSurface aliasing between kernels | `statusType=0x9: Program Inference error` | Compile-time external surface fails at eval |
 | _ANERequest surface rebinding | `-[__NSArrayM procedureIndex]` type confusion, then `0x9` | Request is immutable after construction |
 | _ANEVirtualClient instantiation | All 5 init paths return nil | Kernel-level IOKit entitlement gate |

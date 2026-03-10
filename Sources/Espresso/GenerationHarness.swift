@@ -803,7 +803,7 @@ public struct ANEDirectGenerationModel: ~Copyable, DirectTokenSelectingLanguageM
         classifier: borrowing TensorBuffer
     ) throws(GenerationError) -> ANEGenerationClassifierHead? {
         switch outputHeadBackend {
-        case .cpu, .cpuExactStaged:
+        case .cpu, .cpuExactStaged, .cpuExactClustered:
             return nil
         case .aneClassifier:
             if sharedClassifier {
@@ -829,12 +829,27 @@ public struct ANEDirectGenerationModel: ~Copyable, DirectTokenSelectingLanguageM
             if sharedClassifier {
                 return try CPUStagedExactGenerationOutputHead(
                     classifierWeights: embedding,
-                    vocabSize: vocabSize
+                    vocabSize: vocabSize,
+                    layoutStrategy: .contiguous(shardSize: 1024)
                 )
             }
             return try CPUStagedExactGenerationOutputHead(
                 classifierWeights: classifier,
-                vocabSize: vocabSize
+                vocabSize: vocabSize,
+                layoutStrategy: .contiguous(shardSize: 1024)
+            )
+        case .cpuExactClustered:
+            if sharedClassifier {
+                return try CPUStagedExactGenerationOutputHead(
+                    classifierWeights: embedding,
+                    vocabSize: vocabSize,
+                    layoutStrategy: .clustered(clusterCount: 32, projectionDimensionCount: 24, iterations: 2)
+                )
+            }
+            return try CPUStagedExactGenerationOutputHead(
+                classifierWeights: classifier,
+                vocabSize: vocabSize,
+                layoutStrategy: .clustered(clusterCount: 32, projectionDimensionCount: 24, iterations: 2)
             )
         }
     }
@@ -848,7 +863,7 @@ public struct ANEDirectGenerationModel: ~Copyable, DirectTokenSelectingLanguageM
         classifier: borrowing TensorBuffer
     ) throws(GenerationError) -> ANEGenerationRMSNormClassifierHead? {
         switch outputHeadBackend {
-        case .cpu, .cpuExactStaged, .aneClassifier:
+        case .cpu, .cpuExactStaged, .cpuExactClustered, .aneClassifier:
             return nil
         case .aneRMSNormClassifier:
             if sharedClassifier {
@@ -1029,7 +1044,7 @@ public struct ANEDirectGenerationModel: ~Copyable, DirectTokenSelectingLanguageM
 
         stepLogits.zero()
         switch outputHeadBackend {
-        case .cpu, .cpuExactStaged:
+        case .cpu, .cpuExactStaged, .cpuExactClustered:
             stepLogits.withUnsafeMutablePointer { logitsPtr in
                 classifierPointer { clsPtr in
                     stepNorm.withUnsafePointer { normPtr in
@@ -1119,6 +1134,11 @@ public struct ANEDirectGenerationModel: ~Copyable, DirectTokenSelectingLanguageM
         case .cpuExactStaged:
             guard let cpuExactStagedHead else {
                 throw .runtimeFailure("staged exact CPU output head requested without staged head")
+            }
+            token = try cpuExactStagedHead.selectArgmax(normalizedInput: stepNorm)
+        case .cpuExactClustered:
+            guard let cpuExactStagedHead else {
+                throw .runtimeFailure("clustered exact CPU output head requested without staged head")
             }
             token = try cpuExactStagedHead.selectArgmax(normalizedInput: stepNorm)
         case .aneClassifier:
@@ -1435,7 +1455,7 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
         laneSpatial: Int
     ) throws(GenerationError) -> ANEGenerationClassifierHead? {
         switch outputHeadBackend {
-        case .cpu, .cpuExactStaged:
+        case .cpu, .cpuExactStaged, .cpuExactClustered:
             return nil
         case .aneClassifier:
             if sharedClassifier {
@@ -1469,12 +1489,27 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
             if sharedClassifier {
                 return try CPUStagedExactGenerationOutputHead(
                     classifierWeights: embedding,
-                    vocabSize: vocabSize
+                    vocabSize: vocabSize,
+                    layoutStrategy: .contiguous(shardSize: 1024)
                 )
             }
             return try CPUStagedExactGenerationOutputHead(
                 classifierWeights: classifier,
-                vocabSize: vocabSize
+                vocabSize: vocabSize,
+                layoutStrategy: .contiguous(shardSize: 1024)
+            )
+        case .cpuExactClustered:
+            if sharedClassifier {
+                return try CPUStagedExactGenerationOutputHead(
+                    classifierWeights: embedding,
+                    vocabSize: vocabSize,
+                    layoutStrategy: .clustered(clusterCount: 32, projectionDimensionCount: 24, iterations: 2)
+                )
+            }
+            return try CPUStagedExactGenerationOutputHead(
+                classifierWeights: classifier,
+                vocabSize: vocabSize,
+                layoutStrategy: .clustered(clusterCount: 32, projectionDimensionCount: 24, iterations: 2)
             )
         }
     }
@@ -1489,7 +1524,7 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
         laneSpatial: Int
     ) throws(GenerationError) -> ANEGenerationRMSNormClassifierHead? {
         switch outputHeadBackend {
-        case .cpu, .cpuExactStaged, .aneClassifier:
+        case .cpu, .cpuExactStaged, .cpuExactClustered, .aneClassifier:
             return nil
         case .aneRMSNormClassifier:
             if sharedClassifier {
@@ -1712,7 +1747,7 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
 
         stepLogits.zero()
         switch outputHeadBackend {
-        case .cpu, .cpuExactStaged:
+        case .cpu, .cpuExactStaged, .cpuExactClustered:
             stepLogits.withUnsafeMutablePointer { logitsPtr in
                 classifierPointer { clsPtr in
                     stepNorm.withUnsafePointer { normPtr in
@@ -1823,6 +1858,11 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
         case .cpuExactStaged:
             guard let cpuExactStagedHead else {
                 throw .runtimeFailure("staged exact CPU output head requested without staged head")
+            }
+            token = try cpuExactStagedHead.selectArgmax(normalizedInput: stepNorm)
+        case .cpuExactClustered:
+            guard let cpuExactStagedHead else {
+                throw .runtimeFailure("clustered exact CPU output head requested without staged head")
             }
             token = try cpuExactStagedHead.selectArgmax(normalizedInput: stepNorm)
         case .aneClassifier:

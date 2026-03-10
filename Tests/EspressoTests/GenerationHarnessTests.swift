@@ -40,6 +40,18 @@ private func makeGenerationTestRecurrentWeights(layerCount: Int) -> RecurrentGen
     )
 }
 
+private func makeGenerationTestRowTensor(_ rows: [[Float]]) -> TensorBuffer {
+    let buffer = TensorBuffer(count: rows.count * ModelConfig.dim, zeroed: true)
+    buffer.withUnsafeMutablePointer { ptr in
+        for rowIndex in 0..<rows.count {
+            for dimIndex in 0..<rows[rowIndex].count {
+                ptr[rowIndex * ModelConfig.dim + dimIndex] = rows[rowIndex][dimIndex]
+            }
+        }
+    }
+    return buffer
+}
+
 private struct FakeVerifyResponse: Equatable {
     let sequenceTokens: [UInt16]
     let startIndex: Int
@@ -440,5 +452,48 @@ final class GenerationHarnessTests: XCTestCase {
         XCTAssertEqual(evaluatedShardOffsets, [2, 0])
         XCTAssertEqual(result.evaluatedShardOffsets, [2, 0])
         XCTAssertEqual(result.prunedShardOffsets, [4])
+    }
+
+    func test_cpu_exact_clustered_head_matches_dense_argmax_for_non_contiguous_clusters() throws {
+        let cluster0 = ExactGenerationOutputHeadCluster(
+            summary: ExactGenerationOutputHeadShardSummary(
+                tokenOffset: 0,
+                tokenCount: 2,
+                center: [0.75, 0.25] + Array(repeating: 0, count: ModelConfig.dim - 2),
+                radius: 0.35355338
+            ),
+            tokenIndices: [0, 2],
+            weights: makeGenerationTestRowTensor([
+                [0.5, 0.5],
+                [1.0, 0.0],
+            ])
+        )
+        let cluster1 = ExactGenerationOutputHeadCluster(
+            summary: ExactGenerationOutputHeadShardSummary(
+                tokenOffset: 1,
+                tokenCount: 2,
+                center: [-0.25, -0.25] + Array(repeating: 0, count: ModelConfig.dim - 2),
+                radius: 0.35355338
+            ),
+            tokenIndices: [1, 3],
+            weights: makeGenerationTestRowTensor([
+                [-0.5, 0.0],
+                [0.0, -0.5],
+            ])
+        )
+        let head = try CPUStagedExactGenerationOutputHead(
+            vocabSize: 4,
+            layoutStrategy: .clustered(clusterCount: 2, projectionDimensionCount: 2, iterations: 1),
+            clusters: [cluster0, cluster1]
+        )
+        let normalizedInput = TensorBuffer(count: ModelConfig.dim, zeroed: true)
+        normalizedInput.withUnsafeMutablePointer { ptr in
+            ptr[0] = 1
+        }
+
+        let token = try head.selectArgmax(normalizedInput: normalizedInput)
+
+        XCTAssertEqual(token, 2)
+        XCTAssertEqual(head.lastEvaluatedShardCount, 1)
     }
 }

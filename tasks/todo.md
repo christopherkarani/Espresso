@@ -62,17 +62,36 @@
     - [x] runtime regressed catastrophically (`28.1385625 ms/token` vs `2.3946458333333336 ms/token` control)
     - [x] compile/init regressed (`5176.693166666667 ms` vs `542.6085 ms`)
     - [x] treat contiguous shard geometry as a dead end
+  - [x] try materially better clustered block geometry
+  - [x] reject clustered exact CPU staged head:
+    - [x] geometry improved runtime materially versus contiguous shards (`7.072252604166667 ms/token` vs `28.1385625 ms/token`)
+    - [x] but it still lost badly to the same-run fused-triplet control (`2.7799114583333333 ms/token`)
+    - [x] head/logits still regressed (`5.315468750000001 ms/token` vs `1.3099739583333334 ms/token`)
+    - [x] deprioritize this whole CPU staged exact-head family
   - [ ] stop the avenue immediately if:
     - [ ] the shard bound cannot be defended as exact
     - [ ] most shards still need evaluation in steady state
     - [ ] compile/runtime overhead erases the head-side savings
     - [ ] median runtime regresses materially versus `2.129125 ms/token`
 - [ ] Avenue 2 — new multi-token recurrent generation architecture:
-  - [ ] only proceed after Avenue 1 is measured honestly
-  - [ ] require exact prefix acceptance and real state reuse
-  - [ ] do not reuse the current speculative verifier design
-  - [ ] measure proposer latency, verifier latency, accepted exact tokens/pass, and net `ms/token`
-  - [ ] stop if accepted exact tokens/pass saturates near `1`
+  - [x] only proceed after Avenue 1 is measured honestly
+  - [x] require exact prefix acceptance and real state reuse
+  - [x] do not reuse the current speculative verifier design
+  - [x] choose the first bounded design: `k=2` recurrent branch/commit verification
+  - [ ] add failing tests for branch/commit state reuse semantics
+  - [ ] implement a dedicated recurrent-native verifier substrate:
+    - [ ] draft `2`-layer recurrent proposer
+    - [ ] full `6`-layer fused-triplet verifier with direct state checkpoints for step-1 / step-2
+    - [ ] commit accepted checkpoint directly with no prefix replay and no draft re-prefill
+  - [ ] measure:
+    - [ ] `proposer_ms/pass`
+    - [ ] `verifier_trunk_ms/pass`
+    - [ ] `verifier_head_ms/pass`
+    - [ ] `checkpoint_copy_ms/pass`
+    - [ ] `accepted_exact_tokens/pass`
+    - [ ] `net_ms/token`
+    - [ ] `tok/s`
+  - [ ] stop if accepted exact tokens/pass saturates near `1.0-1.1`
 - [ ] Verification order:
   - [ ] focused non-hardware tests for the staged exact-head seam
   - [ ] targeted hardware generation benchmark runs for the current control
@@ -99,5 +118,7 @@
   - contiguous-shard staged exact CPU head is a strong negative result, not a win
   - the path preserved exact token parity but regressed to `28.1385625 ms/token`
   - the rejection is architectural: contiguous shard bounds are too loose to make branch-and-bound useful here
+  - clustered exact CPU staged head improved the geometry but still lost badly at `7.072252604166667 ms/token`
+  - the next best move is a recurrent-native `k=2` branch/commit verifier, not more staged exact-head tuning
 - Completion gate for this avenue:
   - either produce a new exact single-stream best over `2.129125 ms/token`, or produce a strong measured negative result showing the shard bounds are too loose or too expensive to help
