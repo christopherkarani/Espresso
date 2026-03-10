@@ -1315,22 +1315,8 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
         let exactNextToken: UInt16
         let exactFutureToken: UInt16
         if sourcePairIsA {
-            exactNextToken = try Self.selectTokenFromActivation(
+            (exactNextToken, exactFutureToken) = try Self.selectTokenPairFromPreparedActivations(
                 pair0ActivationA,
-                strategy: strategy,
-                outputHeadBackend: outputHeadBackend,
-                rmsFinal: rmsFinal,
-                stepNorm: stepNorm,
-                stepLogits: stepLogits,
-                embedding: embedding,
-                classifier: classifier,
-                sharedClassifier: sharedClassifier,
-                aneClassifierHead: aneClassifierHead,
-                aneRMSNormClassifierHead: aneRMSNormClassifierHead,
-                vocabSize: vocabSize,
-                stepRMSWorkspace: stepRMSWorkspace
-            )
-            exactFutureToken = try Self.selectTokenFromActivation(
                 pair1ActivationA,
                 strategy: strategy,
                 outputHeadBackend: outputHeadBackend,
@@ -1346,22 +1332,8 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
                 stepRMSWorkspace: stepRMSWorkspace
             )
         } else {
-            exactNextToken = try Self.selectTokenFromActivation(
+            (exactNextToken, exactFutureToken) = try Self.selectTokenPairFromPreparedActivations(
                 pair0ActivationB,
-                strategy: strategy,
-                outputHeadBackend: outputHeadBackend,
-                rmsFinal: rmsFinal,
-                stepNorm: stepNorm,
-                stepLogits: stepLogits,
-                embedding: embedding,
-                classifier: classifier,
-                sharedClassifier: sharedClassifier,
-                aneClassifierHead: aneClassifierHead,
-                aneRMSNormClassifierHead: aneRMSNormClassifierHead,
-                vocabSize: vocabSize,
-                stepRMSWorkspace: stepRMSWorkspace
-            )
-            exactFutureToken = try Self.selectTokenFromActivation(
                 pair1ActivationB,
                 strategy: strategy,
                 outputHeadBackend: outputHeadBackend,
@@ -1526,6 +1498,66 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
         }
 
         return token
+    }
+
+    private static func selectTokenPairFromPreparedActivations(
+        _ activationA: borrowing TensorBuffer,
+        _ activationB: borrowing TensorBuffer,
+        strategy: TokenSelectionStrategy,
+        outputHeadBackend: GenerationOutputHeadBackend,
+        rmsFinal: borrowing TensorBuffer,
+        stepNorm: borrowing TensorBuffer,
+        stepLogits: borrowing TensorBuffer,
+        embedding: borrowing TensorBuffer,
+        classifier: borrowing TensorBuffer,
+        sharedClassifier: Bool,
+        aneClassifierHead: ANEGenerationClassifierHead?,
+        aneRMSNormClassifierHead: ANEGenerationRMSNormClassifierHead?,
+        vocabSize: Int,
+        stepRMSWorkspace: borrowing RMSNorm.Workspace
+    ) throws(GenerationError) -> (UInt16, UInt16) {
+        if outputHeadBackend == .aneRMSNormClassifier {
+            guard let aneRMSNormClassifierHead else {
+                throw .runtimeFailure("two-step ANE fused output-head backend requested without compiled head")
+            }
+            return try aneRMSNormClassifierHead.selectArgmaxPair(
+                rawInputA: activationA,
+                rawInputB: activationB
+            )
+        }
+
+        return (
+            try Self.selectTokenFromActivation(
+                activationA,
+                strategy: strategy,
+                outputHeadBackend: outputHeadBackend,
+                rmsFinal: rmsFinal,
+                stepNorm: stepNorm,
+                stepLogits: stepLogits,
+                embedding: embedding,
+                classifier: classifier,
+                sharedClassifier: sharedClassifier,
+                aneClassifierHead: aneClassifierHead,
+                aneRMSNormClassifierHead: aneRMSNormClassifierHead,
+                vocabSize: vocabSize,
+                stepRMSWorkspace: stepRMSWorkspace
+            ),
+            try Self.selectTokenFromActivation(
+                activationB,
+                strategy: strategy,
+                outputHeadBackend: outputHeadBackend,
+                rmsFinal: rmsFinal,
+                stepNorm: stepNorm,
+                stepLogits: stepLogits,
+                embedding: embedding,
+                classifier: classifier,
+                sharedClassifier: sharedClassifier,
+                aneClassifierHead: aneClassifierHead,
+                aneRMSNormClassifierHead: aneRMSNormClassifierHead,
+                vocabSize: vocabSize,
+                stepRMSWorkspace: stepRMSWorkspace
+            )
+        )
     }
 }
 

@@ -11,7 +11,7 @@ public enum GenerationOutputHeadBackend: Sendable {
     case aneRMSNormClassifier
 }
 
-private enum ANEGenerationOutputHeadIO {
+enum ANEGenerationOutputHeadIO {
     static func initializeInputSurface(
         _ surface: IOSurfaceRef,
         laneSpatial: Int
@@ -54,6 +54,44 @@ private enum ANEGenerationOutputHeadIO {
             }
         } catch {
             throw .runtimeFailure("ANE output-head input write failed: \(error)")
+        }
+    }
+
+    static func writeTokenPair(
+        _ inputA: borrowing TensorBuffer,
+        _ inputB: borrowing TensorBuffer,
+        to surface: IOSurfaceRef,
+        laneSpatial: Int
+    ) throws(GenerationError) {
+        precondition(inputA.count == ModelConfig.dim)
+        precondition(inputB.count == ModelConfig.dim)
+        guard laneSpatial >= 2 else {
+            throw .invalidArguments("ANE output-head pair write requires laneSpatial >= 2")
+        }
+
+        do {
+            try inputA.withUnsafeBufferPointer { src in
+                try SurfaceIO.writeFP16SpatialSlice(
+                    to: surface,
+                    channelOffset: 0,
+                    spatialIndex: 0,
+                    spatial: laneSpatial,
+                    data: src,
+                    channels: ModelConfig.dim
+                )
+            }
+            try inputB.withUnsafeBufferPointer { src in
+                try SurfaceIO.writeFP16SpatialSlice(
+                    to: surface,
+                    channelOffset: 0,
+                    spatialIndex: 1,
+                    spatial: laneSpatial,
+                    data: src,
+                    channels: ModelConfig.dim
+                )
+            }
+        } catch {
+            throw .runtimeFailure("ANE output-head pair input write failed: \(error)")
         }
     }
 
@@ -115,6 +153,45 @@ private enum ANEGenerationOutputHeadIO {
             throw error
         } catch {
             throw .runtimeFailure("ANE output-head argmax failed: \(error)")
+        }
+    }
+
+    static func argmaxTokenPairLogits(
+        from surface: IOSurfaceRef,
+        vocabSize: Int,
+        laneSpatial: Int
+    ) throws(GenerationError) -> (UInt16, UInt16) {
+        guard laneSpatial >= 2 else {
+            throw .invalidArguments("ANE output-head pair argmax requires laneSpatial >= 2")
+        }
+
+        func convert(_ result: SurfaceIO.FP16ArgmaxResult) throws(GenerationError) -> UInt16 {
+            guard let token = UInt16(exactly: result.index) else {
+                throw .invalidArguments("selected token index \(result.index) exceeds UInt16 range")
+            }
+            return token
+        }
+
+        do {
+            let first = try SurfaceIO.argmaxFP16SpatialSlice(
+                from: surface,
+                channelOffset: 0,
+                spatialIndex: 0,
+                spatial: laneSpatial,
+                channels: vocabSize
+            )
+            let second = try SurfaceIO.argmaxFP16SpatialSlice(
+                from: surface,
+                channelOffset: 0,
+                spatialIndex: 1,
+                spatial: laneSpatial,
+                channels: vocabSize
+            )
+            return (try convert(first), try convert(second))
+        } catch let error as GenerationError {
+            throw error
+        } catch {
+            throw .runtimeFailure("ANE output-head pair argmax failed: \(error)")
         }
     }
 }
@@ -200,6 +277,30 @@ final class ANEGenerationClassifierHead {
             laneSpatial: laneSpatial
         )
     }
+
+    func selectArgmaxPair(
+        normalizedInputA: borrowing TensorBuffer,
+        normalizedInputB: borrowing TensorBuffer
+    ) throws(GenerationError) -> (UInt16, UInt16) {
+        try ANEGenerationOutputHeadIO.writeTokenPair(
+            normalizedInputA,
+            normalizedInputB,
+            to: inputSurface,
+            laneSpatial: laneSpatial
+        )
+
+        do {
+            try kernelSet.classifier.eval()
+        } catch {
+            throw .runtimeFailure("ANE classifier pair eval failed: \(error)")
+        }
+
+        return try ANEGenerationOutputHeadIO.argmaxTokenPairLogits(
+            from: outputSurface,
+            vocabSize: vocabSize,
+            laneSpatial: laneSpatial
+        )
+    }
 }
 
 final class ANEGenerationRMSNormClassifierHead {
@@ -280,6 +381,30 @@ final class ANEGenerationRMSNormClassifierHead {
         }
 
         return try ANEGenerationOutputHeadIO.argmaxSingleTokenLogits(
+            from: outputSurface,
+            vocabSize: vocabSize,
+            laneSpatial: laneSpatial
+        )
+    }
+
+    func selectArgmaxPair(
+        rawInputA: borrowing TensorBuffer,
+        rawInputB: borrowing TensorBuffer
+    ) throws(GenerationError) -> (UInt16, UInt16) {
+        try ANEGenerationOutputHeadIO.writeTokenPair(
+            rawInputA,
+            rawInputB,
+            to: inputSurface,
+            laneSpatial: laneSpatial
+        )
+
+        do {
+            try kernelSet.rmsNormClassifier.eval()
+        } catch {
+            throw .runtimeFailure("ANE fused output-head pair eval failed: \(error)")
+        }
+
+        return try ANEGenerationOutputHeadIO.argmaxTokenPairLogits(
             from: outputSurface,
             vocabSize: vocabSize,
             laneSpatial: laneSpatial

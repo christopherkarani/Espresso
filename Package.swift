@@ -110,7 +110,7 @@ let package = Package(
         ),
         .testTarget(
             name: "EspressoTests",
-            dependencies: ["Espresso", "CPUOps"],
+            dependencies: ["Espresso", "CPUOps", "ANEInterop", "ANETypes"],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         .testTarget(

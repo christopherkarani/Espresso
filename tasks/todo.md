@@ -1,14 +1,13 @@
 # TODO
 
-- [x] Keep `3e6cced` as the exact two-step architecture checkpoint, `2e49cab` as the compile/init gate evidence, and `13c688b` as the student-sidecar artifact checkpoint.
-- [x] Re-run hardware truth with longer-budget standalone or release probes before declaring the compile path permanently blocked; log control compile/init time, two-step compile/init time, committed exact tokens/pass, effective `ms/token`, and exact parity status if the run clears first output.
-- [x] Add the smallest direct compile/init instrumentation seam needed to distinguish very long ANE compile latency from a true deadlock or shared-gate stall.
-- [x] Commit `espresso-multitoken-probe` as the low-overhead exact hardware truth seam and keep its repeated 1-layer/2-layer/3-layer/6-layer results recoverable in docs and Wax.
-- [x] Commit the fused-pair two-step trunk breakthrough and keep the repeated 2-layer/4-layer wins recoverable in docs and Wax.
-- [ ] Commit the fused-triplet two-step trunk breakthrough and keep the repeated 6-layer exact wins recoverable in docs and Wax.
-- [ ] Attack the next measured bottleneck with one hypothesis: measure whether the current fused-triplet exact path can be pushed below the standing single-stream best with head batching or candidate-specific lane sweeps before touching future-head training.
-- [ ] If fused two-step trunk work still fails to produce a broader exact win, batch both prepared activations through one verifier-head eval and rerun the same matched-control ladder.
-- [ ] Keep attempt logging exhaustive in `docs/fused-decode-and-next-steps.md`, update review notes below after every major result, write Wax session + durable notes after each confirmed result, and flush immediately.
+- [x] Preserve `3e6cced` as the exact two-step architecture checkpoint, `2e49cab` as the compile/init gate evidence, and `13c688b` as the student-sidecar artifact checkpoint.
+- [x] Keep `f710d13`, `6188715`, and `2c864c2` as the recoverable release-probe, fused-pair, and fused-triplet exact multi-token breakthroughs.
+- [x] Head-batching hypothesis: add failing tests for pair-slice ANE output-head I/O and exact-two-step batched verifier selection before implementation.
+- [x] Implement one-ANE-eval batched RMSNorm+classifier selection for the prepared activation pair on the fused-triplet exact two-step path.
+- [x] Rebuild and rerun the standalone release probe against the exact fused-triplet control; report compile/init, exact parity, committed exact tokens/pass, accepted future tokens/pass, proposer, verifier trunk, verifier logits, state advance, and effective `ms/token`.
+- [x] Kill the head-batching route immediately if it does not move the exact fused-triplet path clearly toward the `4x` window (`<= 1.761196 ms/token` against the looser CoreML control, `<= 1.645556 ms/token` against the standing baseline).
+- [ ] If more upside is needed beyond the new exact `4x` win, measure follow-on work against the new head-batched control instead of reopening the old pre-batching baselines.
+- [ ] Keep attempt logging exhaustive in `docs/fused-decode-and-next-steps.md`, update review notes below after every major result, write Wax session + durable notes after each confirmed result, hand off at major checkpoints, and flush immediately.
 
 # Review
 
@@ -23,3 +22,5 @@
 - The pair-fused win extends through 4 layers: control `2.195484`, `2.334737 ms/token` versus fused-pair two-step `2.149909`, `2.234477 ms/token`.
 - The 6-layer gap narrowed sharply but did not close yet: fused-triplet control `2.146151`, `2.293576 ms/token` versus 6-layer two-step built from fused pairs `2.317794`, `2.529677 ms/token`.
 - Extending the same idea to fused triplets closed that remaining gap: repeated 6-layer exact runs now favored fused-triplet two-step (`2.197565`, `2.176102 ms/token`) over the strong fused-triplet control (`2.616013`, `2.397878 ms/token`) with exact parity and `2.0` committed exact tokens/pass.
+- Batched verifier-head eval is the next exact breakthrough: compile/init-only release probe measured control `811.378125 ms` versus two-step `900.605500 ms`, and repeated 6-layer exact runs measured control `2.786466`, `2.339284`, `2.243776 ms/token` versus batched-head two-step `2.409169`, `1.365719`, `1.564339 ms/token`.
+- Exact parity stayed `match` on all three batched-head runs, `committed_exact_tokens/pass` stayed `2.0`, `accepted_future_tokens/pass` stayed `1.0`, and the three-run medians (`2.339284` control vs `1.564339` two-step) clear `4x` over the standing `6.582224 ms/token` CoreML baseline.

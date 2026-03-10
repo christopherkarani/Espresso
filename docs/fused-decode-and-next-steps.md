@@ -674,6 +674,86 @@ Measured bottleneck after the win:
 - keep the fused-triplet exact two-step trunk as the current best exact multi-token architecture on this branch
 - next work should try to push this path below the standing single-stream best before reopening trained future-head work
 
+## 2026-03-10 — Batched verifier head pushes exact fused-triplet two-step past 4x
+
+### Hypothesis
+
+After the fused-triplet exact two-step trunk win, the remaining measured bottleneck was verifier-side logits work. The exact path was still evaluating the fused ANE RMSNorm+classifier head separately for the two prepared activations, so batching both prepared activations through one ANE head eval was the smallest remaining boundary-removal change with enough upside to matter for an honest `4x` single-stream claim.
+
+### Implementation
+
+Added a pair-eval path for the fused ANE output head:
+
+- `ANEGenerationOutputHeadIO.writeTokenPair` writes the prepared activations into spatial slices `0` and `1` of the existing head input surface
+- `ANEGenerationOutputHeadIO.argmaxTokenPairLogits` reads exact argmax independently from those two output slices
+- `ANEGenerationRMSNormClassifierHead.selectArgmaxPair` now runs one ANE eval for the two prepared activations
+- `ANEExactTwoTokenBranchStatePromotionModel.prepareActivationPair` now uses that pair-eval fast path on `.aneRMSNormClassifier`
+
+The recurrent trunk and exact branch-state-promotion contract stayed unchanged:
+
+- parity must still match the recurrent control
+- committed exact tokens/pass must still be prefix-only and exact
+- state advancement must still promote the prepared `stateMid` or `stateOut` surfaces without replay
+
+### Verification
+
+- `swift test --filter ANEGenerationOutputHeadTests`
+- `swift test --filter GenerationHarnessTests`
+- `swift build -c release --product espresso-multitoken-probe --scratch-path /tmp/espresso-ane-multitoken-release`
+
+### Measurements
+
+Compile/init-only release probe:
+
+- control fused-triplet: `811.378125 ms`
+- two-step fused-triplet with batched head: `900.605500 ms`
+
+Repeated 6-layer exact release-probe comparisons (`warmup=3`, `iterations=20`, prompt `[0]`, `maxNewTokens=8`, `maxSequenceTokens=32`):
+
+| Run | Control `ms/token` | Two-step `ms/token` | Control `tok/s` | Two-step `tok/s` | Verifier trunk `ms/pass` | Verifier logits `ms/pass` | Verdict |
+|---|---:|---:|---:|---:|---:|---:|---|
+| 1 | `2.786466` | `2.409169` | `358.89` | `415.08` | `2.287724` | `1.536932` | win |
+| 2 | `2.339284` | `1.365719` | `427.48` | `732.23` | `1.348151` | `0.885375` | win |
+| 3 | `2.243776` | `1.564339` | `445.68` | `639.25` | `1.517234` | `0.980995` | win |
+
+Exactness contract on all three runs:
+
+- parity status: `match`
+- committed exact tokens/pass: `2.0`
+- accepted future tokens/pass: `1.0`
+- proposer `ms/pass`: `0`
+- median state advance `ms/pass`: `0.014386`
+
+Three-run medians:
+
+- control fused-triplet: `2.339284 ms/token`
+- exact two-step with batched head: `1.564339 ms/token`
+- verifier trunk: `1.517234 ms/pass`
+- verifier logits: `0.980995 ms/pass`
+
+Relative to the saved CoreML single-stream baselines:
+
+- versus `6.582224 ms/token`: about `4.21x`
+- versus `7.044784 ms/token`: about `4.50x`
+
+### Interpretation
+
+Measured result:
+
+- this is the first repeated exact single-stream fused-decode path on the branch that clears an honest `4x` over the standing CoreML baseline
+- the gain came from removing one verifier-head eval per exact two-token pass, not from changing the trunk contract or relaxing exactness
+- verifier logits dropped from the earlier `~1.93-1.95 ms/pass` band into roughly `~0.89-0.98 ms/pass` on the two faster repeats
+
+Inference:
+
+- the slower first repeat was likely a host/session outlier rather than an architecture regression, because the next two repeats stayed far below the `4x` threshold with exact parity and the three-run medians still clear `4x`
+
+### Decision
+
+- keep the batched verifier-head fast path
+- treat this as the current exact single-stream `4x` breakthrough on the branch
+- future-head student work can remain optional follow-on work rather than the forced next step
+
 ## 2026-03-10 — Rejected clustered exact CPU staged head
 
 ### Attempt

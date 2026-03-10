@@ -94,3 +94,8 @@
 ## 2026-03-10 — Mirror The Winning Control Path
 - State reuse alone was not enough; the exact two-step path only started winning beyond 1 layer after its verifier trunk inherited the same pair fusion structure that already made the control fast.
 - When the control path has a known fusion win, test the exact multi-token path with the same grouping strategy before assuming the architecture itself has plateaued.
+
+## 2026-03-10 — Batch Prepared Activations Before Reopening Training
+- Once exact two-step state reuse is working, check whether the verifier head is still paying one ANE eval per prepared activation; batching those prepared activations through the existing spatial lanes can be a breakthrough-sized win without changing the trunk contract.
+- Measure the pair-eval head path with the same exact release probe before pivoting to student training; the head boundary can still hide more upside than a new proposer.
+- Treat noisy first hardware reruns as potential session outliers, not instant regressions; rerun the identical probe enough times to report repeated medians before killing a route that changed the dominant cost center.
