@@ -109,3 +109,8 @@
 - For benchmark-only generation artifacts, do not reuse the full pretrained-model loader when the artifact can legitimately vary layer count; add a dedicated head-weight loader that validates shape-critical fields without hardcoding `ModelConfig.nLayers`.
 - When moving off synthetic prompts, the prompt token must come from the saved artifact manifest or corpus, not a hardcoded `0`; otherwise a “real-data” rerun silently falls back to an unrepresentative start token.
 - CoreML export tooling for reproducible local benchmarks should pin to a supported Python version (`3.12` here); the Python `3.14` `coremltools` install lacked the native `BlobWriter`/`libcoremlpython` pieces needed to save `.mlpackage` models.
+
+## 2026-03-11 — Synthetic Echo Can Hide Zero-Output ANE Failures
+- Never trust a new ANE decode substrate just because the synthetic echo harness stays on token `0`; an all-zero output surface also argmaxes to `0` and can look superficially correct.
+- Before treating any off-echo artifact benchmark as valid, add at least one hardware correctness seam that expects a nonzero token and verify the ANE path matches a CPU teacher on that exact prompt.
+- When a real-artifact benchmark collapses to zeros, revert the debug code after capturing the negative result in docs/results/memory; keep the branch clean and do not let failing probes masquerade as implementation progress.

@@ -2332,3 +2332,33 @@ Interpretation:
 - Important honesty note:
   - this route is still a controlled local-data bigram teacher/student, not a pretrained production checkpoint
   - the real artifact proves the mechanism survives off the synthetic echo shortcut, but it does not close the case for a public `4x` decode claim
+
+## 2026-03-11 — Local real-artifact hardware debug shows the current ANE route is functionally invalid
+
+What was tried:
+- Added focused hardware seams to test the local bigram artifact and the simplest possible one-hot recurrent step on ANE before doing more throughput work.
+- Compared the ANE recurrent control against the offline CPU teacher on the same prompt token and local artifact.
+- Probed the raw recurrent input surface path, the recurrent step path, and a direct ANE generation spike against the same local artifact family.
+
+Measured results:
+- Local bigram recurrent correctness seam:
+  - CPU teacher generated `[105, 110, 116, 32]`
+  - ANE recurrent control generated `[0, 0, 0, 0]`
+- Focused one-hot recurrent seam:
+  - single-layer zero-weight recurrent step returned all-zero `xOut` and `stateOut`
+  - runtime to failure observation: about `0.48s`
+- Raw surface I/O seam:
+  - writing and reading back the one-hot input slice on `xIn` passed in about `0.40s`
+- Direct ANE local-artifact spike:
+  - generated `[0, 0, 0, 0]` instead of the CPU teacher sequence
+  - median direct ANE: `6.5544843749999995 ms/token`
+  - median CoreML: `6.414838541666667 ms/token`
+  - ratio: `0.9786946119108976x`
+
+Interpretation:
+- The current local real-artifact route is not a publishable ANE/CoreML throughput result.
+- The focused seams localize the failure below the artifact-level parity claim:
+  - raw input-surface roundtrip works
+  - the recurrent ANE kernel/session path itself still collapses to zeros on these non-echo seams
+- The failed debug avenue was reverted from code and kept only as docs/results/memory evidence.
+- Practical implication: the only currently publishable `>=3x` claim on this branch remains the synthetic exact `echo` result until a non-echo hardware path is proven functionally valid.
