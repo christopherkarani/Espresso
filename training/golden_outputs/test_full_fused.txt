@@ -1,10 +1,12 @@
 === Test 1: Full fused attention (QKV + matmul + softmax + Wo) ===
-  compile FAIL: 
-  Full fused attention FAILED to compile on ANE
+  COMPILED! Full fused attention works on ANE!
+  Eval: OK
+  Max diff vs CPU: 0.000876 → PASS
+  0.176 ms/iter  1785.4 GFLOPS (1.8 TFLOPS)
 
 === Test 2: Fused FFN benchmark ===
-  compile FAIL: 
-  FFN: FAIL
+  FFN: OK
+  0.186 ms/iter  3239.0 GFLOPS (3.2 TFLOPS)
 
 === Summary ===
 Full transformer layer = Attention + FFN

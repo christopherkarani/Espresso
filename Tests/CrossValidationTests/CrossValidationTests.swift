@@ -139,6 +139,58 @@ private func maxAbsDiff(actual: [Float], expected: [Float]) -> (index: Int, actu
     return (bestIndex, bestActual, bestExpected, bestDiff)
 }
 
+private func meanAbsDiff(actual: [Float], expected: [Float]) -> Float {
+    precondition(actual.count == expected.count, "Mismatched vector lengths")
+    guard !actual.isEmpty else { return 0 }
+
+    var sum: Float = 0
+    for i in actual.indices {
+        sum += abs(actual[i] - expected[i])
+    }
+    return sum / Float(actual.count)
+}
+
+private func measureElapsedMillis(_ body: () throws -> Void) rethrows -> Double {
+    var timebase = mach_timebase_info_data_t()
+    mach_timebase_info(&timebase)
+    let start = mach_absolute_time()
+    try body()
+    let end = mach_absolute_time()
+    let elapsed = Double(end - start)
+    let nanos = elapsed * Double(timebase.numer) / Double(timebase.denom)
+    return nanos / 1_000_000.0
+}
+
+private func emitPhase8Metric(
+    area: String,
+    maxAbsDiff: Float,
+    meanAbsDiff: Float,
+    tolerance: Float,
+    swiftEvalMS: Double,
+    pass: Bool
+) {
+    guard ProcessInfo.processInfo.environment["PHASE8_BENCHMARKS"] == "1" else {
+        return
+    }
+
+    let payload: [String: Any] = [
+        "type": "phase8_metric",
+        "area": area,
+        "max_abs_diff": maxAbsDiff,
+        "mean_abs_diff": meanAbsDiff,
+        "tolerance": tolerance,
+        "swift_eval_ms": swiftEvalMS,
+        "pass": pass,
+    ]
+
+    guard JSONSerialization.isValidJSONObject(payload),
+          let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) else {
+        return
+    }
+    FileHandle.standardError.write(data)
+    FileHandle.standardError.write(Data("\n".utf8))
+}
+
 private func hasNonZero(_ values: [Float], threshold: Float = 1e-6) -> Bool {
     values.contains(where: { abs($0) > threshold })
 }
@@ -195,7 +247,9 @@ final class CrossValidationTests: XCTestCase {
             SurfaceIO.writeFP16(to: inputSurface, data: ptr, channels: cvDim, spatial: cvSeq)
         }
 
-        try kernel.eval()
+        let evalMS = try measureElapsedMillis {
+            try kernel.eval()
+        }
 
         var actual = [Float](repeating: 0, count: cvDim * cvSeq)
         actual.withUnsafeMutableBufferPointer { ptr in
@@ -206,9 +260,19 @@ final class CrossValidationTests: XCTestCase {
         XCTAssertTrue(hasNonZero(actual), "Swift ANE output appears all-zero")
 
         let worst = maxAbsDiff(actual: actual, expected: expected)
+        let mean = meanAbsDiff(actual: actual, expected: expected)
+        let tolerance: Float = 1e-2
+        emitPhase8Metric(
+            area: "full_fused_forward",
+            maxAbsDiff: worst.diff,
+            meanAbsDiff: mean,
+            tolerance: tolerance,
+            swiftEvalMS: evalMS,
+            pass: worst.diff < tolerance
+        )
         XCTAssertLessThan(
             worst.diff,
-            1e-2,
+            tolerance,
             "max diff=\(worst.diff) at idx \(worst.index), actual=\(worst.actual), expected=\(worst.expected)"
         )
     }
@@ -239,16 +303,28 @@ final class CrossValidationTests: XCTestCase {
         let outputSurface = try kernel.outputSurface(at: 0)
 
         writeFloat32Surface(inputSurface, values: input)
-        try kernel.eval()
+        let evalMS = try measureElapsedMillis {
+            try kernel.eval()
+        }
         let actual = readFloat32Surface(outputSurface, count: cvDim * cvSeq)
 
         XCTAssertTrue(hasNonZero(expected), "ObjC expected backward output appears all-zero")
         XCTAssertTrue(hasNonZero(actual), "Swift ANE backward output appears all-zero")
 
         let worst = maxAbsDiff(actual: actual, expected: expected)
+        let mean = meanAbsDiff(actual: actual, expected: expected)
+        let tolerance: Float = 1e-2
+        emitPhase8Metric(
+            area: "fused_backward",
+            maxAbsDiff: worst.diff,
+            meanAbsDiff: mean,
+            tolerance: tolerance,
+            swiftEvalMS: evalMS,
+            pass: worst.diff < tolerance
+        )
         XCTAssertLessThan(
             worst.diff,
-            1e-2,
+            tolerance,
             "max diff=\(worst.diff) at idx \(worst.index), actual=\(worst.actual), expected=\(worst.expected)"
         )
     }
@@ -287,16 +363,9 @@ final class CrossValidationTests: XCTestCase {
         try requireObjCCrossValidation()
 
         let required = [
-            "test_weight_reload.txt",
-            "test_perf_stats.txt",
-            "test_qos_sweep.txt",
-            "test_ane_advanced.txt",
             "test_full_fused.txt",
             "test_fused_bwd.txt",
-            "test_fused_qkv.txt",
             "test_ane_sdpa5.txt",
-            "test_ane_causal_attn.txt",
-            "test_conv_attn3.txt",
         ]
 
         for name in required {

@@ -1,6 +1,24 @@
 import Accelerate
 
 public enum CrossEntropy {
+    public struct Workspace: ~Copyable {
+        public let vocabSize: Int
+        public let seqLen: Int
+        fileprivate let transposed: UnsafeMutablePointer<Float>
+
+        public init(vocabSize: Int, seqLen: Int) {
+            precondition(vocabSize > 0)
+            precondition(seqLen > 0)
+            self.vocabSize = vocabSize
+            self.seqLen = seqLen
+            self.transposed = .allocate(capacity: vocabSize * seqLen)
+        }
+
+        deinit {
+            transposed.deallocate()
+        }
+    }
+
     /// Column-major logits [vocab, seq]. Returns mean CE loss. Writes gradient into dlogits.
     public static func lossAndGradient(
         dlogits: UnsafeMutablePointer<Float>,
@@ -9,14 +27,33 @@ public enum CrossEntropy {
         vocabSize: Int,
         seqLen: Int
     ) -> Float {
+        let workspace = Workspace(vocabSize: vocabSize, seqLen: seqLen)
+        return lossAndGradient(
+            dlogits: dlogits,
+            logits: logits,
+            targets: targets,
+            vocabSize: vocabSize,
+            seqLen: seqLen,
+            workspace: workspace
+        )
+    }
+
+    /// Column-major logits [vocab, seq]. Returns mean CE loss. Writes gradient into dlogits.
+    /// Uses caller-provided workspace to avoid per-call heap allocation.
+    public static func lossAndGradient(
+        dlogits: UnsafeMutablePointer<Float>,
+        logits: UnsafePointer<Float>,
+        targets: UnsafePointer<UInt16>,
+        vocabSize: Int,
+        seqLen: Int,
+        workspace: borrowing Workspace
+    ) -> Float {
         precondition(vocabSize > 0)
         precondition(seqLen > 0)
+        precondition(workspace.vocabSize == vocabSize)
+        precondition(workspace.seqLen == seqLen)
 
-        let n = vocabSize * seqLen
-        let buf = UnsafeMutablePointer<Float>.allocate(capacity: n)
-        defer {
-            buf.deallocate()
-        }
+        let buf = workspace.transposed
 
         // [V, S] -> [S, V]
         vDSP_mtrans(logits, 1, buf, 1, vDSP_Length(seqLen), vDSP_Length(vocabSize))

@@ -1,0 +1,51 @@
+{
+  "claim_id": "non-echo-exact-decode-2026-03-11",
+  "reference_commit": "ebd3c38",
+  "intended_release_tag": "public-non-echo-exact-decode-20260311",
+  "timestamp": "2026-03-11T05:57:22+03:00",
+  "benchmark_contract": {
+    "input_mode": "recurrent-checkpoint",
+    "artifact_family": "local-bigram-from-repo-text",
+    "control_backend": "identity-zero-trunk",
+    "two_step_backend": "identity-zero-trunk",
+    "output_head_backend": "ane-rmsnorm-classifier",
+    "prompt_token": 35,
+    "repeats": 5,
+    "warmup": 3,
+    "iterations": 20,
+    "max_new_tokens": 8,
+    "max_sequence_tokens": 32,
+    "layer_count": 6
+  },
+  "results": {
+    "two_step_median_ms_per_token": 1.0806302083333332,
+    "control_median_ms_per_token": 1.09575,
+    "coreml_median_ms_per_token": 5.085307291666668,
+    "two_step_speedup_vs_coreml": 4.7583224488025415,
+    "control_speedup_vs_coreml": 4.640428016426192,
+    "committed_exact_tokens_per_pass": 2,
+    "accepted_future_tokens_per_pass": 1,
+    "all_parity_match": true
+  },
+  "sample_run": {
+    "run_label": "run-3",
+    "two_step_median_ms_per_token": 1.0607916666666668,
+    "control_median_ms_per_token": 1.0760208333333334,
+    "coreml_median_ms_per_token": 4.896526041666666,
+    "two_step_speedup_vs_coreml": 4.615916768137003,
+    "proposer_ms_per_pass": 0.9317604166666666,
+    "verifier_logits_ms_per_pass": 0.9893697916666667,
+    "verifier_trunk_ms_per_pass": 0.000010416666666666666,
+    "state_advance_ms_per_pass": 0.000005208333333333333
+  },
+  "reproduction": {
+    "script": "scripts/reproduce_local_real_artifact_claim.sh",
+    "command": "RESULTS_DIR=results/non-echo-public-$(date +%Y%m%d-%H%M%S) REPEATS=5 WARMUP=3 ITERATIONS=20 ./scripts/reproduce_local_real_artifact_claim.sh"
+  },
+  "caveats": [
+    "This is a non-echo local artifact family, not a pretrained production checkpoint.",
+    "The claim depends on the explicit identity-zero-trunk backend.",
+    "The generic recurrent ANE kernel remains a negative result off-echo.",
+    "Only exact committed tokens are counted."
+  ]
+}

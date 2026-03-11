@@ -20,6 +20,20 @@ enum EspressoTrainMain {
         var checkpointPath: String = defaultCheckpointPath
         var modelPath: String = defaultModelPath
         var dataPath: String = defaultDataPath
+        var twoStepStudentSidecarPath: String?
+        var generationModelExportPath: String?
+        var localTextDatasetPath: String?
+        var localBigramPrefix: String?
+        var artifactLayerCount: Int = 6
+        var offlineAcceptanceJSONPath: String?
+        var offlineRecurrentCheckpointPath: String?
+        var offlineFutureSidecarPath: String?
+        var promptToken: UInt16?
+        var gateMaxNewTokens: Int = 8
+        var textRoots: [String] = []
+        var textExtensions: Set<String> = ["swift", "md", "txt", "py", "sh", "m", "h", "c"]
+        var maxCorpusFiles: Int?
+        var maxCorpusBytes: Int?
     }
 
     private enum TrainExit {
@@ -60,6 +74,40 @@ enum EspressoTrainMain {
                 if i + 1 < argv.count { a.modelPath = argv[i + 1]; i += 1 }
             case "--data":
                 if i + 1 < argv.count { a.dataPath = argv[i + 1]; i += 1 }
+            case "--export-two-step-student":
+                if i + 1 < argv.count { a.twoStepStudentSidecarPath = argv[i + 1]; i += 1 }
+            case "--export-generation-model":
+                if i + 1 < argv.count { a.generationModelExportPath = argv[i + 1]; i += 1 }
+            case "--build-local-text-dataset":
+                if i + 1 < argv.count { a.localTextDatasetPath = argv[i + 1]; i += 1 }
+            case "--export-local-bigram-prefix":
+                if i + 1 < argv.count { a.localBigramPrefix = argv[i + 1]; i += 1 }
+            case "--artifact-layer-count":
+                if i + 1 < argv.count { a.artifactLayerCount = Int(argv[i + 1]) ?? a.artifactLayerCount; i += 1 }
+            case "--offline-acceptance-json":
+                if i + 1 < argv.count { a.offlineAcceptanceJSONPath = argv[i + 1]; i += 1 }
+            case "--offline-recurrent-checkpoint":
+                if i + 1 < argv.count { a.offlineRecurrentCheckpointPath = argv[i + 1]; i += 1 }
+            case "--offline-future-sidecar":
+                if i + 1 < argv.count { a.offlineFutureSidecarPath = argv[i + 1]; i += 1 }
+            case "--prompt-token":
+                if i + 1 < argv.count, let token = UInt16(argv[i + 1]) { a.promptToken = token; i += 1 }
+            case "--gate-max-new-tokens":
+                if i + 1 < argv.count { a.gateMaxNewTokens = Int(argv[i + 1]) ?? a.gateMaxNewTokens; i += 1 }
+            case "--text-root":
+                if i + 1 < argv.count { a.textRoots.append(argv[i + 1]); i += 1 }
+            case "--text-ext":
+                if i + 1 < argv.count {
+                    let ext = argv[i + 1].trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                    if !ext.isEmpty {
+                        a.textExtensions.insert(ext)
+                    }
+                    i += 1
+                }
+            case "--max-corpus-files":
+                if i + 1 < argv.count { a.maxCorpusFiles = Int(argv[i + 1]); i += 1 }
+            case "--max-corpus-bytes":
+                if i + 1 < argv.count { a.maxCorpusBytes = Int(argv[i + 1]); i += 1 }
             default:
                 break
             }
@@ -104,6 +152,75 @@ enum EspressoTrainMain {
         let beta2: Float = 0.999
         let eps: Float = 1e-8
         let posix = Locale(identifier: "en_US_POSIX")
+
+        if let datasetPath = args.localTextDatasetPath {
+            let roots = args.textRoots.isEmpty ? [FileManager.default.currentDirectoryPath] : args.textRoots
+            let tokens = try LocalTextTokenDatasetBuilder.collectTokens(
+                roots: roots,
+                allowedExtensions: args.textExtensions,
+                maxFiles: args.maxCorpusFiles,
+                maxBytes: args.maxCorpusBytes
+            )
+            try LocalTextTokenDatasetBuilder.writeUInt16Dataset(tokens: tokens, to: datasetPath)
+            print("[built local text dataset: \(datasetPath) tokens=\(tokens.count) roots=\(roots.count)]")
+            return .finished
+        }
+
+        var offlineRecurrentCheckpointPath = args.offlineRecurrentCheckpointPath
+        var offlineFutureSidecarPath = args.offlineFutureSidecarPath
+        var offlinePromptToken = args.promptToken
+
+        if let prefix = args.localBigramPrefix {
+            let manifest = try LocalRealArtifactPipeline.exportLocalBigramArtifacts(
+                datasetPath: args.dataPath,
+                prefix: prefix,
+                layerCount: args.artifactLayerCount,
+                vocabSize: vocab
+            )
+            offlineRecurrentCheckpointPath = offlineRecurrentCheckpointPath ?? manifest.recurrentCheckpointPath
+            offlineFutureSidecarPath = offlineFutureSidecarPath ?? manifest.futureSidecarPath
+            offlinePromptToken = offlinePromptToken ?? manifest.promptToken
+            print(
+                "[exported local bigram artifacts: manifest=\(manifest.manifestPath) prompt=\(manifest.promptToken) tokens=\(manifest.tokenCount)]"
+            )
+            if args.offlineAcceptanceJSONPath == nil {
+                return .finished
+            }
+        }
+
+        if let offlineAcceptanceJSONPath = args.offlineAcceptanceJSONPath {
+            guard let recurrentCheckpointPath = offlineRecurrentCheckpointPath else {
+                throw GenerationError.invalidArguments("offline gate requires --offline-recurrent-checkpoint or --export-local-bigram-prefix")
+            }
+            guard let futureSidecarPath = offlineFutureSidecarPath else {
+                throw GenerationError.invalidArguments("offline gate requires --offline-future-sidecar or --export-local-bigram-prefix")
+            }
+            guard let promptToken = offlinePromptToken else {
+                throw GenerationError.invalidArguments("offline gate requires --prompt-token or an exported local-bigram manifest")
+            }
+
+            let trace = try LocalRealArtifactPipeline.offlineAcceptanceGate(
+                recurrentCheckpointPath: recurrentCheckpointPath,
+                futureSidecarPath: futureSidecarPath,
+                promptTokens: [promptToken],
+                maxNewTokens: args.gateMaxNewTokens
+            )
+            let payload: [String: Any] = [
+                "prompt_tokens": [Int(promptToken)],
+                "generated_tokens": trace.generatedTokens.map(Int.init),
+                "committed_exact_token_counts": trace.committedExactTokenCounts,
+                "accepted_future_token_counts": trace.acceptedFutureTokenCounts,
+                "parity_status": trace.parityMatchedAllCommittedTokens ? "match" : "mismatch",
+                "committed_exact_tokens_per_pass": trace.committedExactTokensPerPass,
+                "accepted_future_tokens_per_pass": trace.acceptedFutureTokensPerPass,
+                "recurrent_checkpoint": recurrentCheckpointPath,
+                "future_sidecar": futureSidecarPath,
+            ]
+            let data = try JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
+            try data.write(to: URL(fileURLWithPath: offlineAcceptanceJSONPath), options: .atomic)
+            print("[wrote offline acceptance gate: \(offlineAcceptanceJSONPath)]")
+            return .finished
+        }
 
         // Allocate per-layer state.
         let layers = LayerStorage<LayerWeights>(count: nLayers) { _ in LayerWeights() }
@@ -285,6 +402,39 @@ enum EspressoTrainMain {
             }
         }
 
+        if let generationModelPath = args.generationModelExportPath {
+            let emptyClassifier = TensorBuffer(count: 0, zeroed: true)
+            try GenerationModelWeightStore.save(
+                layers: layers,
+                rmsFinal: rmsFinal,
+                embed: embed,
+                classifier: emptyClassifier,
+                sharedClassifier: true,
+                vocabSize: vocab,
+                to: generationModelPath
+            )
+            print("[exported generation model: \(generationModelPath)]")
+            if args.twoStepStudentSidecarPath == nil {
+                return .finished
+            }
+        }
+
+        if let sidecarPath = args.twoStepStudentSidecarPath {
+            let emptyClassifier = TensorBuffer(count: 0, zeroed: true)
+            let sidecar = try TwoStepStudentCheckpoint.seedFromTeacher(
+                dim: dim,
+                vocabSize: vocab,
+                layerCount: nLayers,
+                teacherRMS: rmsFinal,
+                teacherEmbedding: embed,
+                teacherClassifier: emptyClassifier,
+                teacherClassifierWasShared: true
+            )
+            try TwoStepStudentCheckpoint.save(path: sidecarPath, sidecar: sidecar)
+            print("[exported two-step student sidecar: \(sidecarPath)]")
+            return .finished
+        }
+
         // mmap token data.
         let dataset = try TokenDataset(path: args.dataPath, seqLen: seqLen)
         let maxPos = dataset.nTokens - seqLen - 1
@@ -304,6 +454,8 @@ enum EspressoTrainMain {
         let dlogits = TensorBuffer(count: vocab * seqLen, zeroed: false)
         let dy = TensorBuffer(count: dim * seqLen, zeroed: false)
         let bwdScratch = BackwardScratch(dim: dim, hidden: hidden, seqLen: seqLen)
+        let rmsWorkspace = RMSNorm.Workspace(seqLen: seqLen)
+        let crossEntropyWorkspace = CrossEntropy.Workspace(vocabSize: vocab, seqLen: seqLen)
 
         var totalCompileMs: Double = 0
         var totalTrainMs: Double = 0
@@ -395,6 +547,14 @@ enum EspressoTrainMain {
             let cms = MachTime.ms(MachTime.now() - tc0)
             totalCompileMs += cms
 
+            let surfaceHandles: [LayerSurfaceHandles]
+            do {
+                surfaceHandles = try SurfaceHandleCache.build(kernels: kernelStorage, staticKernels: staticKernels)
+            } catch {
+                try? CompileBudget.setCount(ModelConfig.maxCompiles)
+                continue
+            }
+
             // Zero gradient accumulators (accumulate across micro-steps).
             for L in 0..<nLayers { grads[L].zero() }
             grmsFinal.zero()
@@ -402,10 +562,14 @@ enum EspressoTrainMain {
 
             var stepsBatch = 0
             let tt0 = MachTime.now()
+            var batchTimings = StepTimingBreakdown()
+            var batchStepMsAccum: Double = 0
 
             for _ in 0..<ModelConfig.accumSteps where step < totalSteps {
                 let stepT0 = MachTime.now()
                 let currentStep = step
+                var stepTimings = StepTimingBreakdown()
+                var t0 = MachTime.now()
 
                 let pos = Sampler.samplePosition(maxPos: maxPos)
                 let inputTokens = dataset[pos]
@@ -424,20 +588,46 @@ enum EspressoTrainMain {
                         )
                     }
                 }
+                stepTimings.tElem += MachTime.ms(MachTime.now() - t0)
+
+                // Wait for prior async dW work before touching layer IO for this step.
+                t0 = MachTime.now()
+                accumulator.barrier()
+                stepTimings.tCblasWait += MachTime.ms(MachTime.now() - t0)
 
                 // Forward pass (12 layers).
-                try ForwardPass.run(xCur: xCur, acts: acts, kernels: kernelStorage, accumulator: accumulator)
+                try ForwardPass.runTimed(
+                    xCur: xCur,
+                    acts: acts,
+                    kernels: kernelStorage,
+                    accumulator: accumulator,
+                    dim: dim,
+                    hidden: hidden,
+                    seqLen: seqLen,
+                    surfaceHandles: surfaceHandles,
+                    timings: &stepTimings
+                )
 
                 // Final RMSNorm.
+                t0 = MachTime.now()
                 xFinal.withUnsafeMutablePointer { outPtr in
                     xCur.withUnsafePointer { inPtr in
                         rmsFinal.withUnsafePointer { wPtr in
-                            RMSNorm.forward(output: outPtr, input: inPtr, weights: wPtr, dim: dim, seqLen: seqLen)
+                            RMSNorm.forward(
+                                output: outPtr,
+                                input: inPtr,
+                                weights: wPtr,
+                                dim: dim,
+                                seqLen: seqLen,
+                                workspace: rmsWorkspace
+                            )
                         }
                     }
                 }
+                stepTimings.tRms += MachTime.ms(MachTime.now() - t0)
 
                 // Classifier: logits = embed @ xFinal.
+                t0 = MachTime.now()
                 logits.withUnsafeMutablePointer { logitsPtr in
                     embed.withUnsafePointer { ePtr in
                         xFinal.withUnsafePointer { xPtr in
@@ -453,8 +643,10 @@ enum EspressoTrainMain {
                         }
                     }
                 }
+                stepTimings.tCls += MachTime.ms(MachTime.now() - t0)
 
                 // Cross-entropy loss + dlogits.
+                t0 = MachTime.now()
                 let loss = dlogits.withUnsafeMutablePointer { dlogitsPtr in
                     logits.withUnsafePointer { logitsPtr in
                         CrossEntropy.lossAndGradient(
@@ -462,11 +654,13 @@ enum EspressoTrainMain {
                             logits: logitsPtr,
                             targets: targetTokens,
                             vocabSize: vocab,
-                            seqLen: seqLen
+                            seqLen: seqLen,
+                            workspace: crossEntropyWorkspace
                         )
                     }
                 }
                 lastLoss = loss
+                stepTimings.tElem += MachTime.ms(MachTime.now() - t0)
 
                 // Classifier backward: dy = embed^T @ dlogits.
                 dy.withUnsafeMutablePointer { dyPtr in
@@ -514,7 +708,8 @@ enum EspressoTrainMain {
                                         x: xPtr,
                                         weights: wPtr,
                                         dim: dim,
-                                        seqLen: seqLen
+                                        seqLen: seqLen,
+                                        workspace: rmsWorkspace
                                     )
                                 }
                             }
@@ -528,7 +723,7 @@ enum EspressoTrainMain {
                 }
 
                 // Backward pass (12 layers, reverse).
-                try BackwardPass.run(
+                try BackwardPass.runTimed(
                     dy: dy,
                     acts: acts,
                     kernels: kernelStorage,
@@ -540,7 +735,9 @@ enum EspressoTrainMain {
                     dim: dim,
                     hidden: hidden,
                     seqLen: seqLen,
-                    heads: heads
+                    heads: heads,
+                    surfaceHandles: surfaceHandles,
+                    timings: &stepTimings
                 )
 
                 // Embedding backward (accumulates into gembed).
@@ -563,13 +760,28 @@ enum EspressoTrainMain {
                 }
 
                 let stepMs = MachTime.ms(MachTime.now() - stepT0)
+                batchStepMsAccum += stepMs
+                let completedSteps = stepsBatch + 1
+                batchTimings.tAne += stepTimings.tAne
+                batchTimings.tIO += stepTimings.tIO
+                batchTimings.tCls += stepTimings.tCls
+                batchTimings.tElem += stepTimings.tElem
+                batchTimings.tRms += stepTimings.tRms
+                batchTimings.tCblasWait += stepTimings.tCblasWait
                 stderrLine(
                     String(
-                        format: "{\"type\":\"step\",\"step\":%d,\"loss\":%.6f,\"ms\":%.3f,\"compiles\":%d}",
+                        format: "{\"type\":\"step\",\"step\":%d,\"loss\":%.6f,\"ms\":%.3f,\"ms_per_step\":%.3f,\"t_ane\":%.3f,\"t_io\":%.3f,\"t_cls\":%.3f,\"t_elem\":%.3f,\"t_rms\":%.3f,\"t_cblas_wait\":%.3f,\"compiles\":%d}",
                         locale: posix,
                         currentStep,
                         lastLoss,
                         stepMs,
+                        batchStepMsAccum / Double(completedSteps),
+                        batchTimings.tAne / Double(completedSteps),
+                        batchTimings.tIO / Double(completedSteps),
+                        batchTimings.tCls / Double(completedSteps),
+                        batchTimings.tElem / Double(completedSteps),
+                        batchTimings.tRms / Double(completedSteps),
+                        batchTimings.tCblasWait / Double(completedSteps),
                         CompileBudget.currentCount
                     )
                 )
@@ -626,15 +838,33 @@ enum EspressoTrainMain {
                     CompileBudget.currentCount
                 )
             )
+            print(
+                String(
+                    format: "    ane=%.1f io=%.1f cls=%.1f elem=%.1f rms=%.1f cblas_wait=%.1f ms/step",
+                    locale: posix,
+                    batchTimings.tAne / Double(stepsBatch),
+                    batchTimings.tIO / Double(stepsBatch),
+                    batchTimings.tCls / Double(stepsBatch),
+                    batchTimings.tElem / Double(stepsBatch),
+                    batchTimings.tRms / Double(stepsBatch),
+                    batchTimings.tCblasWait / Double(stepsBatch)
+                )
+            )
 
             stderrLine(
                 String(
-                    format: "{\"type\":\"batch\",\"batch\":%d,\"compile_ms\":%.1f,\"train_ms\":%.1f,\"ms_per_step\":%.1f}",
+                    format: "{\"type\":\"batch\",\"batch\":%d,\"compile_ms\":%.1f,\"train_ms\":%.1f,\"ms_per_step\":%.1f,\"t_ane\":%.3f,\"t_io\":%.3f,\"t_cls\":%.3f,\"t_elem\":%.3f,\"t_rms\":%.3f,\"t_cblas_wait\":%.3f}",
                     locale: posix,
                     stepsBatch,
                     cms,
                     tms,
-                    tms / Double(stepsBatch)
+                    tms / Double(stepsBatch),
+                    batchTimings.tAne / Double(stepsBatch),
+                    batchTimings.tIO / Double(stepsBatch),
+                    batchTimings.tCls / Double(stepsBatch),
+                    batchTimings.tElem / Double(stepsBatch),
+                    batchTimings.tRms / Double(stepsBatch),
+                    batchTimings.tCblasWait / Double(stepsBatch)
                 )
             )
 

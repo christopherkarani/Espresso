@@ -2,6 +2,66 @@ import Foundation
 import ANEInterop
 import IOSurface
 
+public struct ANEChainingProbe: Sendable {
+    public let hasChainingRequestClass: Bool
+    public let hasPrepareSelector: Bool
+    public let hasOutputSetsClass: Bool
+    public let hasOutputSetsFactory: Bool
+    public let hasOutputSetEnqueueClass: Bool
+    public let hasInputBuffersReadyClass: Bool
+    public let hasSharedSignalEventClass: Bool
+    public let builtOutputSet: Bool
+    public let builtOutputSetEnqueue: Bool
+    public let builtInputBuffersReady: Bool
+    public let builtSharedSignalEvent: Bool
+    public let builtRequest: Bool
+    public let usedArrayLoopbackSymbolIndices: Bool
+    public let usedRealStatsSurface: Bool
+    public let requestValidated: Bool
+    public let requestValid: Bool
+    public let requestValidationFailed: Bool
+    public let inputBuffersReadyValidationFailed: Bool
+    public let calledEnqueueSets: Bool
+    public let enqueueSetsSucceeded: Bool
+    public let calledBuffersReady: Bool
+    public let buffersReadySucceeded: Bool
+    public let prepared: Bool
+    public let stage: Int
+}
+
+public struct ANEVirtualClientProbe: Sendable {
+    public let hasVirtualClientClass: Bool
+    public let hasVirtualClientProperty: Bool
+    public let hasSharedEventsClass: Bool
+    public let hasSharedWaitEventClass: Bool
+    public let hasSharedSignalEventClass: Bool
+    public let hasIOSurfaceSharedEventClass: Bool
+    public let hasDoEvaluateCompletionEvent: Bool
+    public let hasStandardEvaluate: Bool
+    public let hasMapIOSurfaces: Bool
+    public let hasLoadModel: Bool
+    public let hasRequestSharedEventsFactory: Bool
+    public let hasSetSharedEvents: Bool
+    public let hasSetCompletionHandler: Bool
+    public let obtainedVirtualClient: Bool
+    public let triedPropertyOnClient: Bool
+    public let triedDirectSharedConnection: Bool
+    public let triedInitWithSingletonAccess: Bool
+    public let triedNew: Bool
+    public let directConnectSucceeded: Bool
+    public let builtIOSurfaceSharedEvent: Bool
+    public let builtWaitEvent: Bool
+    public let builtSignalEvent: Bool
+    public let builtSharedEventsContainer: Bool
+    public let builtRequest: Bool
+    public let mappedSurfaces: Bool
+    public let loadedOnVirtualClient: Bool
+    public let standardEvalSucceeded: Bool
+    public let completionEventEvalSucceeded: Bool
+    public let completionHandlerFired: Bool
+    public let stage: Int
+}
+
 public struct ANEKernel: ~Copyable {
     private enum CompileGate {
         static let lock = NSLock()
@@ -173,6 +233,153 @@ public struct ANEKernel: ~Copyable {
         }
     }
 
+    /// Last reported on-chip execution time from `_ANEPerformanceStats` (nanoseconds).
+    ///
+    /// Returns `0` when perf stats are disabled (default) or unsupported on this host.
+    public func lastHWExecutionTimeNS() -> UInt64 {
+        ane_interop_last_hw_execution_time_ns(handle)
+    }
+
+    public func chainingProbe(
+        useRealStatsSurface: Bool = false,
+        skipPrepare: Bool = false,
+        validateRequest: Bool = true,
+        useScalarLoopbackSymbolIndices: Bool = false,
+        callEnqueueSets: Bool = false,
+        callBuffersReady: Bool = false,
+        requestProcedureIndex: UInt32 = 0,
+        requestTransactionHandle: UInt64 = 0,
+        requestFWEnqueueDelay: UInt64 = 0,
+        requestMemoryPoolId: UInt64 = 0,
+        enqueueProcedureIndex: UInt32 = 0,
+        enqueueSetIndex: UInt32 = 0,
+        enqueueSignalValue: UInt64 = 0,
+        enqueueSignalNotRequired: Bool = true,
+        enqueueOpenLoop: Bool = false,
+        readyProcedureIndex: UInt32 = 0,
+        readyExecutionDelay: UInt64 = 0,
+        useSharedSignalEvent: Bool = false,
+        sharedSignalEventValue: UInt64 = 1,
+        sharedSignalEventSymbolIndex: UInt32 = 0,
+        sharedSignalEventType: Int64 = 0
+    ) -> ANEChainingProbe {
+        var options = ANEInteropChainingProbeOptions(
+            useRealStatsSurface: useRealStatsSurface,
+            skipPrepare: skipPrepare,
+            validateRequest: validateRequest,
+            useScalarLoopbackSymbolIndices: useScalarLoopbackSymbolIndices,
+            callEnqueueSets: callEnqueueSets,
+            callBuffersReady: callBuffersReady,
+            requestProcedureIndex: requestProcedureIndex,
+            requestTransactionHandle: requestTransactionHandle,
+            requestFWEnqueueDelay: requestFWEnqueueDelay,
+            requestMemoryPoolId: requestMemoryPoolId,
+            enqueueProcedureIndex: enqueueProcedureIndex,
+            enqueueSetIndex: enqueueSetIndex,
+            enqueueSignalValue: enqueueSignalValue,
+            enqueueSignalNotRequired: enqueueSignalNotRequired,
+            enqueueOpenLoop: enqueueOpenLoop,
+            readyProcedureIndex: readyProcedureIndex,
+            readyExecutionDelay: readyExecutionDelay,
+            useSharedSignalEvent: useSharedSignalEvent,
+            sharedSignalEventValue: sharedSignalEventValue,
+            sharedSignalEventSymbolIndex: sharedSignalEventSymbolIndex,
+            sharedSignalEventType: sharedSignalEventType
+        )
+        var raw = ANEInteropChainingProbeResult()
+        ane_interop_probe_chaining_with_options(handle, &options, &raw)
+        return ANEChainingProbe(
+            hasChainingRequestClass: raw.hasChainingRequestClass,
+            hasPrepareSelector: raw.hasPrepareSelector,
+            hasOutputSetsClass: raw.hasOutputSetsClass,
+            hasOutputSetsFactory: raw.hasOutputSetsFactory,
+            hasOutputSetEnqueueClass: raw.hasOutputSetEnqueueClass,
+            hasInputBuffersReadyClass: raw.hasInputBuffersReadyClass,
+            hasSharedSignalEventClass: raw.hasSharedSignalEventClass,
+            builtOutputSet: raw.builtOutputSet,
+            builtOutputSetEnqueue: raw.builtOutputSetEnqueue,
+            builtInputBuffersReady: raw.builtInputBuffersReady,
+            builtSharedSignalEvent: raw.builtSharedSignalEvent,
+            builtRequest: raw.builtRequest,
+            usedArrayLoopbackSymbolIndices: raw.usedArrayLoopbackSymbolIndices,
+            usedRealStatsSurface: raw.usedRealStatsSurface,
+            requestValidated: raw.requestValidated,
+            requestValid: raw.requestValid,
+            requestValidationFailed: raw.requestValidationFailed,
+            inputBuffersReadyValidationFailed: raw.inputBuffersReadyValidationFailed,
+            calledEnqueueSets: raw.calledEnqueueSets,
+            enqueueSetsSucceeded: raw.enqueueSetsSucceeded,
+            calledBuffersReady: raw.calledBuffersReady,
+            buffersReadySucceeded: raw.buffersReadySucceeded,
+            prepared: raw.prepared,
+            stage: Int(raw.stage)
+        )
+    }
+
+    public func virtualClientProbe(
+        useCompletionEvent: Bool = false,
+        useCompletionHandler: Bool = false,
+        useSharedEvents: Bool = false,
+        useWaitEvent: Bool = false,
+        skipEval: Bool = false,
+        mapSurfaces: Bool = false,
+        loadOnVirtualClient: Bool = false,
+        useDirectInstantiation: Bool = false,
+        waitEventValue: UInt64 = 1,
+        waitEventType: UInt64 = 0,
+        signalSymbolIndex: UInt32 = 0,
+        waitSymbolIndex: UInt32 = 0
+    ) -> ANEVirtualClientProbe {
+        var options = ANEInteropVCProbeOptions(
+            useCompletionEvent: useCompletionEvent,
+            useCompletionHandler: useCompletionHandler,
+            useSharedEvents: useSharedEvents,
+            useWaitEvent: useWaitEvent,
+            skipEval: skipEval,
+            mapSurfaces: mapSurfaces,
+            loadOnVirtualClient: loadOnVirtualClient,
+            useDirectInstantiation: useDirectInstantiation,
+            waitEventValue: waitEventValue,
+            waitEventType: waitEventType,
+            signalSymbolIndex: signalSymbolIndex,
+            waitSymbolIndex: waitSymbolIndex
+        )
+        var raw = ANEInteropVCProbeResult()
+        ane_interop_probe_virtual_client_eval(handle, &options, &raw)
+        return ANEVirtualClientProbe(
+            hasVirtualClientClass: raw.hasVirtualClientClass,
+            hasVirtualClientProperty: raw.hasVirtualClientProperty,
+            hasSharedEventsClass: raw.hasSharedEventsClass,
+            hasSharedWaitEventClass: raw.hasSharedWaitEventClass,
+            hasSharedSignalEventClass: raw.hasSharedSignalEventClass,
+            hasIOSurfaceSharedEventClass: raw.hasIOSurfaceSharedEventClass,
+            hasDoEvaluateCompletionEvent: raw.hasDoEvaluateCompletionEvent,
+            hasStandardEvaluate: raw.hasStandardEvaluate,
+            hasMapIOSurfaces: raw.hasMapIOSurfaces,
+            hasLoadModel: raw.hasLoadModel,
+            hasRequestSharedEventsFactory: raw.hasRequestSharedEventsFactory,
+            hasSetSharedEvents: raw.hasSetSharedEvents,
+            hasSetCompletionHandler: raw.hasSetCompletionHandler,
+            obtainedVirtualClient: raw.obtainedVirtualClient,
+            triedPropertyOnClient: raw.triedPropertyOnClient,
+            triedDirectSharedConnection: raw.triedDirectSharedConnection,
+            triedInitWithSingletonAccess: raw.triedInitWithSingletonAccess,
+            triedNew: raw.triedNew,
+            directConnectSucceeded: raw.directConnectSucceeded,
+            builtIOSurfaceSharedEvent: raw.builtIOSurfaceSharedEvent,
+            builtWaitEvent: raw.builtWaitEvent,
+            builtSignalEvent: raw.builtSignalEvent,
+            builtSharedEventsContainer: raw.builtSharedEventsContainer,
+            builtRequest: raw.builtRequest,
+            mappedSurfaces: raw.mappedSurfaces,
+            loadedOnVirtualClient: raw.loadedOnVirtualClient,
+            standardEvalSucceeded: raw.standardEvalSucceeded,
+            completionEventEvalSucceeded: raw.completionEventEvalSucceeded,
+            completionHandlerFired: raw.completionHandlerFired,
+            stage: Int(raw.stage)
+        )
+    }
+
     /// Access input IOSurface (retained; safe to hold independently of kernel lifetime).
     public func inputSurface(at index: Int) throws(ANEError) -> IOSurfaceRef {
         let checkedIndex = try Self.checkedSurfaceIndex(index)
@@ -189,6 +396,124 @@ public struct ANEKernel: ~Copyable {
             throw .outputSurfaceUnavailable(index)
         }
         return surface
+    }
+
+    public struct CodeSigningProbe: Sendable {
+        public let hasGetCodeSigningIdentity: Bool
+        public let hasSetCodeSigningIdentity: Bool
+        public let gotIdentityString: Bool
+        public let setIdentityBeforeInstantiation: Bool
+        public let instantiationSucceededAfterSet: Bool
+        public let identityString: String
+    }
+
+    public static func codeSigningProbe() -> CodeSigningProbe {
+        var raw = ANEInteropCodeSigningProbeResult()
+        ane_interop_probe_code_signing(&raw)
+        let identityStr = withUnsafeBytes(of: raw.identityString) { buf in
+            let ptr = buf.baseAddress!.assumingMemoryBound(to: CChar.self)
+            return String(cString: ptr)
+        }
+        return CodeSigningProbe(
+            hasGetCodeSigningIdentity: raw.hasGetCodeSigningIdentity,
+            hasSetCodeSigningIdentity: raw.hasSetCodeSigningIdentity,
+            gotIdentityString: raw.gotIdentityString,
+            setIdentityBeforeInstantiation: raw.setIdentityBeforeInstantiation,
+            instantiationSucceededAfterSet: raw.instantiationSucceededAfterSet,
+            identityString: identityStr
+        )
+    }
+
+    public struct StandardCompletionProbe: Sendable {
+        public let requestHasCompletionHandler: Bool
+        public let completionHandlerSet: Bool
+        public let requestHasSharedEvents: Bool
+        public let metalDeviceCreated: Bool
+        public let builtMetalSharedEvent: Bool
+        public let builtSignalEvent: Bool
+        public let builtSharedEventsContainer: Bool
+        public let sharedEventsAttached: Bool
+        public let evalSucceeded: Bool
+        public let completionHandlerFired: Bool
+        public let eventValueAdvanced: Bool
+        public let eventValueBefore: UInt64
+        public let eventValueAfter: UInt64
+        public let evalTimeMS: Double
+    }
+
+    public func standardCompletionProbe(useMetalSharedEvent: Bool = false) -> StandardCompletionProbe {
+        var raw = ANEInteropStandardCompletionProbeResult()
+        ane_interop_probe_standard_completion_handler(handle, useMetalSharedEvent, &raw)
+        return StandardCompletionProbe(
+            requestHasCompletionHandler: raw.requestHasCompletionHandler,
+            completionHandlerSet: raw.completionHandlerSet,
+            requestHasSharedEvents: raw.requestHasSharedEvents,
+            metalDeviceCreated: raw.metalDeviceCreated,
+            builtMetalSharedEvent: raw.builtMetalSharedEvent,
+            builtSignalEvent: raw.builtSignalEvent,
+            builtSharedEventsContainer: raw.builtSharedEventsContainer,
+            sharedEventsAttached: raw.sharedEventsAttached,
+            evalSucceeded: raw.evalSucceeded,
+            completionHandlerFired: raw.completionHandlerFired,
+            eventValueAdvanced: raw.eventValueAdvanced,
+            eventValueBefore: raw.eventValueBefore,
+            eventValueAfter: raw.eventValueAfter,
+            evalTimeMS: raw.evalTimeMS
+        )
+    }
+
+    // MARK: - Real-time eval probe
+
+    public struct RealTimeEvalProbe: Sendable {
+        public let hasBeginRealTimeTask: Bool
+        public let hasEndRealTimeTask: Bool
+        public let hasLoadRealTimeModel: Bool
+        public let hasUnloadRealTimeModel: Bool
+        public let hasEvaluateRealTime: Bool
+        public let realtimeLoadSucceeded: Bool
+        public let realtimeEvalSucceeded: Bool
+        public let standardEvalSucceeded: Bool
+        public let realtimeEvalsCompleted: Int
+        public let standardEvalsCompleted: Int
+        public let realtimeTotalMS: Double
+        public let standardTotalMS: Double
+        public let realtimePerEvalMS: Double
+        public let standardPerEvalMS: Double
+        public let savedPerEvalMS: Double
+        public let savedPercent: Double
+    }
+
+    /// Benchmark the real-time eval path vs standard eval on this kernel.
+    ///
+    /// Runs `nIters` evaluations on both paths and returns per-eval timing.
+    /// The real-time path uses `beginRealTimeTask` → `loadRealTimeModel:` →
+    /// `evaluateRealTimeWithModel:` → `unloadRealTimeModel:` → `endRealTimeTask`.
+    public func realTimeEvalProbe(nIters: Int = 30) -> RealTimeEvalProbe {
+        var raw = ANEInteropRealTimeProbeResult()
+        ane_interop_probe_realtime_eval(handle, Int32(nIters), &raw)
+        return RealTimeEvalProbe(
+            hasBeginRealTimeTask: raw.hasBeginRealTimeTask,
+            hasEndRealTimeTask: raw.hasEndRealTimeTask,
+            hasLoadRealTimeModel: raw.hasLoadRealTimeModel,
+            hasUnloadRealTimeModel: raw.hasUnloadRealTimeModel,
+            hasEvaluateRealTime: raw.hasEvaluateRealTime,
+            realtimeLoadSucceeded: raw.realtimeLoadSucceeded,
+            realtimeEvalSucceeded: raw.realtimeEvalSucceeded,
+            standardEvalSucceeded: raw.standardEvalSucceeded,
+            realtimeEvalsCompleted: Int(raw.realtimeEvalsCompleted),
+            standardEvalsCompleted: Int(raw.standardEvalsCompleted),
+            realtimeTotalMS: raw.realtimeTotalMS,
+            standardTotalMS: raw.standardTotalMS,
+            realtimePerEvalMS: raw.realtimePerEvalMS,
+            standardPerEvalMS: raw.standardPerEvalMS,
+            savedPerEvalMS: raw.savedPerEvalMS,
+            savedPercent: raw.savedPercent
+        )
+    }
+
+    /// Quick check: does this kernel's _ANEClient support the real-time eval path?
+    public var hasRealTimeEvalSupport: Bool {
+        ane_interop_runtime_has_realtime_eval(handle)
     }
 
     deinit {

@@ -1,11 +1,10 @@
 === Non-causal SDPA (baseline) ===
-compile FAIL: 
-SDPA compile: FAIL
+SDPA compile: OK
 
 === Decomposed causal attention ===
-compile FAIL: 
+compile FAIL: _ANECompiler : ANECCompile() FAILED
 Q@K^T compile: FAIL
-compile FAIL: 
+compile FAIL: _ANECompiler : ANECCompile() FAILED
 scores@V compile: FAIL
 Some kernels failed to compile, aborting
 

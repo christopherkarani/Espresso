@@ -1,6 +1,30 @@
 import Accelerate
 
 public enum RMSNorm {
+    public struct Workspace: ~Copyable {
+        public let seqLen: Int
+        fileprivate let tmp: UnsafeMutablePointer<Float>
+        fileprivate let ss: UnsafeMutablePointer<Float>
+        fileprivate let rrms: UnsafeMutablePointer<Float>
+        fileprivate let dot: UnsafeMutablePointer<Float>
+
+        public init(seqLen: Int) {
+            precondition(seqLen > 0)
+            self.seqLen = seqLen
+            self.tmp = .allocate(capacity: seqLen)
+            self.ss = .allocate(capacity: seqLen)
+            self.rrms = .allocate(capacity: seqLen)
+            self.dot = .allocate(capacity: seqLen)
+        }
+
+        deinit {
+            tmp.deallocate()
+            ss.deallocate()
+            rrms.deallocate()
+            dot.deallocate()
+        }
+    }
+
     /// Channel-first forward: x[dim, seq], w[dim] -> out[dim, seq]
     public static func forward(
         output: UnsafeMutablePointer<Float>,
@@ -9,17 +33,34 @@ public enum RMSNorm {
         dim: Int,
         seqLen: Int
     ) {
+        let workspace = Workspace(seqLen: seqLen)
+        forward(
+            output: output,
+            input: input,
+            weights: weights,
+            dim: dim,
+            seqLen: seqLen,
+            workspace: workspace
+        )
+    }
+
+    /// Channel-first forward using caller-provided workspace.
+    public static func forward(
+        output: UnsafeMutablePointer<Float>,
+        input: UnsafePointer<Float>,
+        weights: UnsafePointer<Float>,
+        dim: Int,
+        seqLen: Int,
+        workspace: borrowing Workspace
+    ) {
         precondition(dim > 0)
         precondition(seqLen > 0)
+        precondition(workspace.seqLen == seqLen)
 
         let n = vDSP_Length(seqLen)
-        let tmp = UnsafeMutablePointer<Float>.allocate(capacity: seqLen)
-        let ss = UnsafeMutablePointer<Float>.allocate(capacity: seqLen)
-        ss.initialize(repeating: 0, count: seqLen)
-        defer {
-            tmp.deallocate()
-            ss.deallocate()
-        }
+        let tmp = workspace.tmp
+        let ss = workspace.ss
+        vDSP_vclr(ss, 1, n)
 
         for i in 0..<dim {
             let row = input + (i * seqLen)
@@ -53,22 +94,41 @@ public enum RMSNorm {
         dim: Int,
         seqLen: Int
     ) {
+        let workspace = Workspace(seqLen: seqLen)
+        backward(
+            dx: dx,
+            dw: dw,
+            dy: dy,
+            x: x,
+            weights: weights,
+            dim: dim,
+            seqLen: seqLen,
+            workspace: workspace
+        )
+    }
+
+    /// Channel-first backward using caller-provided workspace: computes dx, ACCUMULATES into dw.
+    public static func backward(
+        dx: UnsafeMutablePointer<Float>,
+        dw: UnsafeMutablePointer<Float>,
+        dy: UnsafePointer<Float>,
+        x: UnsafePointer<Float>,
+        weights: UnsafePointer<Float>,
+        dim: Int,
+        seqLen: Int,
+        workspace: borrowing Workspace
+    ) {
         precondition(dim > 0)
         precondition(seqLen > 0)
+        precondition(workspace.seqLen == seqLen)
 
         let n = vDSP_Length(seqLen)
-        let tmp = UnsafeMutablePointer<Float>.allocate(capacity: seqLen)
-        let ss = UnsafeMutablePointer<Float>.allocate(capacity: seqLen)
-        let rrms = UnsafeMutablePointer<Float>.allocate(capacity: seqLen)
-        let dot = UnsafeMutablePointer<Float>.allocate(capacity: seqLen)
-        ss.initialize(repeating: 0, count: seqLen)
-        dot.initialize(repeating: 0, count: seqLen)
-        defer {
-            tmp.deallocate()
-            ss.deallocate()
-            rrms.deallocate()
-            dot.deallocate()
-        }
+        let tmp = workspace.tmp
+        let ss = workspace.ss
+        let rrms = workspace.rrms
+        let dot = workspace.dot
+        vDSP_vclr(ss, 1, n)
+        vDSP_vclr(dot, 1, n)
 
         for i in 0..<dim {
             let row = x + (i * seqLen)
@@ -95,22 +155,22 @@ public enum RMSNorm {
         vDSP_vsmul(ss, 1, &invd, ss, 1, n)         // ss = rrms^2 / d
         vDSP_vmul(dot, 1, ss, 1, dot, 1, n)        // dot = dot * rrms^2 / d
 
-	        for i in 0..<dim {
-	            let xRow = x + (i * seqLen)
-	            let dyRow = dy + (i * seqLen)
-	            let dxRow = dx + (i * seqLen)
+        for i in 0..<dim {
+            let xRow = x + (i * seqLen)
+            let dyRow = dy + (i * seqLen)
+            let dxRow = dx + (i * seqLen)
 
-	            // Correct: dx = rrms * (dy*w - x*dot), where dot already includes w and rrms^2/d.
-	            var wi = weights[i]
-	            vDSP_vsmul(dyRow, 1, &wi, dxRow, 1, n)     // dxRow = dy*w
-	            vDSP_vmul(xRow, 1, dot, 1, tmp, 1, n)      // tmp = x*dot
-	            // vDSP_vsub computes second input minus first input: dxRow = dxRow - tmp
-	            vDSP_vsub(tmp, 1, dxRow, 1, dxRow, 1, n)
-	            vDSP_vmul(dxRow, 1, rrms, 1, dxRow, 1, n)  // dxRow *= rrms
+            // Correct: dx = rrms * (dy*w - x*dot), where dot already includes w and rrms^2/d.
+            var wi = weights[i]
+            vDSP_vsmul(dyRow, 1, &wi, dxRow, 1, n)     // dxRow = dy*w
+            vDSP_vmul(xRow, 1, dot, 1, tmp, 1, n)      // tmp = x*dot
+            // vDSP_vsub computes second input minus first input: dxRow = dxRow - tmp
+            vDSP_vsub(tmp, 1, dxRow, 1, dxRow, 1, n)
+            vDSP_vmul(dxRow, 1, rrms, 1, dxRow, 1, n)  // dxRow *= rrms
 
-	            vDSP_vmul(dyRow, 1, xRow, 1, tmp, 1, n)
-	            vDSP_vmul(tmp, 1, rrms, 1, tmp, 1, n)
-	            var s: Float = 0
+            vDSP_vmul(dyRow, 1, xRow, 1, tmp, 1, n)
+            vDSP_vmul(tmp, 1, rrms, 1, tmp, 1, n)
+            var s: Float = 0
             vDSP_sve(tmp, 1, &s, n)
             dw[i] += s // ACCUMULATE, do not overwrite
         }

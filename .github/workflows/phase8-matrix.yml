@@ -1,0 +1,58 @@
+name: phase8-matrix
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "Package.swift"
+      - "Sources/**"
+      - "Tests/**"
+      - "scripts/**"
+
+jobs:
+  phase8:
+    name: "Phase 8 (${{ matrix.lane }})"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lane: ane-m3
+            runner: [self-hosted, macOS, ane-m3]
+          - lane: ane-m4
+            runner: [self-hosted, macOS, ane-m4]
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Swift Toolchain
+        run: swift --version
+
+      - name: Gate G0 (build + baseline test)
+        run: |
+          set -euo pipefail
+          swift build
+          swift test
+
+      - name: Gate G1 (hardware correctness lane)
+        run: |
+          set -euo pipefail
+          ANE_HARDWARE_TESTS=1 swift test --filter "ANERuntimeTests|EspressoTests|CrossValidationTests"
+
+      - name: Gate G2 (ObjC cross-validation lane)
+        run: |
+          set -euo pipefail
+          OBJC_CROSS_VALIDATION=1 ANE_HARDWARE_TESTS=1 swift test --filter CrossValidationTests
+
+      - name: Gate G3/G4/G5 (benchmark artifacts + grading + regression)
+        run: |
+          set -euo pipefail
+          ./scripts/phase8_benchmark.py --regression-threshold-pct 5 --max-retries 1
+
+      - name: Upload Phase 8 Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase8-${{ matrix.lane }}
+          path: artifacts/benchmarks/phase8
+          if-no-files-found: error

@@ -1,4 +1,5 @@
 import Accelerate
+import IOSurface
 import ANERuntime
 import ANETypes
 import CPUOps
@@ -43,6 +44,14 @@ public struct BackwardScratch: ~Copyable {
 /// Maps to `train_large.m:461-575`.
 public enum BackwardPass {
     @inline(__always)
+    private static func requireBase(_ buffer: UnsafeMutableBufferPointer<Float>) -> UnsafeMutablePointer<Float> {
+        guard let base = buffer.baseAddress else {
+            preconditionFailure("Expected non-empty buffer")
+        }
+        return base
+    }
+
+    @inline(__always)
     private static func mapSurfaceError(_ error: SurfaceIOError) -> ANEError {
         switch error {
         case .argumentOutOfRange:
@@ -75,7 +84,43 @@ public enum BackwardPass {
         dim: Int = ModelConfig.dim,
         hidden: Int = ModelConfig.hidden,
         seqLen: Int = ModelConfig.seqLen,
-        heads: Int = ModelConfig.heads
+        heads: Int = ModelConfig.heads,
+        surfaceHandles: [LayerSurfaceHandles]? = nil
+    ) throws(ANEError) {
+        var ignoredTimings = StepTimingBreakdown()
+        try runTimed(
+            dy: dy,
+            acts: acts,
+            kernels: kernels,
+            staticKernels: staticKernels,
+            grads: grads,
+            weights: weights,
+            scratch: scratch,
+            accumulator: accumulator,
+            dim: dim,
+            hidden: hidden,
+            seqLen: seqLen,
+            heads: heads,
+            surfaceHandles: surfaceHandles,
+            timings: &ignoredTimings
+        )
+    }
+
+    public static func runTimed(
+        dy: borrowing TensorBuffer,
+        acts: borrowing LayerStorage<LayerActivations>,
+        kernels: borrowing LayerStorage<LayerKernelSet>,
+        staticKernels: borrowing LayerStorage<StaticKernel>,
+        grads: borrowing LayerStorage<LayerGradients>,
+        weights: borrowing LayerStorage<LayerWeights>,
+        scratch: borrowing BackwardScratch,
+        accumulator: GradientAccumulator,
+        dim: Int = ModelConfig.dim,
+        hidden: Int = ModelConfig.hidden,
+        seqLen: Int = ModelConfig.seqLen,
+        heads: Int = ModelConfig.heads,
+        surfaceHandles: [LayerSurfaceHandles]? = nil,
+        timings: inout StepTimingBreakdown
     ) throws(ANEError) {
         precondition(dim > 0 && hidden > 0 && seqLen > 0 && heads > 0)
         precondition(dy.count == dim * seqLen)
@@ -83,6 +128,9 @@ public enum BackwardPass {
         precondition(staticKernels.count == kernels.count)
         precondition(grads.count == kernels.count)
         precondition(weights.count == kernels.count)
+        if let handles = surfaceHandles {
+            precondition(handles.count == kernels.count)
+        }
 
         let nLayers = kernels.count
         let dimSeq = dim * seqLen
@@ -90,6 +138,8 @@ public enum BackwardPass {
         let scoreCh = heads * seqLen
 
         for L in stride(from: nLayers - 1, through: 0, by: -1) {
+            let layerHandles = surfaceHandles?[L]
+
             // dffn = dy (residual copy).
             dy.withUnsafePointer { dyPtr in
                 scratch.dffn.withUnsafeMutablePointer { dst in
@@ -98,8 +148,14 @@ public enum BackwardPass {
             }
 
             // === STEP 1: FFN backward (ANE) ===
-            let ffnBwdIn = try kernels[L].ffnBwd.inputSurface(at: 0)
+            let ffnBwdIn: IOSurfaceRef
+            if let handles = layerHandles {
+                ffnBwdIn = handles.ffnBwdIn
+            } else {
+                ffnBwdIn = try kernels[L].ffnBwd.inputSurface(at: 0)
+            }
             var ffnWriteError: SurfaceIOError?
+            var t0 = RuntimeClock.now()
             scratch.dffn.withUnsafeBufferPointer { dffnBuf in
                 do {
                     try SurfaceIO.writeFP16At(
@@ -118,8 +174,15 @@ public enum BackwardPass {
             if let e = ffnWriteError {
                 throw mapSurfaceError(e)
             }
+            timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
 
-            let fwdFFNOut = try kernels[L].fwdFFN.outputSurface(at: 0)
+            let fwdFFNOut: IOSurfaceRef
+            if let handles = layerHandles {
+                fwdFFNOut = handles.fwdFFNOut
+            } else {
+                fwdFFNOut = try kernels[L].fwdFFN.outputSurface(at: 0)
+            }
+            t0 = RuntimeClock.now()
             try mapSurfaceIO {
                 try SurfaceIO.copyFP16(
                     dst: ffnBwdIn,
@@ -130,19 +193,32 @@ public enum BackwardPass {
                     spatial: seqLen
                 )
             }
+            timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
 
+            t0 = RuntimeClock.now()
             try kernels[L].ffnBwd.eval()
+            timings.tAne += RuntimeClock.ms(RuntimeClock.now() - t0)
 
-            let ffnBwdOut = try kernels[L].ffnBwd.outputSurface(at: 0)
-            scratch.dxFfn.withUnsafeMutableBufferPointer { dst in
-                SurfaceIO.readFP16(from: ffnBwdOut, into: dst, channelOffset: 0, channels: dim, spatial: seqLen)
+            let ffnBwdOut: IOSurfaceRef
+            if let handles = layerHandles {
+                ffnBwdOut = handles.ffnBwdOut
+            } else {
+                ffnBwdOut = try kernels[L].ffnBwd.outputSurface(at: 0)
             }
-            scratch.dh1.withUnsafeMutableBufferPointer { dst in
-                SurfaceIO.readFP16(from: ffnBwdOut, into: dst, channelOffset: dim, channels: hidden, spatial: seqLen)
+            t0 = RuntimeClock.now()
+            scratch.dxFfn.withUnsafeMutableBufferPointer { dxFfnBuf in
+                scratch.dh1.withUnsafeMutableBufferPointer { dh1Buf in
+                    scratch.dh3.withUnsafeMutableBufferPointer { dh3Buf in
+                        let regions = [
+                            SurfaceIO.FP16ReadRegion(destination: requireBase(dxFfnBuf), channelOffset: 0, channels: dim),
+                            SurfaceIO.FP16ReadRegion(destination: requireBase(dh1Buf), channelOffset: dim, channels: hidden),
+                            SurfaceIO.FP16ReadRegion(destination: requireBase(dh3Buf), channelOffset: dim + hidden, channels: hidden),
+                        ]
+                        SurfaceIO.readFP16Batched(from: ffnBwdOut, spatial: seqLen, regions: regions)
+                    }
+                }
             }
-            scratch.dh3.withUnsafeMutableBufferPointer { dst in
-                SurfaceIO.readFP16(from: ffnBwdOut, into: dst, channelOffset: dim + hidden, channels: hidden, spatial: seqLen)
-            }
+            timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
 
             // === STEP 1b: Async dW FFN (CPU) ===
             let grW2 = grads[L].W2.withUnsafeMutablePointer { SendablePointer($0) }
@@ -230,10 +306,21 @@ public enum BackwardPass {
             }
 
             // === STEP 4: SDPA backward (ANE) ===
-            let sdpa1In = try kernels[L].sdpaBwd1.inputSurface(at: 0)
-            let fwdAttnOut = try kernels[L].fwdAttn.outputSurface(at: 0)
+            let sdpa1In: IOSurfaceRef
+            if let handles = layerHandles {
+                sdpa1In = handles.sdpaBwd1In
+            } else {
+                sdpa1In = try kernels[L].sdpaBwd1.inputSurface(at: 0)
+            }
+            let fwdAttnOut: IOSurfaceRef
+            if let handles = layerHandles {
+                fwdAttnOut = handles.fwdAttnOut
+            } else {
+                fwdAttnOut = try kernels[L].fwdAttn.outputSurface(at: 0)
+            }
 
             // #6: copy Q|K|V from fwdAttn output (skip o_out at offset 0; Q starts at offset dim)
+            t0 = RuntimeClock.now()
             try mapSurfaceIO {
                 try SurfaceIO.copyFP16(
                     dst: sdpa1In,
@@ -244,9 +331,11 @@ public enum BackwardPass {
                     spatial: seqLen
                 )
             }
+            timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
 
             // #7: write dx2 at offset 3*dim
             var sdpaWriteError: SurfaceIOError?
+            t0 = RuntimeClock.now()
             scratch.dx2.withUnsafeBufferPointer { dx2Buf in
                 do {
                     try SurfaceIO.writeFP16At(
@@ -265,52 +354,80 @@ public enum BackwardPass {
             if let e = sdpaWriteError {
                 throw mapSurfaceError(e)
             }
+            timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
 
+            t0 = RuntimeClock.now()
             try kernels[L].sdpaBwd1.eval()
+            timings.tAne += RuntimeClock.ms(RuntimeClock.now() - t0)
 
             // sdpaBwd2 is the weight-free static kernel for this layer.
-            let sdpa2In = try staticKernels[L].kernel.inputSurface(at: 0)
-            let sdpa2Out = try staticKernels[L].kernel.outputSurface(at: 0)
-            let sdpa1Out = try kernels[L].sdpaBwd1.outputSurface(at: 0)
-
-            // #8: copy dscores from sdpaBwd1 output (skip dv at offset 0)
-            try mapSurfaceIO {
-                try SurfaceIO.copyFP16(
-                    dst: sdpa2In,
-                    dstChannelOffset: 0,
-                    src: sdpa1Out,
-                    srcChannelOffset: dim,
-                    channels: 2 * scoreCh,
-                    spatial: seqLen
-                )
+            let sdpa2In: IOSurfaceRef
+            if let handles = layerHandles {
+                sdpa2In = handles.sdpaBwd2In
+            } else {
+                sdpa2In = try staticKernels[L].kernel.inputSurface(at: 0)
+            }
+            let sdpa2Out: IOSurfaceRef
+            if let handles = layerHandles {
+                sdpa2Out = handles.sdpaBwd2Out
+            } else {
+                sdpa2Out = try staticKernels[L].kernel.outputSurface(at: 0)
+            }
+            let sdpa1Out: IOSurfaceRef
+            if let handles = layerHandles {
+                sdpa1Out = handles.sdpaBwd1Out
+            } else {
+                sdpa1Out = try kernels[L].sdpaBwd1.outputSurface(at: 0)
             }
 
-            // #9: copy Q|K into sdpaBwd2 input at offset 2*SCORE_CH
+            // #8/#9: stage sdpaBwd2 inputs in one dst lock from two source surfaces.
+            t0 = RuntimeClock.now()
             try mapSurfaceIO {
-                try SurfaceIO.copyFP16(
+                let regions = [
+                    SurfaceIO.FP16SourceCopyRegion(
+                        source: sdpa1Out,
+                        dstChannelOffset: 0,
+                        srcChannelOffset: dim,
+                        channels: 2 * scoreCh
+                    ),
+                    SurfaceIO.FP16SourceCopyRegion(
+                        source: fwdAttnOut,
+                        dstChannelOffset: 2 * scoreCh,
+                        srcChannelOffset: dim,
+                        channels: 2 * dim
+                    ),
+                ]
+                try SurfaceIO.copyFP16FromMultipleSources(
                     dst: sdpa2In,
-                    dstChannelOffset: 2 * scoreCh,
-                    src: fwdAttnOut,
-                    srcChannelOffset: dim,
-                    channels: 2 * dim,
-                    spatial: seqLen
+                    spatial: seqLen,
+                    regions: regions
                 )
             }
+            timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
 
+            t0 = RuntimeClock.now()
             try staticKernels[L].kernel.eval()
+            timings.tAne += RuntimeClock.ms(RuntimeClock.now() - t0)
 
             // #10/#11: read dq/dk from sdpaBwd2 output
-            scratch.dq.withUnsafeMutableBufferPointer { dst in
-                SurfaceIO.readFP16(from: sdpa2Out, into: dst, channelOffset: 0, channels: dim, spatial: seqLen)
+            t0 = RuntimeClock.now()
+            scratch.dq.withUnsafeMutableBufferPointer { dqBuf in
+                scratch.dk.withUnsafeMutableBufferPointer { dkBuf in
+                    let regions = [
+                        SurfaceIO.FP16ReadRegion(destination: requireBase(dqBuf), channelOffset: 0, channels: dim),
+                        SurfaceIO.FP16ReadRegion(destination: requireBase(dkBuf), channelOffset: dim, channels: dim),
+                    ]
+                    SurfaceIO.readFP16Batched(from: sdpa2Out, spatial: seqLen, regions: regions)
+                }
             }
-            scratch.dk.withUnsafeMutableBufferPointer { dst in
-                SurfaceIO.readFP16(from: sdpa2Out, into: dst, channelOffset: dim, channels: dim, spatial: seqLen)
-            }
+            timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
 
             // #12: read dv from sdpaBwd1 output (dv is NOT produced by sdpaBwd2)
+            t0 = RuntimeClock.now()
             scratch.dv.withUnsafeMutableBufferPointer { dst in
                 SurfaceIO.readFP16(from: sdpa1Out, into: dst, channelOffset: 0, channels: dim, spatial: seqLen)
             }
+            timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
 
             // === STEP 5: Async dWq/dWk/dWv (CPU) ===
             let grWq = grads[L].Wq.withUnsafeMutablePointer { SendablePointer($0) }
@@ -353,39 +470,54 @@ public enum BackwardPass {
             }
 
             // === STEP 6: QKV backward (ANE) ===
-            let qkvIn = try kernels[L].qkvBwd.inputSurface(at: 0)
-            let qkvOut = try kernels[L].qkvBwd.outputSurface(at: 0)
-
-            // #13: copy dq|dk from sdpaBwd2 output into qkvBwd input at offset 0
-            try mapSurfaceIO {
-                try SurfaceIO.copyFP16(
-                    dst: qkvIn,
-                    dstChannelOffset: 0,
-                    src: sdpa2Out,
-                    srcChannelOffset: 0,
-                    channels: 2 * dim,
-                    spatial: seqLen
-                )
+            let qkvIn: IOSurfaceRef
+            if let handles = layerHandles {
+                qkvIn = handles.qkvBwdIn
+            } else {
+                qkvIn = try kernels[L].qkvBwd.inputSurface(at: 0)
+            }
+            let qkvOut: IOSurfaceRef
+            if let handles = layerHandles {
+                qkvOut = handles.qkvBwdOut
+            } else {
+                qkvOut = try kernels[L].qkvBwd.outputSurface(at: 0)
             }
 
-            // #14: copy dv from sdpaBwd1 output into qkvBwd input at offset 2*dim
+            // #13/#14: pack qkvBwd input from two source surfaces in one dst lock.
+            t0 = RuntimeClock.now()
             try mapSurfaceIO {
-                try SurfaceIO.copyFP16(
+                let regions = [
+                    SurfaceIO.FP16SourceCopyRegion(
+                        source: sdpa2Out,
+                        dstChannelOffset: 0,
+                        srcChannelOffset: 0,
+                        channels: 2 * dim
+                    ),
+                    SurfaceIO.FP16SourceCopyRegion(
+                        source: sdpa1Out,
+                        dstChannelOffset: 2 * dim,
+                        srcChannelOffset: 0,
+                        channels: dim
+                    ),
+                ]
+                try SurfaceIO.copyFP16FromMultipleSources(
                     dst: qkvIn,
-                    dstChannelOffset: 2 * dim,
-                    src: sdpa1Out,
-                    srcChannelOffset: 0,
-                    channels: dim,
-                    spatial: seqLen
+                    spatial: seqLen,
+                    regions: regions
                 )
             }
+            timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
 
+            t0 = RuntimeClock.now()
             try kernels[L].qkvBwd.eval()
+            timings.tAne += RuntimeClock.ms(RuntimeClock.now() - t0)
 
             // #15: read dx_attn
+            t0 = RuntimeClock.now()
             scratch.dxAttn.withUnsafeMutableBufferPointer { dst in
                 SurfaceIO.readFP16(from: qkvOut, into: dst, channelOffset: 0, channels: dim, spatial: seqLen)
             }
+            timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
 
             // === STEP 7: RMSNorm1 backward (CPU) ===
             scratch.dxRms1.withUnsafeMutablePointer { dxRms1Ptr in
@@ -418,7 +550,6 @@ public enum BackwardPass {
             }
         }
 
-        // Barrier before Embedding.backward (matches train_large.m:578).
-        accumulator.barrier()
+        // Barrier intentionally handled by caller to preserve timing attribution.
     }
 }

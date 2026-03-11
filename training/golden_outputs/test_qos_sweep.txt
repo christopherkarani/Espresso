@@ -1,22 +1,22 @@
 === QoS Sweep: compile/load/eval with varying QoS ===
 Kernel: 256x256 conv, spatial=64 (8.4 MFLOPS)
  QoS    Compile       Load    Eval(1) Eval(avg10)  Status
-   0          -          -          -          -  COMPILE_FAIL
-   1          -          -          -          -  COMPILE_FAIL
-   5          -          -          -          -  COMPILE_FAIL
-  10          -          -          -          -  COMPILE_FAIL
-  15          -          -          -          -  COMPILE_FAIL
-  17          -          -          -          -  COMPILE_FAIL
-  19          -          -          -          -  COMPILE_FAIL
-  21          -          -          -          -  COMPILE_FAIL
-  25          -          -          -          -  COMPILE_FAIL
-  31          -          -          -          -  COMPILE_FAIL
-  33          -          -          -          -  COMPILE_FAIL
-  40          -          -          -          -  COMPILE_FAIL
-  47          -          -          -          -  COMPILE_FAIL
-  50          -          -          -          -  COMPILE_FAIL
-  55          -          -          -          -  COMPILE_FAIL
-  60          -          -          -          -  COMPILE_FAIL
-  63          -          -          -          -  COMPILE_FAIL
+   0     16.6ms      2.8ms     0.40ms     0.30ms  OK
+   1     14.8ms      2.5ms     0.38ms     0.26ms  OK
+   5     14.5ms      2.4ms     0.32ms     0.22ms  OK
+  10     13.9ms      2.3ms     0.38ms     0.23ms  OK
+  15     13.3ms      2.4ms     0.38ms     0.18ms  OK
+  17     13.2ms      2.2ms     0.34ms     0.17ms  OK
+  19     13.4ms      2.4ms     0.39ms     0.20ms  OK
+  21     13.0ms      2.2ms     0.37ms     0.21ms  OK
+  25     16.7ms      2.2ms     0.39ms     0.18ms  OK
+  31     13.4ms      2.3ms     0.37ms     0.18ms  OK
+  33     14.1ms      2.5ms     0.38ms     0.27ms  OK
+  40     13.8ms      2.6ms     0.39ms     0.25ms  OK
+  47     13.0ms      2.3ms     0.39ms     0.23ms  OK
+  50     12.5ms      2.5ms     0.37ms     0.24ms  OK
+  55     13.6ms      2.6ms     0.41ms     0.35ms  OK
+  60     13.0ms      2.4ms     0.37ms     0.27ms  OK
+  63     13.9ms      2.4ms     0.40ms     0.33ms  OK
 
 Done.

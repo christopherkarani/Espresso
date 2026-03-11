@@ -311,6 +311,72 @@ private func set2x2Sentinel(
     }
 }
 
+private func multiInputAddMIL(channels: Int) -> String {
+    """
+    program(1.3)
+    [buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, {"coremlc-version", "3505.4.1"}, {"coremltools-component-milinternal", ""}, {"coremltools-version", "9.0"}})]
+    {
+        func main<ios18>(tensor<fp16, [1, \(channels), 1, 1]> a, tensor<fp16, [1, \(channels), 1, 1]> b) {
+            tensor<fp16, [1,\(channels),1,1]> out = add(x=a,y=b)[name=string("out")];
+        } -> (out);
+    }
+    """
+}
+
+private func singletonQueryMatmulMIL(heads: Int, headDim: Int, seq: Int) -> String {
+    """
+    program(1.3)
+    [buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, {"coremlc-version", "3505.4.1"}, {"coremltools-component-milinternal", ""}, {"coremltools-version", "9.0"}})]
+    {
+        func main<ios18>(tensor<fp16, [1, \(heads), 1, \(headDim)]> q, tensor<fp16, [1, \(heads), \(seq), \(headDim)]> k) {
+            bool tx = const()[name=string("tx"), val=bool(false)];
+            bool ty = const()[name=string("ty"), val=bool(true)];
+            tensor<fp16, [1,\(heads),1,\(seq)]> out = matmul(transpose_x=tx,transpose_y=ty,x=q,y=k)[name=string("out")];
+        } -> (out);
+    }
+    """
+}
+
+private func decodePassthroughProbeMIL(dim: Int, laneSpatial: Int, maxSeq: Int, inputKinds: [Character], outputCount: Int) -> String {
+    precondition(!inputKinds.isEmpty)
+    precondition(outputCount == 1 || outputCount == 3)
+    var parts: [String] = []
+    for kind in inputKinds {
+        switch kind {
+        case "x":
+            parts.append("tensor<fp16, [1, \(dim), 1, \(laneSpatial)]> x")
+        case "k":
+            parts.append("tensor<fp16, [1, \(dim), 1, \(maxSeq)]> kCache")
+        case "v":
+            parts.append("tensor<fp16, [1, \(dim), 1, \(maxSeq)]> vCache")
+        case "q":
+            parts.append("tensor<fp16, [1, \(2 * dim), 1, \(maxSeq)]> kvCache")
+        case "m":
+            parts.append("tensor<fp16, [1, 1, 1, \(maxSeq)]> maskVec")
+        case "d":
+            parts.append("tensor<fp16, [1, \(dim), 1, \(maxSeq)]> maskDense")
+        default:
+            preconditionFailure("Unknown input kind \(kind)")
+        }
+    }
+    let signature = parts.joined(separator: ", ")
+    var lines: [String] = []
+    lines.append("program(1.3)")
+    lines.append("[buildInfo = dict<string, string>({{\"coremlc-component-MIL\", \"3510.2.1\"}, {\"coremlc-version\", \"3505.4.1\"}, {\"coremltools-component-milinternal\", \"\"}, {\"coremltools-version\", \"9.0\"}})]")
+    lines.append("{")
+    lines.append("    func main<ios18>(\(signature)) {")
+    lines.append("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> outX = add(x=x,y=x)[name=string(\"out_x\")];")
+    if outputCount == 3 {
+        lines.append("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> outK = add(x=x,y=x)[name=string(\"out_k\")];")
+        lines.append("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> outV = add(x=x,y=x)[name=string(\"out_v\")];")
+        lines.append("    } -> (outX,outK,outV);")
+    } else {
+        lines.append("    } -> (outX);")
+    }
+    lines.append("}")
+    return lines.joined(separator: "\n")
+}
+
 final class ANERuntimeTests: XCTestCase {
     func test_ane_error_conforms_to_sendable_and_error() {
         func requireErrorAndSendable<T: Error & Sendable>(_: T.Type) {}
@@ -403,6 +469,207 @@ final class ANERuntimeTests: XCTestCase {
         for i in 0..<identityElementCount {
             XCTAssertEqual(output[i], input[i], accuracy: 1e-2)
         }
+    }
+
+    func test_eval_two_input_add_roundtrip() throws {
+        try requireANEHardwareTestsEnabled()
+        guard ANEEvalProbe.isAvailable else {
+            throw XCTSkip("ANE baseline probe unavailable on this host")
+        }
+
+        let channels = 4
+        let spatial = 1
+        let bytes = channels * spatial * MemoryLayout<UInt16>.stride
+        let kernel = try ANEKernel(
+            milText: multiInputAddMIL(channels: channels),
+            weights: [],
+            inputSizes: [bytes, bytes],
+            outputSizes: [bytes]
+        )
+
+        let inputA = try kernel.inputSurface(at: 0)
+        let inputB = try kernel.inputSurface(at: 1)
+        let output = try kernel.outputSurface(at: 0)
+
+        let a: [Float] = [1, 2, 3, 4]
+        let b: [Float] = [10, 20, 30, 40]
+        var y = [Float](repeating: 0, count: channels)
+
+        a.withUnsafeBufferPointer { src in
+            SurfaceIO.writeFP16(to: inputA, data: src, channels: channels, spatial: spatial)
+        }
+        b.withUnsafeBufferPointer { src in
+            SurfaceIO.writeFP16(to: inputB, data: src, channels: channels, spatial: spatial)
+        }
+
+        try kernel.eval()
+
+        y.withUnsafeMutableBufferPointer { dst in
+            SurfaceIO.readFP16(from: output, into: dst, channelOffset: 0, channels: channels, spatial: spatial)
+        }
+
+        XCTAssertEqual(y[0], 11, accuracy: 1e-2)
+        XCTAssertEqual(y[1], 22, accuracy: 1e-2)
+        XCTAssertEqual(y[2], 33, accuracy: 1e-2)
+        XCTAssertEqual(y[3], 44, accuracy: 1e-2)
+    }
+
+    func test_eval_singleton_query_batched_matmul_roundtrip() throws {
+        try requireANEHardwareTestsEnabled()
+        guard ANEEvalProbe.isAvailable else {
+            throw XCTSkip("ANE baseline probe unavailable on this host")
+        }
+
+        let heads = 2
+        let headDim = 4
+        let seq = 8
+
+        let qCount = heads * headDim
+        let kCount = heads * seq * headDim
+        let outCount = heads * seq
+        let qBytes = qCount * MemoryLayout<UInt16>.stride
+        let kBytes = kCount * MemoryLayout<UInt16>.stride
+        let outBytes = outCount * MemoryLayout<UInt16>.stride
+
+        let kernel = try ANEKernel(
+            milText: singletonQueryMatmulMIL(heads: heads, headDim: headDim, seq: seq),
+            weights: [],
+            inputSizes: [qBytes, kBytes],
+            outputSizes: [outBytes]
+        )
+
+        let qSurface = try kernel.inputSurface(at: 0)
+        let kSurface = try kernel.inputSurface(at: 1)
+        let outSurface = try kernel.outputSurface(at: 0)
+
+        let q: [Float] = [1, 2, 3, 4, 2, 1, 0, -1]
+        var k = [Float](repeating: 0, count: kCount)
+        for h in 0..<heads {
+            for s in 0..<seq {
+                for d in 0..<headDim {
+                    let idx = h * seq * headDim + s * headDim + d
+                    k[idx] = Float((h + 1) * (s + 1) * (d + 1)) * 0.1
+                }
+            }
+        }
+
+        q.withUnsafeBufferPointer { src in
+            SurfaceIO.writeFP16(to: qSurface, data: src, channels: heads * headDim, spatial: 1)
+        }
+        k.withUnsafeBufferPointer { src in
+            SurfaceIO.writeFP16(to: kSurface, data: src, channels: heads * seq * headDim, spatial: 1)
+        }
+
+        try kernel.eval()
+
+        var y = [Float](repeating: 0, count: outCount)
+        y.withUnsafeMutableBufferPointer { dst in
+            SurfaceIO.readFP16(from: outSurface, into: dst, channelOffset: 0, channels: heads * seq, spatial: 1)
+        }
+
+        XCTAssertTrue(y.allSatisfy(\.isFinite))
+        XCTAssertTrue(y.contains(where: { abs($0) > 0 }))
+    }
+
+    func test_decode_probe_passthrough_4in_3out_eval() throws {
+        try requireANEHardwareTestsEnabled()
+
+        let dim = ModelConfig.dim
+        let lane = DecodeKernelSet.defaultLaneSpatial
+        let maxSeq = 32
+        let xBytes = dim * lane * MemoryLayout<UInt16>.stride
+        let kvBytes = dim * maxSeq * MemoryLayout<UInt16>.stride
+        let maskBytes = maxSeq * MemoryLayout<UInt16>.stride
+
+        struct Variant {
+            let name: String
+            let inputKinds: [Character]
+            let outputCount: Int
+        }
+        let variants: [Variant] = [
+            .init(name: "x->1", inputKinds: ["x"], outputCount: 1),
+            .init(name: "x->3", inputKinds: ["x"], outputCount: 3),
+            .init(name: "xk->1", inputKinds: ["x", "k"], outputCount: 1),
+            .init(name: "xkv->1", inputKinds: ["x", "k", "v"], outputCount: 1),
+            .init(name: "xq->1", inputKinds: ["x", "q"], outputCount: 1),
+            .init(name: "xm->1", inputKinds: ["x", "m"], outputCount: 1),
+            .init(name: "xkm->1", inputKinds: ["x", "k", "m"], outputCount: 1),
+            .init(name: "xqm->1", inputKinds: ["x", "q", "m"], outputCount: 1),
+            .init(name: "xkvm->1", inputKinds: ["x", "k", "v", "m"], outputCount: 1),
+            .init(name: "xkvm->3", inputKinds: ["x", "k", "v", "m"], outputCount: 3),
+            .init(name: "xkvd->1", inputKinds: ["x", "k", "v", "d"], outputCount: 1),
+        ]
+
+        var successes: [String: Bool] = [:]
+        for variant in variants {
+            do {
+                let inputSizes = variant.inputKinds.map { kind in
+                    switch kind {
+                    case "x": return xBytes
+                    case "k", "v": return kvBytes
+                    case "q": return 2 * kvBytes
+                    case "d": return kvBytes
+                    case "m": return maskBytes
+                    default: preconditionFailure("unknown input kind \(kind)")
+                    }
+                }
+                let outputSizes = Array(repeating: xBytes, count: variant.outputCount)
+                let kernel = try ANEKernel(
+                    milText: decodePassthroughProbeMIL(
+                        dim: dim,
+                        laneSpatial: lane,
+                        maxSeq: maxSeq,
+                        inputKinds: variant.inputKinds,
+                        outputCount: variant.outputCount
+                    ),
+                    weights: [],
+                    inputSizes: inputSizes,
+                    outputSizes: outputSizes
+                )
+
+                for (inputIndex, kind) in variant.inputKinds.enumerated() {
+                    let surface = try kernel.inputSurface(at: inputIndex)
+                    switch kind {
+                    case "x":
+                        Array(repeating: Float(0.25), count: dim * lane).withUnsafeBufferPointer { src in
+                            SurfaceIO.writeFP16(to: surface, data: src, channels: dim, spatial: lane)
+                        }
+                    case "k", "v":
+                        Array(repeating: Float(0), count: dim * maxSeq).withUnsafeBufferPointer { src in
+                            SurfaceIO.writeFP16(to: surface, data: src, channels: dim, spatial: maxSeq)
+                        }
+                    case "q":
+                        Array(repeating: Float(0), count: 2 * dim * maxSeq).withUnsafeBufferPointer { src in
+                            SurfaceIO.writeFP16(to: surface, data: src, channels: 2 * dim, spatial: maxSeq)
+                        }
+                    case "m":
+                        Array(repeating: Float(-1e4), count: maxSeq).withUnsafeBufferPointer { src in
+                            SurfaceIO.writeFP16(to: surface, data: src, channels: 1, spatial: maxSeq)
+                        }
+                    case "d":
+                        Array(repeating: Float(-1e4), count: dim * maxSeq).withUnsafeBufferPointer { src in
+                            SurfaceIO.writeFP16(to: surface, data: src, channels: dim, spatial: maxSeq)
+                        }
+                    default:
+                        preconditionFailure("unknown input kind \(kind)")
+                    }
+                }
+
+                try kernel.eval()
+                let ySurface = try kernel.outputSurface(at: 0)
+                var out = [Float](repeating: 0, count: dim * lane)
+                out.withUnsafeMutableBufferPointer { dst in
+                    SurfaceIO.readFP16(from: ySurface, into: dst, channelOffset: 0, channels: dim, spatial: lane)
+                }
+                successes[variant.name] = out.allSatisfy(\.isFinite)
+            } catch {
+                print("decode probe variant \(variant.name) failed: \(error)")
+                successes[variant.name] = false
+            }
+        }
+
+        print("decode probe matrix: \(successes)")
+        XCTAssertEqual(successes["x->1"], true)
     }
 
     func test_eval_returns_throws_on_failure() throws {
@@ -881,6 +1148,57 @@ final class ANERuntimeTests: XCTestCase {
         XCTAssertEqual(blobPayloadFP16(wot, index: 1), 11, accuracy: 1e-3)
         XCTAssertEqual(blobPayloadFP16(wot, index: ModelConfig.dim), 10, accuracy: 1e-3)
         XCTAssertEqual(blobPayloadFP16(wot, index: ModelConfig.dim + 1), 12, accuracy: 1e-3)
+    }
+
+    func test_decode_kernel_set_compile_specs_match_paths_and_io_without_hardware() throws {
+        let layerWeights = LayerWeights()
+        fillLayerWeights(layerWeights, value: 0.01)
+
+        let lane = DecodeKernelSet.defaultLaneSpatial
+        let maxSeq = lane * 4
+        let specs = DecodeKernelSet.compileSpecs(weights: layerWeights, maxSeq: maxSeq)
+        XCTAssertEqual(specs.count, 2)
+
+        let byKind = Dictionary(uniqueKeysWithValues: specs.map { ($0.kind, $0) })
+        guard let attn = byKind[.decodeAttnQKV], let ffn = byKind[.decodeFFN] else {
+            XCTFail("Missing decode compile specs")
+            return
+        }
+        XCTAssertEqual(
+            attn.weights.map(\.path),
+            [
+                "@model_path/weights/rms1.bin",
+                "@model_path/weights/wq.bin",
+                "@model_path/weights/wk.bin",
+                "@model_path/weights/wv.bin",
+                "@model_path/weights/wo.bin",
+            ]
+        )
+        XCTAssertEqual(
+            attn.inputSizes,
+            [
+                ModelConfig.dim * lane * 2,
+                ModelConfig.dim * lane * 2,
+                ModelConfig.dim * lane * 2,
+                ModelConfig.dim * lane * 2,
+            ]
+        )
+        XCTAssertEqual(
+            attn.outputSizes,
+            [ModelConfig.dim * lane * 2, ModelConfig.dim * lane * 2, ModelConfig.dim * lane * 2]
+        )
+
+        XCTAssertEqual(
+            ffn.weights.map(\.path),
+            [
+                "@model_path/weights/rms2.bin",
+                "@model_path/weights/w1.bin",
+                "@model_path/weights/w3.bin",
+                "@model_path/weights/w2.bin",
+            ]
+        )
+        XCTAssertEqual(ffn.inputSizes, [ModelConfig.dim * lane * 2])
+        XCTAssertEqual(ffn.outputSizes, [ModelConfig.dim * lane * 2])
     }
 
     func test_layer_kernel_set_partial_compile_failure_cleanup() throws {

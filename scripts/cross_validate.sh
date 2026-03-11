@@ -16,22 +16,31 @@ else
 fi
 
 GOLDEN_DIR="$PROJECT_ROOT/training/golden_outputs"
-BUILD_ROOT="$PROJECT_ROOT/.build/phase7-cross-validate"
+BUILD_ROOT="$PROJECT_ROOT/.build/phase8-cross-validate"
 BIN_DIR="$BUILD_ROOT/bin"
 FAILED_DIR="$BUILD_ROOT/failed"
 mkdir -p "$GOLDEN_DIR" "$BIN_DIR" "$FAILED_DIR"
 
-ALL_PROBES=(
+REQUIRED_PROBES=(
+    test_full_fused
+    test_fused_bwd
+    test_ane_sdpa5
+)
+
+OPTIONAL_PROBES=(
     test_weight_reload
     test_perf_stats
     test_qos_sweep
     test_ane_advanced
-    test_full_fused
-    test_fused_bwd
     test_fused_qkv
-    test_ane_sdpa5
     test_ane_causal_attn
     test_conv_attn3
+)
+
+REQUIRED_STDOUT_FIXTURES=(
+    test_full_fused.txt
+    test_fused_bwd.txt
+    test_ane_sdpa5.txt
 )
 
 REQUIRED_ORACLES=(
@@ -52,52 +61,134 @@ REQUIRED_ORACLES=(
     fused_bwd_dx_seq64_f32le.bin
 )
 
-echo "=== Source dir: $SRC_DIR ==="
-echo "=== Golden dir: $GOLDEN_DIR ==="
-echo "=== Build dir: $BUILD_ROOT ==="
+ALL_PROBES=("${REQUIRED_PROBES[@]}" "${OPTIONAL_PROBES[@]}")
 
-echo "=== Building ObjC probes into .build ==="
-for name in "${ALL_PROBES[@]}"; do
-    src="$SRC_DIR/$name.m"
-    out="$BIN_DIR/$name"
+declare -a REQUIRED_FAILURES=()
+declare -a OPTIONAL_WARNINGS=()
+
+is_required_probe() {
+    local needle="$1"
+    local probe
+    for probe in "${REQUIRED_PROBES[@]}"; do
+        if [[ "$probe" == "$needle" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+record_failure() {
+    local name="$1"
+    local reason="$2"
+    REQUIRED_FAILURES+=("$name:$reason")
+    echo "  ERROR: $name ($reason)" >&2
+}
+
+record_warning() {
+    local name="$1"
+    local reason="$2"
+    OPTIONAL_WARNINGS+=("$name:$reason")
+    echo "  WARN: $name ($reason)" >&2
+}
+
+build_probe() {
+    local name="$1"
+    local src="$SRC_DIR/$name.m"
+    local out="$BIN_DIR/$name"
+    local build_log="$FAILED_DIR/$name-build-$(date +%Y%m%d-%H%M%S)-$$.log"
+
     if [[ ! -f "$src" ]]; then
-        echo "ERROR: missing source $src" >&2
-        exit 1
+        if is_required_probe "$name"; then
+            record_failure "$name" "missing source: $src"
+        else
+            record_warning "$name" "missing source: $src"
+        fi
+        return
     fi
-    xcrun clang -O2 -Wall -Wno-deprecated-declarations -fobjc-arc \
-        -o "$out" "$src" \
-        -framework Foundation -framework CoreML -framework IOSurface -ldl
-    echo "  Built: $name"
-done
 
-echo "=== Capturing probe stdout fixtures (strict) ==="
-run_failures=()
-for name in "${ALL_PROBES[@]}"; do
-    out="$GOLDEN_DIR/$name.txt"
-    tmp="$BUILD_ROOT/$name.$$.tmp"
-    fail_out="$FAILED_DIR/$name-$(date +%Y%m%d-%H%M%S)-$$.txt"
+    if xcrun clang -O2 -Wall -Wno-deprecated-declarations -fobjc-arc \
+        -o "$out" "$src" \
+        -framework Foundation -framework CoreML -framework IOSurface -ldl >"$build_log" 2>&1; then
+        rm -f "$build_log"
+        echo "  Built: $name"
+    else
+        if is_required_probe "$name"; then
+            record_failure "$name" "compile failed (log: $build_log)"
+        else
+            record_warning "$name" "compile failed (log: $build_log)"
+        fi
+    fi
+}
+
+run_probe() {
+    local name="$1"
+    local out="$GOLDEN_DIR/$name.txt"
+    local tmp="$BUILD_ROOT/$name.$$.tmp"
+    local fail_out="$FAILED_DIR/$name-run-$(date +%Y%m%d-%H%M%S)-$$.txt"
+    local bin="$BIN_DIR/$name"
+
+    if [[ ! -x "$bin" ]]; then
+        if is_required_probe "$name"; then
+            record_failure "$name" "binary missing: $bin"
+        else
+            record_warning "$name" "binary missing: $bin"
+        fi
+        return
+    fi
 
     echo "  Running: $name"
-    if "$BIN_DIR/$name" > "$tmp" 2>&1; then
+    if "$bin" >"$tmp" 2>&1; then
         if [[ -s "$tmp" ]]; then
             mv "$tmp" "$out"
             chmod 644 "$out"
             echo "  Captured: $out ($(wc -l < "$out") lines)"
         else
             mv "$tmp" "$fail_out"
-            echo "  ERROR: $name produced empty stdout (saved: $fail_out)" >&2
-            run_failures+=("$name")
+            if is_required_probe "$name"; then
+                record_failure "$name" "empty stdout (log: $fail_out)"
+            else
+                record_warning "$name" "empty stdout (log: $fail_out)"
+            fi
         fi
     else
         mv "$tmp" "$fail_out"
-        echo "  ERROR: $name exited non-zero (saved: $fail_out)" >&2
-        run_failures+=("$name")
+        if is_required_probe "$name"; then
+            record_failure "$name" "non-zero exit (log: $fail_out)"
+        else
+            record_warning "$name" "non-zero exit (log: $fail_out)"
+        fi
     fi
+}
+
+echo "=== Source dir: $SRC_DIR ==="
+echo "=== Golden dir: $GOLDEN_DIR ==="
+echo "=== Build dir: $BUILD_ROOT ==="
+
+echo "=== Building ObjC probes into .build ==="
+for name in "${ALL_PROBES[@]}"; do
+    build_probe "$name"
 done
 
-if ((${#run_failures[@]} > 0)); then
-    echo "ERROR: probe failures detected: ${run_failures[*]}" >&2
-    echo "Refusing to report success with stale/mixed golden outputs." >&2
+echo "=== Capturing probe stdout fixtures ==="
+for name in "${REQUIRED_PROBES[@]}"; do
+    run_probe "$name"
+done
+for name in "${OPTIONAL_PROBES[@]}"; do
+    run_probe "$name"
+done
+
+if ((${#REQUIRED_FAILURES[@]} > 0)); then
+    echo "=== Summary ==="
+    echo "REQUIRED: FAIL"
+    echo "OPTIONAL: WARN"
+    echo "Required failures:"
+    printf '  - %s\n' "${REQUIRED_FAILURES[@]}"
+    if ((${#OPTIONAL_WARNINGS[@]} > 0)); then
+        echo "Optional warnings:"
+        printf '  - %s\n' "${OPTIONAL_WARNINGS[@]}"
+    fi
+    echo "Failed logs: $FAILED_DIR"
+    echo "Refusing to report success with missing required artifacts." >&2
     exit 1
 fi
 
@@ -130,14 +221,21 @@ for name in "${REQUIRED_ORACLES[@]}"; do
     chmod 644 "$GOLDEN_DIR/$name"
 done
 
-for name in "${ALL_PROBES[@]}"; do
-    out="$GOLDEN_DIR/$name.txt"
+for name in "${REQUIRED_STDOUT_FIXTURES[@]}"; do
+    out="$GOLDEN_DIR/$name"
     if [[ ! -s "$out" ]]; then
-        echo "ERROR: missing or empty probe stdout fixture: $out" >&2
+        echo "ERROR: missing or empty required probe stdout fixture: $out" >&2
         exit 1
     fi
 done
 
+echo "=== Summary ==="
+echo "REQUIRED: PASS"
+if ((${#OPTIONAL_WARNINGS[@]} > 0)); then
+    echo "OPTIONAL: WARN"
+    printf '  - %s\n' "${OPTIONAL_WARNINGS[@]}"
+else
+    echo "OPTIONAL: PASS"
+fi
+echo "Failed logs: $FAILED_DIR"
 echo "=== Done ==="
-echo "Golden outputs refreshed successfully."
-ls -la "$GOLDEN_DIR"

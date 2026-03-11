@@ -1,0 +1,487 @@
+# ANE 10x Optimization Decision Log
+
+Date: 2026-03-06  
+Repo/worktree: `/private/tmp/espresso-ane-max-20260306`  
+Branch: `feat/ane-10x-max-iter-20260306`  
+Latest commit at time of this document: `4a0a6fb`
+
+---
+
+## 1) Goal and constraints
+
+Primary goal:
+- Achieve large decode speedup vs Core ML baseline by using ANE-direct decode with persistent FP16 KV cache.
+
+Secondary goal:
+- Reduce/close prefill gap vs Core ML where possible.
+
+Hard constraints observed on this host:
+- Decode path currently constrained to `decode-max-seq == 32` for stable ANE eval on mixed-input decode-attention kernels.
+- `_ANEPerformanceStats` request-buffer factory returns nil on this host build, so `hwExecutionTime` is currently unavailable in profiling output.
+
+---
+
+## 2) Measurement protocol used
+
+Common protocol:
+- Deterministic seed: `ESPRESSO_BENCH_SEED=1`
+- Output artifacts: `summary.txt`, `summary.json`, CSV latency arrays, CSV kernel profiles.
+- Decode metric gate: strict speedup vs fastest Core ML naive decode median.
+
+Main benchmark commands used:
+- Prefill profile:
+  - `ANE_COMPILE_CACHE_POLICY=preferCached ESPRESSO_BENCH_SEED=1 .build/release/espresso-bench --perf-stats --inference-only --profile-kernels --warmup 20 --iterations 200 --output /tmp/prefill_profile_bdb0bd7`
+- Decode profile:
+  - `ANE_COMPILE_CACHE_POLICY=preferCached ESPRESSO_BENCH_SEED=1 .build/release/espresso-bench --decode --profile-kernels --warmup 20 --iterations 200 --decode-steps 32 --decode-max-seq 32 --output /tmp/decode_profile_bdb0bd7`
+
+---
+
+## 3) What was tried, why, and what happened
+
+| ID | Change tried | Why it was tried | Evidence / artifacts | Outcome | Decision |
+|---|---|---|---|---|---|
+| A1 | Added FP16 spatial slice copy primitive (`copyFP16SpatialSlice`) | Needed for incremental KV-cache slice writes and decode mask updates without CPU tensor rebuilds | Commit `c510af1`; tests in `Tests/ANETypesTests/ANETypesTests.swift` | Primitive works and is used by decode runtime | **SHIP** |
+| A2 | Added decode lane-packing runtime + diagnostics | Isolate why decode kernels fail and make decode contracts explicit | Commit `abff150`; probe logs under `/tmp/decode_probe_seq_*.log` and `/tmp/decode_ffn_spatial_*.log` | Found hard host constraint: decode probe passes at seq=32, fails at >32 with `statusType=0x9`; FFN path fails for spatial `<32` | **SHIP** (diagnostic + guardrails) |
+| A3 | Decode-attention input contract shift to dense mask cache + separate K/V caches | Avoid failing channel-1 mask and concatenated cache input patterns | Commit `2d852c5`; decode runtime files + hardware tests | Decode became stable for supported contract (`maxSeq=32`) | **SHIP** |
+| A4 | Hardware-gated decode correctness tests (KV updates + mask progression) | Ensure decode state updates are correct before perf tuning | `ANE_HARDWARE_TESTS=1 swift test --filter InferenceOptimizationTests/test_decode_kv_cache_updates_and_mask_progresses_on_hardware` | Passes | **SHIP** |
+| A5 | Decode probe matrix test (`x`, `x+k`, `x+k+v`, `x+k+v+denseMask`, etc.) | Hard-proof which shape families eval/fail | `ANE_HARDWARE_TESTS=1 swift test --filter ANERuntimeTests/test_decode_probe_passthrough_4in_3out_eval` | Confirms passing/failing families; failing variants map to same inference error | **SHIP** |
+| A6 | Decode CLI mode + Core ML naive decode baseline + CSV artifacts | Needed strict apples-to-apples decode throughput gate and artifact outputs | Commit `2d852c5`, `bdb0bd7`; decode summaries under `/tmp/decode_*` | Strict decode speedup demonstrated (2.67x–2.72x depending run) | **SHIP** |
+| A7 | Inference kernel profile expansion (host eval, host overhead, lock/body/unlock IO, handoff split) | Needed decomposition of residual prefill gap and host overhead attribution | Commit `bdb0bd7`; profile summaries under `/tmp/prefill_profile_*` | Full breakdown available in summary/CSV/JSON | **SHIP** |
+| A8 | Added run metadata JSON (`git_sha`, env, device/options) | Reproducibility requirement and machine-readable audit trail | `Sources/EspressoBench/RunMetadata.swift`; `summary.json` in output dirs | Metadata now present in decode/prefill outputs | **SHIP** |
+| A9 | `_ANERequest` constructor fallback with weightsBuffer selector | Improve compatibility across private runtime selector variants | `Sources/ANEInterop/ane_interop.m`; commit lineage `abff150`, `bdb0bd7` | Kept safe fallback; no decode-failure signature change | **ITERATE** |
+| A10 | Perf-stats object fallback experiments in interop | Try to recover `hwExecutionTime` data | Local experiments + tests (`ANEPerfStatsTests`) | Forcing placeholder perf-stats object caused runtime exceptions; reverted. Host still reports factory nil. | **ABANDON** (unsafe path) |
+| A11 | Decode eval path sweep (`inmem`, `client`, `clientDirect`, `realtime`) | Test whether failure depended on eval path rather than kernel contract | `/tmp/decode_evalpath_*.log` | All eval paths failed identically for unsupported decode-attn contract (`statusType=0x9`) | **ABANDON** (for this failure mode) |
+| A12 | Compile cache policy reproducibility check (`auto` vs `preferCached`) | Improve compile stability and iteration time | `/tmp/decode_repro_ane10x_run1`, `/tmp/decode_repro_ane10x_run2` | Median latency stable (`0.648479` vs `0.648500` ms/token; delta `0.0032%`), compile time collapsed (`49.49s` → `52.7ms`) | **SHIP** (`preferCached`) |
+| A13 | Decode tile-sync optimization (boundary-only window sync + incremental lane cache updates + removed redundant lane-zero copies) | Full-window cache sync every token was dominating decode IO at `maxSeq > 32` | Commit `5c016ec`; `/tmp/decode_syncopt_before_max128_20260305`, `/tmp/decode_syncopt_after_max128_20260305`, `/tmp/decode_syncopt_before_max256_20260305`, `/tmp/decode_syncopt_after_max256_20260305` | Large, repeatable IO reduction and throughput gain for tiled decode contexts (`128/256`) while preserving hardware correctness tests | **SHIP** |
+| A14 | Decode runtime option sweep on top of A13 (`queue depth`, `eval path`, `power`, `wired`, `pool`, `late latch`, `fences`, `fw signal`) | Try to stack additional constant-factor wins after tile-sync optimization | `/tmp/decode_syncopt_opts_max128_20260305`, `/tmp/decode_syncopt_confirm_evalpath_max128_20260305` | One-shot sweep suggested `ANE_EVAL_PATH=clientDirect`, but 3x confirmation showed baseline parity/no stable gain (median baseline `~0.672–0.676`, candidate `~0.677–0.679`) | **ABANDON** (no reproducible gain) |
+| A15 | Prefill option combo re-check (`ANE_QUEUE_DEPTH=32` + `ANE_MEMORY_POOL_ID=1`) under sequential runs | Verify whether previous prefill gains hold under non-contented, reproducible setup | `/tmp/prefill_syncopt_baseline_seq_20260305`, `/tmp/prefill_syncopt_combo_qd32_pool1_seq_20260305` | Combo regressed vs baseline (median `1.927` vs `1.855` ms); no bottleneck improvement | **ABANDON** |
+| A16 | Fused decode layer prototype (`decode_attn_probe + decode_ffn` in one kernel behind `ESPRESSO_DECODE_LAYER_MODE=fusedLayer`) | Remove one eval per layer/token and test the biggest remaining decode dispatch lever | Quick split2 baseline `/tmp/decode_fused_cycle1_split2_quick_20260306`; compile stall sample `/tmp/espresso-bench_2026-03-06_014704_vEMy.sample.txt` | Prototype built and unit tests passed, but every fused decode compile stalled inside `_ANEClient compileModel`, including a stripped-down passthrough probe. No artifact directory was produced for the fused attempts. | **ABANDON** (compile instability / unsafe) |
+| A17 | Decode runtime option re-sweep at `maxSeq=32` in clean worktree (`preferCached`, `clientDirect`, queue depth, power, wired) | Re-check whether the current cool baseline still has any unclaimed runtime-option win before more invasive decode work | `/tmp/decode_sweep_max32_quick_20260306` | `preferCached` baseline remained best. Confirmation medians: baseline `0.4888/0.4941/0.4940`, `clientDirect` `0.4955/0.4954/0.4926`; median-of-medians delta `+0.27%` against `clientDirect`. `keepModelWired` regressed hard to median `0.587`. | **ABANDON** (runtime tuning exhausted for this shape) |
+| A18 | Request-level decode input surface rebinding (`attnOut -> ffnIn`, `ffnOut_L -> attnIn_L+1`) with request rebuild and client refresh attempts | Lowest-risk route to remove explicit copy steps and build groundwork for chaining | Hardware tests only; no benchmark artifact shipped because correctness/runtime gate failed before profiling | Undersized-surface rejection worked, but equal-size input rebinding caused private-runtime selector mismatches (`-[__NSArrayM procedureIndex]`, then `-[_ANERequest executionDelay]`) and still fell through to `statusType=0x9` ANE inference errors. Real rebinding is unsafe on this host/runtime. | **ABANDON** (fast rollback required) |
+| A19 | Direct decode boundary spatial-slice I/O (`attnIn` write + final `ffnOut` read) | Remove the extra `tokenScratch` boundary hops while keeping the proven two-kernel decode contract unchanged | `/tmp/decode_boundary_before_max128_confirm_r{1,2,3}_20260306`, `/tmp/decode_boundary_after_max128_confirm_r{1,2,3}_20260306` | Small but repeatable decode gain at `maxSeq=128`: median-of-medians `0.485209 -> 0.483041 ms/token` (`-0.45%`), throughput `2042.7 -> 2052.3 tok/s`, p95 slightly better, p99 effectively flat. Attribution is I/O-only: surface I/O `0.031336 -> 0.029447 ms/token`, ANE kernel time essentially flat. | **SHIP** |
+| A20 | Lane-spatial sweep re-check at `maxSeq=128` (`32`, `64`, `128`) | Test whether wider lane windows reduce enough tile-sync overhead to outweigh the extra surface footprint | `/tmp/decode_lane_sweep_max128_l32_quick_20260306`, `/tmp/decode_lane_sweep_max128_l64_quick_20260306`, `/tmp/decode_lane_sweep_max128_l128_quick_20260306` | Current decode contract still prefers `laneSpatial=32`. Wider lanes regressed median (`0.493250 -> 0.499916 -> 0.505333 ms`) and throughput (`1991.6 -> 1962.7 -> 1957.4 tok/s`). | **ABANDON** |
+| A21 | Decode mask-collapse probe (`dense mask` channels `768 -> 1`) | Reduce mask bandwidth and surface footprint on every token/layer update | Hardware tests + reverted local probe; no benchmark artifact shipped because eval failed before perf measurement | One-channel decode mask variants fail on this host/runtime with the same `statusType=0x9` ANE inference error family already seen in unsupported probe shapes. The dense 768-channel mask remains the stable contract. | **ABANDON** |
+| A22 | `_ANEChainingRequest` / `prepareChainingWithModel` proof-of-life probe | The remaining high-ROI decode lever is dispatch collapse, so first prove whether the private chaining primitive is callable on this host before attempting decode integration | Targeted tests: `ANEInteropTests/test_runtime_reports_chaining_support_on_host`, `ANEInteropTests/test_prepare_chaining_probe_identity_kernel_returns_controlled_status`; traced reruns with `ANE_INTEROP_TRACE=1`; live runtime dump of `_ANEIOSurfaceOutputSets` | Runtime hooks are present and a minimal chaining request can be constructed, but `prepareChainingWithModel` immediately returns failure with no `NSError` on a minimal compiled kernel. Retrying with a live `_ANEIOSurfaceOutputSets` object created from the current output surfaces still fails identically. The primitive exists, but naive output-set and loopback wiring is insufficient. | **ITERATE** |
+| A23 | Output-set contract refinement for chaining probe (`statsSurRef=output0`) + isolated external prepare probe | Determine whether the missing D5b contract is in output-set construction or deeper in `prepareChainingWithModel` sequencing | `/tmp/decode_d5b_output0_smoke_20260306`, `/tmp/d5b_probe_prepare_output0_20260306`, `/tmp/decode_d5b_object_probe_20260306.txt`, `/tmp/decode_d5b_request_probe_20260306.txt`, `/tmp/decode_d5b_signature_trace_20260306.txt` | Using `output0` as the stats surface moves the probe cleanly past builder validation and into a fast external `prepareChainingWithModel` failure. Latest isolated artifact `/tmp/d5b_probe_prepare_output0_20260306` completed without hang: compile `21.105 ms`, probe `0.589 ms`, `built_output_set=true`, `built_request=true`, `request_valid=true`, `prepared=false`, `stage=3` (`PREPARE_FAILED`). This removes harness timeout as the primary blocker; the remaining unknown is the semantic contract that `prepareChainingWithModel` expects after a valid request graph is built. | **ITERATE** |
+| A24 | Typed client sequencing probes for `buffersReadyWithModel` and `enqueueSetsWithModel` | Determine whether the remaining D5b blocker is still object-shape mismatch or a deeper loopback / prepare semantic contract | `/tmp/decode_d5b_buffers_ready_trace_20260306.txt`, `/tmp/decode_d5b_enqueue_trace_20260306.txt`, `/tmp/d5b_probe_buffers_ready_output0_20260306`, `/tmp/d5b_probe_enqueue_sets_output0_20260306` | Both client sequencing calls now have isolated bench artifacts and return fast controlled failures rather than selector/array-shape exceptions. Latest `buffersReadyWithModel` artifact `/tmp/d5b_probe_buffers_ready_output0_20260306`: compile `30.979 ms`, probe `0.075 ms`, `called_buffers_ready=true`, `buffers_ready_succeeded=false`, `stage=11` (`INPUT_BUFFERS_READY_CALL_FAILED`). Latest `enqueueSetsWithModel` artifact `/tmp/d5b_probe_enqueue_sets_output0_20260306`: compile `30.816 ms`, probe `0.066 ms`, `called_enqueue_sets=true`, `enqueue_sets_succeeded=false`, `stage=13` (`ENQUEUE_SETS_CALL_FAILED`). Object typing is no longer the blocker; the remaining gap is the deeper loopback symbol / sequencing semantic contract. | **ITERATE** |
+| A25 | Deterministic spawned-process env propagation for isolated chaining probes | External hardware-gated probe tests were reporting false timeouts because the spawned `espresso-bench` process was not inheriting the required deterministic seed/cache policy, so compile jitter could mask the real chaining stage | `ANE_HARDWARE_TESTS=1 swift test --filter ANERuntimeTests.DecodeChainingInteropTests/test_external_prepare_probe_isolated_from_test_harness`, `ANE_HARDWARE_TESTS=1 swift test --filter ANERuntimeTests.DecodeChainingInteropTests/test_external_buffers_ready_probe_records_controlled_client_call`, `ANE_HARDWARE_TESTS=1 swift test --filter ANERuntimeTests.DecodeChainingInteropTests/test_external_enqueue_sets_probe_records_controlled_client_call`, `swift test --filter ANEInteropTests.ANEChainingProbeConfigTests`, `/tmp/d5b_probe_prepare_output0_20260306`, `/tmp/d5b_probe_buffers_ready_output0_20260306`, `/tmp/d5b_probe_enqueue_sets_output0_20260306` | After forcing spawned probe processes to run with `ESPRESSO_BENCH_SEED=1` and `ANE_COMPILE_CACHE_POLICY=preferCached`, all isolated external probes completed quickly and reproducibly. Latest manual artifacts: prepare compile/probe `21.105/0.589 ms` at `stage=3`, buffersReady compile/probe `30.979/0.075 ms` at `stage=11`, enqueueSets compile/probe `30.816/0.066 ms` at `stage=13`. All helper objects and request validation remained green; `hwExecutionTime` stayed unavailable. Decode before/after metrics are `N/A` for this cycle because no probe advanced beyond the current prepare-failed baseline, so no decode benchmark was justified. | **ITERATE** |
+| A26 | D5b metadata sweep + shared-signal-event injection on isolated chaining probe | Exhaust the obvious semantic knobs before abandoning the current D5b contract branch: request metadata (`procedureIndex`, `transactionHandle`, `fwEnqueueDelay`, `memoryPoolId`), helper metadata (`enqueueSets`, `buffersReady`), and non-empty `signalEvents` via `_ANESharedSignalEvent` + `IOSurfaceSharedEvent` | `/tmp/d5b_prepare_base_output0`, `/tmp/d5b_prepare_base_scratch`, `/tmp/d5b_prepare_req_proc1_output0`, `/tmp/d5b_prepare_req_combo_output0`, `/tmp/d5b_prepare_req_combo_scratch`, `/tmp/d5b_enqueue_base`, `/tmp/d5b_enqueue_sig1_req`, `/tmp/d5b_enqueue_open_loop`, `/tmp/d5b_enqueue_proc1_combo`, `/tmp/d5b_buffers_base`, `/tmp/d5b_buffers_delay1`, `/tmp/d5b_buffers_proc1_delay1`, `/tmp/d5b_prepare_sharedsig_t0`, `/tmp/d5b_prepare_sharedsig_t1`, `/tmp/d5b_prepare_sharedsig_t0_tx1`, `/tmp/d5b_prepare_sharedsig_t1_tx1`, `/tmp/d5b_enqueue_sharedsig_match` | Every new probe preserved object construction and request validity, but the runtime stayed on the same failure stages: `prepareChainingWithModel` remained `stage=3`, `enqueueSetsWithModel` remained `stage=13`, and `buffersReadyWithModel` remained `stage=11`. Shared signal-event construction now works (`built_shared_signal_event=true`, class present), but non-empty `signalEvents` still do not change the contract outcome. Decode before/after metrics are `N/A` because no probe advanced past the existing prepare-failed baseline. This strongly suggests the missing D5b contract is deeper than simple metadata or signal-event presence. | **ABANDON** (for this D5b branch) |
+
+---
+
+## 4) Key benchmark snapshots (what changed)
+
+### Decode milestones
+
+1) Stable decode contract snapshot (`2d852c5`):
+- Artifact: `/tmp/decode_profile_ane10x_20260305`
+- ANE median: `0.629 ms/token`
+- Fastest Core ML naive median: `1.711 ms/token`
+- Strict speedup: `2.72x`
+
+2) Post-commit verification (`bdb0bd7`):
+- Artifact: `/tmp/decode_profile_bdb0bd7`
+- ANE median: `0.646 ms/token`
+- Fastest Core ML naive median: `1.722 ms/token`
+- Strict speedup: `2.67x`
+
+Interpretation:
+- Decode path is materially faster than Core ML naive baseline on current supported contract.
+- 10x target is not achieved under current `maxSeq=32` constraint.
+
+3) Tile-sync optimization A/B (same SHA, forced-old path vs optimized path):
+- `maxSeq=128`:
+  - Before (forced old sync each token): `/tmp/decode_syncopt_before_max128_20260305`
+    - mean `0.692`, median `0.685`, p95 `0.748`, p99 `0.820`, `1445 tok/s`
+    - breakdown: ANE `0.409 ms`, IO `0.219 ms`
+  - After (boundary-only sync + incremental tile updates): `/tmp/decode_syncopt_after_max128_20260305`
+    - mean `0.490`, median `0.483`, p95 `0.545`, p99 `0.693`, `2040 tok/s`
+    - breakdown: ANE `0.395 ms`, IO `0.032 ms`
+- `maxSeq=256`:
+  - Before: `/tmp/decode_syncopt_before_max256_20260305`
+    - mean `0.691`, median `0.685`, p95 `0.751`, p99 `0.817`, `1448 tok/s`
+    - breakdown: ANE `0.409 ms`, IO `0.217 ms`
+  - After: `/tmp/decode_syncopt_after_max256_20260305`
+    - mean `0.535`, median `0.492`, p95 `0.700`, p99 `0.836`, `1869 tok/s`
+    - breakdown: ANE `0.436 ms`, IO `0.035 ms`
+
+4) Direct boundary spatial-slice I/O A/B (`maxSeq=128`, 3x confirmations):
+- Clean baseline artifacts:
+  - `/tmp/decode_boundary_before_max128_confirm_r1_20260306`
+  - `/tmp/decode_boundary_before_max128_confirm_r2_20260306`
+  - `/tmp/decode_boundary_before_max128_confirm_r3_20260306`
+- Candidate artifacts:
+  - `/tmp/decode_boundary_after_max128_confirm_r1_20260306`
+  - `/tmp/decode_boundary_after_max128_confirm_r2_20260306`
+  - `/tmp/decode_boundary_after_max128_confirm_r3_20260306`
+- Baseline medians: `0.484708`, `0.486417`, `0.485209`
+- Candidate medians: `0.481958`, `0.483041`, `0.488291`
+- Median-of-medians:
+  - baseline `0.485209 ms/token`
+  - candidate `0.483041 ms/token`
+  - delta `-0.45%`
+- Tail / throughput median-of-medians:
+  - p95 `0.540042 -> 0.539292 ms`
+  - p99 `0.696168 -> 0.696291 ms`
+  - throughput `2042.7 -> 2052.3 tok/s`
+- Attribution:
+  - ANE kernel `0.397825 -> 0.397303 ms/token`
+  - surface I/O `0.031336 -> 0.029447 ms/token`
+Interpretation:
+- This is a real but small decode improvement.
+- The gain comes from boundary I/O reduction only; it does not materially change ANE eval cost.
+- That makes it worth shipping, but it also reinforces that boundary-copy trimming alone will not get decode anywhere near the 6x target.
+
+5) Chaining proof-of-life probe (`_ANEChainingRequest`, 2026-03-06):
+- Tests:
+  - `swift test --filter ANEInteropTests/test_runtime_reports_chaining_support_on_host`
+  - `ANE_HARDWARE_TESTS=1 swift test --filter ANEInteropTests/test_prepare_chaining_probe_identity_kernel_returns_controlled_status`
+  - traced rerun: `ANE_HARDWARE_TESTS=1 ANE_INTEROP_TRACE=1 swift test --filter ANEInteropTests/test_prepare_chaining_probe_identity_kernel_returns_controlled_status`
+- Outcome:
+  - runtime support checks return true for both:
+    - `_ANEChainingRequest` factory
+    - `_ANEClient prepareChainingWithModel:options:chainingReq:qos:error:`
+  - probe status: `ANE_INTEROP_CHAINING_PROBE_PREPARE_FAILED`
+  - traced error: `ANE prepareChaining failed: no error`
+  - live runtime introspection found `_ANEIOSurfaceOutputSets.objectWithstatsSurRef:outputBuffer:`
+  - retrying the probe with a real `_ANEIOSurfaceOutputSets` object still returns `ANE_INTEROP_CHAINING_PROBE_PREPARE_FAILED`
+Interpretation:
+- The chaining primitive is present and the request factory is callable on this host.
+- A naive request with empty `outputSets` / loopback metadata is not enough to prepare chaining successfully, and simply attaching the current outputs via `_ANEIOSurfaceOutputSets` is still insufficient.
+- This is progress because it narrows the next task from “does chaining exist?” to “what exact output-set/loopback contract does the runtime expect?”
+
+4) Strict fairness snapshot after A13 (`maxSeq=128`):
+- Artifact: `/tmp/decode_syncopt_coreml_max128_20260305`
+- ANE median: `0.488 ms/token`
+- Fastest Core ML naive median: `0.988 ms/token` (`.cpuAndNeuralEngine`)
+- Strict speedup: `2.02x`
+
+5) Thermal variance note (`maxSeq=32`, mixed ANE+CoreML run order):
+- Mixed fairness runs showed ANE median drift to `~0.67 ms` in hot runs:
+  - `/tmp/decode_syncopt_coreml_max32_20260305`
+  - `/tmp/decode_syncopt_coreml_max32_r2_20260305`
+- Standalone ANE-only confirmation remains fast/stable:
+  - `/tmp/decode_syncopt_confirm_max32_20260305` median `0.486 ms`, mean `0.488 ms`, `2047 tok/s`.
+Inference: mixed-run thermal state materially affects ANE median on this host; treat strict speedup claims from long mixed runs conservatively and include artifact provenance.
+
+6) Decode runtime option sweep (post-A13):
+- Quick matrix: `/tmp/decode_syncopt_opts_max128_20260305`
+  - Best one-shot median appeared to be `ANE_EVAL_PATH=clientDirect` (`0.507 ms`) vs baseline (`0.663 ms`) in that run order.
+- Confirmation repeats: `/tmp/decode_syncopt_confirm_evalpath_max128_20260305`
+  - Baseline medians: `0.672`, `0.672`, `0.676`
+  - `clientDirect` medians: `0.677`, `0.679`, `0.679`
+- Verdict: runtime option did not hold up under repeats; keep default eval path.
+
+### Prefill snapshots
+
+1) Earlier favorable run:
+- Artifact: `/tmp/prefill_profile_phase2_20260305`
+- ANE median: `0.773 ms`
+- Core ML `.all` median: `1.704 ms`
+
+2) Later heavier run:
+- Artifact: `/tmp/prefill_profile_ane10x_20260305`
+- ANE median: `1.978 ms`
+- Core ML `.all` median: `1.712 ms`
+
+3) Post-commit verification:
+- Artifact: `/tmp/prefill_profile_bdb0bd7`
+- ANE median: `1.872 ms`
+- Core ML `.all` median: `1.541 ms`
+
+4) Sequential re-check (this pass):
+- Baseline (ANE only): `/tmp/prefill_syncopt_baseline_seq_20260305`
+  - mean `1.827`, median `1.855`, p95 `2.077`, p99 `2.184`
+- QueueDepth+Pool combo: `/tmp/prefill_syncopt_combo_qd32_pool1_seq_20260305`
+  - mean `1.903`, median `1.927`, p95 `2.109`, p99 `2.211`
+- Combo verdict: regression; do not ship.
+
+5) Fairness snapshot:
+- `/tmp/prefill_syncopt_coreml_20260305`
+  - ANE median `1.853 ms`
+  - Core ML medians: `.all 1.684`, `.cpuAndNeuralEngine 1.718`, `.cpuAndGPU 1.135`
+  - ANE remains slower than fastest Core ML baseline on this host/profile.
+
+Interpretation:
+- Prefill remains high-variance and can be slower than Core ML in longer/hotter runs.
+- Decomposition shows host-side eval is dominant in measured profile mode on this host; `hwExecutionTime` unavailable prevents hard on-chip floor attribution.
+
+---
+
+## 5) Decision summary (why each call was made)
+
+Decisions shipped:
+- Keep decode architecture with persistent KV + slice updates because it is the only proven path to meaningful decode throughput gains.
+- Keep strict decode guardrails (`maxSeq=32`) to avoid invalid ANE eval contracts and false performance claims.
+- Keep detailed kernel profile reporting and metadata because reproducibility and root-cause attribution improved materially.
+- Keep `ANE_COMPILE_CACHE_POLICY=preferCached` for iteration/repro because compile variance was extreme in auto mode.
+
+Decisions iterated/abandoned:
+- Did not keep unsafe perf-stats object fallback because it caused runtime exceptions (`unrecognized selector`) in private runtime.
+- Did not keep eval-path-based workaround efforts for decode-attn contract failures because failure signature was invariant across paths.
+
+---
+
+## 6) Remaining optimization avenues (prioritized)
+
+### P0 (highest ROI, still unblocked)
+
+1) Lift `maxSeq=32` decode constraint with tiled/lane-packed cache layout
+- Why: most direct path to higher decode speedup and meaningful scaling to real context lengths.
+- Expected impact: largest decode gain potential.
+- Risk: ANE contract fragility on mixed input shapes; requires careful probe-guided expansion.
+
+2) Reduce decode dispatch overhead (attn+ffn fusion and/or deeper chaining)
+- Why: current path still pays two evals per layer/token.
+- Expected impact: significant constant-factor win in token latency.
+- Risk: compiler splitting/failure and private runtime instability.
+
+### P1 (important, but after P0)
+
+3) Build/benchmark a stronger Core ML decode baseline (stateful KV if feasible)
+- Why: stricter competitiveness claim and better understanding of true advantage margin.
+- Expected impact: not necessarily speedup gain, but improves credibility and target calibration.
+- Risk: coremltools complexity and ANE compiler stability.
+
+4) Decode-specific ANE option sweeps (queue depth, eval path, memory pool, fences, latching)
+- Why: could reduce host overhead and improve consistency.
+- Expected impact: moderate constant-factor gains.
+- Risk: unstable behavior and hard-to-reproduce wins without disciplined harnessing.
+
+### P2 (prefill-focused, expected limited upside)
+
+5) Prefill MIL-level variant experiments (RMSNorm forms, larger fusions, attention lowering alternatives)
+- Why: only remaining path if trying to close residual prefill delta.
+- Expected impact: low-to-moderate, likely not multi-x.
+- Risk: high engineering time for potentially marginal gain.
+
+6) Recover `hwExecutionTime` attribution path safely
+- Why: needed for hard bottleneck proof and to distinguish host vs on-chip ceilings.
+- Expected impact: diagnostic quality; may redirect optimization effort.
+- Risk: private API behavior differs by host OS/runtime.
+
+---
+
+## 7) Reality check on targets
+
+Decode:
+- 6x may be possible only after removing current shape constraints and reducing dispatch overhead further.
+- Current demonstrated range is ~2.67x–2.72x at supported contract (`maxSeq=32`).
+
+Prefill:
+- Based on observed behavior and architecture, large multi-x prefill gains vs Core ML are unlikely on this host/path.
+- Practical target is parity to modest win; not 3–6x.
+
+---
+
+## 8) Re-run checklist (exact artifacts expected)
+
+Decode profile run:
+- Output dir should include:
+  - `summary.txt`
+  - `summary.json`
+  - `ane_decode_token_latencies.csv`
+  - `ane_decode_kernel_profile.csv`
+  - `coreml_decode_all_token_latencies.csv`
+  - `coreml_decode_cpuandneuralengine_token_latencies.csv`
+
+Prefill profile run:
+- Output dir should include:
+  - `summary.txt`
+  - `summary.json`
+  - `ane_inference_latencies.csv`
+  - `ane_inference_kernel_profile.csv`
+  - Core ML latency CSVs
+
+---
+
+## 9) Tried vs Regressed (2026-03-06 update)
+
+### Shipped improvements (kept)
+- A13 decode tile-sync optimization (`5c016ec`) is a real win for tiled decode contexts:
+  - `maxSeq=128`: median `0.685 -> 0.483 ms/token`, throughput `1445 -> 2040 tok/s`
+  - `maxSeq=256`: median `0.685 -> 0.492 ms/token`, throughput `1448 -> 1869 tok/s`
+  - Primary bottleneck shift: IO `~0.219/0.217 ms` down to `~0.032/0.035 ms` per token.
+- A19 direct boundary spatial-slice I/O is a smaller, reproducible follow-on win:
+  - `maxSeq=128`: median-of-medians `0.485209 -> 0.483041 ms/token` (`-0.45%`)
+  - throughput `2042.7 -> 2052.3 tok/s`
+  - surface I/O `0.031336 -> 0.029447 ms/token`
+  - p95 improved slightly; p99 stayed effectively flat
+
+### Regressions or non-reproducible results (not kept)
+- Strict decode speedup headline regressed vs earlier best:
+  - Earlier best snapshot: `~2.67x–2.72x` (at `maxSeq=32`)
+  - Recent strict snapshots: `~2.02x–2.20x`
+  - Evidence: `/tmp/decode_syncopt_coreml_max128_20260305`, `/tmp/decode_syncopt_coreml_max32_20260305`, `/tmp/decode_syncopt_coreml_max32_r2_20260305`
+  - Note: mixed ANE+CoreML run ordering showed thermal drift; ANE-only confirm still measured `~0.486 ms` median at `maxSeq=32` (`/tmp/decode_syncopt_confirm_max32_20260305`).
+- Decode runtime option candidate (`ANE_EVAL_PATH=clientDirect`) regressed on confirmation:
+  - One-shot looked faster, but 3x confirmations showed parity/slight regression vs baseline.
+  - Evidence: `/tmp/decode_syncopt_opts_max128_20260305`, `/tmp/decode_syncopt_confirm_evalpath_max128_20260305`
+  - Decision: `ABANDON`.
+- Clean-worktree decode option re-sweep at `maxSeq=32` also failed to produce a better runtime configuration:
+  - Evidence: `/tmp/decode_sweep_max32_quick_20260306`
+  - Baseline `preferCached` remained best at median `0.486 ms` in the quick pass.
+  - Confirmation median-of-medians:
+    - baseline `preferCached`: `0.4940 ms`
+    - `ANE_EVAL_PATH=clientDirect`: `0.4954 ms`
+  - `clientDirect` therefore regressed by `0.27%`, and `ANE_KEEP_MODEL_WIRED=1` materially regressed to median `0.587 ms`.
+  - Decision: `ABANDON` further runtime knob chasing for this shape until a structural change lands.
+- Prefill high-ROI combo (`ANE_QUEUE_DEPTH=32 + ANE_MEMORY_POOL_ID=1`) regressed in sequential re-check:
+  - Baseline median `1.855 ms`
+  - Combo median `1.927 ms`
+  - Evidence: `/tmp/prefill_syncopt_baseline_seq_20260305`, `/tmp/prefill_syncopt_combo_qd32_pool1_seq_20260305`
+  - Decision: `ABANDON`.
+- Fused decode layer prototype (`ESPRESSO_DECODE_LAYER_MODE=fusedLayer`) was discarded before fairness runs:
+  - Split2 control run: `/tmp/decode_fused_cycle1_split2_quick_20260306`
+    - mean `0.665 ms/token`, median `0.666 ms/token`, p95 `0.716 ms`, p99 `0.769 ms`, throughput `1504 tok/s`
+    - ANE kernel `0.586 ms`, surface I/O `0.020 ms`
+  - Fused attempts:
+    - `ESPRESSO_DECODE_LAYER_MODE=fusedLayer` quick run stalled after `Compiling 1 decode ANE kernels (mode=fusedLayer)...`
+    - `ESPRESSO_DECODE_LAYER_MODE=fusedLayer ESPRESSO_DECODE_ATTN_PROBE_MODE=passthrough` also stalled in the same phase
+    - sample `/tmp/espresso-bench_2026-03-06_014704_vEMy.sample.txt` shows the process blocked under `ane_interop_compile -> -[_ANEInMemoryModel compileWithQoS:options:error:] -> -[_ANEClient compileModel:options:qos:error:]`
+  - Why this matters:
+    - The prototype never reached eval, so the failure is structural compile instability, not a performance regression that can be tuned around with runtime options.
+    - Current quick baseline shows decode token time is still mostly kernel/eval (`0.586 ms`) rather than I/O (`0.020 ms`), so small boundary-copy wins alone will not approach the 6x target.
+  - Decision: `ABANDON` this fused graph shape and revert the prototype before moving to the next decode experiment.
+- Decode request-level input rebinding (`ESPRESSO_DECODE_BIND_INPUT_CHAIN`) was discarded before benchmarking:
+  - Targeted hardware tests:
+    - undersized-surface rejection passed
+    - valid-size rebinding failed in real ANE eval
+  - Failure signatures:
+    - `_ANEClient buffersReadyWithModel:inputBuffers:...` with raw arrays throws `-[__NSArrayM procedureIndex]`
+    - retrying with rebuilt `_ANERequest` throws `-[_ANERequest executionDelay]`
+    - eval still fails with `statusType=0x9: Program Inference error`
+  - Interpretation:
+    - Rebuilding `_ANERequest` is not sufficient to safely rebind decode input surfaces after model load on this host/runtime.
+    - This path is too unstable to benchmark or ship, so it was reverted immediately rather than iterated in the hot path.
+  - Decision: `ABANDON`.
+- Decode lane-spatial re-sweep did not uncover a better tiled contract:
+  - Evidence:
+    - `/tmp/decode_lane_sweep_max128_l32_quick_20260306`
+    - `/tmp/decode_lane_sweep_max128_l64_quick_20260306`
+    - `/tmp/decode_lane_sweep_max128_l128_quick_20260306`
+  - Medians:
+    - lane `32`: `0.493250 ms`
+    - lane `64`: `0.499916 ms`
+    - lane `128`: `0.505333 ms`
+  - Decision: `ABANDON` wider lane windows for the current decode contract.
+- Decode mask-collapse (`dense mask` channels `768 -> 1`) failed before benchmarking:
+  - Scope attempted:
+    - changed decode attention generator and runtime expectations to use a 1-channel mask cache
+    - updated hardware tests first to enforce the reduced-mask contract
+  - Outcome:
+    - probe families with reduced-mask variants still fail with `statusType=0x9`
+    - decode hardware tests fail once the one-channel mask path is exercised
+  - Interpretation:
+    - the dense-mask contract is not just conservative; it is currently the stable decode contract on this host/runtime
+  - Decision: `ABANDON`.
+- Chaining proof-of-life did not yield an immediately usable dispatch-collapse path:
+  - Evidence:
+    - `swift test --filter ANEInteropTests/test_runtime_reports_chaining_support_on_host`
+    - `ANE_HARDWARE_TESTS=1 swift test --filter ANEInteropTests/test_prepare_chaining_probe_identity_kernel_returns_controlled_status`
+  - Outcome:
+    - support hooks are present
+    - request creation succeeds
+    - `prepareChainingWithModel` fails immediately with no `NSError`
+  - Interpretation:
+    - the chaining path is not dead, but the runtime contract is stricter than a naive empty `outputSets` / loopback request
+    - the next step is contract discovery, not decode integration
+  - Decision: `ITERATE`.
+- Decode compile-time external surface aliasing was discarded before benchmarking:
+  - Scope attempted:
+    - added a surface-aware compile path so kernels could be built against externally supplied IOSurfaces
+    - attempted intra-layer decode chaining by compiling `decodeFFN` with `decodeAttnQKV` output 0 as its input surface
+  - Targeted hardware tests:
+    - `ANERuntimeTests/test_kernel_rejects_undersized_external_input_surface` passed
+    - `ANERuntimeTests/test_kernel_uses_provided_external_input_surface_and_evals` failed with `statusType=0x9: Program Inference error`
+    - `InferenceOptimizationTests/test_decode_compile_time_chained_stack_matches_baseline_on_hardware` drifted to `NaN`
+  - Interpretation:
+    - the current ANE runtime contract on this host does not safely support externally supplied input IOSurfaces for these compiled kernels
+    - because the primitive itself failed on real hardware, the path was reverted immediately instead of benchmarked
+  - Decision: `ABANDON`.
+
+### Invalid/discarded evidence
+- Parallel prefill benchmark invocation was discarded as non-defensible due host contention; only sequential reruns are used for conclusions in this document.
+- Cross-worktree compare to `main` (`f2d1da0`) on this host cannot produce decode/prefill parity numbers because:
+  - `main` does not include the `espresso-bench` product (`swift build -c release --product espresso-bench` fails: `no product named 'espresso-bench'`).
+  - The only shared perf test (`test_100_steps_benchmark`) is M4-gated and skips on Apple M3 Max in both worktrees.
+Inference: strict decode/prefill regression assessment must be done against the nearest benchmark-capable base in this branch lineage, not `main`, on this host.
+
+---
+
+## 10) Tried vs Hypothesis (Max-Performance Plan)
+
+### Proven tried paths (evidence-backed)
+- Decode tiled IO reduction (A13): **works** and should be preserved as baseline.
+- Decode runtime option stacking after A13 (A14): **no stable gain**; keep default path.
+- Decode compile-time external surface aliasing: **unsafe/abandoned**; do not reuse as a dispatch-reduction path.
+- Prefill queue-depth/memory-pool combo (A15): **regressed** under sequential rerun; do not reuse.
+- Perf-stats fallback hacks (A10): **unsafe/abandoned**; do not pursue private selector spoofing.
+
+### Performance-maximization hypotheses (next experiments)
+
+| H# | Hypothesis | Why it could move needle | Expected impact (decode first) | Validation plan | Ship gate |
+|---|---|---|---|---|---|
+| H1 | **Dispatch reduction**: collapse per-token eval count (attn+ffn fusion/chaining) | Current decode still pays 2 evals/layer/token, so host dispatch overhead remains structural | High (largest remaining decode constant-factor lever) | Implement behind flag, run A/B at `maxSeq=32/128/256`, verify hardware correctness tests + parity checks | `SHIP` only if median gain holds across repeated runs (not one-shot) |
+| H2 | **Decode perf-stats + compile/eval attribution** | We need to prove whether remaining decode headroom is host dispatch or kernel execution before deeper interop work | Medium (measurement quality + experiment targeting) | Add decode-side `lastHWExecutionTimeNS`/compile timing into artifacts; compare split2 baseline vs any future structural change | `SHIP` when artifacts expose actionable attribution without changing decode behavior |
+| H3 | **Decode chaining via `_ANEChainingRequest` / `prepareChainingWithModel`** | Request-level rebinding is unsafe, so the next credible dispatch-reduction route is runtime-native chaining | Medium-to-high | Build a minimal hardware proof-of-life on a tiny multi-procedure or chained request path, then only integrate into decode if the primitive works | `SHIP` only after deterministic correctness and repeated median gain |
+| H4 | **Stable thermal/fairness protocol**: isolate ANE/CoreML run-order effects | Current strict speedup is sensitive to thermal drift, masking real regression/improvement signal | Medium (measurement quality + defensibility) | Interleaved repeated runs with cooldown windows + median-of-medians reporting | `SHIP` as reporting protocol once reproducible |
+| H5 | **Decode maxSeq scaling by contract-safe tiling variants** | If ANE contract permits wider auxiliary inputs safely, fewer sync events may be needed | Medium-to-high if contract-safe | Probe-guided shape expansion tests, then benchmark only passing families | `SHIP` only with stable eval + correctness |
+| H6 | **Prefill fusion/dispatch tuning only** (no risky option combos) | Prefill appears host-eval dominated; options alone did not hold | Low-to-medium | Evaluate only high-ROI fusion/chaining variants with strict repeated runs | `ITERATE` unless repeatable gain > noise floor |
+| H7 | **Stateful Core ML decode baseline (reported separately)** | Tightens fairness and prevents overstating speedup claims | Reporting impact, not direct speed gain | Add optional baseline mode and keep strict naive baseline unchanged | `SHIP` if stable and reproducible |
+
+### Practical ceiling hypothesis (current evidence)
+- With current kernel contract and 2-eval decode dispatch, decode speedups above current `~2x` strict likely require **architectural dispatch reduction (H1)** rather than additional runtime option sweeps.
+- Prefill large multi-x gains are unlikely on this host path without a meaningful reduction in host eval overhead; short-term expectation is parity-to-modest gains, not 3–6x.
+
+### Next queued experiment
+- Discover a valid `_ANEIOSurfaceOutputSets` / loopback contract for `_ANEChainingRequest`, then retry `prepareChainingWithModel` before attempting any decode hot-path integration.
+
+## 2026-03-06 D5b.1 chaining probe instrumentation and output-set contract probe
+- What changed: added guarded chaining probe interop for `_ANEChainingRequest`, `_ANEIOSurfaceOutputSets`, `_ANEOutputSetEnqueue`, `_ANEInputBuffersReady`, decode chain mode parsing (`off|probe|active`), cached per-layer chaining telemetry, and hardware-gated probe/parity tests.
+- Why: remaining decode headroom is structural dispatch overhead; before attempting active chaining, the runtime contract had to be proven on-host with exact failure-stage attribution.
+- Baseline artifact: `/tmp/decode_d5b_baseline_quick_20260306`
+  - mean `0.49792389636718942 ms/token`
+  - median `0.491 ms/token`
+  - p95 `0.55779310000000004 ms`
+  - p99 `0.7090016699999997 ms`
+  - throughput `2008.3390399535256 tok/s`
+  - attribution: ANE `0.40413455078124882 ms/token`, I/O `0.029949075520833195 ms/token`, `hwExecutionTime` unavailable
+- Candidate artifact: `/tmp/decode_d5b_probe_quick_20260306`
+  - mean `0.52260036476562888 ms/token`
+  - median `0.51529199999999997 ms/token`
+  - p95 `0.57737704999999995 ms`
+  - p99 `0.71475041999999989 ms`
+  - throughput `1913.5080406009113 tok/s`
+  - attribution: ANE `0.40506215657552191 ms/token`, I/O `0.028672052408853656 ms/token`, `hwExecutionTime` unavailable
+- Delta vs baseline:
+  - mean `+4.95%`
+  - median `+4.95%`
+  - p95 `+3.51%`
+  - p99 `+0.81%`
+  - throughput `-4.72%`
+- Probe telemetry:
+  - artifact: `/tmp/decode_d5b_probe_quick_20260306/summary.json`
+  - `decode_chain_mode=probe`
+  - layer 0 `attn_dispatch_count_avg=1`
+  - layer 0 `ffn_dispatch_count_avg=1`
+  - layer 0 `chaining_probe_us_avg=0.073626302083339507`
+  - layer 0 `chaining_stage_last=1`
+  - layer 0 `chaining_prepare_successes=0`
+  - layer 0 `chaining_fallbacks=0`
+  - stage `1` maps to `ANE_INTEROP_CHAINING_STAGE_OUTPUT_SETS_BUILD_FAILED`
+- Additional discovery artifacts:
+  - `/tmp/decode_d5b_probe_trace_20260306.txt`
+  - `/tmp/decode_d5b_client_trace_20260306.txt`
+  - `/tmp/decode_d5b_signature_trace_20260306.txt`
+- Tests:
+  - `swift test`
+  - `ANE_HARDWARE_TESTS=1 swift test --filter DecodeChainingInteropTests/test_chaining_probe_identity_kernel_returns_controlled_status`
+  - `ANE_HARDWARE_TESTS=1 swift test --filter DecodeChainingTests/test_decode_probe_mode_preserves_two_layer_outputs_on_hardware`
+  - `ANE_HARDWARE_TESTS=1 swift test --filter ANERuntimeTests/test_decode_probe_passthrough_4in_3out_eval`
+  - `ANE_HARDWARE_TESTS=1 swift test --filter InferenceOptimizationTests/test_decode_kv_cache_updates_and_mask_progresses_on_hardware`
+  - `ANE_HARDWARE_TESTS=1 swift test --filter InferenceOptimizationTests/test_decode_kv_mask_progresses_across_tile_boundaries_on_hardware`
+- Verdict: `ABANDON` for the current `_ANEIOSurfaceOutputSets.objectWithstatsSurRef:outputBuffer:` builder path. `ITERATE` on D5b overall.
+- Commit SHA: none yet; no confirmed gain to ship.
+- Rollback status: no rollback needed; chaining remains disabled by default behind `ESPRESSO_DECODE_CHAIN_MODE`.
+- Next step: derive the real `_ANEIOSurfaceOutputSets` / `_ANEOutputSetEnqueue` / `_ANEInputBuffersReady` object contract from the traced method names and type encodings before trying active chaining.

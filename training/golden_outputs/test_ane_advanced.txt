@@ -201,3 +201,108 @@
   _ANEBatchRequest: NOT FOUND
 
 --- Part 3: weightsBuffer IOSurface test ---
+  Baseline eval (weightsBuffer=nil, procIdx=0): OK
+  Output[0..3]: [0.1000, 0.2000, 0.3000, 0.3999]
+
+  Testing weightsBuffer IOSurface...
+  Request with weightsBuffer: created
+  Eval with weightsBuffer: OK
+  Output[0..3]: [0.1000, 0.2000, 0.3000, 0.3999]
+  weightsBuffer: output unchanged
+
+--- Part 4: procedureIndex sweep (0-15) ---
+  procIdx  0: OK
+  procIdx  1: OK
+  procIdx  2: OK
+  procIdx  3: OK
+  procIdx  4: OK
+  procIdx  5: OK
+  procIdx  6: OK
+  procIdx  7: OK
+  procIdx  8: OK
+  procIdx  9: OK
+  procIdx 10: OK
+  procIdx 11: OK
+  procIdx 12: OK
+  procIdx 13: OK
+  procIdx 14: OK
+  procIdx 15: OK
+
+--- Part 5: All ANE-prefixed classes ---
+  _LSOpenWithPanelDelegate
+  BMDeviceAirplaneMode
+  SLSScreenTelemetryResultsSnapshotPanelDataWrapper
+  XFocalPlane
+  CIFocalPlaneProcessor
+  CIFocalPlaneNative
+  CIFocalPlanePreprocessorInternal
+  CIFocalPlane
+  EspressoANEIOSurface
+  _ANECompilerAnalytics
+  _ANEAnalyticsProcedure
+  _ANEAnalyticsGroup
+  _ANEAnalyticsLayer
+  _ANEAnalyticsTask
+  EspressoProfilingANEcompilerAnalytics
+  EspressoProfilingNetworkANEInfo
+  EspressoPass_style_transfer_two_nets_onlyanepart
+  EspressoPass_wavernn_ane
+  _ANECloneHelper
+  _ANEErrors
+  _ANEInputBuffersReady
+  _ANEPerformanceStats
+  _ANEOutputSetEnqueue
+  _ANEPerformanceStatsIOSurface
+  _ANEWeight
+  _ANEProcedureData
+  _ANEDataReporter
+  _ANEModelToken
+  GraphANESharedEventHandler
+  _MLCANEReductionParameters
+  _MLCANEDomTree
+  _MLCANEWeightOps
+  _MLCANESliceParameters
+  _MLCANEUpsampleParameters
+  _MLCANESoftmaxParameters
+  MLCDeviceANE
+  _MLCANEArithmeticParameters
+  _MLCANEPlistBuilder
+  _MLCANEMatMulParameters
+  _MLCANEConvolutionParameters
+  _MLCANEPoolingParameters
+  _MLCANEIOSurface
+  _MLCANENormalizationParameters
+  _MLCANENeuronParameters
+  _MLCANEModel
+  _MLCANETransposeParameters
+  _MLCANEConcatParameters
+  MLCANEDeviceOps
+  _ANEProgramIOSurfacesMapper
+  ANEServicesLog
+  _ANEProgramForEvaluation
+  _ANEDeviceController
+  _ANESandboxingHelper
+  _ANEQoSMapper
+  _ANEModelInstanceParameters
+  _ANEBuffer
+  _ANEIOSurfaceOutputSets
+  _ANEModel
+  __NSXPCInterfaceProxy__ANEDaemonProtocol
+  _ANEStrings
+  _ANEDaemonConnection
+  _ANEDeviceInfo
+  _ANEClient
+  _ANELog
+  _ANEHashEncoding
+  _ANEIOSurfaceObject
+  _ANERequest
+  _ANEInMemoryModel
+  _ANEInMemoryModelDescriptor
+  _ANEChainingRequest
+  _ANEVirtualClient
+  _ANESharedWaitEvent
+  _ANESharedSignalEvent
+  _ANESharedEvents
+  _PFEvanescentData
+
+Done.

@@ -21,7 +21,24 @@ xcuserdata/
 # Claude Code local settings
 .claude/
 
+# Git worktrees
+.worktrees/
+
 # Large model weights (>10MB binaries)
 # Golden test fixtures are tracked; add entries here for actual model weights
 *.gguf
 *.safetensors
+
+# Benchmark outputs
+benchmarks/results/
+benchmarks/models/*.mlpackage
+
+# Generated artifacts (bench logs, history) and Python caches
+artifacts/*
+!artifacts/benchmarks/
+artifacts/benchmarks/*
+!artifacts/benchmarks/exact-decode-non-echo/
+!artifacts/benchmarks/exact-decode-non-echo/latest.json
+!artifacts/benchmarks/exact-decode-non-echo/latest.csv
+!artifacts/benchmarks/exact-decode-non-echo/latest.md
+scripts/__pycache__/

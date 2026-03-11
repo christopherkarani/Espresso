@@ -6,6 +6,8 @@ let package = Package(
     platforms: [.macOS(.v15)],
     products: [
         .executable(name: "espresso-train", targets: ["EspressoTrain"]),
+        .executable(name: "espresso-bench", targets: ["EspressoBench"]),
+        .executable(name: "espresso-multitoken-probe", targets: ["EspressoMultitokenProbe"]),
         .library(name: "Espresso", targets: ["Espresso"]),
     ],
     targets: [
@@ -56,7 +58,12 @@ let package = Package(
             dependencies: ["ANERuntime", "CPUOps", "ANETypes"],
             path: "Sources/Espresso",
             swiftSettings: [.swiftLanguageMode(.v6)],
-            linkerSettings: [.linkedFramework("Accelerate")]
+            linkerSettings: [
+                .linkedFramework("Accelerate"),
+                .linkedFramework("CoreML"),
+                .linkedFramework("IOSurface"),
+                .linkedFramework("Metal"),
+            ]
         ),
         .executableTarget(
             name: "EspressoTrain",
@@ -64,11 +71,32 @@ let package = Package(
             path: "Sources/EspressoTrain",
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
+        .executableTarget(
+            name: "EspressoBench",
+            dependencies: ["Espresso", "ANERuntime", "ANETypes", "CPUOps", "MILGenerator"],
+            path: "Sources/EspressoBench",
+            swiftSettings: [.swiftLanguageMode(.v6)],
+            linkerSettings: [
+                .linkedFramework("Accelerate"),
+                .linkedFramework("IOSurface"),
+                .linkedFramework("CoreML"),
+            ]
+        ),
+        .executableTarget(
+            name: "EspressoMultitokenProbe",
+            dependencies: ["Espresso", "ANERuntime", "ANETypes"],
+            path: "Sources/EspressoMultitokenProbe",
+            swiftSettings: [.swiftLanguageMode(.v6)],
+            linkerSettings: [
+                .linkedFramework("Accelerate"),
+                .linkedFramework("IOSurface"),
+            ]
+        ),
         .testTarget(name: "ANEInteropTests", dependencies: ["ANEInterop"], swiftSettings: [.swiftLanguageMode(.v6)]),
         .testTarget(name: "ANETypesTests", dependencies: ["ANETypes"], swiftSettings: [.swiftLanguageMode(.v6)]),
         .testTarget(
             name: "MILGeneratorTests",
-            dependencies: ["MILGenerator"],
+            dependencies: ["MILGenerator", "ANERuntime"],
             path: "Tests/MILGeneratorTests",
             resources: [.process("Fixtures")],
             swiftSettings: [.swiftLanguageMode(.v6)]
@@ -76,12 +104,16 @@ let package = Package(
         .testTarget(name: "CPUOpsTests", dependencies: ["CPUOps"], swiftSettings: [.swiftLanguageMode(.v6)]),
         .testTarget(
             name: "ANERuntimeTests",
-            dependencies: ["ANERuntime", "ANEInterop", "MILGenerator", "ANETypes"],
+            dependencies: ["ANERuntime", "ANEInterop", "MILGenerator", "ANETypes", "Espresso"],
             path: "Tests/ANERuntimeTests",
             resources: [.copy("Fixtures")],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
-        .testTarget(name: "EspressoTests", dependencies: ["Espresso"], swiftSettings: [.swiftLanguageMode(.v6)]),
+        .testTarget(
+            name: "EspressoTests",
+            dependencies: ["Espresso", "CPUOps", "ANEInterop", "ANETypes"],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
         .testTarget(
             name: "CrossValidationTests",
             dependencies: ["ANERuntime", "CPUOps", "ANETypes", "Espresso", "MILGenerator"],

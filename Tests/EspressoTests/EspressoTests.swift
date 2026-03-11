@@ -205,6 +205,83 @@ final class EspressoTests: XCTestCase {
         }
     }
 
+    func test_ane_option_snapshot_defaults_when_env_empty() {
+        let snapshot = ANEOptionSnapshot.fromEnvironment([:])
+        XCTAssertEqual(snapshot.compileCachePolicy, "auto")
+        XCTAssertEqual(snapshot.evalPath, "inmem")
+        XCTAssertFalse(snapshot.strictOptions)
+        XCTAssertFalse(snapshot.disablePowerSaving)
+        XCTAssertFalse(snapshot.keepModelWired)
+        XCTAssertFalse(snapshot.enableLateLatch)
+        XCTAssertFalse(snapshot.skipPrepare)
+        XCTAssertFalse(snapshot.disableIOFences)
+        XCTAssertFalse(snapshot.enableFWToFWSignal)
+        XCTAssertFalse(snapshot.useCompilerOptions)
+        XCTAssertFalse(snapshot.perfStatsRequested)
+        XCTAssertNil(snapshot.queueDepth)
+        XCTAssertNil(snapshot.memoryPoolID)
+        XCTAssertNil(snapshot.perfStatsMask)
+        XCTAssertEqual(snapshot.decodeLaneSpatial, 32)
+        XCTAssertEqual(snapshot.benchSeed, "")
+
+        let json = snapshot.asJSON()
+        XCTAssertEqual(json["compile_cache_policy"] as? String, "auto")
+        XCTAssertEqual(json["eval_path"] as? String, "inmem")
+        XCTAssertEqual(json["strict_options"] as? Bool, false)
+        XCTAssertEqual(json["decode_lane_spatial"] as? Int, 32)
+        XCTAssertNil(json["queue_depth"])
+        XCTAssertNil(json["memory_pool_id"])
+        XCTAssertNil(json["perf_stats_mask"])
+    }
+
+    func test_ane_option_snapshot_reads_overrides_and_normalizes_lane_spatial() {
+        let env: [String: String] = [
+            "ANE_COMPILE_CACHE_POLICY": "preferCached",
+            "ANE_EVAL_PATH": "clientDirect",
+            "ANE_STRICT_OPTIONS": "1",
+            "ANE_DISABLE_POWER_SAVING": "1",
+            "ANE_KEEP_MODEL_WIRED": "1",
+            "ANE_ENABLE_LATE_LATCH": "1",
+            "ANE_SKIP_PREPARE": "1",
+            "ANE_DISABLE_IO_FENCES": "1",
+            "ANE_ENABLE_FW_TO_FW_SIGNAL": "1",
+            "ANE_USE_COMPILER_OPTIONS": "1",
+            "ANE_PERF_STATS": "1",
+            "ANE_QUEUE_DEPTH": "16",
+            "ANE_MEMORY_POOL_ID": "2",
+            "ANE_PERF_STATS_MASK": "0xF",
+            "ESPRESSO_DECODE_LANE_SPATIAL": "16",
+            "ESPRESSO_BENCH_SEED": "1",
+        ]
+        let snapshot = ANEOptionSnapshot.fromEnvironment(env)
+        XCTAssertEqual(snapshot.compileCachePolicy, "preferCached")
+        XCTAssertEqual(snapshot.evalPath, "clientDirect")
+        XCTAssertTrue(snapshot.strictOptions)
+        XCTAssertTrue(snapshot.disablePowerSaving)
+        XCTAssertTrue(snapshot.keepModelWired)
+        XCTAssertTrue(snapshot.enableLateLatch)
+        XCTAssertTrue(snapshot.skipPrepare)
+        XCTAssertTrue(snapshot.disableIOFences)
+        XCTAssertTrue(snapshot.enableFWToFWSignal)
+        XCTAssertTrue(snapshot.useCompilerOptions)
+        XCTAssertTrue(snapshot.perfStatsRequested)
+        XCTAssertEqual(snapshot.queueDepth, "16")
+        XCTAssertEqual(snapshot.memoryPoolID, "2")
+        XCTAssertEqual(snapshot.perfStatsMask, "0xF")
+        XCTAssertEqual(snapshot.decodeLaneSpatial, 32)
+        XCTAssertEqual(snapshot.benchSeed, "1")
+
+        var envLargeLane = env
+        envLargeLane["ESPRESSO_DECODE_LANE_SPATIAL"] = "128"
+        let largeLane = ANEOptionSnapshot.fromEnvironment(envLargeLane)
+        XCTAssertEqual(largeLane.decodeLaneSpatial, 128)
+
+        let json = snapshot.asJSON()
+        XCTAssertEqual(json["queue_depth"] as? String, "16")
+        XCTAssertEqual(json["memory_pool_id"] as? String, "2")
+        XCTAssertEqual(json["perf_stats_mask"] as? String, "0xF")
+    }
+
     func test_gradient_accumulator_enqueue_and_barrier() {
         let accumulator = GradientAccumulator()
         let counter = LockedCounter()

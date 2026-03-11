@@ -1,3 +1,26 @@
 === Step 1: Compile with weights A (identity) ===
   Kernel: 64x64 conv, spatial=32
-FAIL: compile: (null)
+  Compile+load: 20.5ms
+  tmpDir: /var/folders/ns/xmz0zmpj7p148vdgr4bwzp8h0000gn/T/78DEB3D205DEF37126A7ACBC60DAF6F019FF0FDC2509F0BFA178EDD27A0F5BCD_AFD34790594113F0B644E1567ABDB63F6A1A657A213DF052B9C9EEF7C88F5DE4_E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855
+
+=== Step 2: Eval with weights A ===
+  Output A[0..3]: [0.0100, 0.0200, 0.0300, 0.0400]
+  Output A[2044..2047]: [20.4531, 20.4531, 20.4688, 20.4844]
+
+=== Step 3: Overwrite weight.bin with B (3x identity), unload+load ===
+  Wrote new weight.bin
+  Unload: OK (0.52ms)
+  Load (no recompile): OK (3.45ms)
+
+=== Step 4: Eval after reload ===
+  Output B[0..3]: [0.0100, 0.0200, 0.0300, 0.0400]
+  Output B[2044..2047]: [20.4531, 20.4531, 20.4688, 20.4844]
+
+=== RESULT ===
+  Max A-B diff: 0.000000
+  Max 3x error: 40.968750
+  Compile+load: 20.5ms | Unload: 0.5ms | Reload: 3.5ms
+
+FAIL: Output did NOT change. Weight reload does not work.
+  ANE cached the compiled model — weights baked at compile time.
+>>> Need alternative: weightsBuffer IOSurface or async recompile <<<

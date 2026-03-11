@@ -194,6 +194,106 @@ final class CPUOpsTests: XCTestCase {
         }
     }
 
+    func test_rmsnorm_workspace_matches_default_paths() {
+        let dim = 8
+        let seqLen = 5
+        let count = dim * seqLen
+        var rng = SplitMix64(seed: 99)
+
+        let x = (0..<count).map { _ in randomFloat(&rng, min: -2.0, max: 2.0) }
+        let weights = (0..<dim).map { _ in randomFloat(&rng, min: -1.5, max: 1.5) }
+        let dy = (0..<count).map { _ in randomFloat(&rng, min: -1.0, max: 1.0) }
+
+        var outDefault = [Float](repeating: 0, count: count)
+        var outWorkspace = [Float](repeating: 0, count: count)
+        var dxDefault = [Float](repeating: 0, count: count)
+        var dxWorkspace = [Float](repeating: 0, count: count)
+        var dwDefault = [Float](repeating: 0, count: dim)
+        var dwWorkspace = [Float](repeating: 0, count: dim)
+
+        x.withUnsafeBufferPointer { xPtr in
+            weights.withUnsafeBufferPointer { wPtr in
+                outDefault.withUnsafeMutableBufferPointer { outPtr in
+                    RMSNorm.forward(
+                        output: outPtr.baseAddress!,
+                        input: xPtr.baseAddress!,
+                        weights: wPtr.baseAddress!,
+                        dim: dim,
+                        seqLen: seqLen
+                    )
+                }
+            }
+        }
+
+        var workspace = RMSNorm.Workspace(seqLen: seqLen)
+        x.withUnsafeBufferPointer { xPtr in
+            weights.withUnsafeBufferPointer { wPtr in
+                outWorkspace.withUnsafeMutableBufferPointer { outPtr in
+                    RMSNorm.forward(
+                        output: outPtr.baseAddress!,
+                        input: xPtr.baseAddress!,
+                        weights: wPtr.baseAddress!,
+                        dim: dim,
+                        seqLen: seqLen,
+                        workspace: workspace
+                    )
+                }
+            }
+        }
+
+        for i in 0..<count {
+            XCTAssertEqual(outWorkspace[i], outDefault[i], accuracy: 1e-6, "forward mismatch at \(i)")
+        }
+
+        x.withUnsafeBufferPointer { xPtr in
+            weights.withUnsafeBufferPointer { wPtr in
+                dy.withUnsafeBufferPointer { dyPtr in
+                    dxDefault.withUnsafeMutableBufferPointer { dxPtr in
+                        dwDefault.withUnsafeMutableBufferPointer { dwPtr in
+                            RMSNorm.backward(
+                                dx: dxPtr.baseAddress!,
+                                dw: dwPtr.baseAddress!,
+                                dy: dyPtr.baseAddress!,
+                                x: xPtr.baseAddress!,
+                                weights: wPtr.baseAddress!,
+                                dim: dim,
+                                seqLen: seqLen
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        x.withUnsafeBufferPointer { xPtr in
+            weights.withUnsafeBufferPointer { wPtr in
+                dy.withUnsafeBufferPointer { dyPtr in
+                    dxWorkspace.withUnsafeMutableBufferPointer { dxPtr in
+                        dwWorkspace.withUnsafeMutableBufferPointer { dwPtr in
+                            RMSNorm.backward(
+                                dx: dxPtr.baseAddress!,
+                                dw: dwPtr.baseAddress!,
+                                dy: dyPtr.baseAddress!,
+                                x: xPtr.baseAddress!,
+                                weights: wPtr.baseAddress!,
+                                dim: dim,
+                                seqLen: seqLen,
+                                workspace: workspace
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        for i in 0..<count {
+            XCTAssertEqual(dxWorkspace[i], dxDefault[i], accuracy: 1e-6, "backward dx mismatch at \(i)")
+        }
+        for i in 0..<dim {
+            XCTAssertEqual(dwWorkspace[i], dwDefault[i], accuracy: 1e-5, "backward dw mismatch at \(i)")
+        }
+    }
+
     func test_rmsnorm_backward_numerical_gradient_check() {
         let dim = 4
         let seqLen = 2
@@ -487,6 +587,52 @@ final class CPUOpsTests: XCTestCase {
                 sum += dlogits[vocabSeqIndex(vocab: v, seq: t, seqLen: seqLen)]
             }
             XCTAssertLessThan(abs(sum), 1e-5, "Gradient sum should be zero at position \(t)")
+        }
+    }
+
+    func test_cross_entropy_workspace_matches_default_api() {
+        let vocabSize = 13
+        let seqLen = 6
+        var rng = SplitMix64(seed: 1701)
+        let logits = (0..<(vocabSize * seqLen)).map { _ in randomFloat(&rng, min: -6.0, max: 6.0) }
+        let targets = (0..<seqLen).map { _ in UInt16(randomInt(&rng, upperBound: vocabSize)) }
+
+        var gradsDefault = [Float](repeating: 0, count: vocabSize * seqLen)
+        var gradsWorkspace = [Float](repeating: 0, count: vocabSize * seqLen)
+
+        let lossDefault = logits.withUnsafeBufferPointer { logitsPtr in
+            targets.withUnsafeBufferPointer { targetsPtr in
+                gradsDefault.withUnsafeMutableBufferPointer { gradPtr in
+                    CrossEntropy.lossAndGradient(
+                        dlogits: gradPtr.baseAddress!,
+                        logits: logitsPtr.baseAddress!,
+                        targets: targetsPtr.baseAddress!,
+                        vocabSize: vocabSize,
+                        seqLen: seqLen
+                    )
+                }
+            }
+        }
+
+        var workspace = CrossEntropy.Workspace(vocabSize: vocabSize, seqLen: seqLen)
+        let lossWorkspace = logits.withUnsafeBufferPointer { logitsPtr in
+            targets.withUnsafeBufferPointer { targetsPtr in
+                gradsWorkspace.withUnsafeMutableBufferPointer { gradPtr in
+                    CrossEntropy.lossAndGradient(
+                        dlogits: gradPtr.baseAddress!,
+                        logits: logitsPtr.baseAddress!,
+                        targets: targetsPtr.baseAddress!,
+                        vocabSize: vocabSize,
+                        seqLen: seqLen,
+                        workspace: workspace
+                    )
+                }
+            }
+        }
+
+        XCTAssertEqual(lossWorkspace, lossDefault, accuracy: 1e-6)
+        for i in 0..<(vocabSize * seqLen) {
+            XCTAssertEqual(gradsWorkspace[i], gradsDefault[i], accuracy: 1e-6, "gradient mismatch at \(i)")
         }
     }
 
