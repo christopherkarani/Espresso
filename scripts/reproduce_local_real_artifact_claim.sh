@@ -1,6 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Public reproduction entry point for the non-echo exact decode release claim.
+# This script:
+# 1. builds a local-text token dataset from the repo,
+# 2. exports the matching recurrent artifact + future sidecar,
+# 3. writes an offline exact-acceptance gate,
+# 4. generates a matching zero-weight CoreML trunk, and
+# 5. runs the matched ANE/CoreML public harness.
+# The default contract reproduces the release documented in
+# docs/releases/2026-03-11-non-echo-exact-decode.md.
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RESULTS_DIR="${RESULTS_DIR:-$ROOT/results/real-artifact-$(date +%Y%m%d-%H%M%S)}"
 DATASET_PATH="$RESULTS_DIR/local-text.uint16.bin"

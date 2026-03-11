@@ -1,10 +1,45 @@
-# Espresso — Backpropagation on Apple Neural Engine
+# Espresso — Reverse-Engineered Apple Neural Engine Research
 
-Training neural networks directly on Apple's Neural Engine (ANE) via reverse-engineered private APIs. No CoreML training APIs, no Metal, no GPU — pure ANE compute.
+Training neural networks and exact decode paths directly on Apple's Neural Engine (ANE) via reverse-engineered private APIs. No CoreML training APIs, no Metal, no GPU for the core ANE path.
+
+## Latest Public Decode Release
+
+The strongest public decode result in this branch is an exact non-echo recurrent two-token ANE decode path on a local real-artifact family:
+
+- Exact two-step ANE decode: `1.0806302083333332 ms/token`
+- Matched one-token ANE control: `1.0957500000000002 ms/token`
+- Matched CoreML `.cpuAndNeuralEngine`: `5.085307291666668 ms/token`
+- Exact two-step speedup vs CoreML: `4.7583224488025415x`
+- Exactness: parity `match`, `committed exact tokens/pass = 2`, `accepted future tokens/pass = 1`
+
+Public evidence:
+- Human summary: [artifacts/benchmarks/exact-decode-non-echo/latest.md](artifacts/benchmarks/exact-decode-non-echo/latest.md)
+- Machine-readable artifact: [artifacts/benchmarks/exact-decode-non-echo/latest.json](artifacts/benchmarks/exact-decode-non-echo/latest.json)
+- Release note: [docs/releases/2026-03-11-non-echo-exact-decode.md](docs/releases/2026-03-11-non-echo-exact-decode.md)
+- Reproduction command: [scripts/reproduce_local_real_artifact_claim.sh](scripts/reproduce_local_real_artifact_claim.sh)
+- Full lab notebook: [docs/fused-decode-and-next-steps.md](docs/fused-decode-and-next-steps.md)
+
+Reproduce the public claim:
+
+```bash
+RESULTS_DIR=results/non-echo-public-$(date +%Y%m%d-%H%M%S) \
+REPEATS=5 WARMUP=3 ITERATIONS=20 \
+./scripts/reproduce_local_real_artifact_claim.sh
+```
+
+What this claim is:
+- A matched same-session ANE/CoreML decode benchmark
+- Exact recurrent-native two-token generation with no approximate commits
+- A non-echo local artifact family built and exported by this repo
+
+What this claim is not:
+- Not a pretrained production checkpoint result
+- Not a repaired generic recurrent ANE kernel; it depends on the explicit `identity-zero-trunk` backend
+- Not a blanket claim about all Apple-model inference or all CoreML workloads
 
 ## What This Is
 
-A from-scratch implementation of transformer training (forward + backward pass) running on the ANE in Apple Silicon. The ANE is a 15.8 TFLOPS (M4) inference accelerator that Apple does not expose for training. This project reverse-engineers the `_ANEClient` / `_ANECompiler` private APIs and the MIL (Model Intermediate Language) format to run custom compute graphs — including backpropagation — directly on ANE hardware.
+A from-scratch implementation of transformer training (forward + backward pass) and exact recurrent decode experiments running on the ANE in Apple Silicon. The ANE is a 15.8 TFLOPS (M4) inference accelerator that Apple does not expose directly for training or for arbitrary custom decode graphs. This project reverse-engineers the `_ANEClient` / `_ANECompiler` private APIs and the MIL (Model Intermediate Language) format to run custom compute graphs directly on ANE hardware.
 
 **Historical ObjC prototype result (M4, single transformer layer, dim=768, seq=512):**
 - 9.3 ms/step, 11.2% ANE utilization (1.78 TFLOPS sustained)

@@ -1,23 +1,15 @@
 # TODO
 
-- [x] Preserve the current non-echo `identity-zero-trunk` public claim as the control and do not weaken its exactness, artifact, or reporting contract.
-- [x] Add TDD seams for ANE-backed future-head selection so proposer behavior can be checked without rerunning the full harness.
-- [x] Replace the CPU future proposer on the exact two-token non-echo path with an ANE head that uses the saved `futureRMS` and `futureClassifier`.
-- [x] Re-verify unit parity, focused hardware parity, and proposer metrics after the ANE proposer is wired in.
-- [x] Rerun the matched recurrent-checkpoint/CoreML harness and keep the change because the exact two-token path beats the previous CPU-proposer two-step median and the one-token ANE identity control.
-- [x] Update docs, lessons, Wax notes, handoff, and review with the stronger non-echo throughput result and the failed smaller-lane probes.
+- [x] Promote `ebd3c38` from an internal milestone to a public-release surface without changing the measured claim.
+- [x] Rewrite the top-level README so the non-echo exact decode result is the first public benchmark story, with explicit caveats and one-command repro.
+- [x] Add a checked-in benchmark artifact for the non-echo release claim that is stable enough to link publicly.
+- [x] Add a release note document tied to the exact claim, exact caveats, repro command, and reference commit.
+- [x] Create a local release tag for the public packaging milestone and leave the worktree clean apart from untracked raw result bundles.
+- [x] Update lessons, Wax notes, handoff, and review with the release-packaging outcome.
 
 # Review
 
-- Previous non-echo control on this branch was the exact local bigram artifact with explicit `identity-zero-trunk` backends and a CPU proposer:
-  - exact two-step `1.2012578125 ms/token`
-  - exact one-token ANE control `1.0598854166666667 ms/token`
-  - matched zero-weight `6`-layer CoreML `4.7705807291666664 ms/token`
-  - exact two-step speedup vs CoreML `3.9541428963040195x`
-  - parity `match`
-  - committed exact tokens/pass `2`
-  - accepted future tokens/pass `1`
-- Current winning non-echo result on this branch uses an ANE future proposer on the same exact `identity-zero-trunk` artifact contract:
+- Current code/control milestone is `ebd3c38`:
   - exact two-step `1.0806302083333332 ms/token`
   - exact one-token ANE control `1.0957500000000002 ms/token`
   - matched zero-weight `6`-layer CoreML `5.085307291666668 ms/token`
@@ -26,13 +18,13 @@
   - parity `match`
   - committed exact tokens/pass `2`
   - accepted future tokens/pass `1`
-- Sample same-session run (`run-3.json`) shows the mechanism clearly:
-  - exact two-step `1.0607916666666668 ms/token`
-  - exact one-token ANE control `1.0760208333333334 ms/token`
-  - proposer `0.9317604166666666 ms/pass`
-  - verifier logits `0.9893697916666667 ms/pass`
-  - verifier trunk `0.000010416666666666666 ms/pass`
-- Failed bounded follow-ups were reverted:
-  - proposer-only `laneSpatial=1` hit ANE `statusType=0x9`
-  - proposer-only `laneSpatial=8` hit ANE `statusType=0x9`
-- The generic RWKV-style recurrent ANE cell remains a separate negative result on non-echo one-hot seams and should not be reopened during this proposer phase.
+- The code/result is frozen enough for recovery, but the repo is not yet public-release quality:
+  - README now leads with the new non-echo decode claim
+  - checked-in benchmark artifacts now exist under `artifacts/benchmarks/exact-decode-non-echo/`
+  - release notes now exist under `docs/releases/2026-03-11-non-echo-exact-decode.md`
+  - the remaining packaging step is to tag and push the milestone, not to invent more prose
+- The public claim must stay constrained:
+  - non-echo local artifact family
+  - exact parity preserved
+  - explicit `identity-zero-trunk` backend
+  - not a pretrained production checkpoint claim

@@ -124,3 +124,8 @@
 - Once exact non-echo acceptance is already `2` committed tokens/pass with parity `match`, stop treating proposer quality as the blocker and measure proposer placement directly; the remaining gap can be pure systems cost.
 - On the `identity-zero-trunk` artifact family, moving the future proposer from CPU onto an ANE fused head was enough to turn the exact two-step path from slower-than-control into faster-than-control in the matched release harness.
 - Keep proposer-only lane sweeps bounded and reversible; smaller proposer lanes (`1` and `8` here) hit ANE `statusType=0x9`, so failed geometry probes should be reverted immediately and kept only as docs/results evidence.
+
+## 2026-03-11 — A Frozen Benchmark Is Not A Public Release
+- A recoverable commit and a local result bundle are not enough for a public-quality release; the claim has to be visible at the top of the README, backed by a checked-in benchmark artifact, and tied to a release note or tag.
+- Keep the public caveats adjacent to the benchmark number, not buried in a long running notebook, so external readers cannot misread the scope.
+- Public benchmark artifacts should be lightweight and checked in (`json/csv/md`) even when the raw run directories stay untracked.

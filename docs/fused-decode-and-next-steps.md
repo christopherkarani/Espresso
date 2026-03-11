@@ -2529,3 +2529,19 @@ Interpretation:
 - The generic RWKV-style recurrent ANE cell remains a separate negative result for non-echo work:
   - this win still depends on the explicit `identity-zero-trunk` backend
   - it does not rehabilitate the broken generic recurrent kernel
+
+## 2026-03-11 — Public release packaging catches up to the non-echo decode milestone
+
+What was done:
+- Promoted the `ebd3c38` non-echo ANE proposer milestone from an internal checkpoint into a public-release surface.
+- Rewrote the top-level README so the non-echo exact decode result is the first benchmark story readers see.
+- Added checked-in release artifacts for the claim:
+  - `artifacts/benchmarks/exact-decode-non-echo/latest.json`
+  - `artifacts/benchmarks/exact-decode-non-echo/latest.csv`
+  - `artifacts/benchmarks/exact-decode-non-echo/latest.md`
+- Added a dedicated release note:
+  - `docs/releases/2026-03-11-non-echo-exact-decode.md`
+
+Interpretation:
+- The result was already technically real; this packaging step makes it recoverable and quote-safe for external readers.
+- The important scope caveats are now adjacent to the public number instead of buried only in this notebook.
