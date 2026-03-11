@@ -28,3 +28,7 @@
   - exact parity preserved
   - explicit `identity-zero-trunk` backend
   - not a pretrained production checkpoint claim
+- README hardening pass:
+  - lead now scopes the performance number to the reproducible non-echo local-artifact benchmark
+  - repro notes now state that first-run `coremltools` bootstrap may occur
+  - public copy now avoids broader "CoreML in general" wording

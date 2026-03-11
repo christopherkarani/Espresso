@@ -129,3 +129,12 @@
 - A recoverable commit and a local result bundle are not enough for a public-quality release; the claim has to be visible at the top of the README, backed by a checked-in benchmark artifact, and tied to a release note or tag.
 - Keep the public caveats adjacent to the benchmark number, not buried in a long running notebook, so external readers cannot misread the scope.
 - Public benchmark artifacts should be lightweight and checked in (`json/csv/md`) even when the raw run directories stay untracked.
+
+## 2026-03-11 — Public Provenance Must Match The Intended Owner
+- When fixing launch-facing provenance, do not preserve stale third-party ownership text in `LICENSE` by default; align the top-level license notice with the intended public repo owner unless the user explicitly wants multi-party attribution there.
+- Treat license headers as part of the release surface, not a passive inherited artifact from an older fork or prototype.
+
+## 2026-03-11 — Public Benchmark Copy Must Be Narrower Than Internal Conviction
+- Launch-facing benchmark headlines must name the exact benchmark scope when the result is artifact-specific; otherwise readers will upgrade a narrow measurement into a blanket product claim.
+- Remove secondary throughput wins from the hero section unless they are backed by the same public harness and caveat level as the primary claim.
+- If a repro path may bootstrap local tooling, say that directly instead of implying a completely offline zero-download first run.
