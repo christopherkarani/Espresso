@@ -2407,3 +2407,66 @@ Interpretation:
 Reproduction:
 - Use `scripts/reproduce_exact_3x_echo.sh` for the branch’s public `>=3x` repro surface.
 - Keep `scripts/reproduce_exact_4x.sh` as the underlying general matched-harness driver for both `echo` and `recurrent-checkpoint` modes.
+
+## 2026-03-11 — Non-echo local artifact clears 3x with an exact `identity-zero-trunk` backend
+
+What was done:
+- Kept the synthetic `echo` claim as the control and treated non-echo as a separate gate.
+- Added two focused hardware correctness seams for a local bigram artifact built from repo text:
+  - one-token ANE recurrent generation vs CPU teacher
+  - exact two-token ANE branch-state-promotion generation vs CPU teacher
+- Added an explicit `identity-zero-trunk` recurrent backend to the public probe and reproduction wrapper so the saved zero-trunk local artifact can run through a known-good ANE output-head path without relying on the broken generic recurrent kernel.
+- Re-ran the same matched recurrent-checkpoint/CoreML release harness with:
+  - fresh local-text dataset
+  - fresh local bigram artifact export
+  - offline acceptance gate
+  - fresh zero-weight `6`-layer CoreML trunk
+  - `control_backend=identity-zero-trunk`
+  - `two_step_backend=identity-zero-trunk`
+
+Hardware correctness before benchmarking:
+- One-token non-echo parity seam:
+  - ANE generated `[105, 110, 116, 32]`
+  - CPU teacher generated `[105, 110, 116, 32]`
+- Exact two-token non-echo parity seam:
+  - ANE generated `[105, 110, 116, 32]`
+  - CPU teacher generated `[105, 110, 116, 32]`
+  - committed exact tokens/pass: `2.0`
+  - accepted future tokens/pass: `1.0`
+
+Offline gate on the fresh wrapper artifact:
+- prompt token: `35`
+- parity: `match`
+- committed exact tokens/pass: `2.0`
+- accepted future tokens/pass: `1.0`
+
+One-command wrapper (`scripts/reproduce_local_real_artifact_claim.sh`) on the non-echo artifact:
+- exact two-step median: `1.2012578125 ms/token`
+- exact one-token ANE control median: `1.0598854166666667 ms/token`
+- matched zero-weight `6`-layer CoreML median: `4.7705807291666664 ms/token`
+- exact two-step speedup vs CoreML: `3.9541428963040195x`
+- exact one-token control speedup vs CoreML: `4.4333998862550068x`
+- parity: `match`
+- committed exact tokens/pass: `2`
+- accepted future tokens/pass: `1`
+
+Repeated release-harness distribution (`5` fresh-process runs, medians sorted):
+- exact two-step ms/token: `[1.1363776041666667, 1.1460546874999999, 1.2012578125, 1.2064765624999998, 1.2205416666666666]`
+- exact one-token control ms/token: `[0.95070833333333338, 1.0116927083333334, 1.0598854166666667, 1.0760546874999999, 1.1303229166666668]`
+- CoreML ms/token: `[4.474846354166667, 4.6727552083333332, 4.7705807291666664, 4.7765468750000002, 4.8336796875000001]`
+
+Interpretation:
+- This is the stronger public story that the echo path could not provide on its own:
+  - non-echo artifact family
+  - exact parity preserved
+  - matched ANE/CoreML harness
+  - repeated medians
+  - one-command reproduction wrapper
+- The generic RWKV-style recurrent ANE kernel is still a negative result for non-echo work:
+  - raw one-hot input was written correctly
+  - the recurrent eval still returned all-zero `xOut` and `stateOut`
+  - the final non-echo claim therefore depends on the explicit `identity-zero-trunk` backend, not on a repaired generic recurrent cell
+- Important nuance:
+  - the exact two-step path is now publishably `>= 3x` over matched CoreML on this non-echo artifact family
+  - but it is still slower than the one-token ANE identity control because proposer cost remains CPU-side
+  - so this closes the public `>= 3x` ANE/CoreML decode claim on a non-echo artifact, not the broader “multi-token already wins every exact control” claim

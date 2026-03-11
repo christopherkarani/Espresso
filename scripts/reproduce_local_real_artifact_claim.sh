@@ -17,6 +17,8 @@ ITERATIONS="${ITERATIONS:-20}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-8}"
 MAX_SEQUENCE_TOKENS="${MAX_SEQUENCE_TOKENS:-32}"
 MAX_CORPUS_BYTES="${MAX_CORPUS_BYTES:-262144}"
+CONTROL_BACKEND="${CONTROL_BACKEND:-identity-zero-trunk}"
+TWO_STEP_BACKEND="${TWO_STEP_BACKEND:-identity-zero-trunk}"
 
 mkdir -p "$RESULTS_DIR"
 
@@ -60,6 +62,8 @@ echo "Generating matching zero-weight CoreML trunk into $COREML_MODEL"
 echo "Running public recurrent-checkpoint harness"
 RESULTS_DIR="$PUBLIC_RESULTS_DIR" \
 INPUT_MODE="recurrent-checkpoint" \
+CONTROL_BACKEND="$CONTROL_BACKEND" \
+TWO_STEP_BACKEND="$TWO_STEP_BACKEND" \
 RECURRENT_CHECKPOINT="$ARTIFACT_PREFIX.recurrent.bin" \
 FUTURE_SIDECAR="$ARTIFACT_PREFIX.future-sidecar.bin" \
 GENERATION_MODEL="$ARTIFACT_PREFIX.generation.bin" \
@@ -83,5 +87,7 @@ LAYER_COUNT="$LAYER_COUNT" \
   echo "offline_committed_exact_tokens_per_pass=$(jq -r '.committed_exact_tokens_per_pass' "$OFFLINE_GATE_JSON")"
   echo "offline_accepted_future_tokens_per_pass=$(jq -r '.accepted_future_tokens_per_pass' "$OFFLINE_GATE_JSON")"
   echo "offline_parity_status=$(jq -r '.parity_status' "$OFFLINE_GATE_JSON")"
+  echo "control_backend=$CONTROL_BACKEND"
+  echo "two_step_backend=$TWO_STEP_BACKEND"
   echo "public_summary=$PUBLIC_RESULTS_DIR/summary.txt"
 } | tee "$RESULTS_DIR/claim-summary.txt"

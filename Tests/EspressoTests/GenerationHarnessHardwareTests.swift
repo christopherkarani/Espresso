@@ -37,6 +37,23 @@ private struct CompileInitBenchmarkSample {
     let reportedCompileTimeMs: Double
 }
 
+private struct SurfacePeak: Equatable {
+    let channel: Int
+    let spatial: Int
+    let value: Float
+}
+
+private func peakValue(of values: [Float], spatial: Int) -> SurfacePeak {
+    precondition(spatial > 0)
+    precondition(values.count.isMultiple(of: spatial))
+    let winner = values.enumerated().max { lhs, rhs in lhs.element < rhs.element }!
+    return SurfacePeak(
+        channel: winner.offset / spatial,
+        spatial: winner.offset % spatial,
+        value: winner.element
+    )
+}
+
 private func fill(_ buffer: borrowing TensorBuffer, value: Float) {
     buffer.withUnsafeMutableBufferPointer { ptr in
         for idx in ptr.indices {
@@ -667,6 +684,196 @@ final class GenerationHarnessHardwareTests: XCTestCase {
 
         XCTAssertGreaterThan(promoted.wallInitMs, 0)
         XCTAssertGreaterThan(promoted.reportedCompileTimeMs, 0)
+    }
+
+    func test_ane_rmsnorm_classifier_head_selects_nonzero_token_on_hardware() throws {
+        try requireGenerationHardware()
+
+        let rmsFinal = TensorBuffer(count: ModelConfig.dim, zeroed: false)
+        rmsFinal.withUnsafeMutablePointer { ptr in
+            for idx in 0..<ModelConfig.dim {
+                ptr[idx] = 1
+            }
+        }
+
+        let classifier = TensorBuffer(count: ModelConfig.vocab * ModelConfig.dim, zeroed: true)
+        classifier.withUnsafeMutablePointer { ptr in
+            ptr[105 * ModelConfig.dim + 35] = 10
+        }
+
+        let head = try ANEGenerationRMSNormClassifierHead(
+            rmsFinal: rmsFinal,
+            classifierWeights: classifier,
+            vocabSize: ModelConfig.vocab,
+            laneSpatial: 32
+        )
+
+        let rawInput = TensorBuffer(count: ModelConfig.dim, zeroed: true)
+        rawInput.withUnsafeMutablePointer { ptr in
+            ptr[35] = 1
+        }
+
+        let selected = try head.selectArgmax(rawInput: rawInput)
+        XCTAssertEqual(selected, 105)
+    }
+
+    func test_recurrent_single_layer_zero_trunk_raw_surface_probe_on_hardware() throws {
+        try requireGenerationHardware()
+        guard ProcessInfo.processInfo.environment["ANE_NEGATIVE_PROBES"] == "1" else {
+            throw XCTSkip("Set ANE_NEGATIVE_PROBES=1 to run the documented negative recurrent raw-surface probe")
+        }
+
+        let weights = makeEchoRecurrentGenerationWeights(layerCount: 1)
+        var session = try RWKVStyleRecurrentSession(weights: weights.layers[0], laneSpatial: 32)
+        try session.reset()
+
+        let input = TensorBuffer(count: ModelConfig.dim, zeroed: true)
+        input.withUnsafeMutablePointer { ptr in
+            ptr[35] = 1
+        }
+        try SurfaceIO.copyFP16(
+            dst: session.handles.xIn,
+            dstChannelOffset: 0,
+            src: session.handles.zeroLane,
+            srcChannelOffset: 0,
+            channels: ModelConfig.dim,
+            spatial: session.handles.laneSpatial
+        )
+        try input.withUnsafeBufferPointer { tokenBuf in
+            try SurfaceIO.writeFP16SpatialSlice(
+                to: session.handles.xIn,
+                channelOffset: 0,
+                spatialIndex: 0,
+                spatial: session.handles.laneSpatial,
+                data: tokenBuf,
+                channels: ModelConfig.dim
+            )
+        }
+
+        let surfaceCount = ModelConfig.dim * session.handles.laneSpatial
+        var xInValues = [Float](repeating: 0, count: surfaceCount)
+        var xOutValues = [Float](repeating: 0, count: surfaceCount)
+        var stateOutValues = [Float](repeating: 0, count: surfaceCount)
+        xInValues.withUnsafeMutableBufferPointer { buffer in
+            SurfaceIO.readFP16(
+                from: session.handles.xIn,
+                into: buffer,
+                channelOffset: 0,
+                channels: ModelConfig.dim,
+                spatial: session.handles.laneSpatial
+            )
+        }
+
+        try session.kernels.step.eval()
+
+        xOutValues.withUnsafeMutableBufferPointer { buffer in
+            SurfaceIO.readFP16(
+                from: session.handles.xOut,
+                into: buffer,
+                channelOffset: 0,
+                channels: ModelConfig.dim,
+                spatial: session.handles.laneSpatial
+            )
+        }
+        stateOutValues.withUnsafeMutableBufferPointer { buffer in
+            SurfaceIO.readFP16(
+                from: session.handles.stateOut,
+                into: buffer,
+                channelOffset: 0,
+                channels: ModelConfig.dim,
+                spatial: session.handles.laneSpatial
+            )
+        }
+
+        let xInPeak = peakValue(of: xInValues, spatial: session.handles.laneSpatial)
+        let xOutPeak = peakValue(of: xOutValues, spatial: session.handles.laneSpatial)
+        let stateOutPeak = peakValue(of: stateOutValues, spatial: session.handles.laneSpatial)
+
+        print(
+            """
+            recurrent raw probe xInPeak=\(xInPeak) xOutPeak=\(xOutPeak) stateOutPeak=\(stateOutPeak)
+            """
+        )
+
+        XCTAssertEqual(xInPeak.channel, 35)
+        XCTAssertEqual(xInPeak.spatial, 0)
+        XCTAssertGreaterThan(xInPeak.value, 0.5)
+        XCTAssertTrue(
+            xOutPeak.value > 0.5 || stateOutPeak.value > 0.5,
+            "expected recurrent eval to preserve nonzero signal on at least one output surface; xOutPeak=\(xOutPeak) stateOutPeak=\(stateOutPeak)"
+        )
+    }
+
+    func test_identity_zero_trunk_local_bigram_recurrent_generation_matches_cpu_teacher_on_hardware() throws {
+        try requireGenerationHardware()
+
+        let recurrentWeights = try LocalBigramArtifactBuilder.buildRecurrentWeights(
+            tokens: [35, 105, 110, 116, 32, 105, 110, 116, 32],
+            layerCount: 1,
+            vocabSize: ModelConfig.vocab
+        )
+        let expectedTokens: [UInt16] = [105, 110, 116, 32]
+
+        let cpuTeacher = try CPURecurrentGenerationModel(
+            weights: recurrentWeights,
+            layerCount: 1
+        )
+        var cpuHarness = DirectTokenSelectionGenerationHarness(model: cpuTeacher, strategy: .argmax)
+        let cpuTrace = try cpuHarness.generate(promptTokens: [35], maxNewTokens: 4)
+
+        let aneModel = try ANERecurrentGenerationModel(
+            weights: recurrentWeights,
+            layerCount: 1,
+            maxSequenceTokens: 32,
+            outputHeadBackend: .aneRMSNormClassifier,
+            trunkBackend: .identityZeroTrunk
+        )
+        var aneHarness = DirectTokenSelectionGenerationHarness(model: aneModel, strategy: .argmax)
+        let aneTrace = try aneHarness.generate(promptTokens: [35], maxNewTokens: 4)
+
+        XCTAssertEqual(cpuTrace.generatedTokens, expectedTokens)
+        XCTAssertEqual(aneTrace.generatedTokens, expectedTokens)
+        XCTAssertEqual(aneTrace.generatedTokens, cpuTrace.generatedTokens)
+    }
+
+    func test_identity_zero_trunk_local_bigram_exact_two_token_generation_matches_cpu_teacher_on_hardware() throws {
+        try requireGenerationHardware()
+
+        let recurrentWeights = try LocalBigramArtifactBuilder.buildRecurrentWeights(
+            tokens: [35, 105, 110, 116, 32, 105, 110, 116, 32],
+            layerCount: 1,
+            vocabSize: ModelConfig.vocab
+        )
+        let futureSidecar = try LocalBigramArtifactBuilder.buildFutureSidecar(
+            tokens: [35, 105, 110, 116, 32, 105, 110, 116, 32],
+            layerCount: 1,
+            vocabSize: ModelConfig.vocab
+        )
+
+        let cpuTeacher = try CPURecurrentGenerationModel(
+            weights: recurrentWeights,
+            layerCount: 1
+        )
+        var cpuHarness = DirectTokenSelectionGenerationHarness(model: cpuTeacher, strategy: .argmax)
+        let cpuTrace = try cpuHarness.generate(promptTokens: [35], maxNewTokens: 4)
+
+        let aneModel = try ANEExactTwoTokenBranchStatePromotionModel(
+            weights: recurrentWeights,
+            futureSidecar: futureSidecar,
+            layerCount: 1,
+            maxSequenceTokens: 32,
+            outputHeadBackend: .aneRMSNormClassifier,
+            trunkBackend: .identityZeroTrunk
+        )
+        var aneHarness = ExactTwoTokenGenerationHarness(model: aneModel, strategy: .argmax)
+        let aneTrace = try aneHarness.generate(promptTokens: [35], maxNewTokens: 4)
+
+        XCTAssertEqual(aneTrace.generatedTokens, cpuTrace.generatedTokens)
+        XCTAssertEqual(aneTrace.generatedTokens, [105, 110, 116, 32])
+        XCTAssertEqual(aneTrace.committedExactTokenCounts, [2, 2])
+        XCTAssertEqual(aneTrace.acceptedFutureTokenCounts, [1, 1])
+        XCTAssertEqual(aneTrace.committedExactTokensPerPass, 2, accuracy: 0.0001)
+        XCTAssertEqual(aneTrace.acceptedFutureTokensPerPass, 1, accuracy: 0.0001)
     }
 
     func test_recurrent_exact_two_token_branch_state_promotion_reports_pass_breakdown_on_hardware() throws {

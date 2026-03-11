@@ -209,6 +209,8 @@ private func parseControlBackend(_ raw: String) -> RecurrentGenerationTrunkBacke
         return .fusedTwoLayerPairs
     case "fused-triplet":
         return .fusedThreeLayerTriplets
+    case "identity-zero-trunk":
+        return .identityZeroTrunk
     default:
         fatal("Unknown control backend: \(raw)")
     }
@@ -598,6 +600,7 @@ private func describe(_ backend: RecurrentGenerationTrunkBackend) -> String {
     case .singleLayer: return "single"
     case .fusedTwoLayerPairs: return "fused-pair"
     case .fusedThreeLayerTriplets: return "fused-triplet"
+    case .identityZeroTrunk: return "identity-zero-trunk"
     }
 }
 

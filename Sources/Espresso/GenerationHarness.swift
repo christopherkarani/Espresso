@@ -18,6 +18,7 @@ public enum RecurrentGenerationTrunkBackend: Sendable {
     case singleLayer
     case fusedTwoLayerPairs
     case fusedThreeLayerTriplets
+    case identityZeroTrunk
 }
 
 public struct GenerationPerformanceSnapshot: Sendable, Equatable {
@@ -248,6 +249,31 @@ public protocol ExactTwoTokenGeneratingLanguageModel: ~Copyable, GenerationPerfo
         remainingTokenBudget: Int,
         strategy: TokenSelectionStrategy
     ) throws(GenerationError) -> ExactTwoTokenPassResult
+}
+
+@inline(__always)
+private func tensorBufferIsAllZero(_ buffer: borrowing TensorBuffer) -> Bool {
+    buffer.withUnsafeBufferPointer { ptr in
+        for value in ptr where value != 0 {
+            return false
+        }
+        return true
+    }
+}
+
+private func recurrentWeightsUseIdentityZeroTrunk(
+    _ weights: borrowing RecurrentGenerationWeights,
+    layerCount: Int
+) -> Bool {
+    for idx in 0..<layerCount {
+        guard tensorBufferIsAllZero(weights.layers[idx].Wx),
+              tensorBufferIsAllZero(weights.layers[idx].Ws),
+              tensorBufferIsAllZero(weights.layers[idx].Wd),
+              tensorBufferIsAllZero(weights.layers[idx].Wo) else {
+            return false
+        }
+    }
+    return true
 }
 
 public protocol TwoTokenDraftingLanguageModel: ~Copyable {
@@ -893,6 +919,10 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
         if outputHeadBackend == .cpuExactStaged || outputHeadBackend == .cpuExactClustered {
             throw .invalidArguments("two-step branch-state promotion model does not support staged CPU output heads")
         }
+        if trunkBackend == .identityZeroTrunk,
+           !recurrentWeightsUseIdentityZeroTrunk(weights, layerCount: layerCount) {
+            throw .invalidArguments("identity zero-trunk backend requires all recurrent Wx/Ws/Wd/Wo weights to be zero")
+        }
 
         let compileStart = GenerationClock.now()
         let twoStepSessions: LayerStorage<RWKVStyleTwoStepRecurrentSession>
@@ -971,6 +1001,16 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
                 )
             } catch {
                 throw .runtimeFailure("fused three-layer two-step kernel/session setup failed: \(error)")
+            }
+        case .identityZeroTrunk:
+            twoStepSessions = LayerStorage<RWKVStyleTwoStepRecurrentSession>(count: 0) { _ in
+                fatalError("unreachable")
+            }
+            fusedPairTwoStepSessions = LayerStorage<RWKVStyleFusedTwoLayerTwoStepSession>(count: 0) { _ in
+                fatalError("unreachable")
+            }
+            fusedTripletTwoStepSessions = LayerStorage<RWKVStyleFusedThreeLayerTwoStepSession>(count: 0) { _ in
+                fatalError("unreachable")
             }
         }
 
@@ -1111,6 +1151,8 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
                     throw .runtimeFailure("two-step recurrent reset failed at layer \(idx): \(error)")
                 }
             }
+        case .identityZeroTrunk:
+            break
         case .fusedTwoLayerPairs:
             for idx in 0..<fusedPairTwoStepSessions.count {
                 do {
@@ -1307,6 +1349,8 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
                 }
                 sourcePairIsA.toggle()
             }
+        case .identityZeroTrunk:
+            sourcePairIsA = true
         case .fusedTwoLayerPairs:
             for idx in 0..<fusedPairTwoStepSessions.count {
                 var timings = StepTimingBreakdown()
@@ -1425,6 +1469,8 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
                     throw .runtimeFailure("two-step recurrent state promotion failed at layer \(idx): \(error)")
                 }
             }
+        case .identityZeroTrunk:
+            break
         case .fusedTwoLayerPairs:
             for idx in 0..<fusedPairTwoStepSessions.count {
                 do {
@@ -2591,6 +2637,10 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
         if trunkBackend == .fusedThreeLayerTriplets, !layerCount.isMultiple(of: 3) {
             throw .invalidArguments("fused three-layer recurrent trunk backend requires a layerCount that is a multiple of 3")
         }
+        if trunkBackend == .identityZeroTrunk,
+           !recurrentWeightsUseIdentityZeroTrunk(weights, layerCount: layerCount) {
+            throw .invalidArguments("identity zero-trunk backend requires all recurrent Wx/Ws/Wd/Wo weights to be zero")
+        }
         guard trunkLaneSpatial > 0 else {
             throw .invalidArguments("recurrent trunk laneSpatial must be > 0")
         }
@@ -2868,6 +2918,8 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
                     throw .runtimeFailure("recurrent reset failed at layer \(idx): \(error)")
                 }
             }
+        case .identityZeroTrunk:
+            break
         case .fusedTwoLayerPairs:
             for idx in 0..<fusedPairSessions.count {
                 do {
@@ -2988,6 +3040,8 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
                 }
                 sourceIsA.toggle()
             }
+        case .identityZeroTrunk:
+            sourceIsA = true
         case .fusedTwoLayerPairs:
             for idx in 0..<fusedPairSessions.count {
                 var timings = StepTimingBreakdown()

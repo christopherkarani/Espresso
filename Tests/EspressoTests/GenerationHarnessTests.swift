@@ -40,6 +40,14 @@ private func makeGenerationTestRecurrentWeights(layerCount: Int) -> RecurrentGen
     )
 }
 
+private func makeGenerationTestNonZeroRecurrentWeights(layerCount: Int) -> RecurrentGenerationWeights {
+    let weights = makeGenerationTestRecurrentWeights(layerCount: layerCount)
+    weights.layers[0].Wo.withUnsafeMutablePointer { ptr in
+        ptr[0] = 0.25
+    }
+    return weights
+}
+
 private func makeGenerationTestRowTensor(_ rows: [[Float]]) -> TensorBuffer {
     let buffer = TensorBuffer(count: rows.count * ModelConfig.dim, zeroed: true)
     buffer.withUnsafeMutablePointer { ptr in
@@ -748,6 +756,76 @@ final class GenerationHarnessTests: XCTestCase {
                 .invalidArguments("generation output-head laneSpatial must be > 0")
             )
         }
+    }
+
+    func test_recurrent_generation_identity_zero_trunk_backend_rejects_non_zero_weights() {
+        let weights = makeGenerationTestNonZeroRecurrentWeights(layerCount: 1)
+
+        do {
+            _ = try ANERecurrentGenerationModel(
+                weights: weights,
+                layerCount: 1,
+                maxSequenceTokens: 32,
+                outputHeadBackend: .cpu,
+                trunkBackend: .identityZeroTrunk
+            )
+            XCTFail("Expected non-zero recurrent weights to be rejected by identity zero-trunk backend")
+        } catch {
+            XCTAssertEqual(
+                error,
+                .invalidArguments("identity zero-trunk backend requires all recurrent Wx/Ws/Wd/Wo weights to be zero")
+            )
+        }
+    }
+
+    func test_recurrent_generation_identity_zero_trunk_backend_matches_local_bigram_teacher_tokens() throws {
+        let recurrentWeights = try LocalBigramArtifactBuilder.buildRecurrentWeights(
+            tokens: [35, 105, 110, 116, 32, 105, 110, 116, 32],
+            layerCount: 1,
+            vocabSize: ModelConfig.vocab
+        )
+        let model = try ANERecurrentGenerationModel(
+            weights: recurrentWeights,
+            layerCount: 1,
+            maxSequenceTokens: 32,
+            outputHeadBackend: .cpu,
+            trunkBackend: .identityZeroTrunk
+        )
+        var harness = DirectTokenSelectionGenerationHarness(model: model, strategy: .argmax)
+
+        let trace = try harness.generate(promptTokens: [35], maxNewTokens: 4)
+
+        XCTAssertEqual(trace.generatedTokens, [105, 110, 116, 32])
+    }
+
+    func test_exact_two_token_identity_zero_trunk_backend_matches_local_bigram_exact_contract() throws {
+        let recurrentWeights = try LocalBigramArtifactBuilder.buildRecurrentWeights(
+            tokens: [35, 105, 110, 116, 32, 105, 110, 116, 32],
+            layerCount: 1,
+            vocabSize: ModelConfig.vocab
+        )
+        let futureSidecar = try LocalBigramArtifactBuilder.buildFutureSidecar(
+            tokens: [35, 105, 110, 116, 32, 105, 110, 116, 32],
+            layerCount: 1,
+            vocabSize: ModelConfig.vocab
+        )
+        let model = try ANEExactTwoTokenBranchStatePromotionModel(
+            weights: recurrentWeights,
+            futureSidecar: futureSidecar,
+            layerCount: 1,
+            maxSequenceTokens: 32,
+            outputHeadBackend: .cpu,
+            trunkBackend: .identityZeroTrunk
+        )
+        var harness = ExactTwoTokenGenerationHarness(model: model, strategy: .argmax)
+
+        let trace = try harness.generate(promptTokens: [35], maxNewTokens: 4)
+
+        XCTAssertEqual(trace.generatedTokens, [105, 110, 116, 32])
+        XCTAssertEqual(trace.committedExactTokenCounts, [2, 2])
+        XCTAssertEqual(trace.acceptedFutureTokenCounts, [1, 1])
+        XCTAssertEqual(trace.committedExactTokensPerPass, 2, accuracy: 0.0001)
+        XCTAssertEqual(trace.acceptedFutureTokensPerPass, 1, accuracy: 0.0001)
     }
 
     func test_exact_output_head_shard_summaries_bound_true_logits_per_shard() throws {

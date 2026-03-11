@@ -114,3 +114,8 @@
 - Never trust a new ANE decode substrate just because the synthetic echo harness stays on token `0`; an all-zero output surface also argmaxes to `0` and can look superficially correct.
 - Before treating any off-echo artifact benchmark as valid, add at least one hardware correctness seam that expects a nonzero token and verify the ANE path matches a CPU teacher on that exact prompt.
 - When a real-artifact benchmark collapses to zeros, revert the debug code after capturing the negative result in docs/results/memory; keep the branch clean and do not let failing probes masquerade as implementation progress.
+
+## 2026-03-11 — Zero-Trunk Artifacts Need An Explicit Exact Backend
+- When the saved recurrent artifact is mathematically zero-trunk, do not keep forcing it through a broken generic recurrent kernel just because the interface exists; first prove the kernel is wrong with a raw-surface hardware probe, then add the smallest exact backend that matches the artifact contract.
+- Keep that specialization explicit in the benchmark contract and CLI (`identity-zero-trunk` here); hidden auto-detection would make the public claim harder to audit.
+- A stronger public story can come from a non-echo artifact family even if the multi-token path is not the fastest ANE variant, as long as the same matched harness shows exact parity and `>= 3x` over CoreML.

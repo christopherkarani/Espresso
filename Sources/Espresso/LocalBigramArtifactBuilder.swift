@@ -25,6 +25,24 @@ public struct LocalBigramArtifacts: ~Copyable {
 }
 
 public enum LocalBigramArtifactBuilder {
+    public static func buildRecurrentWeights(
+        tokens: [UInt16],
+        layerCount: Int,
+        vocabSize: Int = ModelConfig.vocab
+    ) throws(LocalBigramArtifactBuilderError) -> RecurrentGenerationWeights {
+        let artifacts = try build(tokens: tokens, layerCount: layerCount, vocabSize: vocabSize)
+        return artifacts.recurrentWeights
+    }
+
+    public static func buildFutureSidecar(
+        tokens: [UInt16],
+        layerCount: Int,
+        vocabSize: Int = ModelConfig.vocab
+    ) throws(LocalBigramArtifactBuilderError) -> TwoStepStudentSidecar {
+        let artifacts = try build(tokens: tokens, layerCount: layerCount, vocabSize: vocabSize)
+        return artifacts.futureSidecar
+    }
+
     public static func build(
         tokens: [UInt16],
         layerCount: Int,
