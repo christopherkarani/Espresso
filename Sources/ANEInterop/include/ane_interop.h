@@ -203,6 +203,29 @@ bool ane_interop_io_copy_multi_src(IOSurfaceRef dst,
                                    int region_count,
                                    int spatial);
 
+/// Write embeddings for multiple streams to their spatial lanes under one lock.
+/// Fuses embedding lookup + FP32→FP16 conversion + strided write.
+/// embedding_table is FP32 [vocabSize × dim], row-major.
+bool ane_interop_io_write_embedding_batch_fp16(
+    IOSurfaceRef surface,
+    int ch_off,
+    int spatial,
+    const float *embedding_table,
+    int dim,
+    const uint16_t *token_ids,
+    int stream_count);
+
+/// Argmax over multiple spatial lanes under one lock.
+/// Writes stream_count (index, value) pairs to out_indices and out_values.
+bool ane_interop_io_argmax_batch_fp16_spatial(
+    IOSurfaceRef surface,
+    int ch_off,
+    int spatial,
+    int channels,
+    int stream_count,
+    int *out_indices,
+    float *out_values);
+
 /// Lock/unlock surfaces independently for batched I/O sequences.
 /// Use these to amortize lock overhead across write→eval→read cycles.
 bool ane_interop_io_lock_write(IOSurfaceRef surface);
