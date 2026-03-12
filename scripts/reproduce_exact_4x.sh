@@ -343,6 +343,7 @@ jq -s \
   committed_exact_tokens_per_pass: (map(.two_step.median_committed_exact_tokens_per_pass) | sort | .[((length - 1) / 2 | floor)]),
   accepted_future_tokens_per_pass: (map(.two_step.median_accepted_future_tokens_per_pass) | sort | .[((length - 1) / 2 | floor)]),
   all_parity_match: (all(.[]; .parity_status == "match")),
+  per_run_parity: (map(.parity_status)),
   per_run_timestamps: (map(.probe_timestamp // null))
 }' "${valid_runs[@]}" > "$RESULTS_DIR/summary.json"
 
