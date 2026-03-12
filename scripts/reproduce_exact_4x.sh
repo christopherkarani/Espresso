@@ -412,7 +412,9 @@ jq -s \
     iqr_ms: (map(.control.median_ms_per_token) | sort | if length < 4 then (last - first) else (.[((length * 3 / 4) | floor)] - .[((length / 4) | floor)]) end),
     breakdown: {
       trunk_ms_per_token: (map(.control.median_trunk_ms_per_token // null) | if all(. != null) then sort | .[((length - 1) / 2 | floor)] else null end),
-      logits_ms_per_token: (map(.control.median_logits_ms_per_token // null) | if all(. != null) then sort | .[((length - 1) / 2 | floor)] else null end)
+      logits_ms_per_token: (map(.control.median_logits_ms_per_token // null) | if all(. != null) then sort | .[((length - 1) / 2 | floor)] else null end),
+      per_run_trunk_ms: (map(.control.median_trunk_ms_per_token // null)),
+      per_run_logits_ms: (map(.control.median_logits_ms_per_token // null))
     }
   },
   coreml: {
@@ -430,7 +432,9 @@ jq -s \
     iqr_ms: (map(.coreml.median_ms_per_token) | sort | if length < 4 then (last - first) else (.[((length * 3 / 4) | floor)] - .[((length / 4) | floor)]) end),
     breakdown: {
       trunk_ms_per_token: (map(.coreml.median_trunk_ms_per_token // null) | if all(. != null) then sort | .[((length - 1) / 2 | floor)] else null end),
-      logits_ms_per_token: (map(.coreml.median_logits_ms_per_token // null) | if all(. != null) then sort | .[((length - 1) / 2 | floor)] else null end)
+      logits_ms_per_token: (map(.coreml.median_logits_ms_per_token // null) | if all(. != null) then sort | .[((length - 1) / 2 | floor)] else null end),
+      per_run_trunk_ms: (map(.coreml.median_trunk_ms_per_token // null)),
+      per_run_logits_ms: (map(.coreml.median_logits_ms_per_token // null))
     }
   },
   two_step_speedup_vs_coreml: (map(.two_step_speedup_vs_coreml) | sort | .[((length - 1) / 2 | floor)]),
