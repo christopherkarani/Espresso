@@ -1668,7 +1668,8 @@ final class GenerationHarnessHardwareTests: XCTestCase {
             let laneSpatial: Int
             if streamCount <= 32 { laneSpatial = 32 }
             else if streamCount <= 64 { laneSpatial = 64 }
-            else { laneSpatial = 128 }
+            else if streamCount <= 128 { laneSpatial = 128 }
+            else { laneSpatial = 256 }
 
             let compileStart = GenerationClock.now()
 
@@ -1876,7 +1877,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         let warmup = 3
         let iterations = 20
         let maxNewTokens = 8
-        let streamCounts = [1, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128]
+        let streamCounts = [32, 64, 128, 256]
 
         let batched = try benchmarkBatchedRecurrentGeneration(
             layerCount: 6,

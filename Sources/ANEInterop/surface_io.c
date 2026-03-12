@@ -5,6 +5,7 @@
 
 #if defined(__aarch64__) || defined(__arm64__)
 #include <arm_neon.h>
+#define ARGMAX_MAX_NVECS 64  /* supports up to spatial=512 */
 #endif
 
 #include "ane_interop.h"
@@ -470,6 +471,44 @@ bool ane_interop_io_write_embedding_batch_fp16(
 
     {
         _Float16 *dstF16 = (_Float16 *)base;
+
+#if defined(__aarch64__) || defined(__arm64__)
+        /*
+         * NEON channel-major embedding write.
+         * For each channel c, gather embedding values from all streams and
+         * convert float32→fp16 in 8-wide NEON vectors, writing a contiguous
+         * row per channel. Much better cache behavior than per-stream scattered writes.
+         */
+        if (stream_count > 0 && (stream_count % 8) == 0 && stream_count <= 512) {
+            /* Pre-compute row pointers for each stream (avoid repeated multiply in inner loop) */
+            const float *embRows[512];
+            for (int s = 0; s < stream_count; s++) {
+                embRows[s] = embedding_table + (size_t)token_ids[s] * (size_t)dim;
+            }
+
+            for (int c = 0; c < dim; c++) {
+                _Float16 *dstRow = dstF16 + (size_t)(ch_off + c) * spatialSz;
+                for (int s = 0; s < stream_count; s += 8) {
+                    float32x4_t lo = {
+                        embRows[s+0][c], embRows[s+1][c],
+                        embRows[s+2][c], embRows[s+3][c]
+                    };
+                    float32x4_t hi = {
+                        embRows[s+4][c], embRows[s+5][c],
+                        embRows[s+6][c], embRows[s+7][c]
+                    };
+                    float16x4_t lo16 = vcvt_f16_f32(lo);
+                    float16x4_t hi16 = vcvt_f16_f32(hi);
+                    float16x8_t combined = vcombine_f16(lo16, hi16);
+                    vst1q_f16(dstRow + s, combined);
+                }
+            }
+            ok = true;
+            goto cleanup;
+        }
+#endif
+
+        /* Scalar fallback */
         for (int s = 0; s < stream_count; s++) {
             int token = (int)token_ids[s];
             const float *embRow = embedding_table + (size_t)token * (size_t)dim;
@@ -527,12 +566,11 @@ bool ane_interop_io_argmax_batch_fp16_spatial(
          * Process spatial lanes as N × float16x8_t per channel row.
          * Branchless: vcgtq_f16 + vbslq for masked conditional update.
          * Indices tracked as uint16_t (fits vocab ≤ 65535).
-         * Supports any spatial that is a multiple of 8, up to 128.
          */
-        if (spatial > 0 && spatial <= 128 && (spatial % 8) == 0) {
+        if (spatial > 0 && spatial <= 512 && (spatial % 8) == 0) {
             const int nvecs = spatial / 8;
-            float16x8_t bestV[16];
-            uint16x8_t bestI[16];
+            float16x8_t bestV[ARGMAX_MAX_NVECS];
+            uint16x8_t bestI[ARGMAX_MAX_NVECS];
 
             const _Float16 *row0 = srcF16 + (size_t)ch_off * spatialSz;
             for (int v = 0; v < nvecs; v++) {
@@ -551,14 +589,12 @@ bool ane_interop_io_argmax_batch_fp16_spatial(
                 }
             }
 
-            /* Store results */
-            _Float16 bvBuf[128];
-            uint16_t biBuf[128];
+            _Float16 bvBuf[512];
+            uint16_t biBuf[512];
             for (int v = 0; v < nvecs; v++) {
                 vst1q_f16(bvBuf + v * 8, bestV[v]);
                 vst1q_u16(biBuf + v * 8, bestI[v]);
             }
-
             for (int s = 0; s < stream_count; s++) {
                 out_indices[s] = (int)biBuf[s];
                 out_values[s] = (float)bvBuf[s];
