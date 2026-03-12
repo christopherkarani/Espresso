@@ -357,6 +357,7 @@ jq -s \
   --arg power_source "$(pmset -g batt 2>/dev/null | head -1 | sed "s/.*'\(.*\)'.*/\1/" || echo unknown)" \
   --argjson outer_elapsed "$(printf '%s\n' "${valid_outer_elapsed[@]}" | jq -s '.')" \
 '{
+  probe_version: (map(.probe_version // null) | .[0]),
   results_dir: $dir,
   timestamp: $ts,
   git_commit: $commit,
