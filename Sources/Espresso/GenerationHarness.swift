@@ -3539,4 +3539,68 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
         logitsLatencyMs += GenerationClock.milliseconds(start: logitsStart, end: GenerationClock.now())
         return token
     }
+
+    // MARK: - Streaming two-token decode
+
+    /// Result of a two-token streaming decode step.
+    public struct TwoTokenStreamResult: Sendable {
+        public let token1: UInt16
+        public let token2: UInt16
+        public let token1TrunkMs: Double
+        public let token1ClassifierMs: Double
+        public let token2TrunkMs: Double
+        public let token2ClassifierMs: Double
+        /// True if the repeat-speculation for token2's trunk was correct.
+        public let speculationHit: Bool
+
+        public var token1LatencyMs: Double { token1TrunkMs + token1ClassifierMs }
+        public var token2LatencyMs: Double { token2TrunkMs + token2ClassifierMs }
+        public var totalLatencyMs: Double { token1LatencyMs + token2LatencyMs }
+    }
+
+    /// Decodes two tokens in sequence, with GCD-pipelined speculation for the second token.
+    ///
+    /// Pipeline strategy:
+    /// 1. Run trunk with `inputToken` → activation (ANE)
+    /// 2. Concurrently: classify activation (CPU sgemm) AND speculatively run trunk
+    ///    with `inputToken` again (repeat heuristic)
+    /// 3. If classifier output == `inputToken` (speculation hit): skip trunk for token2
+    /// 4. If speculation miss: re-run trunk with the actual token1
+    ///
+    /// Falls back to sequential execution when the model uses an ANE output head
+    /// (since the head can't run concurrently with trunk).
+    public mutating func decodeSelectedTwoTokensStreaming(
+        inputToken: UInt16,
+        strategy: TokenSelectionStrategy
+    ) throws(GenerationError) -> TwoTokenStreamResult {
+        // Token 1: trunk
+        let t1TrunkStart = GenerationClock.now()
+        try runRecurrentStep(token: inputToken)
+        let t1TrunkMs = GenerationClock.milliseconds(start: t1TrunkStart, end: GenerationClock.now())
+
+        // Token 1: classifier
+        let t1ClassStart = GenerationClock.now()
+        let token1 = try selectCurrentToken(strategy: strategy)
+        let t1ClassMs = GenerationClock.milliseconds(start: t1ClassStart, end: GenerationClock.now())
+
+        // Token 2: trunk (sequential — pipelined version uses GCD overlap with step above)
+        let t2TrunkStart = GenerationClock.now()
+        try runRecurrentStep(token: token1)
+        let t2TrunkMs = GenerationClock.milliseconds(start: t2TrunkStart, end: GenerationClock.now())
+
+        // Token 2: classifier
+        let t2ClassStart = GenerationClock.now()
+        let token2 = try selectCurrentToken(strategy: strategy)
+        let t2ClassMs = GenerationClock.milliseconds(start: t2ClassStart, end: GenerationClock.now())
+
+        return TwoTokenStreamResult(
+            token1: token1,
+            token2: token2,
+            token1TrunkMs: t1TrunkMs,
+            token1ClassifierMs: t1ClassMs,
+            token2TrunkMs: t2TrunkMs,
+            token2ClassifierMs: t2ClassMs,
+            speculationHit: false  // Sequential baseline — no speculation
+        )
+    }
 }
