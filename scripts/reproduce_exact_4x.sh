@@ -115,6 +115,12 @@ trap cleanup_on_interrupt INT TERM
   if [[ -n "$GENERATION_MODEL" ]]; then
     echo "generation_model_sha256=$(shasum -a 256 "$GENERATION_MODEL" | awk '{print $1}')"
   fi
+  # CoreML model hash (directory — hash all file contents deterministically)
+  if [[ -d "$COREML_MODEL" ]]; then
+    echo "coreml_model_sha256=$(find "$COREML_MODEL" -type f | sort | xargs shasum -a 256 | shasum -a 256 | awk '{print $1}')"
+  elif [[ -f "$COREML_MODEL" ]]; then
+    echo "coreml_model_sha256=$(shasum -a 256 "$COREML_MODEL" | awk '{print $1}')"
+  fi
   # System environment snapshot for regression diagnosis
   echo "chip=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo unknown)"
   echo "hw_model=$(sysctl -n hw.model 2>/dev/null || echo unknown)"
