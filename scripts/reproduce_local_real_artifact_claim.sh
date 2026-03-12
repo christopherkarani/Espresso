@@ -122,8 +122,11 @@ LAYER_COUNT="$LAYER_COUNT" \
     echo "harness_valid_runs=$(jq -r '.valid_runs' "$PUBLIC_RESULTS_DIR/summary.json")"
     echo "harness_failed_runs=$(jq -r '.failed_runs // 0' "$PUBLIC_RESULTS_DIR/summary.json")"
   fi
-  # Propagate gate status from inner harness
-  if [[ -f "$PUBLIC_RESULTS_DIR/summary.txt" ]]; then
+  # Propagate gate status from inner harness (prefer JSON source)
+  if [[ -f "$PUBLIC_RESULTS_DIR/summary.json" ]]; then
+    echo "harness_gate_status=$(jq -r '.reproducibility.gate_status // "unknown"' "$PUBLIC_RESULTS_DIR/summary.json")"
+    echo "harness_outlier_count=$(jq -r '.reproducibility.outlier_count // 0' "$PUBLIC_RESULTS_DIR/summary.json")"
+  elif [[ -f "$PUBLIC_RESULTS_DIR/summary.txt" ]]; then
     gate_line="$(grep '^gate_status=' "$PUBLIC_RESULTS_DIR/summary.txt" || true)"
     if [[ -n "$gate_line" ]]; then
       echo "harness_$gate_line"
