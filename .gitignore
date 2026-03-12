@@ -23,6 +23,8 @@ xcuserdata/
 
 # Git worktrees
 .worktrees/
+autoresearch-master/
+autoresearch-results.tsv
 
 # Large model weights (>10MB binaries)
 # Golden test fixtures are tracked; add entries here for actual model weights
