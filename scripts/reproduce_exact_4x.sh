@@ -380,4 +380,16 @@ if [[ ${#valid_runs[@]} -ge 4 ]]; then
   fi
 fi
 
+# Merge gate status and outlier info into summary.json
+gate_json="$(jq -n \
+  --arg status "$gate_status" \
+  --arg cv_thresh "$CV_THRESHOLD" \
+  --argjson outlier_count "$outlier_count" \
+  '{gate_status: $status, cv_threshold: ($cv_thresh | tonumber), outlier_count: $outlier_count}')"
+if [[ ${#valid_runs[@]} -ge 4 && -n "$outlier_info" ]]; then
+  gate_json="$(echo "$gate_json" | jq --argjson oi "$outlier_info" '. + {outlier_fences: {lo: $oi.lo_fence, hi: $oi.hi_fence, q1: $oi.q1, q3: $oi.q3, iqr: $oi.iqr}}')"
+fi
+jq --argjson gate "$gate_json" '. + {reproducibility: $gate}' "$RESULTS_DIR/summary.json" > "$RESULTS_DIR/summary.json.tmp" \
+  && mv "$RESULTS_DIR/summary.json.tmp" "$RESULTS_DIR/summary.json"
+
 echo "Wrote raw JSON, stderr logs, and summary.json to $RESULTS_DIR"
