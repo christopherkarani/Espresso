@@ -1096,7 +1096,7 @@ bool ane_interop_io_argmax_batch_fp16_spatial_parallel(
             surface, ch_off, spatial, channels, stream_count,
             out_indices, out_values);
     }
-    if (n_blocks > 8) n_blocks = 8;  /* cap at 8 */
+    if (n_blocks > 8) n_blocks = 8;  /* cap at 8: n=16 shows regression from dispatch overhead */
 
     size_t spatialSz = (size_t)spatial;
     size_t maxCh = (size_t)(ch_off + channels - 1);
