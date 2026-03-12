@@ -281,6 +281,7 @@ jq -s \
   --argjson layers "$LAYER_COUNT" \
   --arg control_backend "$CONTROL_BACKEND" \
   --arg two_step_backend "$TWO_STEP_BACKEND" \
+  --arg output_head_backend "$OUTPUT_HEAD_BACKEND" \
   --argjson requested_repeats "$REPEATS" \
   --argjson failed "$failed_runs" \
   --argjson total_elapsed_s "$total_benchmark_elapsed" \
@@ -296,6 +297,7 @@ jq -s \
     input_mode: $input_mode,
     control_backend: $control_backend,
     two_step_backend: $two_step_backend,
+    output_head_backend: $output_head_backend,
     warmup: $warmup,
     iterations: $iterations,
     max_new_tokens: $max_new_tokens,
