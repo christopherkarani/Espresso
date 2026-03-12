@@ -98,10 +98,10 @@ public struct TensorBuffer: ~Copyable {
 
     /// Creates a non-owning view over an arbitrary Float pointer.
     ///
-    /// Internal use only — the caller must guarantee the pointer remains valid
+    /// The caller must guarantee the pointer remains valid
     /// for the lifetime of the returned TensorBuffer.
     @inline(__always)
-    internal init(nonOwningPointer ptr: UnsafeMutablePointer<Float>, count: Int) {
+    public init(nonOwningPointer ptr: UnsafeMutablePointer<Float>, count: Int) {
         precondition(count >= 0)
         self.count = count
         self.rawStorage = UnsafeMutableRawPointer(ptr)

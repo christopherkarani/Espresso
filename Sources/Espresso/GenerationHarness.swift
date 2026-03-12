@@ -2771,6 +2771,7 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
     private var logitsLatencyMs: Double
     private let blockMaxNorms: [Float]
     private let partitionedLogitsScratch: TensorBuffer
+    private let deferredANEHead: DeferredANEHead?
 
     public var performanceSnapshot: GenerationPerformanceSnapshot {
         GenerationPerformanceSnapshot(
@@ -2905,6 +2906,36 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
             partitionedLogitsScratch = TensorBuffer(count: 0, zeroed: true)
         }
 
+        // Deferred ANE compilation: extract raw pointers before weights are consumed
+        let deferredANEHead: DeferredANEHead?
+        if outputHeadBackend == .cpuThenANE {
+            let deferred = DeferredANEHead()
+            let rmsPtr = rmsFinal.withUnsafePointer { UnsafeMutablePointer(mutating: $0) }
+            let clsPtr: UnsafeMutablePointer<Float>
+            if sharedClassifier {
+                clsPtr = embedding.withUnsafePointer { UnsafeMutablePointer(mutating: $0) }
+            } else {
+                clsPtr = classifier.withUnsafePointer { UnsafeMutablePointer(mutating: $0) }
+            }
+            let clsCount = vocabSize * ModelConfig.dim
+            let capturedVocab = vocabSize
+            let capturedLane = outputHeadLaneSpatial
+            // Background compile — pointers valid because self owns the TensorBuffers
+            DispatchQueue.global(qos: .userInitiated).async {
+                let rmsBuf = TensorBuffer(nonOwningPointer: rmsPtr, count: ModelConfig.dim)
+                let clsBuf = TensorBuffer(nonOwningPointer: clsPtr, count: clsCount)
+                if let head = try? ANEGenerationRMSNormClassifierHead(
+                    rmsFinal: rmsBuf, classifierWeights: clsBuf,
+                    vocabSize: capturedVocab, laneSpatial: capturedLane
+                ) {
+                    deferred.store(head)
+                }
+            }
+            deferredANEHead = deferred
+        } else {
+            deferredANEHead = nil
+        }
+
         self.vocabSize = vocabSize
         self.layerCount = layerCount
         self.maxSequenceTokens = maxSequenceTokens
@@ -2932,6 +2963,7 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
         self.logitsLatencyMs = 0
         self.blockMaxNorms = blockMaxNorms
         self.partitionedLogitsScratch = partitionedLogitsScratch
+        self.deferredANEHead = deferredANEHead
     }
 
     private static func emptyLayerStorage<Element: ~Copyable>(_: Element.Type = Element.self) -> LayerStorage<Element> {
@@ -3447,30 +3479,39 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
                 token = try aneRMSNormClassifierHead.selectArgmax(rawInput: activationB)
             }
         case .cpuThenANE:
-            stepLogits.zero()
-            stepLogits.withUnsafeMutablePointer { logitsPtr in
-                classifierPointer { clsPtr in
-                    stepNorm.withUnsafePointer { normPtr in
-                        BLAS.sgemm(
-                            CblasRowMajor,
-                            CblasNoTrans,
-                            CblasNoTrans,
-                            m: Int32(vocabSize),
-                            n: 1,
-                            k: Int32(ModelConfig.dim),
-                            alpha: 1.0,
-                            a: clsPtr,
-                            lda: Int32(ModelConfig.dim),
-                            b: normPtr,
-                            ldb: 1,
-                            beta: 0.0,
-                            c: logitsPtr,
-                            ldc: 1
-                        )
+            // If deferred ANE head is ready, use it; otherwise fall through to CPU sgemm
+            if let readyHead = deferredANEHead?.readyHead() {
+                if currentActivationIsA {
+                    token = try readyHead.selectArgmax(rawInput: activationA)
+                } else {
+                    token = try readyHead.selectArgmax(rawInput: activationB)
+                }
+            } else {
+                stepLogits.zero()
+                stepLogits.withUnsafeMutablePointer { logitsPtr in
+                    classifierPointer { clsPtr in
+                        stepNorm.withUnsafePointer { normPtr in
+                            BLAS.sgemm(
+                                CblasRowMajor,
+                                CblasNoTrans,
+                                CblasNoTrans,
+                                m: Int32(vocabSize),
+                                n: 1,
+                                k: Int32(ModelConfig.dim),
+                                alpha: 1.0,
+                                a: clsPtr,
+                                lda: Int32(ModelConfig.dim),
+                                b: normPtr,
+                                ldb: 1,
+                                beta: 0.0,
+                                c: logitsPtr,
+                                ldc: 1
+                            )
+                        }
                     }
                 }
+                token = try selectToken(from: stepLogits, strategy: strategy)
             }
-            token = try selectToken(from: stepLogits, strategy: strategy)
         case .cpuPartitionedArgmax:
             // Partitioned argmax with Cauchy-Schwarz block pruning (greedy only)
             var skippedBlocks = 0
