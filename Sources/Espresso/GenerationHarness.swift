@@ -1321,6 +1321,40 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
         }
 
         try Self.writeTokenEmbedding(token, embedding: embedding, into: pair0ActivationA)
+
+        // Fast path for identity-zero-trunk: skip pair1 entirely (trunk is no-op,
+        // and pair1 output head result is discarded anyway during single-token commit).
+        // This halves the output-head cost during prefill.
+        if case .identityZeroTrunk = trunkBackend {
+            let logitsStart = GenerationClock.now()
+            let exactNextToken = try Self.selectTokenFromActivation(
+                pair0ActivationA,
+                strategy: strategy,
+                outputHeadBackend: outputHeadBackend,
+                rmsFinal: rmsFinal,
+                stepNorm: stepNorm,
+                stepLogits: stepLogits,
+                embedding: embedding,
+                classifier: classifier,
+                sharedClassifier: sharedClassifier,
+                aneClassifierHead: aneClassifierHead,
+                aneRMSNormClassifierHead: aneRMSNormClassifierHead,
+                vocabSize: vocabSize,
+                stepRMSWorkspace: stepRMSWorkspace
+            )
+            let logitsLatencyMs = GenerationClock.milliseconds(start: logitsStart, end: GenerationClock.now())
+            self.logitsLatencyMs += logitsLatencyMs
+
+            let stateAdvanceLatencyMs = try promotePreparedPair(stepCount: 1)
+            captureProposalActivationForNextPass(sourcePairIsA: true, committedStepCount: 1)
+            consumedTokens += 1
+            lastSingleTokenTrunkLatencyMs = stateAdvanceLatencyMs
+            lastSingleTokenLogitsLatencyMs = logitsLatencyMs
+            return exactNextToken
+        }
+
+        // Non-identity trunks: use full pair preparation (trunk processes both pairs
+        // for state management, but pair1 output head result is still discarded)
         pair1ActivationA.zero()
         let prepared = try prepareActivationPair(strategy: strategy)
         let stateAdvanceLatencyMs = try promotePreparedPair(stepCount: 1)

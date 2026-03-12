@@ -278,10 +278,12 @@ where Model: DirectTokenSelectingLanguageModel & GenerationPerformanceTrackable,
     var throughput: [Double] = []
     var trunkLatencies: [Double] = []
     var logitsLatencies: [Double] = []
+    var prefillLatencies: [Double] = []
     tokenLatencies.reserveCapacity(iterations)
     throughput.reserveCapacity(iterations)
     trunkLatencies.reserveCapacity(iterations)
     logitsLatencies.reserveCapacity(iterations)
+    prefillLatencies.reserveCapacity(iterations)
 
     let compileTimeMs = harness.model.performanceSnapshot.compileTimeMs
 
@@ -293,6 +295,7 @@ where Model: DirectTokenSelectingLanguageModel & GenerationPerformanceTrackable,
             throughput.append(trace.tokensPerSecond)
             trunkLatencies.append(snapshot.trunkLatencyMs / Double(maxNewTokens))
             logitsLatencies.append(snapshot.logitsLatencyMs / Double(maxNewTokens))
+            prefillLatencies.append(trace.prefillLatencyMs)
         }
     }
 
@@ -301,7 +304,8 @@ where Model: DirectTokenSelectingLanguageModel & GenerationPerformanceTrackable,
         medianTokensPerSecond: median(throughput),
         compileTimeMs: compileTimeMs,
         medianTrunkMsPerToken: median(trunkLatencies),
-        medianLogitsMsPerToken: median(logitsLatencies)
+        medianLogitsMsPerToken: median(logitsLatencies),
+        medianPrefillMs: median(prefillLatencies)
     )
 }
 
@@ -321,6 +325,7 @@ where Model: ExactTwoTokenGeneratingLanguageModel & GenerationPerformanceTrackab
     var verifierTrunkMsPerPass: [Double] = []
     var verifierLogitsMsPerPass: [Double] = []
     var stateAdvanceMsPerPass: [Double] = []
+    var prefillLatencies: [Double] = []
 
     tokenLatencies.reserveCapacity(iterations)
     throughput.reserveCapacity(iterations)
@@ -330,6 +335,7 @@ where Model: ExactTwoTokenGeneratingLanguageModel & GenerationPerformanceTrackab
     verifierTrunkMsPerPass.reserveCapacity(iterations)
     verifierLogitsMsPerPass.reserveCapacity(iterations)
     stateAdvanceMsPerPass.reserveCapacity(iterations)
+    prefillLatencies.reserveCapacity(iterations)
 
     let compileTimeMs = harness.model.performanceSnapshot.compileTimeMs
 
@@ -344,6 +350,7 @@ where Model: ExactTwoTokenGeneratingLanguageModel & GenerationPerformanceTrackab
             verifierTrunkMsPerPass.append(trace.verifierTrunkLatencyMsPerPass)
             verifierLogitsMsPerPass.append(trace.verifierLogitsLatencyMsPerPass)
             stateAdvanceMsPerPass.append(trace.stateAdvanceLatencyMsPerPass)
+            prefillLatencies.append(trace.prefillLatencyMs)
         }
     }
 
@@ -356,7 +363,8 @@ where Model: ExactTwoTokenGeneratingLanguageModel & GenerationPerformanceTrackab
         medianProposerMsPerPass: median(proposerMsPerPass),
         medianVerifierTrunkMsPerPass: median(verifierTrunkMsPerPass),
         medianVerifierLogitsMsPerPass: median(verifierLogitsMsPerPass),
-        medianStateAdvanceMsPerPass: median(stateAdvanceMsPerPass)
+        medianStateAdvanceMsPerPass: median(stateAdvanceMsPerPass),
+        medianPrefillMs: median(prefillLatencies)
     )
 }
 
@@ -562,6 +570,8 @@ private func comparePayload(options: Options) throws -> [String: Any] {
             "median_tokens_per_second": control.medianTokensPerSecond,
             "median_trunk_ms_per_token": control.medianTrunkMsPerToken,
             "median_logits_ms_per_token": control.medianLogitsMsPerToken,
+            "ttft_ms": control.medianPrefillMs,
+            "ttft_cold_ms": controlInitMs + control.medianPrefillMs,
             "generated_tokens": controlParityTrace.generatedTokens.map(Int.init),
         ],
         "two_step": [
@@ -575,6 +585,8 @@ private func comparePayload(options: Options) throws -> [String: Any] {
             "median_verifier_trunk_ms_per_pass": twoStep.medianVerifierTrunkMsPerPass,
             "median_verifier_logits_ms_per_pass": twoStep.medianVerifierLogitsMsPerPass,
             "median_state_advance_ms_per_pass": twoStep.medianStateAdvanceMsPerPass,
+            "ttft_ms": twoStep.medianPrefillMs,
+            "ttft_cold_ms": twoStepInitMs + twoStep.medianPrefillMs,
             "generated_tokens": twoStepParityTrace.generatedTokens.map(Int.init),
         ],
     ]
@@ -588,6 +600,8 @@ private func comparePayload(options: Options) throws -> [String: Any] {
             "reported_compile_ms": coreML.compileTimeMs,
             "median_trunk_ms_per_token": coreML.medianTrunkMsPerToken,
             "median_logits_ms_per_token": coreML.medianLogitsMsPerToken,
+            "ttft_ms": coreML.medianPrefillMs,
+            "ttft_cold_ms": coreML.compileTimeMs + coreML.medianPrefillMs,
         ]
         payload["two_step_speedup_vs_coreml"] = coreML.medianTokenMs / twoStep.medianTokenMs
         payload["control_speedup_vs_coreml"] = coreML.medianTokenMs / control.medianTokenMs
