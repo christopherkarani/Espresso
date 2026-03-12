@@ -19,6 +19,7 @@ public enum RecurrentGenerationTrunkBackend: Sendable {
     case fusedTwoLayerPairs
     case fusedThreeLayerTriplets
     case identityZeroTrunk
+    case identityZeroTrunkLookup
 }
 
 public struct GenerationPerformanceSnapshot: Sendable, Equatable {
@@ -887,6 +888,9 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
     private var lastSingleTokenTrunkLatencyMs: Double
     private var lastSingleTokenLogitsLatencyMs: Double
     private var hasCurrentProposalActivation: Bool
+    private var currentProposalLookupToken: UInt16?
+    private var exactNextTokenLookupCache: [UInt16: UInt16]
+    private var futureTokenLookupCache: [UInt16: UInt16]
 
     public var performanceSnapshot: GenerationPerformanceSnapshot {
         GenerationPerformanceSnapshot(
@@ -924,12 +928,16 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
         if outputHeadBackend == .cpuExactStaged || outputHeadBackend == .cpuExactClustered {
             throw .invalidArguments("two-step branch-state promotion model does not support staged CPU output heads")
         }
-        if trunkBackend == .identityZeroTrunk,
+        if (trunkBackend == .identityZeroTrunk || trunkBackend == .identityZeroTrunkLookup),
            !recurrentWeightsUseIdentityZeroTrunk(weights, layerCount: layerCount) {
             throw .invalidArguments("identity zero-trunk backend requires all recurrent Wx/Ws/Wd/Wo weights to be zero")
         }
+        if trunkBackend == .identityZeroTrunkLookup, futureSidecar == nil {
+            throw .invalidArguments("identity zero-trunk lookup backend requires futureSidecar")
+        }
 
         let compileStart = GenerationClock.now()
+        let usesIdentityZeroTrunkLookup = trunkBackend == .identityZeroTrunkLookup
         let twoStepSessions: LayerStorage<RWKVStyleTwoStepRecurrentSession>
         let fusedPairTwoStepSessions: LayerStorage<RWKVStyleFusedTwoLayerTwoStepSession>
         let fusedTripletTwoStepSessions: LayerStorage<RWKVStyleFusedThreeLayerTwoStepSession>
@@ -1007,7 +1015,7 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
             } catch {
                 throw .runtimeFailure("fused three-layer two-step kernel/session setup failed: \(error)")
             }
-        case .identityZeroTrunk:
+        case .identityZeroTrunk, .identityZeroTrunkLookup:
             twoStepSessions = LayerStorage<RWKVStyleTwoStepRecurrentSession>(count: 0) { _ in
                 fatalError("unreachable")
             }
@@ -1059,8 +1067,10 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
         }
 
         let aneClassifierHead: ANEGenerationClassifierHead?
-        switch outputHeadBackend {
-        case .aneClassifier:
+        switch (usesIdentityZeroTrunkLookup, outputHeadBackend) {
+        case (true, _):
+            aneClassifierHead = nil
+        case (false, .aneClassifier):
             do {
                 if sharedClassifier {
                     aneClassifierHead = try ANEGenerationClassifierHead(
@@ -1083,8 +1093,10 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
         }
 
         let aneRMSNormClassifierHead: ANEGenerationRMSNormClassifierHead?
-        switch outputHeadBackend {
-        case .aneRMSNormClassifier:
+        switch (usesIdentityZeroTrunkLookup, outputHeadBackend) {
+        case (true, _):
+            aneRMSNormClassifierHead = nil
+        case (false, .aneRMSNormClassifier):
             do {
                 if sharedClassifier {
                     aneRMSNormClassifierHead = try ANEGenerationRMSNormClassifierHead(
@@ -1108,7 +1120,9 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
             aneRMSNormClassifierHead = nil
         }
 
-        let futureOutputHeadBackend: GenerationOutputHeadBackend = hasFutureProposer ? outputHeadBackend : .cpu
+        let futureOutputHeadBackend: GenerationOutputHeadBackend = usesIdentityZeroTrunkLookup
+            ? .cpu
+            : (hasFutureProposer ? outputHeadBackend : .cpu)
 
         let futureANEClassifierHead: ANEGenerationClassifierHead?
         switch futureOutputHeadBackend {
@@ -1182,6 +1196,9 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
         self.lastSingleTokenTrunkLatencyMs = 0
         self.lastSingleTokenLogitsLatencyMs = 0
         self.hasCurrentProposalActivation = false
+        self.currentProposalLookupToken = nil
+        self.exactNextTokenLookupCache = [:]
+        self.futureTokenLookupCache = [:]
     }
 
     public mutating func reset() throws(GenerationError) {
@@ -1194,7 +1211,7 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
                     throw .runtimeFailure("two-step recurrent reset failed at layer \(idx): \(error)")
                 }
             }
-        case .identityZeroTrunk:
+        case .identityZeroTrunk, .identityZeroTrunkLookup:
             break
         case .fusedTwoLayerPairs:
             for idx in 0..<fusedPairTwoStepSessions.count {
@@ -1224,6 +1241,7 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
         lastSingleTokenTrunkLatencyMs = 0
         lastSingleTokenLogitsLatencyMs = 0
         hasCurrentProposalActivation = false
+        currentProposalLookupToken = nil
     }
 
     public mutating func prefillSelectedToken(
@@ -1251,6 +1269,12 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
     ) throws(GenerationError) -> ExactTwoTokenPassResult {
         guard remainingTokenBudget > 0 else {
             throw .invalidArguments("remainingTokenBudget must be > 0")
+        }
+        if trunkBackend == .identityZeroTrunkLookup {
+            return try performIdentityZeroLookupPass(
+                currentToken: currentToken,
+                remainingTokenBudget: remainingTokenBudget
+            )
         }
 
         let proposerStart = GenerationClock.now()
@@ -1318,6 +1342,17 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
         }
         guard consumedTokens < maxSequenceTokens else {
             throw .invalidArguments("two-step recurrent generation overflow at maxSequenceTokens \(maxSequenceTokens)")
+        }
+        if trunkBackend == .identityZeroTrunkLookup {
+            let logitsStart = GenerationClock.now()
+            let exactNextToken = try cachedExactNextToken(for: token)
+            let logitsLatencyMs = GenerationClock.milliseconds(start: logitsStart, end: GenerationClock.now())
+            consumedTokens += 1
+            lastSingleTokenTrunkLatencyMs = 0
+            lastSingleTokenLogitsLatencyMs = logitsLatencyMs
+            self.logitsLatencyMs += logitsLatencyMs
+            currentProposalLookupToken = token
+            return exactNextToken
         }
 
         try Self.writeTokenEmbedding(token, embedding: embedding, into: pair0ActivationA)
@@ -1392,7 +1427,7 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
                 }
                 sourcePairIsA.toggle()
             }
-        case .identityZeroTrunk:
+        case .identityZeroTrunk, .identityZeroTrunkLookup:
             sourcePairIsA = true
         case .fusedTwoLayerPairs:
             for idx in 0..<fusedPairTwoStepSessions.count {
@@ -1512,7 +1547,7 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
                     throw .runtimeFailure("two-step recurrent state promotion failed at layer \(idx): \(error)")
                 }
             }
-        case .identityZeroTrunk:
+        case .identityZeroTrunk, .identityZeroTrunkLookup:
             break
         case .fusedTwoLayerPairs:
             for idx in 0..<fusedPairTwoStepSessions.count {
@@ -1547,6 +1582,125 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
                 }
             }
         }
+    }
+
+    private mutating func performIdentityZeroLookupPass(
+        currentToken: UInt16,
+        remainingTokenBudget: Int
+    ) throws(GenerationError) -> ExactTwoTokenPassResult {
+        guard Int(currentToken) < vocabSize else {
+            throw .invalidArguments("token \(currentToken) exceeds vocab size \(vocabSize)")
+        }
+        guard consumedTokens < maxSequenceTokens else {
+            throw .invalidArguments("two-step recurrent generation overflow at maxSequenceTokens \(maxSequenceTokens)")
+        }
+        guard let proposalToken = currentProposalLookupToken else {
+            throw .runtimeFailure("identity zero-trunk lookup backend requires a proposal token before exact pass")
+        }
+
+        let proposerStart = GenerationClock.now()
+        let proposedFutureToken = try cachedFutureToken(for: proposalToken)
+        let proposerLatencyMs = GenerationClock.milliseconds(start: proposerStart, end: GenerationClock.now())
+
+        let verifierStart = GenerationClock.now()
+        let exactNextToken = try cachedExactNextToken(for: currentToken)
+        let exactFutureToken = remainingTokenBudget > 1
+            ? try cachedExactNextToken(for: proposedFutureToken)
+            : exactNextToken
+        let verifierLogitsLatencyMs = GenerationClock.milliseconds(start: verifierStart, end: GenerationClock.now())
+        logitsLatencyMs += verifierLogitsLatencyMs
+
+        if remainingTokenBudget == 1 {
+            consumedTokens += 1
+            lastSingleTokenTrunkLatencyMs = 0
+            lastSingleTokenLogitsLatencyMs = verifierLogitsLatencyMs
+            currentProposalLookupToken = currentToken
+            return ExactTwoTokenPassResult(
+                committedTokens: [currentToken],
+                nextCurrentToken: exactNextToken,
+                metrics: ExactTwoTokenPassMetrics(
+                    proposerLatencyMs: proposerLatencyMs,
+                    verifierTrunkLatencyMs: 0,
+                    verifierLogitsLatencyMs: verifierLogitsLatencyMs,
+                    stateAdvanceLatencyMs: 0,
+                    acceptedFutureTokenCount: 0,
+                    committedExactTokenCount: 1
+                )
+            )
+        }
+
+        let plan = ExactTwoTokenBranchPromotionPlan.make(
+            currentToken: currentToken,
+            proposedFutureToken: proposedFutureToken,
+            exactNextToken: exactNextToken,
+            exactFutureToken: exactFutureToken,
+            remainingTokenBudget: remainingTokenBudget
+        )
+        consumedTokens += plan.promotedStepCount
+        currentProposalLookupToken = plan.promotedStepCount == 2 ? exactNextToken : currentToken
+
+        return ExactTwoTokenPassResult(
+            committedTokens: plan.committedTokens,
+            nextCurrentToken: plan.nextCurrentToken,
+            metrics: ExactTwoTokenPassMetrics(
+                proposerLatencyMs: proposerLatencyMs,
+                verifierTrunkLatencyMs: 0,
+                verifierLogitsLatencyMs: verifierLogitsLatencyMs,
+                stateAdvanceLatencyMs: 0,
+                acceptedFutureTokenCount: plan.acceptedFutureTokenCount,
+                committedExactTokenCount: plan.committedExactTokenCount
+            )
+        )
+    }
+
+    private mutating func cachedExactNextToken(for currentToken: UInt16) throws(GenerationError) -> UInt16 {
+        if let cached = exactNextTokenLookupCache[currentToken] {
+            return cached
+        }
+
+        try Self.writeTokenEmbedding(currentToken, embedding: embedding, into: zeroActivation)
+        let selected = try Self.selectTokenFromActivation(
+            zeroActivation,
+            strategy: .argmax,
+            outputHeadBackend: .cpu,
+            rmsFinal: rmsFinal,
+            stepNorm: stepNorm,
+            stepLogits: stepLogits,
+            embedding: embedding,
+            classifier: classifier,
+            sharedClassifier: sharedClassifier,
+            aneClassifierHead: nil,
+            aneRMSNormClassifierHead: nil,
+            vocabSize: vocabSize,
+            stepRMSWorkspace: stepRMSWorkspace
+        )
+        exactNextTokenLookupCache[currentToken] = selected
+        return selected
+    }
+
+    private mutating func cachedFutureToken(for currentToken: UInt16) throws(GenerationError) -> UInt16 {
+        if let cached = futureTokenLookupCache[currentToken] {
+            return cached
+        }
+
+        try Self.writeTokenEmbedding(currentToken, embedding: embedding, into: zeroActivation)
+        let selected = try Self.selectTokenFromActivation(
+            zeroActivation,
+            strategy: .argmax,
+            outputHeadBackend: .cpu,
+            rmsFinal: futureRMS,
+            stepNorm: futureNorm,
+            stepLogits: futureLogits,
+            embedding: embedding,
+            classifier: futureClassifier,
+            sharedClassifier: false,
+            aneClassifierHead: nil,
+            aneRMSNormClassifierHead: nil,
+            vocabSize: vocabSize,
+            stepRMSWorkspace: futureRMSWorkspace
+        )
+        futureTokenLookupCache[currentToken] = selected
+        return selected
     }
 
     private mutating func selectProposedFutureToken(
@@ -2680,7 +2834,7 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
         if trunkBackend == .fusedThreeLayerTriplets, !layerCount.isMultiple(of: 3) {
             throw .invalidArguments("fused three-layer recurrent trunk backend requires a layerCount that is a multiple of 3")
         }
-        if trunkBackend == .identityZeroTrunk,
+        if (trunkBackend == .identityZeroTrunk || trunkBackend == .identityZeroTrunkLookup),
            !recurrentWeightsUseIdentityZeroTrunk(weights, layerCount: layerCount) {
             throw .invalidArguments("identity zero-trunk backend requires all recurrent Wx/Ws/Wd/Wo weights to be zero")
         }
@@ -2961,7 +3115,7 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
                     throw .runtimeFailure("recurrent reset failed at layer \(idx): \(error)")
                 }
             }
-        case .identityZeroTrunk:
+        case .identityZeroTrunk, .identityZeroTrunkLookup:
             break
         case .fusedTwoLayerPairs:
             for idx in 0..<fusedPairSessions.count {
@@ -3083,7 +3237,7 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
                 }
                 sourceIsA.toggle()
             }
-        case .identityZeroTrunk:
+        case .identityZeroTrunk, .identityZeroTrunkLookup:
             sourceIsA = true
         case .fusedTwoLayerPairs:
             for idx in 0..<fusedPairSessions.count {

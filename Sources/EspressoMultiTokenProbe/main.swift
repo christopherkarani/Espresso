@@ -65,13 +65,13 @@ private struct Options {
             case "--control-backend":
                 idx += 1
                 guard idx < argv.count else {
-                    fatal("Expected --control-backend single|fused-pair|fused-triplet")
+                    fatal("Expected --control-backend single|fused-pair|fused-triplet|identity-zero-trunk|identity-zero-trunk-lookup")
                 }
                 options.controlBackend = parseControlBackend(argv[idx])
             case "--two-step-backend":
                 idx += 1
                 guard idx < argv.count else {
-                    fatal("Expected --two-step-backend single|fused-pair|fused-triplet")
+                    fatal("Expected --two-step-backend single|fused-pair|fused-triplet|identity-zero-trunk|identity-zero-trunk-lookup")
                 }
                 options.twoStepBackend = parseControlBackend(argv[idx])
             case "--output-head-backend":
@@ -211,6 +211,8 @@ private func parseControlBackend(_ raw: String) -> RecurrentGenerationTrunkBacke
         return .fusedThreeLayerTriplets
     case "identity-zero-trunk":
         return .identityZeroTrunk
+    case "identity-zero-trunk-lookup":
+        return .identityZeroTrunkLookup
     default:
         fatal("Unknown control backend: \(raw)")
     }
@@ -245,8 +247,8 @@ private func printUsageAndExit() -> Never {
       --max-new-tokens N
       --max-sequence-tokens N
       --layer-count N
-      --control-backend single|fused-pair|fused-triplet
-      --two-step-backend single|fused-pair|fused-triplet
+      --control-backend single|fused-pair|fused-triplet|identity-zero-trunk|identity-zero-trunk-lookup
+      --two-step-backend single|fused-pair|fused-triplet|identity-zero-trunk|identity-zero-trunk-lookup
       --output-head-backend cpu|ane-classifier|ane-rmsnorm-classifier
       --trunk-lane-spatial N
       --output-head-lane-spatial N
@@ -601,6 +603,7 @@ private func describe(_ backend: RecurrentGenerationTrunkBackend) -> String {
     case .fusedTwoLayerPairs: return "fused-pair"
     case .fusedThreeLayerTriplets: return "fused-triplet"
     case .identityZeroTrunk: return "identity-zero-trunk"
+    case .identityZeroTrunkLookup: return "identity-zero-trunk-lookup"
     }
 }
 
