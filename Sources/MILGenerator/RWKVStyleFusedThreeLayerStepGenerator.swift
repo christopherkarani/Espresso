@@ -16,10 +16,13 @@ import ANETypes
 /// - `stateOut2` `[1, dim, 1, laneSpatial]`
 public struct RWKVStyleFusedThreeLayerStepGenerator: MILProgramGenerator {
     public let laneSpatial: Int
+    public let groups: Int
 
-    public init(laneSpatial: Int = 32) {
+    public init(laneSpatial: Int = 32, groups: Int = 1) {
         precondition(laneSpatial > 0)
+        precondition(groups > 0 && ModelConfig.dim % groups == 0)
         self.laneSpatial = laneSpatial
+        self.groups = groups
     }
 
     public var inputBytes: Int { ModelConfig.dim * laneSpatial * 2 }
@@ -52,7 +55,12 @@ public struct RWKVStyleFusedThreeLayerStepGenerator: MILProgramGenerator {
         b.appendLine(")];")
         b.appendLine("        fp16 eps = const()[name=string(\"eps\"), val=fp16(0.00001)];")
         b.appendLine("        fp16 nhalf = const()[name=string(\"nhalf\"), val=fp16(-0.5)];")
-        b.append(MILText.convConst)
+        // Conv constants — groups may be > 1 for grouped convolutions
+        b.appendLine("        string pt = const()[name=string(\"pt\"), val=string(\"valid\")];")
+        b.appendLine("        tensor<int32, [2]> st = const()[name=string(\"st\"), val=tensor<int32, [2]>([1,1])];")
+        b.appendLine("        tensor<int32, [4]> pd = const()[name=string(\"pd\"), val=tensor<int32, [4]>([0,0,0,0])];")
+        b.appendLine("        tensor<int32, [2]> dl = const()[name=string(\"dl\"), val=tensor<int32, [2]>([1,1])];")
+        b.appendLine("        int32 gr = const()[name=string(\"gr\"), val=int32(\(groups))];")
 
         appendLayer(
             builder: &b,
@@ -104,6 +112,7 @@ public struct RWKVStyleFusedThreeLayerStepGenerator: MILProgramGenerator {
         outputX: String,
         outputState: String
     ) {
+        let chPerGroup = dim / groups
         b.appendLine("        tensor<fp16, [1,\(dim),1,\(lane)]> \(prefix)sq = mul(x=\(inputX),y=\(inputX))[name=string(\"\(prefix)sq\")];")
         b.appendLine("        tensor<fp16, [1,1,1,\(lane)]> \(prefix)ss = reduce_sum(x=\(prefix)sq,axes=raxCh,keep_dims=kd)[name=string(\"\(prefix)ss\")];")
         b.appendLine("        tensor<fp16, [1,1,1,\(lane)]> \(prefix)ss2 = mul(x=\(prefix)ss,y=invd)[name=string(\"\(prefix)ss2\")];")
@@ -112,10 +121,10 @@ public struct RWKVStyleFusedThreeLayerStepGenerator: MILProgramGenerator {
         b.appendLine("        tensor<fp16, [1,\(dim),1,\(lane)]> \(prefix)xr = mul(x=\(inputX),y=\(prefix)rrms)[name=string(\"\(prefix)xr\")];")
         b.appendLine("        tensor<fp16, [1,\(dim),1,1]> \(prefix)rw = const()[name=string(\"\(prefix)rw\"), val=tensor<fp16, [1,\(dim),1,1]>(BLOBFILE(path=string(\"@model_path/weights/rwkv_rms\(layerIndex).bin\"), offset=uint64(64)))];")
         b.appendLine("        tensor<fp16, [1,\(dim),1,\(lane)]> \(prefix)xn = mul(x=\(prefix)xr,y=\(prefix)rw)[name=string(\"\(prefix)xn\")];")
-        b.appendLine("        tensor<fp16, [\(dim),\(dim),1,1]> \(prefix)Wx = const()[name=string(\"\(prefix)Wx\"), val=tensor<fp16, [\(dim),\(dim),1,1]>(BLOBFILE(path=string(\"@model_path/weights/wx\(layerIndex).bin\"), offset=uint64(64)))];")
-        b.appendLine("        tensor<fp16, [\(dim),\(dim),1,1]> \(prefix)Ws = const()[name=string(\"\(prefix)Ws\"), val=tensor<fp16, [\(dim),\(dim),1,1]>(BLOBFILE(path=string(\"@model_path/weights/ws\(layerIndex).bin\"), offset=uint64(64)))];")
-        b.appendLine("        tensor<fp16, [\(dim),\(dim),1,1]> \(prefix)Wd = const()[name=string(\"\(prefix)Wd\"), val=tensor<fp16, [\(dim),\(dim),1,1]>(BLOBFILE(path=string(\"@model_path/weights/wd\(layerIndex).bin\"), offset=uint64(64)))];")
-        b.appendLine("        tensor<fp16, [\(dim),\(dim),1,1]> \(prefix)Wo = const()[name=string(\"\(prefix)Wo\"), val=tensor<fp16, [\(dim),\(dim),1,1]>(BLOBFILE(path=string(\"@model_path/weights/wo\(layerIndex).bin\"), offset=uint64(64)))];")
+        b.appendLine("        tensor<fp16, [\(dim),\(chPerGroup),1,1]> \(prefix)Wx = const()[name=string(\"\(prefix)Wx\"), val=tensor<fp16, [\(dim),\(chPerGroup),1,1]>(BLOBFILE(path=string(\"@model_path/weights/wx\(layerIndex).bin\"), offset=uint64(64)))];")
+        b.appendLine("        tensor<fp16, [\(dim),\(chPerGroup),1,1]> \(prefix)Ws = const()[name=string(\"\(prefix)Ws\"), val=tensor<fp16, [\(dim),\(chPerGroup),1,1]>(BLOBFILE(path=string(\"@model_path/weights/ws\(layerIndex).bin\"), offset=uint64(64)))];")
+        b.appendLine("        tensor<fp16, [\(dim),\(chPerGroup),1,1]> \(prefix)Wd = const()[name=string(\"\(prefix)Wd\"), val=tensor<fp16, [\(dim),\(chPerGroup),1,1]>(BLOBFILE(path=string(\"@model_path/weights/wd\(layerIndex).bin\"), offset=uint64(64)))];")
+        b.appendLine("        tensor<fp16, [\(dim),\(chPerGroup),1,1]> \(prefix)Wo = const()[name=string(\"\(prefix)Wo\"), val=tensor<fp16, [\(dim),\(chPerGroup),1,1]>(BLOBFILE(path=string(\"@model_path/weights/wo\(layerIndex).bin\"), offset=uint64(64)))];")
         b.appendLine("        tensor<fp16, [1,\(dim),1,\(lane)]> \(prefix)xMix = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=\(prefix)Wx,x=\(prefix)xn)[name=string(\"\(prefix)x_mix\")];")
         b.appendLine("        tensor<fp16, [1,\(dim),1,\(lane)]> \(prefix)sMix = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=\(prefix)Ws,x=\(inputState))[name=string(\"\(prefix)s_mix\")];")
         b.appendLine("        tensor<fp16, [1,\(dim),1,\(lane)]> \(prefix)carry = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=\(prefix)Wd,x=\(inputState))[name=string(\"\(prefix)carry\")];")

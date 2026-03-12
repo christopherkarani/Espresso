@@ -1662,7 +1662,8 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         maxNewTokens: Int,
         warmup: Int,
         iterations: Int,
-        streamCounts: [Int]
+        streamCounts: [Int],
+        groups: Int = 1
     ) throws -> ConcurrentGenerationScalingReport {
         let dim = ModelConfig.dim
         var samples: [ConcurrentGenerationScalingSample] = []
@@ -1690,7 +1691,8 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                         weights0: weights.layers[base],
                         weights1: weights.layers[base + 1],
                         weights2: weights.layers[base + 2],
-                        laneSpatial: laneSpatial
+                        laneSpatial: laneSpatial,
+                        groups: groups
                     )
                 }
             )
@@ -2348,7 +2350,8 @@ final class GenerationHarnessHardwareTests: XCTestCase {
             maxNewTokens: maxNewTokens,
             warmup: warmup,
             iterations: iterations,
-            streamCounts: streamCounts
+            streamCounts: streamCounts,
+            groups: 16
         )
 
         XCTAssertEqual(batched.samples.map(\.streamCount), streamCounts)
@@ -3634,6 +3637,295 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         b.appendLine("    } -> (logits);")
         b.appendLine("}")
         return b.text
+    }
+
+    // MARK: - Grouped conv ANE probe
+
+    func test_grouped_conv_probe_on_hardware() throws {
+        try requireGenerationHardware()
+
+        let dim = ModelConfig.dim  // 768
+        let lane = 512
+        let warmup = 5
+        let iterations = 30
+
+        // Build a fp16 blob with 128-byte header (matches WeightBlob format)
+        func buildFP16Blob(elementCount: Int) -> Data {
+            let payloadBytes = elementCount * 2
+            var data = Data(count: 128 + payloadBytes)
+            data.withUnsafeMutableBytes { raw in
+                let base = raw.baseAddress!.assumingMemoryBound(to: UInt8.self)
+                base[0] = 1
+                base[4] = 2
+                base[64] = 0xEF
+                base[65] = 0xBE
+                base[66] = 0xAD
+                base[67] = 0xDE
+                base[68] = 1
+                raw.storeBytes(of: UInt32(payloadBytes).littleEndian, toByteOffset: 72, as: UInt32.self)
+                raw.storeBytes(of: UInt32(128).littleEndian, toByteOffset: 80, as: UInt32.self)
+                // Fill payload with small fp16 values
+                let payload = raw.baseAddress!.advanced(by: 128).assumingMemoryBound(to: UInt16.self)
+                for i in 0..<elementCount {
+                    payload[i] = Float16(Float(i % 256) * 0.001).bitPattern
+                }
+            }
+            return data
+        }
+
+        // First: minimal compile check — single conv with weight blob
+        let minimalMil = """
+        program(1.3)
+        [buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, {"coremlc-version", "3505.4.1"}, {"coremltools-component-milinternal", ""}, {"coremltools-version", "9.0"}})]
+        {
+            func main<ios18>(tensor<fp16, [1, \(dim), 1, \(lane)]> x) {
+                string pt = const()[name=string("pt"), val=string("valid")];
+                tensor<int32, [2]> st = const()[name=string("st"), val=tensor<int32, [2]>([1,1])];
+                tensor<int32, [4]> pd = const()[name=string("pd"), val=tensor<int32, [4]>([0,0,0,0])];
+                tensor<int32, [2]> dl = const()[name=string("dl"), val=tensor<int32, [2]>([1,1])];
+                int32 gr = const()[name=string("gr"), val=int32(1)];
+                tensor<fp16, [\(dim),\(dim),1,1]> W = const()[name=string("W"), val=tensor<fp16, [\(dim),\(dim),1,1]>(BLOBFILE(path=string("@model_path/weights/w.bin"), offset=uint64(64)))];
+                tensor<fp16, [1,\(dim),1,\(lane)]> out = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=W,x=x)[name=string("out")];
+            } -> (out);
+        }
+        """
+        let wBlob = buildFP16Blob(elementCount: dim * dim)
+        do {
+            let kernel = try ANEKernel(
+                milText: minimalMil,
+                weights: [(path: "@model_path/weights/w.bin", data: wBlob)],
+                inputSizes: [dim * lane * 2],
+                outputSizes: [dim * lane * 2],
+                checkBudget: false
+            )
+            try kernel.eval()
+            print("minimal_conv_probe: SUCCESS")
+        } catch {
+            print("minimal_conv_probe: FAILED \(error)")
+        }
+
+        // Test each group count
+        let groupCounts = [1, 4, 8, 16, 64, 768]
+
+        for groups in groupCounts {
+            guard dim % groups == 0 else { continue }
+            let chPerGroup = dim / groups
+
+            // Build single-layer RWKV MIL with grouped convs
+            let mil = """
+            program(1.3)
+            [buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, {"coremlc-version", "3505.4.1"}, {"coremltools-component-milinternal", ""}, {"coremltools-version", "9.0"}})]
+            {
+                func main<ios18>(tensor<fp16, [1, \(dim), 1, \(lane)]> x, tensor<fp16, [1, \(dim), 1, \(lane)]> stateIn) {
+                    tensor<int32, [1]> raxCh = const()[name=string("rax_ch"), val=tensor<int32, [1]>([1])];
+                    bool kd = const()[name=string("kd"), val=bool(true)];
+                    fp16 invd = const()[name=string("invd"), val=fp16(0.0013)];
+                    fp16 eps = const()[name=string("eps"), val=fp16(0.00001)];
+                    fp16 nhalf = const()[name=string("nhalf"), val=fp16(-0.5)];
+                    string pt = const()[name=string("pt"), val=string("valid")];
+                    tensor<int32, [2]> st = const()[name=string("st"), val=tensor<int32, [2]>([1,1])];
+                    tensor<int32, [4]> pd = const()[name=string("pd"), val=tensor<int32, [4]>([0,0,0,0])];
+                    tensor<int32, [2]> dl = const()[name=string("dl"), val=tensor<int32, [2]>([1,1])];
+                    int32 gr = const()[name=string("gr"), val=int32(\(groups))];
+
+                    tensor<fp16, [1,\(dim),1,\(lane)]> sq = mul(x=x,y=x)[name=string("sq")];
+                    tensor<fp16, [1,1,1,\(lane)]> ss = reduce_sum(x=sq,axes=raxCh,keep_dims=kd)[name=string("ss")];
+                    tensor<fp16, [1,1,1,\(lane)]> ss2 = mul(x=ss,y=invd)[name=string("ss2")];
+                    tensor<fp16, [1,1,1,\(lane)]> ss3 = add(x=ss2,y=eps)[name=string("ss3")];
+                    tensor<fp16, [1,1,1,\(lane)]> rrms = pow(x=ss3,y=nhalf)[name=string("rrms")];
+                    tensor<fp16, [1,\(dim),1,\(lane)]> xr = mul(x=x,y=rrms)[name=string("xr")];
+                    tensor<fp16, [1,\(dim),1,1]> rw = const()[name=string("rw"), val=tensor<fp16, [1,\(dim),1,1]>(BLOBFILE(path=string("@model_path/weights/rms.bin"), offset=uint64(64)))];
+                    tensor<fp16, [1,\(dim),1,\(lane)]> xn = mul(x=xr,y=rw)[name=string("xn")];
+
+                    tensor<fp16, [\(dim),\(chPerGroup),1,1]> Wx = const()[name=string("Wx"), val=tensor<fp16, [\(dim),\(chPerGroup),1,1]>(BLOBFILE(path=string("@model_path/weights/wx.bin"), offset=uint64(64)))];
+                    tensor<fp16, [\(dim),\(chPerGroup),1,1]> Ws = const()[name=string("Ws"), val=tensor<fp16, [\(dim),\(chPerGroup),1,1]>(BLOBFILE(path=string("@model_path/weights/ws.bin"), offset=uint64(64)))];
+                    tensor<fp16, [\(dim),\(chPerGroup),1,1]> Wd = const()[name=string("Wd"), val=tensor<fp16, [\(dim),\(chPerGroup),1,1]>(BLOBFILE(path=string("@model_path/weights/wd.bin"), offset=uint64(64)))];
+                    tensor<fp16, [\(dim),\(chPerGroup),1,1]> Wo = const()[name=string("Wo"), val=tensor<fp16, [\(dim),\(chPerGroup),1,1]>(BLOBFILE(path=string("@model_path/weights/wo.bin"), offset=uint64(64)))];
+
+                    tensor<fp16, [1,\(dim),1,\(lane)]> xMix = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Wx,x=xn)[name=string("x_mix")];
+                    tensor<fp16, [1,\(dim),1,\(lane)]> sMix = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Ws,x=stateIn)[name=string("s_mix")];
+                    tensor<fp16, [1,\(dim),1,\(lane)]> carry = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Wd,x=stateIn)[name=string("carry")];
+                    tensor<fp16, [1,\(dim),1,\(lane)]> mixPre = add(x=xMix,y=sMix)[name=string("mix_pre")];
+                    tensor<fp16, [1,\(dim),1,\(lane)]> gate = sigmoid(x=mixPre)[name=string("gate")];
+                    tensor<fp16, [1,\(dim),1,\(lane)]> gatedCarry = mul(x=carry,y=gate)[name=string("gated_carry")];
+                    tensor<fp16, [1,\(dim),1,\(lane)]> stateOut = add(x=xMix,y=gatedCarry)[name=string("state_out")];
+                    tensor<fp16, [1,\(dim),1,\(lane)]> proj = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Wo,x=stateOut)[name=string("proj")];
+                    tensor<fp16, [1,\(dim),1,\(lane)]> xNext = add(x=x,y=proj)[name=string("x_next")];
+                } -> (xNext, stateOut);
+            }
+            """
+
+            let convWeightSize = dim * chPerGroup
+            let rmsBlob = buildFP16Blob(elementCount: dim)
+            let convBlob = buildFP16Blob(elementCount: convWeightSize)
+            let inputBytes = dim * lane * 2
+
+            do {
+                let kernel = try ANEKernel(
+                    milText: mil,
+                    weights: [
+                        (path: "@model_path/weights/rms.bin", data: rmsBlob),
+                        (path: "@model_path/weights/wx.bin", data: convBlob),
+                        (path: "@model_path/weights/ws.bin", data: convBlob),
+                        (path: "@model_path/weights/wd.bin", data: convBlob),
+                        (path: "@model_path/weights/wo.bin", data: convBlob)
+                    ],
+                    inputSizes: [inputBytes, inputBytes],
+                    outputSizes: [inputBytes, inputBytes],
+                    checkBudget: false
+                )
+
+                // Warmup
+                for _ in 0..<warmup { try kernel.eval() }
+
+                // Timed
+                var evalUs: [Double] = []
+                evalUs.reserveCapacity(iterations)
+                for _ in 0..<iterations {
+                    let start = GenerationClock.now()
+                    try kernel.eval()
+                    let elapsed = machMicroseconds(GenerationClock.now() - start)
+                    evalUs.append(elapsed)
+                }
+                evalUs.sort()
+                let median = evalUs[evalUs.count / 2]
+                let weightMB = Double(dim * chPerGroup * 4 * 2 + dim * 2) / (1024.0 * 1024.0)
+                print("grouped_conv_probe groups=\(groups) chPerGroup=\(chPerGroup) eval_median_us=\(median) weight_MB=\(String(format: "%.2f", weightMB))")
+            } catch {
+                print("grouped_conv_probe groups=\(groups) chPerGroup=\(chPerGroup) FAILED: \(error)")
+            }
+        }
+    }
+
+    // MARK: - 3-layer fused grouped conv probe
+
+    func test_grouped_conv_3layer_fused_probe_on_hardware() throws {
+        try requireGenerationHardware()
+
+        let dim = ModelConfig.dim  // 768
+        let lane = 512
+        let warmup = 5
+        let iterations = 30
+
+        func buildFP16Blob3L(elementCount: Int) -> Data {
+            let payloadBytes = elementCount * 2
+            var data = Data(count: 128 + payloadBytes)
+            data.withUnsafeMutableBytes { raw in
+                let base = raw.baseAddress!.assumingMemoryBound(to: UInt8.self)
+                base[0] = 1; base[4] = 2
+                base[64] = 0xEF; base[65] = 0xBE; base[66] = 0xAD; base[67] = 0xDE; base[68] = 1
+                raw.storeBytes(of: UInt32(payloadBytes).littleEndian, toByteOffset: 72, as: UInt32.self)
+                raw.storeBytes(of: UInt32(128).littleEndian, toByteOffset: 80, as: UInt32.self)
+                let payload = raw.baseAddress!.advanced(by: 128).assumingMemoryBound(to: UInt16.self)
+                for i in 0..<elementCount { payload[i] = Float16(Float(i % 256) * 0.001).bitPattern }
+            }
+            return data
+        }
+
+        func buildFused3LayerMIL(groups: Int) -> String {
+            let chPerGroup = dim / groups
+            var mil = """
+            program(1.3)
+            [buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, {"coremlc-version", "3505.4.1"}, {"coremltools-component-milinternal", ""}, {"coremltools-version", "9.0"}})]
+            {
+                func main<ios18>(tensor<fp16, [1, \(dim), 1, \(lane)]> x, tensor<fp16, [1, \(dim), 1, \(lane)]> stateIn0, tensor<fp16, [1, \(dim), 1, \(lane)]> stateIn1, tensor<fp16, [1, \(dim), 1, \(lane)]> stateIn2) {
+                    tensor<int32, [1]> raxCh = const()[name=string("rax_ch"), val=tensor<int32, [1]>([1])];
+                    bool kd = const()[name=string("kd"), val=bool(true)];
+                    fp16 invd = const()[name=string("invd"), val=fp16(0.0013)];
+                    fp16 eps = const()[name=string("eps"), val=fp16(0.00001)];
+                    fp16 nhalf = const()[name=string("nhalf"), val=fp16(-0.5)];
+                    string pt = const()[name=string("pt"), val=string("valid")];
+                    tensor<int32, [2]> st = const()[name=string("st"), val=tensor<int32, [2]>([1,1])];
+                    tensor<int32, [4]> pd = const()[name=string("pd"), val=tensor<int32, [4]>([0,0,0,0])];
+                    tensor<int32, [2]> dl = const()[name=string("dl"), val=tensor<int32, [2]>([1,1])];
+                    int32 gr = const()[name=string("gr"), val=int32(\(groups))];
+
+            """
+            for i in 0..<3 {
+                let p = "l\(i)_"
+                let xIn = i == 0 ? "x" : "l\(i-1)_xNext"
+                let xOut = i == 2 ? "xNext" : "l\(i)_xNext"
+                let sIn = "stateIn\(i)"
+                let sOut = "stateOut\(i)"
+                mil += """
+                        tensor<fp16, [1,\(dim),1,\(lane)]> \(p)sq = mul(x=\(xIn),y=\(xIn))[name=string("\(p)sq")];
+                        tensor<fp16, [1,1,1,\(lane)]> \(p)ss = reduce_sum(x=\(p)sq,axes=raxCh,keep_dims=kd)[name=string("\(p)ss")];
+                        tensor<fp16, [1,1,1,\(lane)]> \(p)ss2 = mul(x=\(p)ss,y=invd)[name=string("\(p)ss2")];
+                        tensor<fp16, [1,1,1,\(lane)]> \(p)ss3 = add(x=\(p)ss2,y=eps)[name=string("\(p)ss3")];
+                        tensor<fp16, [1,1,1,\(lane)]> \(p)rrms = pow(x=\(p)ss3,y=nhalf)[name=string("\(p)rrms")];
+                        tensor<fp16, [1,\(dim),1,\(lane)]> \(p)xr = mul(x=\(xIn),y=\(p)rrms)[name=string("\(p)xr")];
+                        tensor<fp16, [1,\(dim),1,1]> \(p)rw = const()[name=string("\(p)rw"), val=tensor<fp16, [1,\(dim),1,1]>(BLOBFILE(path=string("@model_path/weights/rms\(i).bin"), offset=uint64(64)))];
+                        tensor<fp16, [1,\(dim),1,\(lane)]> \(p)xn = mul(x=\(p)xr,y=\(p)rw)[name=string("\(p)xn")];
+                        tensor<fp16, [\(dim),\(chPerGroup),1,1]> \(p)Wx = const()[name=string("\(p)Wx"), val=tensor<fp16, [\(dim),\(chPerGroup),1,1]>(BLOBFILE(path=string("@model_path/weights/wx\(i).bin"), offset=uint64(64)))];
+                        tensor<fp16, [\(dim),\(chPerGroup),1,1]> \(p)Ws = const()[name=string("\(p)Ws"), val=tensor<fp16, [\(dim),\(chPerGroup),1,1]>(BLOBFILE(path=string("@model_path/weights/ws\(i).bin"), offset=uint64(64)))];
+                        tensor<fp16, [\(dim),\(chPerGroup),1,1]> \(p)Wd = const()[name=string("\(p)Wd"), val=tensor<fp16, [\(dim),\(chPerGroup),1,1]>(BLOBFILE(path=string("@model_path/weights/wd\(i).bin"), offset=uint64(64)))];
+                        tensor<fp16, [\(dim),\(chPerGroup),1,1]> \(p)Wo = const()[name=string("\(p)Wo"), val=tensor<fp16, [\(dim),\(chPerGroup),1,1]>(BLOBFILE(path=string("@model_path/weights/wo\(i).bin"), offset=uint64(64)))];
+                        tensor<fp16, [1,\(dim),1,\(lane)]> \(p)xMix = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=\(p)Wx,x=\(p)xn)[name=string("\(p)x_mix")];
+                        tensor<fp16, [1,\(dim),1,\(lane)]> \(p)sMix = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=\(p)Ws,x=\(sIn))[name=string("\(p)s_mix")];
+                        tensor<fp16, [1,\(dim),1,\(lane)]> \(p)carry = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=\(p)Wd,x=\(sIn))[name=string("\(p)carry")];
+                        tensor<fp16, [1,\(dim),1,\(lane)]> \(p)mixPre = add(x=\(p)xMix,y=\(p)sMix)[name=string("\(p)mix_pre")];
+                        tensor<fp16, [1,\(dim),1,\(lane)]> \(p)gate = sigmoid(x=\(p)mixPre)[name=string("\(p)gate")];
+                        tensor<fp16, [1,\(dim),1,\(lane)]> \(p)gatedCarry = mul(x=\(p)carry,y=\(p)gate)[name=string("\(p)gated_carry")];
+                        tensor<fp16, [1,\(dim),1,\(lane)]> \(sOut) = add(x=\(p)xMix,y=\(p)gatedCarry)[name=string("\(p)state_out")];
+                        tensor<fp16, [1,\(dim),1,\(lane)]> \(p)proj = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=\(p)Wo,x=\(sOut))[name=string("\(p)proj")];
+                        tensor<fp16, [1,\(dim),1,\(lane)]> \(xOut) = add(x=\(xIn),y=\(p)proj)[name=string("\(p)x_next")];
+
+                """
+            }
+            mil += """
+                } -> (xNext,stateOut0,stateOut1,stateOut2);
+            }
+            """
+            return mil
+        }
+
+        let groupCounts = [1, 16, 64]
+        let inputBytes = dim * lane * 2
+
+        for groups in groupCounts {
+            let chPerGroup = dim / groups
+            let convWeightSize = dim * chPerGroup
+            let rmsBlob = buildFP16Blob3L(elementCount: dim)
+            let convBlob = buildFP16Blob3L(elementCount: convWeightSize)
+
+            var weightPairs: [(path: String, data: Data)] = []
+            for i in 0..<3 {
+                weightPairs.append(("@model_path/weights/rms\(i).bin", rmsBlob))
+                weightPairs.append(("@model_path/weights/wx\(i).bin", convBlob))
+                weightPairs.append(("@model_path/weights/ws\(i).bin", convBlob))
+                weightPairs.append(("@model_path/weights/wd\(i).bin", convBlob))
+                weightPairs.append(("@model_path/weights/wo\(i).bin", convBlob))
+            }
+
+            let mil = buildFused3LayerMIL(groups: groups)
+
+            do {
+                let kernel = try ANEKernel(
+                    milText: mil,
+                    weights: weightPairs,
+                    inputSizes: [inputBytes, inputBytes, inputBytes, inputBytes],
+                    outputSizes: [inputBytes, inputBytes, inputBytes, inputBytes],
+                    checkBudget: false
+                )
+
+                for _ in 0..<warmup { try kernel.eval() }
+
+                var evalUs: [Double] = []
+                evalUs.reserveCapacity(iterations)
+                for _ in 0..<iterations {
+                    let start = GenerationClock.now()
+                    try kernel.eval()
+                    let elapsed = machMicroseconds(GenerationClock.now() - start)
+                    evalUs.append(elapsed)
+                }
+                evalUs.sort()
+                let median = evalUs[evalUs.count / 2]
+                let weightMB = Double(3 * (dim * chPerGroup * 4 * 2 + dim * 2)) / (1024.0 * 1024.0)
+                print("fused_3l_grouped groups=\(groups) chPerGroup=\(chPerGroup) eval_median_us=\(median) weight_MB=\(String(format: "%.2f", weightMB))")
+            } catch {
+                print("fused_3l_grouped groups=\(groups) chPerGroup=\(chPerGroup) FAILED: \(error)")
+            }
+        }
     }
 
     func test_metal_argmax_probe_on_hardware() throws {
