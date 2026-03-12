@@ -258,14 +258,10 @@ private func printUsageAndExit() -> Never {
     exit(0)
 }
 
+// Use GenerationMetrics.median from the Espresso library to avoid duplication
+@inline(__always)
 private func median(_ values: [Double]) -> Double {
-    guard !values.isEmpty else { return 0 }
-    let sorted = values.sorted()
-    let mid = sorted.count / 2
-    if sorted.count.isMultiple(of: 2) {
-        return (sorted[mid - 1] + sorted[mid]) * 0.5
-    }
-    return sorted[mid]
+    GenerationMetrics.median(values)
 }
 
 // Use GenerationMetrics.percentile from the Espresso library to avoid duplication
