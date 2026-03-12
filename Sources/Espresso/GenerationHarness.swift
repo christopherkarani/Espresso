@@ -1053,8 +1053,8 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
             futureClassifier = GenerationWeightCloner.cloneTensor(futureSidecar.futureClassifier)
             hasFutureProposer = true
         } else {
-            futureRMS = TensorBuffer(count: ModelConfig.dim, zeroed: true)
-            futureClassifier = TensorBuffer(count: vocabSize * ModelConfig.dim, zeroed: true)
+            futureRMS = TensorBuffer(count: 0, zeroed: true)
+            futureClassifier = TensorBuffer(count: 0, zeroed: true)
             hasFutureProposer = false
         }
 
@@ -1155,8 +1155,8 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
         self.hasFutureProposer = hasFutureProposer
         self.stepNorm = TensorBuffer(count: ModelConfig.dim, zeroed: true)
         self.stepLogits = TensorBuffer(count: vocabSize, zeroed: true)
-        self.futureNorm = TensorBuffer(count: ModelConfig.dim, zeroed: true)
-        self.futureLogits = TensorBuffer(count: vocabSize, zeroed: true)
+        self.futureNorm = TensorBuffer(count: hasFutureProposer ? ModelConfig.dim : 0, zeroed: true)
+        self.futureLogits = TensorBuffer(count: hasFutureProposer ? vocabSize : 0, zeroed: true)
         self.zeroActivation = TensorBuffer(count: ModelConfig.dim, zeroed: true)
         self.pair0ActivationA = TensorBuffer(count: ModelConfig.dim, zeroed: true)
         self.pair1ActivationA = TensorBuffer(count: ModelConfig.dim, zeroed: true)
