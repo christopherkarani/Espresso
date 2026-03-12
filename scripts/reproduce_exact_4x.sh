@@ -464,6 +464,12 @@ for path_label in two_step control coreml speedup; do
   fi
 done
 
+# Speedup floor: warn if any run shows two_step slower than coreml
+if jq -e --arg min "$speedup_min" '($min | tonumber) < 1.0' <<< 'null' >/dev/null 2>&1; then
+  gate_status="warn"
+  gate_warnings="${gate_warnings}SPEEDUP_BELOW_1X: minimum speedup=${speedup_min} (two_step slower than coreml in at least one run)\n"
+fi
+
 echo ""
 echo "=== Reproducibility Gate ==="
 echo "status=$gate_status"
