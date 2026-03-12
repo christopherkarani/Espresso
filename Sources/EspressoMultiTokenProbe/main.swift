@@ -283,7 +283,7 @@ private func benchmarkDirectSelectionHarness<Model>(
     maxNewTokens: Int,
     warmup: Int,
     iterations: Int
-) throws -> GenerationBenchmarkSample
+) throws -> (sample: GenerationBenchmarkSample, rawTokenLatenciesMs: [Double])
 where Model: DirectTokenSelectingLanguageModel & GenerationPerformanceTrackable, Model: ~Copyable {
     var tokenLatencies: [Double] = []
     var throughput: [Double] = []
@@ -307,7 +307,7 @@ where Model: DirectTokenSelectingLanguageModel & GenerationPerformanceTrackable,
         }
     }
 
-    return GenerationBenchmarkSample(
+    let sample = GenerationBenchmarkSample(
         medianTokenMs: median(tokenLatencies),
         medianTokensPerSecond: median(throughput),
         compileTimeMs: compileTimeMs,
@@ -316,6 +316,7 @@ where Model: DirectTokenSelectingLanguageModel & GenerationPerformanceTrackable,
         p95TokenMs: percentile(tokenLatencies, at: 95),
         p99TokenMs: percentile(tokenLatencies, at: 99)
     )
+    return (sample, tokenLatencies)
 }
 
 private func benchmarkExactTwoTokenHarness<Model>(
@@ -324,7 +325,7 @@ private func benchmarkExactTwoTokenHarness<Model>(
     maxNewTokens: Int,
     warmup: Int,
     iterations: Int
-) throws -> ExactTwoTokenBenchmarkSample
+) throws -> (sample: ExactTwoTokenBenchmarkSample, rawTokenLatenciesMs: [Double])
 where Model: ExactTwoTokenGeneratingLanguageModel & GenerationPerformanceTrackable, Model: ~Copyable {
     var tokenLatencies: [Double] = []
     var throughput: [Double] = []
@@ -360,7 +361,7 @@ where Model: ExactTwoTokenGeneratingLanguageModel & GenerationPerformanceTrackab
         }
     }
 
-    return ExactTwoTokenBenchmarkSample(
+    let sample = ExactTwoTokenBenchmarkSample(
         medianTokenMs: median(tokenLatencies),
         medianTokensPerSecond: median(throughput),
         compileTimeMs: compileTimeMs,
@@ -373,6 +374,7 @@ where Model: ExactTwoTokenGeneratingLanguageModel & GenerationPerformanceTrackab
         p95TokenMs: percentile(tokenLatencies, at: 95),
         p99TokenMs: percentile(tokenLatencies, at: 99)
     )
+    return (sample, tokenLatencies)
 }
 
 private func measureRecurrentControlCompileInitOnly(options: Options) throws -> CompileInitBenchmarkSample {
@@ -522,7 +524,7 @@ private func comparePayload(options: Options) throws -> [String: Any] {
     printStderr("Parity status: \(exactParity ? "match" : "mismatch")")
 
     printStderr("Benchmarking control")
-    let control = try benchmarkDirectSelectionHarness(
+    let (control, controlRawLatencies) = try benchmarkDirectSelectionHarness(
         harness: &controlHarness,
         promptTokens: prompt,
         maxNewTokens: options.maxNewTokens,
@@ -532,7 +534,7 @@ private func comparePayload(options: Options) throws -> [String: Any] {
     printStderr(String(format: "Control median %.6f ms/token", control.medianTokenMs))
 
     printStderr("Benchmarking two-step")
-    let twoStep = try benchmarkExactTwoTokenHarness(
+    let (twoStep, twoStepRawLatencies) = try benchmarkExactTwoTokenHarness(
         harness: &twoStepHarness,
         promptTokens: prompt,
         maxNewTokens: options.maxNewTokens,
@@ -579,6 +581,7 @@ private func comparePayload(options: Options) throws -> [String: Any] {
             "median_logits_ms_per_token": control.medianLogitsMsPerToken,
             "p95_ms_per_token": control.p95TokenMs,
             "p99_ms_per_token": control.p99TokenMs,
+            "raw_token_latencies_ms": controlRawLatencies,
             "generated_tokens": controlParityTrace.generatedTokens.map(Int.init),
         ],
         "two_step": [
@@ -594,6 +597,7 @@ private func comparePayload(options: Options) throws -> [String: Any] {
             "median_state_advance_ms_per_pass": twoStep.medianStateAdvanceMsPerPass,
             "p95_ms_per_token": twoStep.p95TokenMs,
             "p99_ms_per_token": twoStep.p99TokenMs,
+            "raw_token_latencies_ms": twoStepRawLatencies,
             "generated_tokens": twoStepParityTrace.generatedTokens.map(Int.init),
         ],
     ]
