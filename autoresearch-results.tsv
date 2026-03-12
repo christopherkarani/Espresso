@@ -2,3 +2,4 @@ cycle	timestamp	hypothesis	change	control_ttft_ms	two_step_ttft_ms	control_ttft_
 0	2026-03-12T09:35	baseline	none	0.993	2.133	18.784	46.812	match	baseline	cpu output-head, identity-zero-trunk, warmup=1, iter=3, maxNew=4
 1	2026-03-12T13:45	skip pair1 logits in prefill	runCommittedSingleToken fast-path for identityZeroTrunk	0.975	0.996	14.743	19.411	match	yes	-53% two_step_ttft_ms; pair1 output head was redundant during single-token commit
 2	2026-03-12T14:15	eliminate unused futureClassifier alloc	futureClassifier/futureRMS/futureNorm/futureLogits count=0 when no sidecar	15.1	0.99	15.6	11.7	match	yes	two_step_cold_ttft_ms 19.4→11.7 (-40%); removed ~49MB zeroed buffer alloc in init
+3	2026-03-12T15:00	vDSP_maxvi argmax + remove redundant stepLogits.zero	selectToken uses vectorized vDSP_maxvi; skip zero before beta=0 sgemm	0.888	0.884	-	-	match	yes	-12% warm TTFT (1.0→0.88ms); both control+two_step benefit from shared selectToken

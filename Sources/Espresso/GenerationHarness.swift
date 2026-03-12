@@ -455,14 +455,11 @@ private func selectToken(
     }
     switch strategy {
     case .argmax:
-        let bestIndex = logits.withUnsafeBufferPointer { buffer in
-            var bestIndex = 0
-            var bestValue = buffer[0]
-            for idx in 1..<buffer.count where buffer[idx] > bestValue {
-                bestValue = buffer[idx]
-                bestIndex = idx
-            }
-            return bestIndex
+        let bestIndex = logits.withUnsafePointer { ptr in
+            var maxValue: Float = 0
+            var maxIndex: vDSP_Length = 0
+            vDSP_maxvi(ptr, 1, &maxValue, &maxIndex, vDSP_Length(logits.count))
+            return Int(maxIndex)
         }
         guard let token = UInt16(exactly: bestIndex) else {
             throw .invalidArguments("selected token index \(bestIndex) exceeds UInt16 range")
@@ -1691,7 +1688,7 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
         let token: UInt16
         switch outputHeadBackend {
         case .cpu:
-            stepLogits.zero()
+            // beta=0.0 means sgemm overwrites C entirely — no pre-zeroing needed
             stepLogits.withUnsafeMutablePointer { logitsPtr in
                 classifierPointer(
                     sharedClassifier: sharedClassifier,
