@@ -232,6 +232,8 @@ jq -s \
   --argjson layers "$LAYER_COUNT" \
   --arg control_backend "$CONTROL_BACKEND" \
   --arg two_step_backend "$TWO_STEP_BACKEND" \
+  --argjson requested_repeats "$REPEATS" \
+  --argjson failed "$failed_runs" \
 '{
   results_dir: $dir,
   timestamp: $ts,
@@ -247,8 +249,9 @@ jq -s \
     max_sequence_tokens: $max_seq,
     layer_count: $layers
   },
+  requested_repeats: $requested_repeats,
   valid_runs: (length),
-  repeats: (length),
+  failed_runs: $failed,
   two_step: {
     median_ms_per_token: (map(.two_step.median_ms_per_token) | sort | .[((length - 1) / 2 | floor)]),
     p95_ms_per_token: (map(.two_step.p95_ms_per_token // empty) | if length == 0 then null else sort | .[((length - 1) / 2 | floor)] end),
