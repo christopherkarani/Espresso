@@ -1693,8 +1693,6 @@ final class GenerationHarnessHardwareTests: XCTestCase {
             )
 
             let vocabSize = weights.vocabSize
-            let activationBuf = TensorBuffer(count: dim, zeroed: true)
-
             let compileTimeMs = machMilliseconds(GenerationClock.now() - compileStart)
 
             // Extract surface refs for direct access (IOSurfaceRef is Copyable)
@@ -1725,7 +1723,6 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                     try batchedTokenStep(
                         tokens: &tokens,
                         streamCount: streamCount,
-                        activationBuf: activationBuf,
                         embedding: weights.embedding,
                         dim: dim,
                         laneSpatial: laneSpatial,
@@ -1756,7 +1753,6 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                     try batchedTokenStep(
                         tokens: &tokens,
                         streamCount: streamCount,
-                        activationBuf: activationBuf,
                         embedding: weights.embedding,
                         dim: dim,
                         laneSpatial: laneSpatial,
@@ -1799,7 +1795,6 @@ final class GenerationHarnessHardwareTests: XCTestCase {
     private func batchedTokenStep(
         tokens: inout [UInt16],
         streamCount: Int,
-        activationBuf: borrowing TensorBuffer,
         embedding: borrowing TensorBuffer,
         dim: Int,
         laneSpatial: Int,
@@ -1815,23 +1810,17 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         head: ANEGenerationRMSNormClassifierHead,
         vocabSize: Int
     ) throws {
-        // 1. Write each stream's embedding to its spatial lane in triplet 0's xIn
-        for streamIdx in 0..<streamCount {
-            let token = tokens[streamIdx]
-            activationBuf.withUnsafeMutablePointer { dst in
-                embedding.withUnsafePointer { embPtr in
-                    let base = Int(token) * dim
-                    for d in 0..<dim { dst[d] = embPtr[base + d] }
-                }
-            }
-            try activationBuf.withUnsafeBufferPointer { src in
-                try SurfaceIO.writeFP16SpatialSlice(
+        // 1. Write all embeddings to spatial lanes in one locked pass
+        try embedding.withUnsafePointer { embPtr in
+            try tokens.withUnsafeBufferPointer { tokenBuf in
+                try SurfaceIO.writeEmbeddingBatchFP16(
                     to: t0xIn,
                     channelOffset: 0,
-                    spatialIndex: streamIdx,
                     spatial: laneSpatial,
-                    data: src,
-                    channels: dim
+                    embeddingTable: embPtr,
+                    dim: dim,
+                    tokenIDs: tokenBuf.baseAddress!,
+                    streamCount: streamCount
                 )
             }
         }
@@ -1864,16 +1853,16 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         // 8. Eval output head (processes all lanes simultaneously)
         try head.kernelSet.rmsNormClassifier.eval()
 
-        // 9. Argmax per spatial lane
+        // 9. Batched argmax across all spatial lanes (one lock)
+        let argmaxResults = try SurfaceIO.argmaxBatchFP16Spatial(
+            from: headOut,
+            channelOffset: 0,
+            spatial: laneSpatial,
+            channels: vocabSize,
+            streamCount: streamCount
+        )
         for streamIdx in 0..<streamCount {
-            let result = try SurfaceIO.argmaxFP16SpatialSlice(
-                from: headOut,
-                channelOffset: 0,
-                spatialIndex: streamIdx,
-                spatial: laneSpatial,
-                channels: vocabSize
-            )
-            tokens[streamIdx] = UInt16(result.index)
+            tokens[streamIdx] = UInt16(argmaxResults[streamIdx].index)
         }
     }
 

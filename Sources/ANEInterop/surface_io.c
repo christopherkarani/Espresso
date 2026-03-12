@@ -432,6 +432,161 @@ cleanup:
     return ok;
 }
 
+bool ane_interop_io_write_embedding_batch_fp16(
+    IOSurfaceRef surface,
+    int ch_off,
+    int spatial,
+    const float *embedding_table,
+    int dim,
+    const uint16_t *token_ids,
+    int stream_count) {
+
+    if (!surface || !embedding_table || !token_ids) return false;
+    if (ch_off < 0 || spatial <= 0 || dim <= 0 || stream_count <= 0) return false;
+    if (stream_count > spatial) return false;
+    if (dim > INT_MAX - ch_off) return false;
+
+    size_t spatialSz = (size_t)spatial;
+    size_t maxCh = (size_t)(ch_off + dim - 1);
+    size_t maxIdxElems;
+    size_t elemCount;
+    if (mul_size_overflow(maxCh, spatialSz, &maxIdxElems)) return false;
+    if (add_size_overflow(maxIdxElems, (size_t)(spatial - 1), &maxIdxElems)) return false;
+    if (add_size_overflow(maxIdxElems, 1, &elemCount)) return false;
+
+    size_t bytes;
+    if (mul_size_overflow(elemCount, sizeof(_Float16), &bytes)) return false;
+
+    if (IOSurfaceLock(surface, 0, NULL) != kIOReturnSuccess) return false;
+    bool ok = false;
+
+    void *base = IOSurfaceGetBaseAddress(surface);
+    if (!base) goto cleanup;
+    if (bytes > IOSurfaceGetAllocSize(surface)) goto cleanup;
+
+    {
+        _Float16 *dstF16 = (_Float16 *)base;
+        for (int s = 0; s < stream_count; s++) {
+            int token = (int)token_ids[s];
+            const float *embRow = embedding_table + (size_t)token * (size_t)dim;
+            for (int c = 0; c < dim; c++) {
+                size_t idx = (size_t)(ch_off + c) * spatialSz + (size_t)s;
+                dstF16[idx] = (_Float16)embRow[c];
+            }
+        }
+    }
+    ok = true;
+
+cleanup:
+    IOSurfaceUnlock(surface, 0, NULL);
+    return ok;
+}
+
+bool ane_interop_io_argmax_batch_fp16_spatial(
+    IOSurfaceRef surface,
+    int ch_off,
+    int spatial,
+    int channels,
+    int stream_count,
+    int *out_indices,
+    float *out_values) {
+
+    if (!surface || !out_indices || !out_values) return false;
+    if (ch_off < 0 || spatial <= 0 || channels <= 0 || stream_count <= 0) return false;
+    if (stream_count > spatial) return false;
+    if (channels > INT_MAX - ch_off) return false;
+
+    size_t spatialSz = (size_t)spatial;
+    size_t maxCh = (size_t)(ch_off + channels - 1);
+    size_t maxIdxElems;
+    size_t elemCount;
+    if (mul_size_overflow(maxCh, spatialSz, &maxIdxElems)) return false;
+    if (add_size_overflow(maxIdxElems, (size_t)(spatial - 1), &maxIdxElems)) return false;
+    if (add_size_overflow(maxIdxElems, 1, &elemCount)) return false;
+
+    size_t bytes;
+    if (mul_size_overflow(elemCount, sizeof(_Float16), &bytes)) return false;
+
+    if (IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL) != kIOReturnSuccess) return false;
+    bool ok = false;
+
+    const void *base = IOSurfaceGetBaseAddress(surface);
+    if (!base) goto cleanup;
+    if (bytes > IOSurfaceGetAllocSize(surface)) goto cleanup;
+
+    {
+        const _Float16 *srcF16 = (const _Float16 *)base;
+
+        for (int s = 0; s < stream_count; s++) {
+            const size_t baseIdx = (size_t)ch_off * spatialSz + (size_t)s;
+            const size_t stride = spatialSz;
+            int bestIndex = 0;
+            _Float16 bestValue = srcF16[baseIdx];
+
+            const _Float16 *cursor = srcF16 + baseIdx + stride;
+            int c = 1;
+
+            /* 8-way unrolled scan per lane */
+            if (channels >= 8) {
+                _Float16 bv0 = srcF16[baseIdx];
+                _Float16 bv1 = srcF16[baseIdx + stride];
+                _Float16 bv2 = srcF16[baseIdx + stride * 2];
+                _Float16 bv3 = srcF16[baseIdx + stride * 3];
+                _Float16 bv4 = srcF16[baseIdx + stride * 4];
+                _Float16 bv5 = srcF16[baseIdx + stride * 5];
+                _Float16 bv6 = srcF16[baseIdx + stride * 6];
+                _Float16 bv7 = srcF16[baseIdx + stride * 7];
+                int bi0 = 0, bi1 = 1, bi2 = 2, bi3 = 3;
+                int bi4 = 4, bi5 = 5, bi6 = 6, bi7 = 7;
+
+                c = 8;
+                cursor = srcF16 + baseIdx + stride * 8;
+                for (; c + 7 < channels; c += 8) {
+                    _Float16 v0 = cursor[0];
+                    _Float16 v1 = cursor[stride];
+                    _Float16 v2 = cursor[stride * 2];
+                    _Float16 v3 = cursor[stride * 3];
+                    _Float16 v4 = cursor[stride * 4];
+                    _Float16 v5 = cursor[stride * 5];
+                    _Float16 v6 = cursor[stride * 6];
+                    _Float16 v7 = cursor[stride * 7];
+                    if (v0 > bv0) { bv0 = v0; bi0 = c; }
+                    if (v1 > bv1) { bv1 = v1; bi1 = c + 1; }
+                    if (v2 > bv2) { bv2 = v2; bi2 = c + 2; }
+                    if (v3 > bv3) { bv3 = v3; bi3 = c + 3; }
+                    if (v4 > bv4) { bv4 = v4; bi4 = c + 4; }
+                    if (v5 > bv5) { bv5 = v5; bi5 = c + 5; }
+                    if (v6 > bv6) { bv6 = v6; bi6 = c + 6; }
+                    if (v7 > bv7) { bv7 = v7; bi7 = c + 7; }
+                    cursor += stride * 8;
+                }
+
+                bestValue = bv0; bestIndex = bi0;
+                if (bv1 > bestValue || (bv1 == bestValue && bi1 < bestIndex)) { bestValue = bv1; bestIndex = bi1; }
+                if (bv2 > bestValue || (bv2 == bestValue && bi2 < bestIndex)) { bestValue = bv2; bestIndex = bi2; }
+                if (bv3 > bestValue || (bv3 == bestValue && bi3 < bestIndex)) { bestValue = bv3; bestIndex = bi3; }
+                if (bv4 > bestValue || (bv4 == bestValue && bi4 < bestIndex)) { bestValue = bv4; bestIndex = bi4; }
+                if (bv5 > bestValue || (bv5 == bestValue && bi5 < bestIndex)) { bestValue = bv5; bestIndex = bi5; }
+                if (bv6 > bestValue || (bv6 == bestValue && bi6 < bestIndex)) { bestValue = bv6; bestIndex = bi6; }
+                if (bv7 > bestValue || (bv7 == bestValue && bi7 < bestIndex)) { bestValue = bv7; bestIndex = bi7; }
+            }
+
+            for (; c < channels; c++, cursor += stride) {
+                _Float16 value = *cursor;
+                if (value > bestValue) { bestValue = value; bestIndex = c; }
+            }
+
+            out_indices[s] = bestIndex;
+            out_values[s] = (float)bestValue;
+        }
+    }
+    ok = true;
+
+cleanup:
+    IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+    return ok;
+}
+
 bool ane_interop_io_write_fp16(IOSurfaceRef surface,
                                const float *data, int channels, int spatial) {
     return ane_interop_io_write_fp16_at(surface, 0, data, channels, spatial);
