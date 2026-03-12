@@ -28,6 +28,21 @@ if [[ "$REPEATS" -lt 3 || $((REPEATS % 2)) -ne 1 ]]; then
   exit 1
 fi
 
+if [[ "$ITERATIONS" -lt 1 ]]; then
+  echo "ITERATIONS must be >= 1" >&2
+  exit 1
+fi
+
+if [[ "$WARMUP" -lt 0 ]]; then
+  echo "WARMUP must be >= 0" >&2
+  exit 1
+fi
+
+if [[ "$LAYER_COUNT" -lt 1 ]]; then
+  echo "LAYER_COUNT must be >= 1" >&2
+  exit 1
+fi
+
 if [[ ! -e "$COREML_MODEL" ]]; then
   echo "CoreML model not found at $COREML_MODEL" >&2
   exit 1
