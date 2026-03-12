@@ -352,4 +352,32 @@ echo "==="
   fi
 } >> "$RESULTS_DIR/summary.txt"
 
+# Outlier detection: flag runs outside 1.5x IQR (Tukey fences)
+outlier_count=0
+outlier_runs=""
+if [[ ${#valid_runs[@]} -ge 4 ]]; then
+  outlier_info="$(jq -s '
+    [.[] | {file: input_filename, val: .two_step.median_ms_per_token}] |
+    sort_by(.val) |
+    (length) as $n |
+    (.[($n / 4 | floor)].val) as $q1 |
+    (.[($n * 3 / 4 | floor)].val) as $q3 |
+    ($q3 - $q1) as $iqr |
+    ($q1 - 1.5 * $iqr) as $lo |
+    ($q3 + 1.5 * $iqr) as $hi |
+    {q1: $q1, q3: $q3, iqr: $iqr, lo_fence: $lo, hi_fence: $hi,
+     outliers: [.[] | select(.val < $lo or .val > $hi)]}
+  ' "${valid_runs[@]}")"
+  outlier_count="$(echo "$outlier_info" | jq '.outliers | length')"
+  if [[ $outlier_count -gt 0 ]]; then
+    outlier_runs="$(echo "$outlier_info" | jq -r '.outliers[] | "\(.file): \(.val) ms/token"')"
+    echo ""
+    echo "=== Outlier Detection ==="
+    echo "outlier_count=$outlier_count"
+    echo "$outlier_runs"
+    echo "fences: $(echo "$outlier_info" | jq -r '"[\(.lo_fence), \(.hi_fence)]"')"
+    echo "==="
+  fi
+fi
+
 echo "Wrote raw JSON, stderr logs, and summary.json to $RESULTS_DIR"
