@@ -42,3 +42,20 @@ artifacts/benchmarks/*
 !artifacts/benchmarks/exact-decode-non-echo/latest.csv
 !artifacts/benchmarks/exact-decode-non-echo/latest.md
 scripts/__pycache__/
+
+# Development / internal documentation
+docs/
+prompts/
+scripts/
+tasks/
+AGENTS.md
+CLAUDE.md
+
+# Internal development directories
+archive/
+autoresearch-master/
+results/
+training/
+
+# Tooling version pins
+.swift-version

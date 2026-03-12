@@ -1,7 +1,0 @@
-=== Fused W1b+W3b backward (slice+conv+add) ===
-Compile: OK
-Load: OK
-Eval: OK
-dx max diff: 0.001825
-
-DONE
