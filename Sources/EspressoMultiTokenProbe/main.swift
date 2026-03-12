@@ -635,6 +635,8 @@ private func describe(_ backend: GenerationOutputHeadBackend) -> String {
     case .cpuExactClustered: return "cpu-exact-clustered"
     case .aneClassifier: return "ane-classifier"
     case .aneRMSNormClassifier: return "ane-rmsnorm-classifier"
+    case .cpuThenANE: return "cpu-then-ane"
+    case .cpuPartitionedArgmax: return "cpu-partitioned-argmax"
     }
 }
 

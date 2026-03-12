@@ -1,5 +1,6 @@
 import Foundation
 import IOSurface
+import os.lock
 import ANERuntime
 import ANETypes
 
@@ -9,6 +10,41 @@ public enum GenerationOutputHeadBackend: Sendable {
     case cpuExactClustered
     case aneClassifier
     case aneRMSNormClassifier
+    /// CPU for the first token; background-compiles ANE head and switches to it once ready.
+    case cpuThenANE
+    /// Vocabulary-partitioned argmax with Cauchy-Schwarz pruning.
+    case cpuPartitionedArgmax
+}
+
+// MARK: - Deferred ANE head
+
+/// Thread-safe container for a lazily background-compiled `ANEGenerationRMSNormClassifierHead`.
+///
+/// The owning model initialises this during its own init, launches a background compile on
+/// `DispatchQueue.global(qos: .userInitiated)`, then stores the compiled head here once done.
+/// Readers on the hot token-selection path call `readyHead` which performs a single `os_unfair_lock`-
+/// protected load — cheap on the fast path once the head is compiled, and never blocks.
+public final class DeferredANEHead: @unchecked Sendable {
+    private var _lock: os_unfair_lock = os_unfair_lock()
+    private var _head: ANEGenerationRMSNormClassifierHead?
+
+    public init() {}
+
+    /// Store the compiled head. Safe to call from any thread exactly once.
+    func store(_ head: consuming ANEGenerationRMSNormClassifierHead) {
+        os_unfair_lock_lock(&_lock)
+        _head = consume head
+        os_unfair_lock_unlock(&_lock)
+    }
+
+    /// Returns the compiled head if background compilation has finished, otherwise `nil`.
+    /// This is the hot-path read — lock acquisition is extremely brief (pointer load).
+    func readyHead() -> ANEGenerationRMSNormClassifierHead? {
+        os_unfair_lock_lock(&_lock)
+        let h = _head
+        os_unfair_lock_unlock(&_lock)
+        return h
+    }
 }
 
 enum ANEGenerationOutputHeadIO {

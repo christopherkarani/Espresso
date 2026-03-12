@@ -1740,6 +1740,35 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
             token = try aneRMSNormClassifierHead.selectArgmax(rawInput: activation)
         case .cpuExactStaged, .cpuExactClustered:
             throw .runtimeFailure("two-step branch-state promotion model does not support staged CPU output heads")
+        case .cpuThenANE, .cpuPartitionedArgmax:
+            // Fall through to CPU sgemm path for now
+            stepLogits.withUnsafeMutablePointer { logitsPtr in
+                classifierPointer(
+                    sharedClassifier: sharedClassifier,
+                    embedding: embedding,
+                    classifier: classifier
+                ) { clsPtr in
+                    stepNorm.withUnsafePointer { normPtr in
+                        BLAS.sgemm(
+                            CblasRowMajor,
+                            CblasNoTrans,
+                            CblasNoTrans,
+                            m: Int32(vocabSize),
+                            n: 1,
+                            k: Int32(ModelConfig.dim),
+                            alpha: 1.0,
+                            a: clsPtr,
+                            lda: Int32(ModelConfig.dim),
+                            b: normPtr,
+                            ldb: 1,
+                            beta: 0.0,
+                            c: logitsPtr,
+                            ldc: 1
+                        )
+                    }
+                }
+            }
+            token = try selectToken(from: stepLogits, strategy: strategy)
         }
 
         return token
@@ -2003,6 +2032,9 @@ public struct RecurrentGenerationWeights: ~Copyable {
     public let classifier: TensorBuffer
     public let sharedClassifier: Bool
     public let vocabSize: Int
+    /// Retains the mmap backing buffer so non-owning slice views remain valid.
+    /// When weights are not mmap-backed, this is a zero-element sentinel buffer.
+    private let mmapBacking: TensorBuffer
 
     public init(
         layers: consuming LayerStorage<RWKVStyleRecurrentWeights>,
@@ -2018,6 +2050,26 @@ public struct RecurrentGenerationWeights: ~Copyable {
         self.classifier = classifier
         self.sharedClassifier = sharedClassifier
         self.vocabSize = vocabSize
+        self.mmapBacking = TensorBuffer(count: 0, zeroed: false)
+    }
+
+    /// Init with an mmap backing buffer whose lifetime keeps all non-owning slices valid.
+    public init(
+        layers: consuming LayerStorage<RWKVStyleRecurrentWeights>,
+        rmsFinal: consuming TensorBuffer,
+        embedding: consuming TensorBuffer,
+        classifier: consuming TensorBuffer,
+        sharedClassifier: Bool,
+        vocabSize: Int = ModelConfig.vocab,
+        mmapBacking: consuming TensorBuffer
+    ) {
+        self.layers = layers
+        self.rmsFinal = rmsFinal
+        self.embedding = embedding
+        self.classifier = classifier
+        self.sharedClassifier = sharedClassifier
+        self.vocabSize = vocabSize
+        self.mmapBacking = mmapBacking
     }
 }
 
@@ -2249,7 +2301,7 @@ public struct ANEDirectGenerationModel: ~Copyable, DirectTokenSelectingLanguageM
         classifier: borrowing TensorBuffer
     ) throws(GenerationError) -> ANEGenerationClassifierHead? {
         switch outputHeadBackend {
-        case .cpu, .cpuExactStaged, .cpuExactClustered:
+        case .cpu, .cpuExactStaged, .cpuExactClustered, .cpuThenANE, .cpuPartitionedArgmax:
             return nil
         case .aneClassifier:
             if sharedClassifier {
@@ -2269,7 +2321,7 @@ public struct ANEDirectGenerationModel: ~Copyable, DirectTokenSelectingLanguageM
         classifier: borrowing TensorBuffer
     ) throws(GenerationError) -> CPUStagedExactGenerationOutputHead? {
         switch outputHeadBackend {
-        case .cpu, .aneClassifier, .aneRMSNormClassifier:
+        case .cpu, .aneClassifier, .aneRMSNormClassifier, .cpuThenANE, .cpuPartitionedArgmax:
             return nil
         case .cpuExactStaged:
             if sharedClassifier {
@@ -2309,7 +2361,7 @@ public struct ANEDirectGenerationModel: ~Copyable, DirectTokenSelectingLanguageM
         classifier: borrowing TensorBuffer
     ) throws(GenerationError) -> ANEGenerationRMSNormClassifierHead? {
         switch outputHeadBackend {
-        case .cpu, .cpuExactStaged, .cpuExactClustered, .aneClassifier:
+        case .cpu, .cpuExactStaged, .cpuExactClustered, .aneClassifier, .cpuThenANE, .cpuPartitionedArgmax:
             return nil
         case .aneRMSNormClassifier:
             if sharedClassifier {
@@ -2488,7 +2540,7 @@ public struct ANEDirectGenerationModel: ~Copyable, DirectTokenSelectingLanguageM
 
         stepLogits.zero()
         switch outputHeadBackend {
-        case .cpu, .cpuExactStaged, .cpuExactClustered:
+        case .cpu, .cpuExactStaged, .cpuExactClustered, .cpuThenANE, .cpuPartitionedArgmax:
             stepLogits.withUnsafeMutablePointer { logitsPtr in
                 classifierPointer { clsPtr in
                     stepNorm.withUnsafePointer { normPtr in
@@ -2595,6 +2647,32 @@ public struct ANEDirectGenerationModel: ~Copyable, DirectTokenSelectingLanguageM
                 throw .runtimeFailure("ANE fused output-head backend requested without compiled head")
             }
             token = try aneRMSNormClassifierHead.selectArgmax(rawInput: xCur)
+        case .cpuThenANE, .cpuPartitionedArgmax:
+            // Fall through to CPU sgemm path
+            stepLogits.zero()
+            stepLogits.withUnsafeMutablePointer { logitsPtr in
+                classifierPointer { clsPtr in
+                    stepNorm.withUnsafePointer { normPtr in
+                        BLAS.sgemm(
+                            CblasRowMajor,
+                            CblasNoTrans,
+                            CblasNoTrans,
+                            m: Int32(vocabSize),
+                            n: 1,
+                            k: Int32(ModelConfig.dim),
+                            alpha: 1.0,
+                            a: clsPtr,
+                            lda: Int32(ModelConfig.dim),
+                            b: normPtr,
+                            ldb: 1,
+                            beta: 0.0,
+                            c: logitsPtr,
+                            ldc: 1
+                        )
+                    }
+                }
+            }
+            token = try selectToken(from: stepLogits, strategy: strategy)
         }
 
         logitsLatencyMs += GenerationClock.milliseconds(start: logitsStart, end: GenerationClock.now())
@@ -2912,7 +2990,7 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
         laneSpatial: Int
     ) throws(GenerationError) -> ANEGenerationClassifierHead? {
         switch outputHeadBackend {
-        case .cpu, .cpuExactStaged, .cpuExactClustered:
+        case .cpu, .cpuExactStaged, .cpuExactClustered, .cpuThenANE, .cpuPartitionedArgmax:
             return nil
         case .aneClassifier:
             if sharedClassifier {
@@ -2940,7 +3018,7 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
         classifier: borrowing TensorBuffer
     ) throws(GenerationError) -> CPUStagedExactGenerationOutputHead? {
         switch outputHeadBackend {
-        case .cpu, .aneClassifier, .aneRMSNormClassifier:
+        case .cpu, .aneClassifier, .aneRMSNormClassifier, .cpuThenANE, .cpuPartitionedArgmax:
             return nil
         case .cpuExactStaged:
             if sharedClassifier {
@@ -2981,7 +3059,7 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
         laneSpatial: Int
     ) throws(GenerationError) -> ANEGenerationRMSNormClassifierHead? {
         switch outputHeadBackend {
-        case .cpu, .cpuExactStaged, .cpuExactClustered, .aneClassifier:
+        case .cpu, .cpuExactStaged, .cpuExactClustered, .aneClassifier, .cpuThenANE, .cpuPartitionedArgmax:
             return nil
         case .aneRMSNormClassifier:
             if sharedClassifier {
@@ -3206,7 +3284,7 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
 
         stepLogits.zero()
         switch outputHeadBackend {
-        case .cpu, .cpuExactStaged, .cpuExactClustered:
+        case .cpu, .cpuExactStaged, .cpuExactClustered, .cpuThenANE, .cpuPartitionedArgmax:
             stepLogits.withUnsafeMutablePointer { logitsPtr in
                 classifierPointer { clsPtr in
                     stepNorm.withUnsafePointer { normPtr in
@@ -3338,6 +3416,32 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
             } else {
                 token = try aneRMSNormClassifierHead.selectArgmax(rawInput: activationB)
             }
+        case .cpuThenANE, .cpuPartitionedArgmax:
+            // Fall through to CPU sgemm path
+            stepLogits.zero()
+            stepLogits.withUnsafeMutablePointer { logitsPtr in
+                classifierPointer { clsPtr in
+                    stepNorm.withUnsafePointer { normPtr in
+                        BLAS.sgemm(
+                            CblasRowMajor,
+                            CblasNoTrans,
+                            CblasNoTrans,
+                            m: Int32(vocabSize),
+                            n: 1,
+                            k: Int32(ModelConfig.dim),
+                            alpha: 1.0,
+                            a: clsPtr,
+                            lda: Int32(ModelConfig.dim),
+                            b: normPtr,
+                            ldb: 1,
+                            beta: 0.0,
+                            c: logitsPtr,
+                            ldc: 1
+                        )
+                    }
+                }
+            }
+            token = try selectToken(from: stepLogits, strategy: strategy)
         }
 
         logitsLatencyMs += GenerationClock.milliseconds(start: logitsStart, end: GenerationClock.now())
