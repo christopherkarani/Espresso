@@ -261,6 +261,7 @@ speedup_cv="$(jq -s 'map(.two_step_speedup_vs_coreml) | (length) as $n | (add / 
   echo "two_step_speedup_min=$(jq -s 'map(.two_step_speedup_vs_coreml) | min' "${valid_runs[@]}")"
   echo "two_step_speedup_max=$(jq -s 'map(.two_step_speedup_vs_coreml) | max' "${valid_runs[@]}")"
   echo "two_step_speedup_cv=$speedup_cv"
+  echo "control_speedup_vs_coreml=$(jq -s 'map(.control_speedup_vs_coreml // null) | if all(. != null) then sort | .[((length - 1) / 2 | floor)] else "n/a" end' "${valid_runs[@]}")"
   echo "total_elapsed_s=$total_benchmark_elapsed"
   echo "committed_exact_tokens_per_pass=$committed_tokens_per_pass"
   echo "accepted_future_tokens_per_pass=$accepted_future_tokens_per_pass"
