@@ -12,7 +12,9 @@ private func readStoriesConfigHeader() throws -> String {
         .deletingLastPathComponent()
         .deletingLastPathComponent()
         .deletingLastPathComponent()
+    let testsDir = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
     let candidates = [
+        testsDir.appendingPathComponent("Fixtures/stories_config.h"),
         repoRoot.appendingPathComponent("training/stories_config.h"),
         repoRoot.appendingPathComponent("archive/training/stories_config.h"),
     ]
@@ -22,7 +24,7 @@ private func readStoriesConfigHeader() throws -> String {
     throw NSError(
         domain: "ANETypesTests",
         code: 1,
-        userInfo: [NSLocalizedDescriptionKey: "stories_config.h not found in training/ or archive/training/"]
+        userInfo: [NSLocalizedDescriptionKey: "stories_config.h not found in test fixtures, training/, or archive/training/"]
     )
 }
 
