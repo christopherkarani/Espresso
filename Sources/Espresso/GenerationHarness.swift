@@ -2769,6 +2769,8 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
     public private(set) var compileTimeMs: Double
     private var trunkLatencyMs: Double
     private var logitsLatencyMs: Double
+    private let blockMaxNorms: [Float]
+    private let partitionedLogitsScratch: TensorBuffer
 
     public var performanceSnapshot: GenerationPerformanceSnapshot {
         GenerationPerformanceSnapshot(
@@ -2877,6 +2879,32 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
         )
         let compileTimeMs = GenerationClock.milliseconds(start: compileStart, end: GenerationClock.now())
 
+        // Precompute block max norms for partitioned argmax (before consuming embedding/classifier)
+        let blockMaxNorms: [Float]
+        let partitionedLogitsScratch: TensorBuffer
+        if outputHeadBackend == .cpuPartitionedArgmax {
+            let blockSize = PartitionedArgmax.defaultBlockSize
+            if sharedClassifier {
+                blockMaxNorms = embedding.withUnsafePointer { clsPtr in
+                    PartitionedArgmax.precomputeBlockMaxNorms(
+                        classifier: clsPtr, vocabSize: vocabSize,
+                        dim: ModelConfig.dim, blockSize: blockSize
+                    )
+                }
+            } else {
+                blockMaxNorms = classifier.withUnsafePointer { clsPtr in
+                    PartitionedArgmax.precomputeBlockMaxNorms(
+                        classifier: clsPtr, vocabSize: vocabSize,
+                        dim: ModelConfig.dim, blockSize: blockSize
+                    )
+                }
+            }
+            partitionedLogitsScratch = TensorBuffer(count: blockSize, zeroed: true)
+        } else {
+            blockMaxNorms = []
+            partitionedLogitsScratch = TensorBuffer(count: 0, zeroed: true)
+        }
+
         self.vocabSize = vocabSize
         self.layerCount = layerCount
         self.maxSequenceTokens = maxSequenceTokens
@@ -2902,6 +2930,8 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
         self.compileTimeMs = compileTimeMs
         self.trunkLatencyMs = 0
         self.logitsLatencyMs = 0
+        self.blockMaxNorms = blockMaxNorms
+        self.partitionedLogitsScratch = partitionedLogitsScratch
     }
 
     private static func emptyLayerStorage<Element: ~Copyable>(_: Element.Type = Element.self) -> LayerStorage<Element> {
@@ -3416,8 +3446,7 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
             } else {
                 token = try aneRMSNormClassifierHead.selectArgmax(rawInput: activationB)
             }
-        case .cpuThenANE, .cpuPartitionedArgmax:
-            // Fall through to CPU sgemm path
+        case .cpuThenANE:
             stepLogits.zero()
             stepLogits.withUnsafeMutablePointer { logitsPtr in
                 classifierPointer { clsPtr in
@@ -3442,6 +3471,28 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
                 }
             }
             token = try selectToken(from: stepLogits, strategy: strategy)
+        case .cpuPartitionedArgmax:
+            // Partitioned argmax with Cauchy-Schwarz block pruning (greedy only)
+            var skippedBlocks = 0
+            let tokenIndex = partitionedLogitsScratch.withUnsafeMutablePointer { scratchPtr in
+                classifierPointer { clsPtr in
+                    stepNorm.withUnsafePointer { normPtr in
+                        blockMaxNorms.withUnsafeBufferPointer { normsPtr in
+                            PartitionedArgmax.compute(
+                                classifier: clsPtr,
+                                input: normPtr,
+                                logitsScratch: scratchPtr,
+                                blockMaxNorms: normsPtr.baseAddress!,
+                                vocabSize: vocabSize,
+                                dim: ModelConfig.dim,
+                                blockSize: PartitionedArgmax.defaultBlockSize,
+                                skippedBlocks: &skippedBlocks
+                            )
+                        }
+                    }
+                }
+            }
+            token = UInt16(tokenIndex)
         }
 
         logitsLatencyMs += GenerationClock.milliseconds(start: logitsStart, end: GenerationClock.now())
