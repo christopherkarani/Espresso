@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <dispatch/dispatch.h>
 
 #if defined(__aarch64__) || defined(__arm64__)
 #include <arm_neon.h>
@@ -1017,4 +1018,163 @@ cleanup:
     }
     IOSurfaceUnlock(dst, 0, NULL);
     return ok;
+}
+
+/* ---------- Channel-partitioned parallel argmax ---------- */
+
+#if defined(__aarch64__) || defined(__arm64__)
+
+typedef struct {
+    const _Float16 *base;
+    int spatial;
+    int ch_start;
+    int ch_end;
+    _Float16 *partial_values;   /* [spatial] */
+    uint16_t *partial_indices;  /* [spatial] */
+} argmax_block_ctx;
+
+static void neon_partial_argmax(void *ctx_ptr) {
+    argmax_block_ctx *ctx = (argmax_block_ctx *)ctx_ptr;
+    const _Float16 *base = ctx->base;
+    const int spatial = ctx->spatial;
+    const int ch_start = ctx->ch_start;
+    const int ch_end = ctx->ch_end;
+    const int nvecs = spatial / 8;
+    const size_t spatialSz = (size_t)spatial;
+
+    float16x8_t bestV[ARGMAX_MAX_NVECS];
+    uint16x8_t bestI[ARGMAX_MAX_NVECS];
+
+    const _Float16 *row0 = base + (size_t)ch_start * spatialSz;
+    for (int v = 0; v < nvecs; v++) {
+        bestV[v] = vld1q_f16(row0 + v * 8);
+        bestI[v] = vdupq_n_u16((uint16_t)ch_start);
+    }
+
+    for (int c = ch_start + 1; c < ch_end; c++) {
+        const _Float16 *row = base + (size_t)c * spatialSz;
+        uint16x8_t cidx = vdupq_n_u16((uint16_t)c);
+        for (int v = 0; v < nvecs; v++) {
+            float16x8_t vals = vld1q_f16(row + v * 8);
+            uint16x8_t gt = vcgtq_f16(vals, bestV[v]);
+            bestV[v] = vbslq_f16(gt, vals, bestV[v]);
+            bestI[v] = vbslq_u16(gt, cidx, bestI[v]);
+        }
+    }
+
+    for (int v = 0; v < nvecs; v++) {
+        vst1q_f16(ctx->partial_values + v * 8, bestV[v]);
+        vst1q_u16(ctx->partial_indices + v * 8, bestI[v]);
+    }
+}
+
+#endif /* __aarch64__ */
+
+bool ane_interop_io_argmax_batch_fp16_spatial_parallel(
+    IOSurfaceRef surface,
+    int ch_off,
+    int spatial,
+    int channels,
+    int stream_count,
+    int *out_indices,
+    float *out_values,
+    int n_blocks) {
+
+    /* Fall back to serial for small workloads or invalid n_blocks */
+    if (n_blocks <= 1 || channels < n_blocks * 2) {
+        return ane_interop_io_argmax_batch_fp16_spatial(
+            surface, ch_off, spatial, channels, stream_count,
+            out_indices, out_values);
+    }
+
+#if defined(__aarch64__) || defined(__arm64__)
+    if (!surface || !out_indices || !out_values) return false;
+    if (ch_off < 0 || spatial <= 0 || channels <= 0 || stream_count <= 0) return false;
+    if (stream_count > spatial) return false;
+    if (spatial > 512 || (spatial % 8) != 0) {
+        return ane_interop_io_argmax_batch_fp16_spatial(
+            surface, ch_off, spatial, channels, stream_count,
+            out_indices, out_values);
+    }
+    if (n_blocks > 8) n_blocks = 8;  /* cap at 8 */
+
+    size_t spatialSz = (size_t)spatial;
+    size_t maxCh = (size_t)(ch_off + channels - 1);
+    size_t maxIdxElems;
+    if (mul_size_overflow(maxCh, spatialSz, &maxIdxElems)) return false;
+    size_t elemCount;
+    if (add_size_overflow(maxIdxElems, (size_t)(spatial - 1), &maxIdxElems)) return false;
+    if (add_size_overflow(maxIdxElems, 1, &elemCount)) return false;
+    size_t bytes;
+    if (mul_size_overflow(elemCount, sizeof(_Float16), &bytes)) return false;
+
+    if (IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL) != kIOReturnSuccess) return false;
+    bool ok = false;
+
+    const void *base = IOSurfaceGetBaseAddress(surface);
+    if (!base) goto cleanup;
+    if (bytes > IOSurfaceGetAllocSize(surface)) goto cleanup;
+
+    {
+        const _Float16 *srcF16 = (const _Float16 *)base;
+        const _Float16 *src_offset = srcF16 + (size_t)ch_off * spatialSz;
+
+        /* Allocate per-block partial results */
+        _Float16 *all_values = (_Float16 *)malloc((size_t)n_blocks * spatial * sizeof(_Float16));
+        uint16_t *all_indices = (uint16_t *)malloc((size_t)n_blocks * spatial * sizeof(uint16_t));
+        argmax_block_ctx *ctxs = (argmax_block_ctx *)malloc((size_t)n_blocks * sizeof(argmax_block_ctx));
+
+        if (!all_values || !all_indices || !ctxs) {
+            free(all_values); free(all_indices); free(ctxs);
+            goto cleanup;
+        }
+
+        /* Set up blocks: partition channels evenly */
+        int chPerBlock = channels / n_blocks;
+        for (int b = 0; b < n_blocks; b++) {
+            ctxs[b].base = src_offset;
+            ctxs[b].spatial = spatial;
+            ctxs[b].ch_start = b * chPerBlock;
+            ctxs[b].ch_end = (b == n_blocks - 1) ? channels : (b + 1) * chPerBlock;
+            ctxs[b].partial_values = all_values + b * spatial;
+            ctxs[b].partial_indices = all_indices + b * spatial;
+        }
+
+        /* Dispatch parallel partial argmax */
+        dispatch_queue_t queue = dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0);
+        dispatch_apply((size_t)n_blocks, queue, ^(size_t block_idx) {
+            neon_partial_argmax(&ctxs[block_idx]);
+        });
+
+        /* Merge: for each lane, find global best across all blocks */
+        for (int s = 0; s < stream_count; s++) {
+            _Float16 bestVal = all_values[s];
+            uint16_t bestIdx = all_indices[s];
+            for (int b = 1; b < n_blocks; b++) {
+                _Float16 v = all_values[b * spatial + s];
+                uint16_t i = all_indices[b * spatial + s];
+                if (v > bestVal) {
+                    bestVal = v;
+                    bestIdx = i;
+                }
+            }
+            out_indices[s] = (int)bestIdx;
+            out_values[s] = (float)bestVal;
+        }
+
+        free(all_values);
+        free(all_indices);
+        free(ctxs);
+        ok = true;
+    }
+
+cleanup:
+    IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+    return ok;
+
+#else
+    return ane_interop_io_argmax_batch_fp16_spatial(
+        surface, ch_off, spatial, channels, stream_count,
+        out_indices, out_values);
+#endif
 }

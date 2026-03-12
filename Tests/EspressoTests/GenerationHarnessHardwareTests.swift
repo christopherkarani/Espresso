@@ -1887,9 +1887,9 @@ final class GenerationHarnessHardwareTests: XCTestCase {
 
         try headEval()
 
-        let argmaxResults = try SurfaceIO.argmaxBatchFP16Spatial(
+        let argmaxResults = try SurfaceIO.argmaxBatchFP16SpatialParallel(
             from: headOut, channelOffset: 0, spatial: laneSpatial,
-            channels: vocabSize, streamCount: streamCount
+            channels: vocabSize, streamCount: streamCount, nBlocks: 4
         )
         for streamIdx in 0..<streamCount {
             tokens[streamIdx] = UInt16(argmaxResults[streamIdx].index)
@@ -2250,7 +2250,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
 
         // K-sweep at 256 lanes: measure head eval with different bottleneck sizes
         print("=== K-sweep at lane=\(laneSpatial) ===")
-        for kVal in [32, 64, 128, 256, 512] {
+        for kVal in [64, 80, 96, 112, 128, 160, 192] {
             let kInvd: Float = 1.0 / Float(dim)
             var kb = MILBuilder(reserveCapacity: 4_096)
             kb.append(MILText.header)
@@ -2341,6 +2341,108 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                 """
             )
         }
+    }
+
+    // MARK: - Parallel argmax probe
+
+    func test_parallel_argmax_vs_serial_on_hardware() throws {
+        try requireGenerationHardware()
+
+        let laneSpatial = 256
+        let streamCount = 256
+        let vocabSize = ModelConfig.vocab  // 32000
+        let iterations = 50
+        let warmup = 10
+
+        // Build a factored head to get a realistic logits surface
+        let weights = makeEchoRecurrentGenerationWeights(layerCount: 6)
+        let factoredHead = try FactoredGenerationRMSNormClassifierKernelSet(
+            rmsFinal: weights.rmsFinal,
+            classifierProjection: TensorBuffer(count: 128 * ModelConfig.dim, zeroed: true),
+            classifierExpansion: TensorBuffer(count: vocabSize * 128, zeroed: true),
+            vocabSize: vocabSize,
+            bottleneck: 128,
+            laneSpatial: laneSpatial
+        )
+        let headOut = try factoredHead.rmsNormClassifier.outputSurface(at: 0)
+        // Eval head once to populate the surface
+        try factoredHead.rmsNormClassifier.eval()
+
+        // Warmup both paths
+        for _ in 0..<warmup {
+            let _ = try SurfaceIO.argmaxBatchFP16Spatial(
+                from: headOut, channelOffset: 0, spatial: laneSpatial,
+                channels: vocabSize, streamCount: streamCount
+            )
+            let _ = try SurfaceIO.argmaxBatchFP16SpatialParallel(
+                from: headOut, channelOffset: 0, spatial: laneSpatial,
+                channels: vocabSize, streamCount: streamCount, nBlocks: 2
+            )
+            let _ = try SurfaceIO.argmaxBatchFP16SpatialParallel(
+                from: headOut, channelOffset: 0, spatial: laneSpatial,
+                channels: vocabSize, streamCount: streamCount, nBlocks: 4
+            )
+        }
+
+        // Serial argmax
+        var serialUs: [Double] = []
+        for _ in 0..<iterations {
+            let t = GenerationClock.now()
+            let _ = try SurfaceIO.argmaxBatchFP16Spatial(
+                from: headOut, channelOffset: 0, spatial: laneSpatial,
+                channels: vocabSize, streamCount: streamCount
+            )
+            serialUs.append(machMicroseconds(GenerationClock.now() - t))
+        }
+
+        // Parallel argmax n=2
+        var par2Us: [Double] = []
+        for _ in 0..<iterations {
+            let t = GenerationClock.now()
+            let _ = try SurfaceIO.argmaxBatchFP16SpatialParallel(
+                from: headOut, channelOffset: 0, spatial: laneSpatial,
+                channels: vocabSize, streamCount: streamCount, nBlocks: 2
+            )
+            par2Us.append(machMicroseconds(GenerationClock.now() - t))
+        }
+
+        // Parallel argmax n=4
+        var par4Us: [Double] = []
+        for _ in 0..<iterations {
+            let t = GenerationClock.now()
+            let _ = try SurfaceIO.argmaxBatchFP16SpatialParallel(
+                from: headOut, channelOffset: 0, spatial: laneSpatial,
+                channels: vocabSize, streamCount: streamCount, nBlocks: 4
+            )
+            par4Us.append(machMicroseconds(GenerationClock.now() - t))
+        }
+
+        // Correctness check: serial and parallel must agree
+        let serialResult = try SurfaceIO.argmaxBatchFP16Spatial(
+            from: headOut, channelOffset: 0, spatial: laneSpatial,
+            channels: vocabSize, streamCount: streamCount
+        )
+        let par4Result = try SurfaceIO.argmaxBatchFP16SpatialParallel(
+            from: headOut, channelOffset: 0, spatial: laneSpatial,
+            channels: vocabSize, streamCount: streamCount, nBlocks: 4
+        )
+        for i in 0..<streamCount {
+            XCTAssertEqual(serialResult[i].index, par4Result[i].index,
+                           "Parallel argmax mismatch at lane \(i)")
+        }
+
+        func median(_ arr: [Double]) -> Double {
+            let sorted = arr.sorted()
+            return sorted[sorted.count / 2]
+        }
+
+        let sMedian = median(serialUs)
+        let p2Median = median(par2Us)
+        let p4Median = median(par4Us)
+        print("argmax @\(streamCount) streams, \(vocabSize) vocab, \(iterations) iterations:")
+        print("  serial:     \(String(format: "%.1f", sMedian)) µs")
+        print("  parallel_2: \(String(format: "%.1f", p2Median)) µs (\(String(format: "%+.1f", p2Median - sMedian)) µs, \(String(format: "%.1f", (sMedian - p2Median) / sMedian * 100))% faster)")
+        print("  parallel_4: \(String(format: "%.1f", p4Median)) µs (\(String(format: "%+.1f", p4Median - sMedian)) µs, \(String(format: "%.1f", (sMedian - p4Median) / sMedian * 100))% faster)")
     }
 
     // MARK: - MIL op ANE compile probes (argmax alternatives)
@@ -3238,9 +3340,9 @@ final class GenerationHarnessHardwareTests: XCTestCase {
             try factoredHead.rmsNormClassifier.eval()
             t2 = GenerationClock.now(); evalHeadUs.append(machMicroseconds(t2 - t)); t = t2
 
-            let argmaxResults = try SurfaceIO.argmaxBatchFP16Spatial(
+            let argmaxResults = try SurfaceIO.argmaxBatchFP16SpatialParallel(
                 from: headOut, channelOffset: 0, spatial: laneSpatial,
-                channels: vocabSize, streamCount: streamCount
+                channels: vocabSize, streamCount: streamCount, nBlocks: 4
             )
             for i in 0..<streamCount { tokens[i] = UInt16(argmaxResults[i].index) }
             t2 = GenerationClock.now(); argmaxUs.append(machMicroseconds(t2 - t))

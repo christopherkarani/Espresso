@@ -427,6 +427,40 @@ public enum SurfaceIO {
         }
     }
 
+    public static func argmaxBatchFP16SpatialParallel(
+        from surface: IOSurfaceRef,
+        channelOffset: Int,
+        spatial: Int,
+        channels: Int,
+        streamCount: Int,
+        nBlocks: Int = 4
+    ) throws(SurfaceIOError) -> [FP16ArgmaxResult] {
+        let chOff32 = try checkedNonNegativeInt32(channelOffset)
+        let spatial32 = try checkedNonNegativeInt32(spatial)
+        let channels32 = try checkedNonNegativeInt32(channels)
+        let count32 = try checkedNonNegativeInt32(streamCount)
+        let blocks32 = try checkedNonNegativeInt32(nBlocks)
+        guard spatial > 0, channels > 0, streamCount > 0, streamCount <= spatial else {
+            throw .argumentOutOfRange
+        }
+
+        var indices = [Int32](repeating: 0, count: streamCount)
+        var values = [Float](repeating: 0, count: streamCount)
+        let ok = indices.withUnsafeMutableBufferPointer { idxBuf in
+            values.withUnsafeMutableBufferPointer { valBuf in
+                ane_interop_io_argmax_batch_fp16_spatial_parallel(
+                    surface, chOff32, spatial32, channels32, count32,
+                    idxBuf.baseAddress!, valBuf.baseAddress!, blocks32
+                )
+            }
+        }
+        guard ok else { throw .interopCallFailed }
+
+        return (0..<streamCount).map { i in
+            FP16ArgmaxResult(index: Int(indices[i]), value: values[i])
+        }
+    }
+
     public static func copyFP16Batched(dst: IOSurfaceRef,
                                        src: IOSurfaceRef,
                                        spatial: Int,

@@ -226,6 +226,19 @@ bool ane_interop_io_argmax_batch_fp16_spatial(
     int *out_indices,
     float *out_values);
 
+/// Channel-partitioned parallel argmax: splits channels into n_blocks
+/// and uses dispatch_apply to process each block on a separate core.
+/// n_blocks should be 2-4 for best results. Falls back to serial if n_blocks <= 1.
+bool ane_interop_io_argmax_batch_fp16_spatial_parallel(
+    IOSurfaceRef surface,
+    int ch_off,
+    int spatial,
+    int channels,
+    int stream_count,
+    int *out_indices,
+    float *out_values,
+    int n_blocks);
+
 /// Lock/unlock surfaces independently for batched I/O sequences.
 /// Use these to amortize lock overhead across write→eval→read cycles.
 bool ane_interop_io_lock_write(IOSurfaceRef surface);
