@@ -6,7 +6,7 @@
 
 #if defined(__aarch64__) || defined(__arm64__)
 #include <arm_neon.h>
-#define ARGMAX_MAX_NVECS 64  /* supports up to spatial=512 */
+#define ARGMAX_MAX_NVECS 128  /* supports up to spatial=1024 */
 #endif
 
 #include "ane_interop.h"
@@ -1091,12 +1091,12 @@ bool ane_interop_io_argmax_batch_fp16_spatial_parallel(
     if (!surface || !out_indices || !out_values) return false;
     if (ch_off < 0 || spatial <= 0 || channels <= 0 || stream_count <= 0) return false;
     if (stream_count > spatial) return false;
-    if (spatial > 512 || (spatial % 8) != 0) {
+    if (spatial > 1024 || (spatial % 8) != 0) {
         return ane_interop_io_argmax_batch_fp16_spatial(
             surface, ch_off, spatial, channels, stream_count,
             out_indices, out_values);
     }
-    if (n_blocks > 8) n_blocks = 8;
+    if (n_blocks > 32) n_blocks = 32;
 
     size_t spatialSz = (size_t)spatial;
     size_t maxCh = (size_t)(ch_off + channels - 1);
@@ -1119,12 +1119,13 @@ bool ane_interop_io_argmax_batch_fp16_spatial_parallel(
         const _Float16 *srcF16 = (const _Float16 *)base;
         const _Float16 *src_offset = srcF16 + (size_t)ch_off * spatialSz;
 
-        /* Stack-allocated per-block partial results.
-         * Max: 8 blocks × 512 spatial = 4096 entries × 2 bytes = 8KB each. */
-        _Float16 all_values[8 * 512];
-        uint16_t all_indices[8 * 512];
-        argmax_block_ctx ctxs_arr[8];
-        argmax_block_ctx *ctxs = ctxs_arr;  /* pointer for block capture */
+        _Float16 *all_values = (_Float16 *)malloc((size_t)n_blocks * spatialSz * sizeof(_Float16));
+        uint16_t *all_indices = (uint16_t *)malloc((size_t)n_blocks * spatialSz * sizeof(uint16_t));
+        argmax_block_ctx *ctxs = (argmax_block_ctx *)malloc((size_t)n_blocks * sizeof(argmax_block_ctx));
+        if (!all_values || !all_indices || !ctxs) {
+            free(all_values); free(all_indices); free(ctxs);
+            goto cleanup;
+        }
 
         /* Set up blocks: partition channels evenly */
         int chPerBlock = channels / n_blocks;
@@ -1159,6 +1160,9 @@ bool ane_interop_io_argmax_batch_fp16_spatial_parallel(
             out_values[s] = (float)bestVal;
         }
 
+        free(all_values);
+        free(all_indices);
+        free(ctxs);
         ok = true;
     }
 
@@ -1188,9 +1192,9 @@ bool ane_interop_io_argmax_batch_fp16_spatial_nolock(
     if (ch_off < 0 || spatial <= 0 || channels <= 0 || stream_count <= 0) return false;
     if (stream_count > spatial) return false;
     if (n_blocks <= 1) n_blocks = 1;
-    if (n_blocks > 8) n_blocks = 8;
+    if (n_blocks > 32) n_blocks = 32;
     if (channels < n_blocks * 2) n_blocks = 1;
-    if (spatial > 512 || (spatial % 8) != 0) n_blocks = 1;
+    if (spatial > 2048 || (spatial % 8) != 0) n_blocks = 1;
 
     /* No lock — caller guarantees coherency */
     const void *base = IOSurfaceGetBaseAddress(surface);
@@ -1227,11 +1231,14 @@ bool ane_interop_io_argmax_batch_fp16_spatial_nolock(
         return true;
     }
 
-    /* Parallel path */
-    _Float16 all_values[8 * 512];
-    uint16_t all_indices[8 * 512];
-    argmax_block_ctx ctxs_arr[8];
-    argmax_block_ctx *ctxs = ctxs_arr;
+    /* Parallel path — heap allocate for large spatial */
+    _Float16 *all_values = (_Float16 *)malloc((size_t)n_blocks * (size_t)spatial * sizeof(_Float16));
+    uint16_t *all_indices = (uint16_t *)malloc((size_t)n_blocks * (size_t)spatial * sizeof(uint16_t));
+    argmax_block_ctx *ctxs = (argmax_block_ctx *)malloc((size_t)n_blocks * sizeof(argmax_block_ctx));
+    if (!all_values || !all_indices || !ctxs) {
+        free(all_values); free(all_indices); free(ctxs);
+        return false;
+    }
 
     int chPerBlock = channels / n_blocks;
     for (int b = 0; b < n_blocks; b++) {
@@ -1262,6 +1269,7 @@ bool ane_interop_io_argmax_batch_fp16_spatial_nolock(
         out_indices[s] = (int)bestIdx;
         out_values[s] = (float)bestVal;
     }
+    free(all_values); free(all_indices); free(ctxs);
     return true;
 #else
     return false;
@@ -1361,10 +1369,10 @@ bool ane_interop_fused_expansion_argmax_fp16(
     if (!proj_surface || !expansion_weights_fp16 || !out_indices || !out_values) return false;
     if (spatial <= 0 || bottleneck <= 0 || groups <= 0 || vocab_size <= 0) return false;
     if (stream_count <= 0 || stream_count > spatial) return false;
-    if (spatial > 512 || (spatial % 8) != 0) return false;
+    if (spatial > 2048 || (spatial % 8) != 0) return false;
     if (bottleneck % groups != 0 || vocab_size % groups != 0) return false;
     if (n_blocks <= 1) n_blocks = 1;
-    if (n_blocks > 8) n_blocks = 8;
+    if (n_blocks > 32) n_blocks = 32;
     if (vocab_size < n_blocks * 2) n_blocks = 1;
 
     int cols_per_group = bottleneck / groups;
@@ -1404,8 +1412,9 @@ bool ane_interop_fused_expansion_argmax_fp16(
         ctx.ch_start = 0;
         ctx.ch_end = vocab_size;
 
-        _Float16 values[512];  /* max spatial */
-        uint16_t indices[512];
+        _Float16 *values = (_Float16 *)malloc((size_t)spatial * sizeof(_Float16));
+        uint16_t *indices = (uint16_t *)malloc((size_t)spatial * sizeof(uint16_t));
+        if (!values || !indices) { free(values); free(indices); free(proj_local); return false; }
         ctx.partial_values = values;
         ctx.partial_indices = indices;
 
@@ -1415,13 +1424,17 @@ bool ane_interop_fused_expansion_argmax_fp16(
             out_indices[s] = (int)indices[s];
             out_values[s] = (float)values[s];
         }
+        free(values);
+        free(indices);
         ok = true;
     } else {
         /* Parallel path */
-        _Float16 all_values[8 * 512];
-        uint16_t all_indices[8 * 512];
-        fused_exp_argmax_ctx ctxs_arr[8];
-        fused_exp_argmax_ctx *ctxs = ctxs_arr;
+        _Float16 *all_values = (_Float16 *)malloc((size_t)n_blocks * spatial * sizeof(_Float16));
+        uint16_t *all_indices = (uint16_t *)malloc((size_t)n_blocks * spatial * sizeof(uint16_t));
+        fused_exp_argmax_ctx *ctxs = (fused_exp_argmax_ctx *)malloc((size_t)n_blocks * sizeof(fused_exp_argmax_ctx));
+        if (!all_values || !all_indices || !ctxs) {
+            free(all_values); free(all_indices); free(ctxs); free(proj_local); return false;
+        }
 
         int chPerBlock = vocab_size / n_blocks;
         for (int b = 0; b < n_blocks; b++) {
@@ -1458,6 +1471,9 @@ bool ane_interop_fused_expansion_argmax_fp16(
             out_indices[s] = (int)bestIdx;
             out_values[s] = (float)bestVal;
         }
+        free(all_values);
+        free(all_indices);
+        free(ctxs);
         ok = true;
     }
 
