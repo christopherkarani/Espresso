@@ -214,9 +214,36 @@ coreml_cv="$(jq -s 'map(.coreml.median_ms_per_token) | (length) as $n | (add / $
 } | tee "$RESULTS_DIR/summary.txt"
 
 # Machine-readable aggregate JSON combining all per-run data with summary stats
-jq -s --arg dir "$RESULTS_DIR" '{
+jq -s \
+  --arg dir "$RESULTS_DIR" \
+  --arg ts "$(date -Iseconds)" \
+  --arg commit "$(git -C "$ROOT" rev-parse HEAD)" \
+  --arg branch "$(git -C "$ROOT" rev-parse --abbrev-ref HEAD)" \
+  --arg input_mode "$INPUT_MODE" \
+  --argjson warmup "$WARMUP" \
+  --argjson iterations "$ITERATIONS" \
+  --argjson max_new_tokens "$MAX_NEW_TOKENS" \
+  --argjson max_seq "$MAX_SEQUENCE_TOKENS" \
+  --argjson layers "$LAYER_COUNT" \
+  --arg control_backend "$CONTROL_BACKEND" \
+  --arg two_step_backend "$TWO_STEP_BACKEND" \
+'{
   results_dir: $dir,
-  repeats: length,
+  timestamp: $ts,
+  git_commit: $commit,
+  git_branch: $branch,
+  benchmark_contract: {
+    input_mode: $input_mode,
+    control_backend: $control_backend,
+    two_step_backend: $two_step_backend,
+    warmup: $warmup,
+    iterations: $iterations,
+    max_new_tokens: $max_new_tokens,
+    max_sequence_tokens: $max_seq,
+    layer_count: $layers
+  },
+  valid_runs: (length),
+  repeats: (length),
   two_step: {
     median_ms_per_token: (map(.two_step.median_ms_per_token) | sort | .[((length - 1) / 2 | floor)]),
     p95_ms_per_token: (map(.two_step.p95_ms_per_token // empty) | if length == 0 then null else sort | .[((length - 1) / 2 | floor)] end),
