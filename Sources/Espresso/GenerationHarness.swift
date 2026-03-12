@@ -253,11 +253,11 @@ public protocol ExactTwoTokenGeneratingLanguageModel: ~Copyable, GenerationPerfo
 
 @inline(__always)
 private func tensorBufferIsAllZero(_ buffer: borrowing TensorBuffer) -> Bool {
-    buffer.withUnsafeBufferPointer { ptr in
-        for value in ptr where value != 0 {
-            return false
-        }
-        return true
+    guard buffer.count > 0 else { return true }
+    return buffer.withUnsafePointer { ptr in
+        var maxMagnitude: Float = 0
+        vDSP_maxmgv(ptr, 1, &maxMagnitude, vDSP_Length(buffer.count))
+        return maxMagnitude == 0
     }
 }
 
