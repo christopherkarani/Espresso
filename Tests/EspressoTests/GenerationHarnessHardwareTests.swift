@@ -1877,6 +1877,36 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         }
     }
 
+    func test_batched_multistream_high_lane_sweep_on_hardware() throws {
+        try requireGenerationHardware()
+
+        let prompt: [UInt16] = [0]
+        let warmup = 3
+        let iterations = 20
+        let maxNewTokens = 8
+        let streamCounts = [1, 4, 8, 12, 16, 24, 32]
+
+        let batched = try benchmarkBatchedRecurrentGeneration(
+            layerCount: 6,
+            promptTokens: prompt,
+            maxNewTokens: maxNewTokens,
+            warmup: warmup,
+            iterations: iterations,
+            streamCounts: streamCounts
+        )
+
+        XCTAssertEqual(batched.samples.map(\.streamCount), streamCounts)
+        XCTAssertTrue(batched.samples.allSatisfy { $0.medianMsPerToken > 0 })
+
+        for sample in batched.samples {
+            print(
+                """
+                batched ane streams=\(sample.streamCount) median_ms_token=\(sample.medianMsPerToken) aggregate_tps=\(sample.aggregateTokensPerSecond) per_stream_tps=\(sample.perStreamTokensPerSecond) compile=\(sample.compileTimeMs) round_ms=\(sample.medianRoundLatencyMs)
+                """
+            )
+        }
+    }
+
     private func machMilliseconds(_ deltaTicks: UInt64) -> Double {
         var info = mach_timebase_info_data_t()
         mach_timebase_info(&info)
