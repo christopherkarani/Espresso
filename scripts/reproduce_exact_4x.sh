@@ -208,6 +208,8 @@ coreml_cv="$(jq -s 'map(.coreml.median_ms_per_token) | (length) as $n | (add / $
   echo "coreml_max_ms_per_token=$coreml_max_ms"
   echo "coreml_cv=$coreml_cv"
   echo "two_step_speedup_vs_coreml=$speedup_median"
+  echo "two_step_speedup_min=$(jq -s 'map(.two_step_speedup_vs_coreml) | min' "${valid_runs[@]}")"
+  echo "two_step_speedup_max=$(jq -s 'map(.two_step_speedup_vs_coreml) | max' "${valid_runs[@]}")"
   echo "committed_exact_tokens_per_pass=$committed_tokens_per_pass"
   echo "accepted_future_tokens_per_pass=$accepted_future_tokens_per_pass"
   echo "all_parity_match=$all_parity_match"
@@ -272,6 +274,8 @@ jq -s \
     per_run_medians_ms: (map(.coreml.median_ms_per_token))
   },
   two_step_speedup_vs_coreml: (map(.two_step_speedup_vs_coreml) | sort | .[((length - 1) / 2 | floor)]),
+  two_step_speedup_min: (map(.two_step_speedup_vs_coreml) | min),
+  two_step_speedup_max: (map(.two_step_speedup_vs_coreml) | max),
   committed_exact_tokens_per_pass: (map(.two_step.median_committed_exact_tokens_per_pass) | sort | .[((length - 1) / 2 | floor)]),
   accepted_future_tokens_per_pass: (map(.two_step.median_accepted_future_tokens_per_pass) | sort | .[((length - 1) / 2 | floor)]),
   all_parity_match: (all(.[]; .parity_status == "match"))
