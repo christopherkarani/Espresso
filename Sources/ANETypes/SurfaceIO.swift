@@ -496,6 +496,48 @@ public enum SurfaceIO {
         }
     }
 
+    /// Fused expansion + argmax: reads a small projected surface, computes
+    /// matmul + argmax on CPU without materializing full vocab logits.
+    /// `expansionWeightsFP16` must point to contiguous fp16 [vocabSize, bottleneck/groups].
+    public static func fusedExpansionArgmax(
+        projSurface: IOSurfaceRef,
+        projChannelOffset: Int = 0,
+        spatial: Int,
+        bottleneck: Int,
+        groups: Int,
+        expansionWeightsFP16: UnsafeRawPointer,
+        vocabSize: Int,
+        streamCount: Int,
+        nBlocks: Int = 8
+    ) throws(SurfaceIOError) -> [FP16ArgmaxResult] {
+        guard spatial > 0, bottleneck > 0, groups > 0, vocabSize > 0, streamCount > 0 else {
+            throw .argumentOutOfRange
+        }
+        var indices = [Int32](repeating: 0, count: streamCount)
+        var values = [Float](repeating: 0, count: streamCount)
+        let ok = indices.withUnsafeMutableBufferPointer { idxBuf in
+            values.withUnsafeMutableBufferPointer { valBuf in
+                ane_interop_fused_expansion_argmax_fp16(
+                    projSurface,
+                    Int32(projChannelOffset),
+                    Int32(spatial),
+                    Int32(bottleneck),
+                    Int32(groups),
+                    expansionWeightsFP16,
+                    Int32(vocabSize),
+                    Int32(streamCount),
+                    idxBuf.baseAddress!,
+                    valBuf.baseAddress!,
+                    Int32(nBlocks)
+                )
+            }
+        }
+        guard ok else { throw .interopCallFailed }
+        return (0..<streamCount).map { i in
+            FP16ArgmaxResult(index: Int(indices[i]), value: values[i])
+        }
+    }
+
     public static func copyFP16Batched(dst: IOSurfaceRef,
                                        src: IOSurfaceRef,
                                        spatial: Int,

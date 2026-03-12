@@ -256,6 +256,23 @@ bool ane_interop_io_argmax_batch_fp16_spatial_nolock(
     float *out_values,
     int n_blocks);
 
+/// Fused expansion + argmax: reads a small projected surface, computes
+/// expansion matmul + argmax on CPU without materializing full vocab logits.
+/// expansion_weights_fp16: fp16 [vocab_size, bottleneck/groups] row-major.
+/// Locks/copies proj surface internally. n_blocks for parallel dispatch.
+bool ane_interop_fused_expansion_argmax_fp16(
+    IOSurfaceRef proj_surface,
+    int proj_ch_off,
+    int spatial,
+    int bottleneck,
+    int groups,
+    const void *expansion_weights_fp16,
+    int vocab_size,
+    int stream_count,
+    int *out_indices,
+    float *out_values,
+    int n_blocks);
+
 /// Lock/unlock surfaces independently for batched I/O sequences.
 /// Use these to amortize lock overhead across write→eval→read cycles.
 bool ane_interop_io_lock_write(IOSurfaceRef surface);
