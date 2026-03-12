@@ -1,8 +1,12 @@
 import Accelerate
 import XCTest
 import ANETypes
+import ANERuntime
+import ANEInterop
 import CoreML
 import CPUOps
+import IOSurface
+@testable import MILGenerator
 @testable import Espresso
 
 private func requireGenerationHardware(file: StaticString = #filePath, line: UInt = #line) throws {
@@ -1689,12 +1693,17 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                 }
             )
 
-            let head = try ANEGenerationRMSNormClassifierHead(
+            // Head kernel — use factored classifier for lower weight-loading latency
+            let factoredHead = try FactoredGenerationRMSNormClassifierKernelSet(
                 rmsFinal: weights.rmsFinal,
-                classifierWeights: weights.embedding,
+                classifierProjection: TensorBuffer(count: 128 * ModelConfig.dim, zeroed: true),
+                classifierExpansion: TensorBuffer(count: weights.vocabSize * 128, zeroed: true),
                 vocabSize: weights.vocabSize,
+                bottleneck: 128,
                 laneSpatial: laneSpatial
             )
+            let headInputSurface = try factoredHead.rmsNormClassifier.inputSurface(at: 0)
+            let headOutputSurface = try factoredHead.rmsNormClassifier.outputSurface(at: 0)
 
             let vocabSize = weights.vocabSize
             let compileTimeMs = machMilliseconds(GenerationClock.now() - compileStart)
@@ -1716,15 +1725,15 @@ final class GenerationHarnessHardwareTests: XCTestCase {
             let t1sOut0 = tripletCount > 1 ? tripletSessions[1].handles.stateOut0 : t0sOut0
             let t1sOut1 = tripletCount > 1 ? tripletSessions[1].handles.stateOut1 : t0sOut1
             let t1sOut2 = tripletCount > 1 ? tripletSessions[1].handles.stateOut2 : t0sOut2
-            let headIn = head.inputSurface
-            let headOut = head.outputSurface
+            let headIn = headInputSurface
+            let headOut = headOutputSurface
 
             // Warmup
             for _ in 0..<warmup {
                 for tIdx in 0..<tripletCount { try tripletSessions[tIdx].reset() }
                 var tokens = Array(repeating: promptTokens[0], count: streamCount)
                 for _ in 0..<maxNewTokens {
-                    try batchedTokenStep(
+                    try batchedTokenStepWithEval(
                         tokens: &tokens,
                         streamCount: streamCount,
                         embedding: weights.embedding,
@@ -1739,7 +1748,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                         t1sIn0: t1sIn0, t1sIn1: t1sIn1, t1sIn2: t1sIn2,
                         t1sOut0: t1sOut0, t1sOut1: t1sOut1, t1sOut2: t1sOut2,
                         headIn: headIn, headOut: headOut,
-                        head: head,
+                        headEval: { try factoredHead.rmsNormClassifier.eval() },
                         vocabSize: vocabSize
                     )
                 }
@@ -1754,7 +1763,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
 
                 let start = GenerationClock.now()
                 for _ in 0..<maxNewTokens {
-                    try batchedTokenStep(
+                    try batchedTokenStepWithEval(
                         tokens: &tokens,
                         streamCount: streamCount,
                         embedding: weights.embedding,
@@ -1769,7 +1778,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                         t1sIn0: t1sIn0, t1sIn1: t1sIn1, t1sIn2: t1sIn2,
                         t1sOut0: t1sOut0, t1sOut1: t1sOut1, t1sOut2: t1sOut2,
                         headIn: headIn, headOut: headOut,
-                        head: head,
+                        headEval: { try factoredHead.rmsNormClassifier.eval() },
                         vocabSize: vocabSize
                     )
                 }
@@ -1814,56 +1823,72 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         head: ANEGenerationRMSNormClassifierHead,
         vocabSize: Int
     ) throws {
-        // 1. Write all embeddings to spatial lanes in one locked pass
+        try batchedTokenStepWithEval(
+            tokens: &tokens, streamCount: streamCount,
+            embedding: embedding, dim: dim, laneSpatial: laneSpatial,
+            tripletCount: tripletCount, tripletSessions: &tripletSessions,
+            t0xIn: t0xIn, t0xOut: t0xOut,
+            t0sIn0: t0sIn0, t0sIn1: t0sIn1, t0sIn2: t0sIn2,
+            t0sOut0: t0sOut0, t0sOut1: t0sOut1, t0sOut2: t0sOut2,
+            t1xIn: t1xIn, t1xOut: t1xOut,
+            t1sIn0: t1sIn0, t1sIn1: t1sIn1, t1sIn2: t1sIn2,
+            t1sOut0: t1sOut0, t1sOut1: t1sOut1, t1sOut2: t1sOut2,
+            headIn: headIn, headOut: headOut,
+            headEval: { try head.kernelSet.rmsNormClassifier.eval() },
+            vocabSize: vocabSize
+        )
+    }
+
+    private func batchedTokenStepWithEval(
+        tokens: inout [UInt16],
+        streamCount: Int,
+        embedding: borrowing TensorBuffer,
+        dim: Int,
+        laneSpatial: Int,
+        tripletCount: Int,
+        tripletSessions: inout LayerStorage<RWKVStyleFusedThreeLayerSession>,
+        t0xIn: IOSurfaceRef, t0xOut: IOSurfaceRef,
+        t0sIn0: IOSurfaceRef, t0sIn1: IOSurfaceRef, t0sIn2: IOSurfaceRef,
+        t0sOut0: IOSurfaceRef, t0sOut1: IOSurfaceRef, t0sOut2: IOSurfaceRef,
+        t1xIn: IOSurfaceRef, t1xOut: IOSurfaceRef,
+        t1sIn0: IOSurfaceRef, t1sIn1: IOSurfaceRef, t1sIn2: IOSurfaceRef,
+        t1sOut0: IOSurfaceRef, t1sOut1: IOSurfaceRef, t1sOut2: IOSurfaceRef,
+        headIn: IOSurfaceRef, headOut: IOSurfaceRef,
+        headEval: () throws -> Void,
+        vocabSize: Int
+    ) throws {
         try embedding.withUnsafePointer { embPtr in
             try tokens.withUnsafeBufferPointer { tokenBuf in
                 try SurfaceIO.writeEmbeddingBatchFP16(
-                    to: t0xIn,
-                    channelOffset: 0,
-                    spatial: laneSpatial,
-                    embeddingTable: embPtr,
-                    dim: dim,
-                    tokenIDs: tokenBuf.baseAddress!,
-                    streamCount: streamCount
+                    to: t0xIn, channelOffset: 0, spatial: laneSpatial,
+                    embeddingTable: embPtr, dim: dim,
+                    tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount
                 )
             }
         }
 
-        // 2. Eval triplet 0 (processes all spatial lanes simultaneously)
         try tripletSessions[0].kernels.step.eval()
 
-        // 3. Copy state for triplet 0 (all lanes at once)
         try SurfaceIO.copyFP16(dst: t0sIn0, dstChannelOffset: 0, src: t0sOut0, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
         try SurfaceIO.copyFP16(dst: t0sIn1, dstChannelOffset: 0, src: t0sOut1, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
         try SurfaceIO.copyFP16(dst: t0sIn2, dstChannelOffset: 0, src: t0sOut2, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
 
-        // 4. Transfer activations between triplets via surface-to-surface copy
         if tripletCount > 1 {
             try SurfaceIO.copyFP16(dst: t1xIn, dstChannelOffset: 0, src: t0xOut, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
-
-            // 5. Eval triplet 1
             try tripletSessions[1].kernels.step.eval()
-
-            // 6. Copy state for triplet 1
             try SurfaceIO.copyFP16(dst: t1sIn0, dstChannelOffset: 0, src: t1sOut0, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
             try SurfaceIO.copyFP16(dst: t1sIn1, dstChannelOffset: 0, src: t1sOut1, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
             try SurfaceIO.copyFP16(dst: t1sIn2, dstChannelOffset: 0, src: t1sOut2, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
         }
 
-        // 7. Copy last triplet's xOut to head input (all lanes, one copy)
         let lastXOut = tripletCount > 1 ? t1xOut : t0xOut
         try SurfaceIO.copyFP16(dst: headIn, dstChannelOffset: 0, src: lastXOut, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
 
-        // 8. Eval output head (processes all lanes simultaneously)
-        try head.kernelSet.rmsNormClassifier.eval()
+        try headEval()
 
-        // 9. Batched argmax across all spatial lanes (one lock)
         let argmaxResults = try SurfaceIO.argmaxBatchFP16Spatial(
-            from: headOut,
-            channelOffset: 0,
-            spatial: laneSpatial,
-            channels: vocabSize,
-            streamCount: streamCount
+            from: headOut, channelOffset: 0, spatial: laneSpatial,
+            channels: vocabSize, streamCount: streamCount
         )
         for streamIdx in 0..<streamCount {
             tokens[streamIdx] = UInt16(argmaxResults[streamIdx].index)
@@ -1897,6 +1922,288 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                 batched ane streams=\(sample.streamCount) median_ms_token=\(sample.medianMsPerToken) aggregate_tps=\(sample.aggregateTokensPerSecond) per_stream_tps=\(sample.perStreamTokensPerSecond) compile=\(sample.compileTimeMs) round_ms=\(sample.medianRoundLatencyMs)
                 """
             )
+        }
+    }
+
+    // MARK: - MIL op ANE compile probes (argmax alternatives)
+
+    func test_ane_argmax_alternatives_compile_probe_on_hardware() throws {
+        try requireGenerationHardware()
+
+        let inCh = 256
+        let spatial = 32
+
+        // --- Probe 1: reduce_argmax (scalar axis variant) ---
+        let milArgmax = """
+        program(1.3)
+        [buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, {"coremlc-version", "3505.4.1"}, {"coremltools-component-milinternal", ""}, {"coremltools-version", "9.0"}})]
+        {
+            func main<ios18>(tensor<fp16, [1, \(inCh), 1, \(spatial)]> x) {
+                int32 ax = const()[name=string("ax"), val=int32(1)];
+                bool kd = const()[name=string("kd"), val=bool(true)];
+                tensor<int32, [1, 1, 1, \(spatial)]> idx = reduce_argmax(x=x, axis=ax, keep_dims=kd)[name=string("argmax")];
+                string to_fp32 = const()[name=string("to_fp32"), val=string("fp32")];
+                tensor<fp32, [1, 1, 1, \(spatial)]> idx_f = cast(dtype=to_fp32, x=idx)[name=string("cast_out")];
+            } -> (idx_f);
+        }
+        """
+        let argmaxResult = tryCompileAndEval(
+            label: "reduce_argmax_scalar_axis",
+            milText: milArgmax,
+            inputBytes: inCh * spatial * 2,
+            outputBytes: 1 * spatial * 4
+        )
+        print("probe reduce_argmax_scalar_axis: \(argmaxResult)")
+
+        // --- Probe 2: topk(k=1) returning values only ---
+        let milTopk = """
+        program(1.3)
+        [buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, {"coremlc-version", "3505.4.1"}, {"coremltools-component-milinternal", ""}, {"coremltools-version", "9.0"}})]
+        {
+            func main<ios18>(tensor<fp16, [1, \(inCh), 1, \(spatial)]> x) {
+                int32 k = const()[name=string("k"), val=int32(1)];
+                int32 ax = const()[name=string("ax"), val=int32(1)];
+                bool asc = const()[name=string("asc"), val=bool(false)];
+                tensor<fp16, [1, 1, 1, \(spatial)]> vals, tensor<int32, [1, 1, 1, \(spatial)]> indices = topk(x=x, k=k, axis=ax, ascending=asc)[name=string("topk")];
+                string to_fp32 = const()[name=string("to_fp32"), val=string("fp32")];
+                tensor<fp32, [1, 1, 1, \(spatial)]> idx_f = cast(dtype=to_fp32, x=indices)[name=string("cast_idx")];
+            } -> (idx_f);
+        }
+        """
+        let topkResult = tryCompileAndEval(
+            label: "topk_k1",
+            milText: milTopk,
+            inputBytes: inCh * spatial * 2,
+            outputBytes: 1 * spatial * 4
+        )
+        print("probe topk_k1: \(topkResult)")
+
+        // --- Probe 3: reduce_max (confirmed in memory, verify with vocab-scale) ---
+        let milReduceMax = """
+        program(1.3)
+        [buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, {"coremlc-version", "3505.4.1"}, {"coremltools-component-milinternal", ""}, {"coremltools-version", "9.0"}})]
+        {
+            func main<ios18>(tensor<fp16, [1, \(inCh), 1, \(spatial)]> x) {
+                tensor<int32, [1]> ax = const()[name=string("ax"), val=tensor<int32, [1]>([1])];
+                bool kd = const()[name=string("kd"), val=bool(true)];
+                tensor<fp16, [1, 1, 1, \(spatial)]> mx = reduce_max(x=x, axes=ax, keep_dims=kd)[name=string("rmax")];
+            } -> (mx);
+        }
+        """
+        let reduceMaxResult = tryCompileAndEval(
+            label: "reduce_max",
+            milText: milReduceMax,
+            inputBytes: inCh * spatial * 2,
+            outputBytes: 1 * spatial * 2
+        )
+        print("probe reduce_max: \(reduceMaxResult)")
+
+        // --- Probe 4: reduce_argmin (test if any reduce_arg* works) ---
+        let milArgmin = """
+        program(1.3)
+        [buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, {"coremlc-version", "3505.4.1"}, {"coremltools-component-milinternal", ""}, {"coremltools-version", "9.0"}})]
+        {
+            func main<ios18>(tensor<fp16, [1, \(inCh), 1, \(spatial)]> x) {
+                tensor<fp16, [1, \(inCh), 1, \(spatial)]> neg = mul(x=x, y=fp16(-1.0))[name=string("neg")];
+                tensor<int32, [1]> ax = const()[name=string("ax"), val=tensor<int32, [1]>([1])];
+                bool kd = const()[name=string("kd"), val=bool(true)];
+                tensor<int32, [1, 1, 1, \(spatial)]> idx = reduce_argmin(x=neg, axis=ax, keep_dims=kd)[name=string("argmin")];
+                string to_fp32 = const()[name=string("to_fp32"), val=string("fp32")];
+                tensor<fp32, [1, 1, 1, \(spatial)]> idx_f = cast(dtype=to_fp32, x=idx)[name=string("cast_out")];
+            } -> (idx_f);
+        }
+        """
+        let argminResult = tryCompileAndEval(
+            label: "reduce_argmin_via_neg",
+            milText: milArgmin,
+            inputBytes: inCh * spatial * 2,
+            outputBytes: 1 * spatial * 4
+        )
+        print("probe reduce_argmin_via_neg: \(argminResult)")
+
+        // --- Probe 5: Constructed argmax via reduce_max + equal + mul + reduce_sum ---
+        let milConstructed = """
+        program(1.3)
+        [buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, {"coremlc-version", "3505.4.1"}, {"coremltools-component-milinternal", ""}, {"coremltools-version", "9.0"}})]
+        {
+            func main<ios18>(tensor<fp16, [1, \(inCh), 1, \(spatial)]> x) {
+                tensor<int32, [1]> ax = const()[name=string("ax"), val=tensor<int32, [1]>([1])];
+                bool kd = const()[name=string("kd"), val=bool(true)];
+                tensor<fp16, [1, 1, 1, \(spatial)]> mx = reduce_max(x=x, axes=ax, keep_dims=kd)[name=string("rmax")];
+                tensor<bool, [1, \(inCh), 1, \(spatial)]> eq = equal(x=x, y=mx)[name=string("eq")];
+                string to_fp16 = const()[name=string("to_fp16"), val=string("fp16")];
+                tensor<fp16, [1, \(inCh), 1, \(spatial)]> mask = cast(dtype=to_fp16, x=eq)[name=string("mask")];
+                tensor<fp16, [1, \(inCh), 1, 1]> indices = const()[name=string("indices"), val=tensor<fp16, [1, \(inCh), 1, 1]>(BLOBFILE(path=string("@model_path/weights/indices.bin"), offset=uint64(64)))];
+                tensor<fp16, [1, \(inCh), 1, \(spatial)]> masked = mul(x=mask, y=indices)[name=string("masked")];
+                tensor<fp16, [1, 1, 1, \(spatial)]> result = reduce_max(x=masked, axes=ax, keep_dims=kd)[name=string("result")];
+            } -> (result);
+        }
+        """
+        // Build indices weight blob: [0, 1, 2, ..., inCh-1] as fp16
+        var indexData = Data(count: 128 + inCh * 2)  // 128-byte header + fp16 values
+        for i in 0..<inCh {
+            let val = Float16(Float(i))
+            var bits = val.bitPattern
+            indexData.replaceSubrange((128 + i * 2)..<(128 + i * 2 + 2), with: Data(bytes: &bits, count: 2))
+        }
+        let constructedResult = tryCompileAndEvalWithWeights(
+            label: "constructed_argmax",
+            milText: milConstructed,
+            weights: [("@model_path/weights/indices.bin", indexData)],
+            inputBytes: inCh * spatial * 2,
+            outputBytes: 1 * spatial * 2
+        )
+        print("probe constructed_argmax: \(constructedResult)")
+
+        // --- Probe 6: Blocked reduce_max (reshape + reduce_max along H axis) ---
+        // Reshape [1, 256, 1, 32] → [1, 4, 64, 32] → reduce_max(axis=2) → [1, 4, 1, 32]
+        let blocks = 4
+        let blockSize = inCh / blocks  // 64
+        let milBlocked = """
+        program(1.3)
+        [buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, {"coremlc-version", "3505.4.1"}, {"coremltools-component-milinternal", ""}, {"coremltools-version", "9.0"}})]
+        {
+            func main<ios18>(tensor<fp16, [1, \(inCh), 1, \(spatial)]> x) {
+                tensor<int32, [4]> shape = const()[name=string("shape"), val=tensor<int32, [4]>([1, \(blocks), \(blockSize), \(spatial)])];
+                tensor<fp16, [1, \(blocks), \(blockSize), \(spatial)]> xr = reshape(x=x, shape=shape)[name=string("reshape")];
+                tensor<int32, [1]> ax = const()[name=string("ax"), val=tensor<int32, [1]>([2])];
+                bool kd = const()[name=string("kd"), val=bool(true)];
+                tensor<fp16, [1, \(blocks), 1, \(spatial)]> bmax = reduce_max(x=xr, axes=ax, keep_dims=kd)[name=string("bmax")];
+            } -> (bmax);
+        }
+        """
+        let blockedResult = tryCompileAndEval(
+            label: "blocked_reduce_max",
+            milText: milBlocked,
+            inputBytes: inCh * spatial * 2,
+            outputBytes: blocks * spatial * 2
+        )
+        print("probe blocked_reduce_max: \(blockedResult)")
+
+        // --- Probe 7: Full-vocab blocked reduce_max at realistic scale ---
+        // Reshape [1, 32000, 1, 32] → [1, 250, 128, 32] → reduce_max(axis=2) → [1, 250, 1, 32]
+        let vocabBlocks = 250
+        let vocabBlockSize = 128
+        let fullVocab = vocabBlocks * vocabBlockSize  // 32000
+        let milFullBlocked = """
+        program(1.3)
+        [buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, {"coremlc-version", "3505.4.1"}, {"coremltools-component-milinternal", ""}, {"coremltools-version", "9.0"}})]
+        {
+            func main<ios18>(tensor<fp16, [1, \(fullVocab), 1, \(spatial)]> x) {
+                tensor<int32, [4]> shape = const()[name=string("shape"), val=tensor<int32, [4]>([1, \(vocabBlocks), \(vocabBlockSize), \(spatial)])];
+                tensor<fp16, [1, \(vocabBlocks), \(vocabBlockSize), \(spatial)]> xr = reshape(x=x, shape=shape)[name=string("reshape")];
+                tensor<int32, [1]> ax = const()[name=string("ax"), val=tensor<int32, [1]>([2])];
+                bool kd = const()[name=string("kd"), val=bool(true)];
+                tensor<fp16, [1, \(vocabBlocks), 1, \(spatial)]> bmax = reduce_max(x=xr, axes=ax, keep_dims=kd)[name=string("bmax")];
+            } -> (bmax);
+        }
+        """
+        let fullBlockedResult = tryCompileAndEval(
+            label: "full_vocab_blocked_reduce_max",
+            milText: milFullBlocked,
+            inputBytes: fullVocab * spatial * 2,
+            outputBytes: vocabBlocks * spatial * 2
+        )
+        print("probe full_vocab_blocked_reduce_max: \(fullBlockedResult)")
+
+        // --- Probe 8: Fused head (RMSNorm + classifier + reduce_max) with two outputs ---
+        // This combines the head kernel with reduce_max to output both logits and max value
+        let dim = ModelConfig.dim
+        let vocab = 32000
+        let invd: Float = 1.0 / Float(dim)
+        let milFusedHead = """
+        program(1.3)
+        [buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, {"coremlc-version", "3505.4.1"}, {"coremltools-component-milinternal", ""}, {"coremltools-version", "9.0"}})]
+        {
+            func main<ios18>(tensor<fp16, [1, \(dim), 1, \(spatial)]> x) {
+                tensor<fp16, [1,\(dim),1,\(spatial)]> sq = mul(x=x,y=x)[name=string("sq")];
+                tensor<int32, [1]> raxCh = const()[name=string("rax_ch"), val=tensor<int32, [1]>([1])];
+                bool kd = const()[name=string("kd"), val=bool(true)];
+                tensor<fp16, [1,1,1,\(spatial)]> ss = reduce_sum(x=sq,axes=raxCh,keep_dims=kd)[name=string("ss")];
+                fp16 invd = const()[name=string("invd"), val=fp16(\(String(format: "%.6f", invd)))];
+                tensor<fp16, [1,1,1,\(spatial)]> ss2 = mul(x=ss,y=invd)[name=string("ss2")];
+                fp16 eps = const()[name=string("eps"), val=fp16(0.00001)];
+                tensor<fp16, [1,1,1,\(spatial)]> ss3 = add(x=ss2,y=eps)[name=string("ss3")];
+                fp16 nhalf = const()[name=string("nhalf"), val=fp16(-0.5)];
+                tensor<fp16, [1,1,1,\(spatial)]> rrms = pow(x=ss3,y=nhalf)[name=string("rrms")];
+                tensor<fp16, [1,\(dim),1,\(spatial)]> xr = mul(x=x,y=rrms)[name=string("xr")];
+                tensor<fp16, [1,\(dim),1,1]> rw = const()[name=string("rw"), val=tensor<fp16, [1,\(dim),1,1]>(BLOBFILE(path=string("@model_path/weights/rms_final.bin"), offset=uint64(64)))];
+                tensor<fp16, [1,\(dim),1,\(spatial)]> xn = mul(x=xr,y=rw)[name=string("xn")];
+                string pt = const()[name=string("pt"), val=string("valid")];
+                tensor<int32, [2]> st = const()[name=string("st"), val=tensor<int32, [2]>([1,1])];
+                tensor<int32, [4]> pd = const()[name=string("pd"), val=tensor<int32, [4]>([0,0,0,0])];
+                tensor<int32, [2]> dl = const()[name=string("dl"), val=tensor<int32, [2]>([1,1])];
+                int32 gr = const()[name=string("gr"), val=int32(1)];
+                tensor<fp16, [\(vocab), \(dim), 1, 1]> Wcls = const()[name=string("Wcls"), val=tensor<fp16, [\(vocab), \(dim), 1, 1]>(BLOBFILE(path=string("@model_path/weights/classifier.bin"), offset=uint64(64)))];
+                tensor<fp16, [1, \(vocab), 1, \(spatial)]> logits = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Wcls,x=xn)[name=string("cls")];
+                tensor<fp16, [1, 1, 1, \(spatial)]> maxval = reduce_max(x=logits,axes=raxCh,keep_dims=kd)[name=string("maxval")];
+            } -> (logits, maxval);
+        }
+        """
+        let rmsWeightSize = dim * 2 + 128  // fp16 + header
+        let clsWeightSize = vocab * dim * 2 + 128
+        var rmsData = Data(repeating: 0, count: rmsWeightSize)
+        // Fill RMS weights with 1.0
+        for i in 0..<dim {
+            let val = Float16(1.0)
+            var bits = val.bitPattern
+            rmsData.replaceSubrange((128 + i * 2)..<(128 + i * 2 + 2), with: Data(bytes: &bits, count: 2))
+        }
+        var clsData = Data(repeating: 0, count: clsWeightSize)
+        // Fill classifier with small random-ish values (just zeros is fine for compile test)
+        let logitsOutBytes = vocab * spatial * 2
+        let maxvalOutBytes = 1 * spatial * 2
+        let fusedHeadResult = tryCompileAndEvalWithWeights(
+            label: "fused_head_with_reduce_max",
+            milText: milFusedHead,
+            weights: [
+                ("@model_path/weights/rms_final.bin", rmsData),
+                ("@model_path/weights/classifier.bin", clsData)
+            ],
+            inputBytes: dim * spatial * 2,
+            outputSizes: [logitsOutBytes, maxvalOutBytes]
+        )
+        print("probe fused_head_with_reduce_max: \(fusedHeadResult)")
+    }
+
+    private enum ProbeResult: CustomStringConvertible {
+        case compileFailed(String)
+        case evalFailed(String)
+        case evalSuccess
+        var description: String {
+            switch self {
+            case .compileFailed(let e): return "COMPILE_FAILED: \(e)"
+            case .evalFailed(let e): return "EVAL_FAILED: \(e)"
+            case .evalSuccess: return "SUCCESS"
+            }
+        }
+    }
+
+    private func tryCompileAndEval(label: String, milText: String, inputBytes: Int, outputBytes: Int) -> ProbeResult {
+        tryCompileAndEvalWithWeights(label: label, milText: milText, weights: [], inputBytes: inputBytes, outputBytes: outputBytes)
+    }
+
+    private func tryCompileAndEvalWithWeights(label: String, milText: String, weights: [(path: String, data: Data)], inputBytes: Int, outputBytes: Int) -> ProbeResult {
+        tryCompileAndEvalWithWeights(label: label, milText: milText, weights: weights, inputBytes: inputBytes, outputSizes: [outputBytes])
+    }
+
+    private func tryCompileAndEvalWithWeights(label: String, milText: String, weights: [(path: String, data: Data)], inputBytes: Int, outputSizes: [Int]) -> ProbeResult {
+        do {
+            let kernel = try ANEKernel(
+                milText: milText,
+                weights: weights.map { (path: $0.0, data: $0.1) },
+                inputSizes: [inputBytes],
+                outputSizes: outputSizes,
+                checkBudget: false
+            )
+            do {
+                try kernel.eval()
+                return .evalSuccess
+            } catch {
+                return .evalFailed("\(error)")
+            }
+        } catch {
+            return .compileFailed("\(error)")
         }
     }
 
@@ -2058,6 +2365,323 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         print("  eval_head:   \(String(format: "%.1f", median(evalHeadUs))) µs (\(String(format: "%.1f", median(evalHeadUs) / totalUs * 100))%)")
         print("  argmax:      \(String(format: "%.1f", median(argmaxUs))) µs (\(String(format: "%.1f", median(argmaxUs) / totalUs * 100))%)")
         print("  TOTAL:       \(String(format: "%.1f", totalUs)) µs")
+    }
+
+    func test_factored_head_eval_benchmark_on_hardware() throws {
+        try requireGenerationHardware()
+
+        let dim = ModelConfig.dim  // 768
+        let vocab = 32000
+        let laneSpatial = 256
+        let warmup = 5
+        let iterations = 30
+
+        // Build proper weight blobs using WeightBlob
+        let rmsWeights = [Float](repeating: 1.0, count: dim)
+        let rmsBlob = WeightBlob.build(from: rmsWeights, rows: 1, cols: dim)
+
+        let clsWeights = [Float](repeating: 0.0, count: vocab * dim)
+        let clsBlob = WeightBlob.build(from: clsWeights, rows: vocab, cols: dim)
+
+        // --- Build direct head kernel (existing) ---
+        let directGen = GenerationRMSNormClassifierGenerator(vocabSize: vocab, laneSpatial: laneSpatial)
+        let directKernel = try ANEKernel(
+            milText: directGen.milText,
+            weights: [
+                (path: "@model_path/weights/rms_final.bin", data: rmsBlob),
+                (path: "@model_path/weights/classifier.bin", data: clsBlob)
+            ],
+            inputBytes: directGen.inputBytes,
+            outputBytes: vocab * laneSpatial * 2,
+            checkBudget: false
+        )
+
+        // --- Build factored head kernel: [768→k→32000] ---
+        let k = 128
+        let factoredMIL = buildFactoredHeadMIL(dim: dim, vocab: vocab, lane: laneSpatial, bottleneck: k)
+
+        let w1Weights = [Float](repeating: 0.0, count: k * dim)
+        let w1Blob = WeightBlob.build(from: w1Weights, rows: k, cols: dim)
+
+        let w2Weights = [Float](repeating: 0.0, count: vocab * k)
+        let w2Blob = WeightBlob.build(from: w2Weights, rows: vocab, cols: k)
+
+        let factoredKernel = try ANEKernel(
+            milText: factoredMIL,
+            weights: [
+                (path: "@model_path/weights/rms_final.bin", data: rmsBlob),
+                (path: "@model_path/weights/cls_proj.bin", data: w1Blob),
+                (path: "@model_path/weights/cls_expand.bin", data: w2Blob)
+            ],
+            inputBytes: dim * laneSpatial * 2,
+            outputBytes: vocab * laneSpatial * 2,
+            checkBudget: false
+        )
+
+        // --- Benchmark direct ---
+        for _ in 0..<warmup { try directKernel.eval() }
+        var directUs: [Double] = []
+        for _ in 0..<iterations {
+            let t = GenerationClock.now()
+            try directKernel.eval()
+            let t2 = GenerationClock.now()
+            directUs.append(machMicroseconds(t2 - t))
+        }
+
+        // --- Benchmark factored k=128 ---
+        for _ in 0..<warmup { try factoredKernel.eval() }
+        var factoredUs: [Double] = []
+        for _ in 0..<iterations {
+            let t = GenerationClock.now()
+            try factoredKernel.eval()
+            let t2 = GenerationClock.now()
+            factoredUs.append(machMicroseconds(t2 - t))
+        }
+
+        // --- Sweep additional k values ---
+        let kValues = [32, 64, 256]
+        var kResults: [(k: Int, median: Double)] = []
+
+        for kv in kValues {
+            let mil = buildFactoredHeadMIL(dim: dim, vocab: vocab, lane: laneSpatial, bottleneck: kv)
+            let w1 = WeightBlob.build(from: [Float](repeating: 0.0, count: kv * dim), rows: kv, cols: dim)
+            let w2 = WeightBlob.build(from: [Float](repeating: 0.0, count: vocab * kv), rows: vocab, cols: kv)
+            do {
+                let kernel = try ANEKernel(
+                    milText: mil,
+                    weights: [
+                        (path: "@model_path/weights/rms_final.bin", data: rmsBlob),
+                        (path: "@model_path/weights/cls_proj.bin", data: w1),
+                        (path: "@model_path/weights/cls_expand.bin", data: w2)
+                    ],
+                    inputBytes: dim * laneSpatial * 2,
+                    outputBytes: vocab * laneSpatial * 2,
+                    checkBudget: false
+                )
+                for _ in 0..<warmup { try kernel.eval() }
+                var us: [Double] = []
+                for _ in 0..<iterations {
+                    let t = GenerationClock.now()
+                    try kernel.eval()
+                    let t2 = GenerationClock.now()
+                    us.append(machMicroseconds(t2 - t))
+                }
+                kResults.append((k: kv, median: median(us)))
+            } catch {
+                print("  k=\(kv): COMPILE FAILED")
+            }
+        }
+
+        func median(_ arr: [Double]) -> Double {
+            let sorted = arr.sorted()
+            let n = sorted.count
+            return n % 2 == 0 ? (sorted[n/2 - 1] + sorted[n/2]) / 2.0 : sorted[n/2]
+        }
+
+        let directMedian = median(directUs)
+        let factoredMedian = median(factoredUs)
+
+        print("Head eval sweep (laneSpatial=\(laneSpatial), dim=\(dim), vocab=\(vocab)):")
+        print("  direct [768→32000]:  \(String(format: "%.1f", directMedian)) µs (weights \(String(format: "%.1f", Double(vocab * dim * 2) / 1_048_576.0)) MB)")
+        print("  k=\(k): \(String(format: "%.1f", factoredMedian)) µs (\(String(format: "%.2f", directMedian / factoredMedian))x, weights \(String(format: "%.1f", Double(k * dim * 2 + vocab * k * 2) / 1_048_576.0)) MB)")
+        for r in kResults {
+            let kWt = Double(r.k * dim * 2 + vocab * r.k * 2) / 1_048_576.0
+            print("  k=\(r.k): \(String(format: "%.1f", r.median)) µs (\(String(format: "%.2f", directMedian / r.median))x, weights \(String(format: "%.1f", kWt)) MB)")
+        }
+    }
+
+    private func buildFactoredHeadMIL(dim: Int, vocab: Int, lane: Int, bottleneck k: Int) -> String {
+        let invd: Float = 1.0 / Float(dim)
+        var b = MILBuilder(reserveCapacity: 4_096)
+        b.append(MILText.header)
+        b.appendLine("    func main<ios18>(tensor<fp16, [1, \(dim), 1, \(lane)]> x) {")
+        // RMSNorm
+        b.appendLine("        tensor<fp16, [1,\(dim),1,\(lane)]> sq = mul(x=x,y=x)[name=string(\"sq\")];")
+        b.appendLine("        tensor<int32, [1]> raxCh = const()[name=string(\"rax_ch\"), val=tensor<int32, [1]>([1])];")
+        b.appendLine("        bool kd = const()[name=string(\"kd\"), val=bool(true)];")
+        b.appendLine("        tensor<fp16, [1,1,1,\(lane)]> ss = reduce_sum(x=sq,axes=raxCh,keep_dims=kd)[name=string(\"ss\")];")
+        b.append("        fp16 invd = const()[name=string(\"invd\"), val=fp16(")
+        b.appendFP16(invd)
+        b.appendLine(")];")
+        b.appendLine("        tensor<fp16, [1,1,1,\(lane)]> ss2 = mul(x=ss,y=invd)[name=string(\"ss2\")];")
+        b.appendLine("        fp16 eps = const()[name=string(\"eps\"), val=fp16(0.00001)];")
+        b.appendLine("        tensor<fp16, [1,1,1,\(lane)]> ss3 = add(x=ss2,y=eps)[name=string(\"ss3\")];")
+        b.appendLine("        fp16 nhalf = const()[name=string(\"nhalf\"), val=fp16(-0.5)];")
+        b.appendLine("        tensor<fp16, [1,1,1,\(lane)]> rrms = pow(x=ss3,y=nhalf)[name=string(\"rrms\")];")
+        b.appendLine("        tensor<fp16, [1,\(dim),1,\(lane)]> xr = mul(x=x,y=rrms)[name=string(\"xr\")];")
+        b.appendLine(
+            "        tensor<fp16, [1,\(dim),1,1]> rw = const()[name=string(\"rw\"), val=tensor<fp16, [1,\(dim),1,1]>(BLOBFILE(path=string(\"@model_path/weights/rms_final.bin\"), offset=uint64(64)))];"
+        )
+        b.appendLine("        tensor<fp16, [1,\(dim),1,\(lane)]> xn = mul(x=xr,y=rw)[name=string(\"xn\")];")
+        b.append(MILText.convConst)
+        // Factored conv: [dim→k]
+        b.appendLine(
+            "        tensor<fp16, [\(k), \(dim), 1, 1]> Wproj = const()[name=string(\"Wproj\"), val=tensor<fp16, [\(k), \(dim), 1, 1]>(BLOBFILE(path=string(\"@model_path/weights/cls_proj.bin\"), offset=uint64(64)))];"
+        )
+        b.appendLine(
+            "        tensor<fp16, [1, \(k), 1, \(lane)]> proj = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Wproj,x=xn)[name=string(\"proj\")];"
+        )
+        // Factored conv: [k→vocab]
+        b.appendLine(
+            "        tensor<fp16, [\(vocab), \(k), 1, 1]> Wexp = const()[name=string(\"Wexp\"), val=tensor<fp16, [\(vocab), \(k), 1, 1]>(BLOBFILE(path=string(\"@model_path/weights/cls_expand.bin\"), offset=uint64(64)))];"
+        )
+        b.appendLine(
+            "        tensor<fp16, [1, \(vocab), 1, \(lane)]> logits = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Wexp,x=proj)[name=string(\"expand\")];"
+        )
+        b.appendLine("    } -> (logits);")
+        b.appendLine("}")
+        return b.text
+    }
+
+    func test_batched_step_component_timing_256_on_hardware() throws {
+        try requireGenerationHardware()
+
+        let layerCount = 6
+        let streamCount = 256
+        let dim = ModelConfig.dim
+        let laneSpatial = 256
+        let iterations = 50
+
+        let weights = makeEchoRecurrentGenerationWeights(layerCount: layerCount)
+        let tripletCount = layerCount / 3
+
+        var tripletSessions = try LayerStorage<RWKVStyleFusedThreeLayerSession>(
+            count: tripletCount,
+            throwingInitializer: { tripletIdx in
+                let base = tripletIdx * 3
+                return try RWKVStyleFusedThreeLayerSession(
+                    weights0: weights.layers[base],
+                    weights1: weights.layers[base + 1],
+                    weights2: weights.layers[base + 2],
+                    laneSpatial: laneSpatial
+                )
+            }
+        )
+
+        let head = try ANEGenerationRMSNormClassifierHead(
+            rmsFinal: weights.rmsFinal,
+            classifierWeights: weights.embedding,
+            vocabSize: weights.vocabSize,
+            laneSpatial: laneSpatial
+        )
+
+        let t0xIn = tripletSessions[0].handles.xIn
+        let t0xOut = tripletSessions[0].handles.xOut
+        let t0sIn0 = tripletSessions[0].handles.stateIn0
+        let t0sIn1 = tripletSessions[0].handles.stateIn1
+        let t0sIn2 = tripletSessions[0].handles.stateIn2
+        let t0sOut0 = tripletSessions[0].handles.stateOut0
+        let t0sOut1 = tripletSessions[0].handles.stateOut1
+        let t0sOut2 = tripletSessions[0].handles.stateOut2
+        let t1xIn = tripletSessions[1].handles.xIn
+        let t1xOut = tripletSessions[1].handles.xOut
+        let t1sIn0 = tripletSessions[1].handles.stateIn0
+        let t1sIn1 = tripletSessions[1].handles.stateIn1
+        let t1sIn2 = tripletSessions[1].handles.stateIn2
+        let t1sOut0 = tripletSessions[1].handles.stateOut0
+        let t1sOut1 = tripletSessions[1].handles.stateOut1
+        let t1sOut2 = tripletSessions[1].handles.stateOut2
+        let headIn = head.inputSurface
+        let headOut = head.outputSurface
+        let vocabSize = weights.vocabSize
+
+        var tokens = Array(repeating: UInt16(0), count: streamCount)
+
+        // Warmup
+        for _ in 0..<3 {
+            try batchedTokenStep(
+                tokens: &tokens, streamCount: streamCount,
+                embedding: weights.embedding, dim: dim, laneSpatial: laneSpatial,
+                tripletCount: tripletCount, tripletSessions: &tripletSessions,
+                t0xIn: t0xIn, t0xOut: t0xOut,
+                t0sIn0: t0sIn0, t0sIn1: t0sIn1, t0sIn2: t0sIn2,
+                t0sOut0: t0sOut0, t0sOut1: t0sOut1, t0sOut2: t0sOut2,
+                t1xIn: t1xIn, t1xOut: t1xOut,
+                t1sIn0: t1sIn0, t1sIn1: t1sIn1, t1sIn2: t1sIn2,
+                t1sOut0: t1sOut0, t1sOut1: t1sOut1, t1sOut2: t1sOut2,
+                headIn: headIn, headOut: headOut,
+                head: head, vocabSize: vocabSize
+            )
+        }
+
+        var embedUs: [Double] = []
+        var evalT0Us: [Double] = []
+        var stateT0Us: [Double] = []
+        var xferUs: [Double] = []
+        var evalT1Us: [Double] = []
+        var stateT1Us: [Double] = []
+        var headCopyUs: [Double] = []
+        var evalHeadUs: [Double] = []
+        var argmaxUs: [Double] = []
+
+        for _ in 0..<iterations {
+            var t = GenerationClock.now()
+
+            try weights.embedding.withUnsafePointer { embPtr in
+                try tokens.withUnsafeBufferPointer { tokenBuf in
+                    try SurfaceIO.writeEmbeddingBatchFP16(
+                        to: t0xIn, channelOffset: 0, spatial: laneSpatial,
+                        embeddingTable: embPtr, dim: dim,
+                        tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount
+                    )
+                }
+            }
+            var t2 = GenerationClock.now(); embedUs.append(machMicroseconds(t2 - t)); t = t2
+
+            try tripletSessions[0].kernels.step.eval()
+            t2 = GenerationClock.now(); evalT0Us.append(machMicroseconds(t2 - t)); t = t2
+
+            try SurfaceIO.copyFP16(dst: t0sIn0, dstChannelOffset: 0, src: t0sOut0, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+            try SurfaceIO.copyFP16(dst: t0sIn1, dstChannelOffset: 0, src: t0sOut1, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+            try SurfaceIO.copyFP16(dst: t0sIn2, dstChannelOffset: 0, src: t0sOut2, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+            t2 = GenerationClock.now(); stateT0Us.append(machMicroseconds(t2 - t)); t = t2
+
+            try SurfaceIO.copyFP16(dst: t1xIn, dstChannelOffset: 0, src: t0xOut, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+            t2 = GenerationClock.now(); xferUs.append(machMicroseconds(t2 - t)); t = t2
+
+            try tripletSessions[1].kernels.step.eval()
+            t2 = GenerationClock.now(); evalT1Us.append(machMicroseconds(t2 - t)); t = t2
+
+            try SurfaceIO.copyFP16(dst: t1sIn0, dstChannelOffset: 0, src: t1sOut0, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+            try SurfaceIO.copyFP16(dst: t1sIn1, dstChannelOffset: 0, src: t1sOut1, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+            try SurfaceIO.copyFP16(dst: t1sIn2, dstChannelOffset: 0, src: t1sOut2, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+            t2 = GenerationClock.now(); stateT1Us.append(machMicroseconds(t2 - t)); t = t2
+
+            try SurfaceIO.copyFP16(dst: headIn, dstChannelOffset: 0, src: t1xOut, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+            t2 = GenerationClock.now(); headCopyUs.append(machMicroseconds(t2 - t)); t = t2
+
+            try head.kernelSet.rmsNormClassifier.eval()
+            t2 = GenerationClock.now(); evalHeadUs.append(machMicroseconds(t2 - t)); t = t2
+
+            let argmaxResults = try SurfaceIO.argmaxBatchFP16Spatial(
+                from: headOut, channelOffset: 0, spatial: laneSpatial,
+                channels: vocabSize, streamCount: streamCount
+            )
+            for i in 0..<streamCount { tokens[i] = UInt16(argmaxResults[i].index) }
+            t2 = GenerationClock.now(); argmaxUs.append(machMicroseconds(t2 - t))
+        }
+
+        func median(_ arr: [Double]) -> Double {
+            let sorted = arr.sorted()
+            let n = sorted.count
+            return n % 2 == 0 ? (sorted[n/2 - 1] + sorted[n/2]) / 2.0 : sorted[n/2]
+        }
+
+        let totalUs = median(embedUs) + median(evalT0Us) + median(stateT0Us) + median(xferUs) +
+            median(evalT1Us) + median(stateT1Us) + median(headCopyUs) + median(evalHeadUs) + median(argmaxUs)
+
+        print("Component timing (median µs, \(streamCount) streams @ lane=\(laneSpatial), \(iterations) iterations):")
+        print("  embed_write: \(String(format: "%.1f", median(embedUs))) µs (\(String(format: "%.1f", median(embedUs) / totalUs * 100))%)")
+        print("  eval_T0:     \(String(format: "%.1f", median(evalT0Us))) µs (\(String(format: "%.1f", median(evalT0Us) / totalUs * 100))%)")
+        print("  state_T0:    \(String(format: "%.1f", median(stateT0Us))) µs (\(String(format: "%.1f", median(stateT0Us) / totalUs * 100))%)")
+        print("  xfer_T0T1:   \(String(format: "%.1f", median(xferUs))) µs (\(String(format: "%.1f", median(xferUs) / totalUs * 100))%)")
+        print("  eval_T1:     \(String(format: "%.1f", median(evalT1Us))) µs (\(String(format: "%.1f", median(evalT1Us) / totalUs * 100))%)")
+        print("  state_T1:    \(String(format: "%.1f", median(stateT1Us))) µs (\(String(format: "%.1f", median(stateT1Us) / totalUs * 100))%)")
+        print("  head_copy:   \(String(format: "%.1f", median(headCopyUs))) µs (\(String(format: "%.1f", median(headCopyUs) / totalUs * 100))%)")
+        print("  eval_head:   \(String(format: "%.1f", median(evalHeadUs))) µs (\(String(format: "%.1f", median(evalHeadUs) / totalUs * 100))%)")
+        print("  argmax:      \(String(format: "%.1f", median(argmaxUs))) µs (\(String(format: "%.1f", median(argmaxUs) / totalUs * 100))%)")
+        print("  TOTAL:       \(String(format: "%.1f", totalUs)) µs")
+        print("  implied_tps: \(String(format: "%.1f", Double(streamCount) / (totalUs / 1_000_000.0)))")
     }
 
     private func machMicroseconds(_ deltaTicks: UInt64) -> Double {
