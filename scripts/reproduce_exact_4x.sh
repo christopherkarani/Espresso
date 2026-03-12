@@ -356,6 +356,7 @@ jq -s \
   --arg macos_build "$(sw_vers -buildVersion 2>/dev/null || echo unknown)" \
   --arg power_source "$(pmset -g batt 2>/dev/null | head -1 | sed "s/.*'\(.*\)'.*/\1/" || echo unknown)" \
   --argjson outer_elapsed "$(printf '%s\n' "${valid_outer_elapsed[@]}" | jq -s '.')" \
+  --argjson run_files "$(printf '%s\n' "${valid_runs[@]}" | while read -r f; do basename "$f"; done | jq -nR '[inputs | select(length > 0)]')" \
 '{
   probe_version: (map(.probe_version // null) | .[0]),
   results_dir: $dir,
@@ -466,6 +467,7 @@ jq -s \
   all_parity_match: (all(.[]; .parity_status == "match")),
   per_run_parity: (map(.parity_status)),
   per_run_timestamps: (map(.probe_timestamp // null)),
+  valid_run_files: $run_files,
   per_run_wall_elapsed_s: (map(.probe_wall_elapsed_s // null)),
   per_run_outer_elapsed_s: $outer_elapsed,
   sum_probe_wall_elapsed_s: (map(.probe_wall_elapsed_s // 0) | add),
