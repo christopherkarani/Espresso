@@ -1585,9 +1585,7 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
         activation.withUnsafeMutablePointer { dst in
             embedding.withUnsafePointer { embeddingPtr in
                 let base = Int(token) * ModelConfig.dim
-                for dimIdx in 0..<ModelConfig.dim {
-                    dst[dimIdx] = embeddingPtr[base + dimIdx]
-                }
+                dst.update(from: embeddingPtr.advanced(by: base), count: ModelConfig.dim)
             }
         }
     }
@@ -2448,9 +2446,7 @@ public struct ANEDirectGenerationModel: ~Copyable, DirectTokenSelectingLanguageM
         xCur.withUnsafeMutablePointer { dst in
             embedding.withUnsafePointer { embeddingPtr in
                 let base = Int(token) * ModelConfig.dim
-                for dimIdx in 0..<ModelConfig.dim {
-                    dst[dimIdx] = embeddingPtr[base + dimIdx]
-                }
+                dst.update(from: embeddingPtr.advanced(by: base), count: ModelConfig.dim)
             }
         }
 
@@ -3111,9 +3107,7 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
         activationA.withUnsafeMutablePointer { dst in
             embedding.withUnsafePointer { embeddingPtr in
                 let base = Int(token) * ModelConfig.dim
-                for dimIdx in 0..<ModelConfig.dim {
-                    dst[dimIdx] = embeddingPtr[base + dimIdx]
-                }
+                dst.update(from: embeddingPtr.advanced(by: base), count: ModelConfig.dim)
             }
         }
 
