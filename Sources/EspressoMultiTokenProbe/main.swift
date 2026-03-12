@@ -185,12 +185,15 @@ private func printStderr(_ message: String) {
     }
 }
 
-@inline(__always)
-private func machMilliseconds(_ delta: UInt64) -> Double {
+private let machTimebaseNanosPerTick: Double = {
     var info = mach_timebase_info_data_t()
     mach_timebase_info(&info)
-    let nanos = (Double(delta) * Double(info.numer)) / Double(info.denom)
-    return nanos / 1_000_000.0
+    return Double(info.numer) / Double(info.denom)
+}()
+
+@inline(__always)
+private func machMilliseconds(_ delta: UInt64) -> Double {
+    (Double(delta) * machTimebaseNanosPerTick) / 1_000_000.0
 }
 
 @inline(__always)
