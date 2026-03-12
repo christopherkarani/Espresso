@@ -14,6 +14,7 @@ public struct LocalRealArtifactManifest: Sendable, Equatable, Codable {
     public let recurrentCheckpointPath: String
     public let futureSidecarPath: String
     public let manifestPath: String
+    public let recurrentTrunkMode: LocalBigramRecurrentTrunkMode
     public let promptToken: UInt16
     public let tokenCount: Int
     public let layerCount: Int
@@ -25,6 +26,7 @@ public struct LocalRealArtifactManifest: Sendable, Equatable, Codable {
         recurrentCheckpointPath: String,
         futureSidecarPath: String,
         manifestPath: String,
+        recurrentTrunkMode: LocalBigramRecurrentTrunkMode,
         promptToken: UInt16,
         tokenCount: Int,
         layerCount: Int,
@@ -35,6 +37,7 @@ public struct LocalRealArtifactManifest: Sendable, Equatable, Codable {
         self.recurrentCheckpointPath = recurrentCheckpointPath
         self.futureSidecarPath = futureSidecarPath
         self.manifestPath = manifestPath
+        self.recurrentTrunkMode = recurrentTrunkMode
         self.promptToken = promptToken
         self.tokenCount = tokenCount
         self.layerCount = layerCount
@@ -47,7 +50,9 @@ public enum LocalRealArtifactPipeline {
         datasetPath: String,
         prefix: String,
         layerCount: Int = ModelConfig.nLayers,
-        vocabSize: Int = ModelConfig.vocab
+        vocabSize: Int = ModelConfig.vocab,
+        maxAcceptedFutureTokens: Int = 1,
+        recurrentTrunkMode: LocalBigramRecurrentTrunkMode = .zero
     ) throws -> LocalRealArtifactManifest {
         guard !prefix.isEmpty else {
             throw LocalRealArtifactPipelineError.invalidPrefix(prefix)
@@ -64,7 +69,9 @@ public enum LocalRealArtifactPipeline {
         let artifacts = try LocalBigramArtifactBuilder.build(
             tokens: tokens,
             layerCount: layerCount,
-            vocabSize: vocabSize
+            vocabSize: vocabSize,
+            maxAcceptedFutureTokens: maxAcceptedFutureTokens,
+            recurrentTrunkMode: recurrentTrunkMode
         )
 
         let generationModelPath = "\(prefix).generation.bin"
@@ -86,6 +93,7 @@ public enum LocalRealArtifactPipeline {
             recurrentCheckpointPath: recurrentCheckpointPath,
             futureSidecarPath: futureSidecarPath,
             manifestPath: manifestPath,
+            recurrentTrunkMode: recurrentTrunkMode,
             promptToken: tokens.first ?? 0,
             tokenCount: tokens.count,
             layerCount: layerCount,
@@ -108,6 +116,7 @@ public enum LocalRealArtifactPipeline {
         futureSidecarPath: String,
         promptTokens: [UInt16],
         maxNewTokens: Int,
+        maxAcceptedFutureTokens: Int = 1,
         strategy: TokenSelectionStrategy = .argmax
     ) throws -> OfflineExactAcceptanceTrace {
         do {
@@ -124,13 +133,28 @@ public enum LocalRealArtifactPipeline {
                 futureSidecar: sidecar
             )
 
-            return try OfflineExactAcceptanceEvaluator.evaluate(
-                teacher: &teacher,
-                student: &student,
-                promptTokens: promptTokens,
-                maxNewTokens: maxNewTokens,
-                strategy: strategy
-            )
+            switch maxAcceptedFutureTokens {
+            case 1:
+                return try OfflineExactAcceptanceEvaluator.evaluate(
+                    teacher: &teacher,
+                    student: &student,
+                    promptTokens: promptTokens,
+                    maxNewTokens: maxNewTokens,
+                    strategy: strategy
+                )
+            case 2:
+                return try OfflineExactAcceptanceEvaluator.evaluateThreeToken(
+                    teacher: &teacher,
+                    student: &student,
+                    promptTokens: promptTokens,
+                    maxNewTokens: maxNewTokens,
+                    strategy: strategy
+                )
+            default:
+                throw GenerationError.invalidArguments(
+                    "offline acceptance gate supports maxAcceptedFutureTokens 1 or 2, got \(maxAcceptedFutureTokens)"
+                )
+            }
         } catch {
             throw LocalRealArtifactPipelineError.modelLoadFailed("\(error)")
         }

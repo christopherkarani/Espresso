@@ -25,11 +25,14 @@ enum EspressoTrainMain {
         var localTextDatasetPath: String?
         var localBigramPrefix: String?
         var artifactLayerCount: Int = 6
+        var exportLocalBigramMaxAcceptedFutureTokens: Int = 1
+        var localBigramRecurrentTrunkMode: LocalBigramRecurrentTrunkMode = .zero
         var offlineAcceptanceJSONPath: String?
         var offlineRecurrentCheckpointPath: String?
         var offlineFutureSidecarPath: String?
         var promptToken: UInt16?
         var gateMaxNewTokens: Int = 8
+        var offlineAcceptanceMaxAcceptedFutureTokens: Int = 1
         var textRoots: [String] = []
         var textExtensions: Set<String> = ["swift", "md", "txt", "py", "sh", "m", "h", "c"]
         var maxCorpusFiles: Int?
@@ -84,6 +87,24 @@ enum EspressoTrainMain {
                 if i + 1 < argv.count { a.localBigramPrefix = argv[i + 1]; i += 1 }
             case "--artifact-layer-count":
                 if i + 1 < argv.count { a.artifactLayerCount = Int(argv[i + 1]) ?? a.artifactLayerCount; i += 1 }
+            case "--export-local-bigram-max-accepted-future-tokens":
+                if i + 1 < argv.count {
+                    a.exportLocalBigramMaxAcceptedFutureTokens =
+                        Int(argv[i + 1]) ?? a.exportLocalBigramMaxAcceptedFutureTokens
+                    i += 1
+                }
+            case "--local-bigram-recurrent-trunk-mode":
+                if i + 1 < argv.count {
+                    guard let mode = parseLocalBigramRecurrentTrunkMode(argv[i + 1]) else {
+                        fputs(
+                            "espresso-train error: expected --local-bigram-recurrent-trunk-mode zero|compiled-identity-residual\n",
+                            stderr
+                        )
+                        exit(1)
+                    }
+                    a.localBigramRecurrentTrunkMode = mode
+                    i += 1
+                }
             case "--offline-acceptance-json":
                 if i + 1 < argv.count { a.offlineAcceptanceJSONPath = argv[i + 1]; i += 1 }
             case "--offline-recurrent-checkpoint":
@@ -94,6 +115,12 @@ enum EspressoTrainMain {
                 if i + 1 < argv.count, let token = UInt16(argv[i + 1]) { a.promptToken = token; i += 1 }
             case "--gate-max-new-tokens":
                 if i + 1 < argv.count { a.gateMaxNewTokens = Int(argv[i + 1]) ?? a.gateMaxNewTokens; i += 1 }
+            case "--offline-acceptance-max-accepted-future-tokens":
+                if i + 1 < argv.count {
+                    a.offlineAcceptanceMaxAcceptedFutureTokens =
+                        Int(argv[i + 1]) ?? a.offlineAcceptanceMaxAcceptedFutureTokens
+                    i += 1
+                }
             case "--text-root":
                 if i + 1 < argv.count { a.textRoots.append(argv[i + 1]); i += 1 }
             case "--text-ext":
@@ -114,6 +141,19 @@ enum EspressoTrainMain {
             i += 1
         }
         return a
+    }
+
+    private static func parseLocalBigramRecurrentTrunkMode(
+        _ raw: String
+    ) -> LocalBigramRecurrentTrunkMode? {
+        switch raw {
+        case "zero":
+            return .zero
+        case "compiled-identity-residual":
+            return .compiledIdentityResidual
+        default:
+            return nil
+        }
     }
 
     // MARK: - Timing
@@ -175,7 +215,9 @@ enum EspressoTrainMain {
                 datasetPath: args.dataPath,
                 prefix: prefix,
                 layerCount: args.artifactLayerCount,
-                vocabSize: vocab
+                vocabSize: vocab,
+                maxAcceptedFutureTokens: args.exportLocalBigramMaxAcceptedFutureTokens,
+                recurrentTrunkMode: args.localBigramRecurrentTrunkMode
             )
             offlineRecurrentCheckpointPath = offlineRecurrentCheckpointPath ?? manifest.recurrentCheckpointPath
             offlineFutureSidecarPath = offlineFutureSidecarPath ?? manifest.futureSidecarPath
@@ -203,13 +245,15 @@ enum EspressoTrainMain {
                 recurrentCheckpointPath: recurrentCheckpointPath,
                 futureSidecarPath: futureSidecarPath,
                 promptTokens: [promptToken],
-                maxNewTokens: args.gateMaxNewTokens
+                maxNewTokens: args.gateMaxNewTokens,
+                maxAcceptedFutureTokens: args.offlineAcceptanceMaxAcceptedFutureTokens
             )
             let payload: [String: Any] = [
                 "prompt_tokens": [Int(promptToken)],
                 "generated_tokens": trace.generatedTokens.map(Int.init),
                 "committed_exact_token_counts": trace.committedExactTokenCounts,
                 "accepted_future_token_counts": trace.acceptedFutureTokenCounts,
+                "max_accepted_future_tokens_per_pass": args.offlineAcceptanceMaxAcceptedFutureTokens,
                 "parity_status": trace.parityMatchedAllCommittedTokens ? "match" : "mismatch",
                 "committed_exact_tokens_per_pass": trace.committedExactTokensPerPass,
                 "accepted_future_tokens_per_pass": trace.acceptedFutureTokensPerPass,

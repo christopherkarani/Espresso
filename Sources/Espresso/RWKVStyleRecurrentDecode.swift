@@ -17,7 +17,7 @@ public struct RWKVStyleRecurrentScalingReport: Sendable {
 }
 
 @inline(__always)
-private func makeRWKVZeroLaneSurface(laneSpatial: Int) throws(ANEError) -> IOSurfaceRef {
+func makeRWKVZeroLaneSurface(laneSpatial: Int) throws(ANEError) -> IOSurfaceRef {
     guard let zeroLane = ane_interop_create_surface(ModelConfig.dim * laneSpatial * 2) else {
         throw .surfaceAllocationFailed
     }
@@ -150,6 +150,113 @@ public struct RWKVStyleRecurrentSession: ~Copyable {
             }
         } catch {
             throw .invalidArguments("recurrent output readback failed: \(error)")
+        }
+        timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
+        self.stepCount += 1
+    }
+}
+
+public struct RWKVStyleStateFreeSurfaceHandles {
+    public let xIn: IOSurfaceRef
+    public let xOut: IOSurfaceRef
+    public let zeroLane: IOSurfaceRef
+    public let laneSpatial: Int
+
+    public init(kernels: borrowing RWKVStyleStateFreeKernelSet) throws(ANEError) {
+        self.xIn = try kernels.step.inputSurface(at: 0)
+        self.xOut = try kernels.step.outputSurface(at: 0)
+        self.laneSpatial = kernels.laneSpatial
+        self.zeroLane = try makeRWKVZeroLaneSurface(laneSpatial: kernels.laneSpatial)
+    }
+}
+
+public struct RWKVStyleStateFreeSession: ~Copyable {
+    public let kernels: RWKVStyleStateFreeKernelSet
+    public let handles: RWKVStyleStateFreeSurfaceHandles
+    public private(set) var stepCount: Int
+
+    public init(
+        weights: borrowing RWKVStyleRecurrentWeights,
+        laneSpatial: Int = RWKVStyleStateFreeKernelSet.defaultLaneSpatial
+    ) throws(ANEError) {
+        let kernels = try RWKVStyleStateFreeKernelSet(weights: weights, laneSpatial: laneSpatial)
+        let handles = try RWKVStyleStateFreeSurfaceHandles(kernels: kernels)
+        self.kernels = kernels
+        self.handles = handles
+        self.stepCount = 0
+    }
+
+    public mutating func reset() throws(ANEError) {
+        do {
+            try SurfaceIO.copyFP16(
+                dst: handles.xIn,
+                dstChannelOffset: 0,
+                src: handles.zeroLane,
+                srcChannelOffset: 0,
+                channels: ModelConfig.dim,
+                spatial: handles.laneSpatial
+            )
+        } catch {
+            throw .invalidArguments("state-free recurrent zero reset failed: \(error)")
+        }
+        self.stepCount = 0
+    }
+
+    public mutating func step(
+        tokenInput: borrowing TensorBuffer,
+        output: borrowing TensorBuffer,
+        timings: inout StepTimingBreakdown
+    ) throws(ANEError) {
+        precondition(tokenInput.count == ModelConfig.dim)
+        precondition(output.count == ModelConfig.dim)
+
+        var t0 = RuntimeClock.now()
+        do {
+            try SurfaceIO.copyFP16(
+                dst: handles.xIn,
+                dstChannelOffset: 0,
+                src: handles.zeroLane,
+                srcChannelOffset: 0,
+                channels: ModelConfig.dim,
+                spatial: handles.laneSpatial
+            )
+            try tokenInput.withUnsafeBufferPointer { tokenBuf in
+                try SurfaceIO.writeFP16SpatialSlice(
+                    to: handles.xIn,
+                    channelOffset: 0,
+                    spatialIndex: 0,
+                    spatial: handles.laneSpatial,
+                    data: tokenBuf,
+                    channels: ModelConfig.dim
+                )
+            }
+        } catch {
+            throw .invalidArguments("state-free recurrent input write failed: \(error)")
+        }
+        timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
+
+        t0 = RuntimeClock.now()
+        do {
+            try kernels.step.eval()
+        } catch {
+            throw .invalidArguments("state-free recurrent step eval failed at step \(stepCount): \(error)")
+        }
+        timings.tAne += RuntimeClock.ms(RuntimeClock.now() - t0)
+
+        t0 = RuntimeClock.now()
+        do {
+            try output.withUnsafeMutableBufferPointer { outBuf in
+                try SurfaceIO.readFP16SpatialSlice(
+                    from: handles.xOut,
+                    channelOffset: 0,
+                    spatialIndex: 0,
+                    spatial: handles.laneSpatial,
+                    into: outBuf,
+                    channels: ModelConfig.dim
+                )
+            }
+        } catch {
+            throw .invalidArguments("state-free recurrent output readback failed: \(error)")
         }
         timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
         self.stepCount += 1
@@ -476,6 +583,120 @@ public struct RWKVStyleFusedThreeLayerSession: ~Copyable {
             }
         } catch {
             throw .invalidArguments("fused three-layer recurrent output readback failed: \(error)")
+        }
+        timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
+        self.stepCount += 1
+    }
+}
+
+public struct RWKVStyleFusedThreeLayerStateFreeSurfaceHandles {
+    public let xIn: IOSurfaceRef
+    public let xOut: IOSurfaceRef
+    public let zeroLane: IOSurfaceRef
+    public let laneSpatial: Int
+
+    public init(kernels: borrowing RWKVStyleFusedThreeLayerStateFreeKernelSet) throws(ANEError) {
+        self.xIn = try kernels.step.inputSurface(at: 0)
+        self.xOut = try kernels.step.outputSurface(at: 0)
+        self.laneSpatial = kernels.laneSpatial
+        self.zeroLane = try makeRWKVZeroLaneSurface(laneSpatial: kernels.laneSpatial)
+    }
+}
+
+public struct RWKVStyleFusedThreeLayerStateFreeSession: ~Copyable {
+    public let kernels: RWKVStyleFusedThreeLayerStateFreeKernelSet
+    public let handles: RWKVStyleFusedThreeLayerStateFreeSurfaceHandles
+    public private(set) var stepCount: Int
+
+    public init(
+        weights0: borrowing RWKVStyleRecurrentWeights,
+        weights1: borrowing RWKVStyleRecurrentWeights,
+        weights2: borrowing RWKVStyleRecurrentWeights,
+        laneSpatial: Int = RWKVStyleFusedThreeLayerStateFreeKernelSet.defaultLaneSpatial
+    ) throws(ANEError) {
+        let kernels = try RWKVStyleFusedThreeLayerStateFreeKernelSet(
+            weights0: weights0,
+            weights1: weights1,
+            weights2: weights2,
+            laneSpatial: laneSpatial
+        )
+        let handles = try RWKVStyleFusedThreeLayerStateFreeSurfaceHandles(kernels: kernels)
+        self.kernels = kernels
+        self.handles = handles
+        self.stepCount = 0
+    }
+
+    public mutating func reset() throws(ANEError) {
+        do {
+            try SurfaceIO.copyFP16(
+                dst: handles.xIn,
+                dstChannelOffset: 0,
+                src: handles.zeroLane,
+                srcChannelOffset: 0,
+                channels: ModelConfig.dim,
+                spatial: handles.laneSpatial
+            )
+        } catch {
+            throw .invalidArguments("fused three-layer state-free recurrent zero reset failed: \(error)")
+        }
+        self.stepCount = 0
+    }
+
+    public mutating func step(
+        tokenInput: borrowing TensorBuffer,
+        output: borrowing TensorBuffer,
+        timings: inout StepTimingBreakdown
+    ) throws(ANEError) {
+        precondition(tokenInput.count == ModelConfig.dim)
+        precondition(output.count == ModelConfig.dim)
+
+        var t0 = RuntimeClock.now()
+        do {
+            try SurfaceIO.copyFP16(
+                dst: handles.xIn,
+                dstChannelOffset: 0,
+                src: handles.zeroLane,
+                srcChannelOffset: 0,
+                channels: ModelConfig.dim,
+                spatial: handles.laneSpatial
+            )
+            try tokenInput.withUnsafeBufferPointer { tokenBuf in
+                try SurfaceIO.writeFP16SpatialSlice(
+                    to: handles.xIn,
+                    channelOffset: 0,
+                    spatialIndex: 0,
+                    spatial: handles.laneSpatial,
+                    data: tokenBuf,
+                    channels: ModelConfig.dim
+                )
+            }
+        } catch {
+            throw .invalidArguments("fused three-layer state-free recurrent input write failed: \(error)")
+        }
+        timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
+
+        t0 = RuntimeClock.now()
+        do {
+            try kernels.step.eval()
+        } catch {
+            throw .invalidArguments("fused three-layer state-free recurrent eval failed at step \(stepCount): \(error)")
+        }
+        timings.tAne += RuntimeClock.ms(RuntimeClock.now() - t0)
+
+        t0 = RuntimeClock.now()
+        do {
+            try output.withUnsafeMutableBufferPointer { outBuf in
+                try SurfaceIO.readFP16SpatialSlice(
+                    from: handles.xOut,
+                    channelOffset: 0,
+                    spatialIndex: 0,
+                    spatial: handles.laneSpatial,
+                    into: outBuf,
+                    channels: ModelConfig.dim
+                )
+            }
+        } catch {
+            throw .invalidArguments("fused three-layer state-free recurrent output readback failed: \(error)")
         }
         timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
         self.stepCount += 1

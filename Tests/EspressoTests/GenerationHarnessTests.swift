@@ -48,6 +48,14 @@ private func makeGenerationTestNonZeroRecurrentWeights(layerCount: Int) -> Recur
     return weights
 }
 
+private func makeGenerationTestStatefulRecurrentWeights(layerCount: Int) -> RecurrentGenerationWeights {
+    let weights = makeGenerationTestRecurrentWeights(layerCount: layerCount)
+    weights.layers[0].Ws.withUnsafeMutablePointer { ptr in
+        ptr[0] = 0.25
+    }
+    return weights
+}
+
 private func makeGenerationTestRowTensor(_ rows: [[Float]]) -> TensorBuffer {
     let buffer = TensorBuffer(count: rows.count * ModelConfig.dim, zeroed: true)
     buffer.withUnsafeMutablePointer { ptr in
@@ -261,6 +269,53 @@ private struct FakeExactTwoTokenModel: ExactTwoTokenGeneratingLanguageModel {
         passCalls.append((currentToken, remainingTokenBudget))
         guard !passQueue.isEmpty else {
             throw .invalidArguments("missing fake exact two-token pass response")
+        }
+        let next = passQueue.removeFirst()
+        XCTAssertEqual(next.currentToken, currentToken)
+        XCTAssertEqual(next.remainingTokenBudget, remainingTokenBudget)
+        return next.result
+    }
+}
+
+private struct FakeExactThreeTokenPassResponse: Equatable {
+    let currentToken: UInt16
+    let remainingTokenBudget: Int
+    let result: ExactThreeTokenPassResult
+}
+
+private struct FakeExactThreeTokenModel: ExactThreeTokenGeneratingLanguageModel {
+    let vocabSize: Int
+    var selectedPrefillToken: UInt16
+    var passQueue: [FakeExactThreeTokenPassResponse]
+
+    var performanceSnapshot: GenerationPerformanceSnapshot {
+        GenerationPerformanceSnapshot()
+    }
+
+    private(set) var resetCount: Int = 0
+    private(set) var prefillSelectedCalls: [[UInt16]] = []
+    private(set) var passCalls: [(currentToken: UInt16, remainingTokenBudget: Int)] = []
+
+    mutating func reset() throws(GenerationError) {
+        resetCount += 1
+    }
+
+    mutating func prefillSelectedToken(
+        promptTokens: [UInt16],
+        strategy: TokenSelectionStrategy
+    ) throws(GenerationError) -> UInt16 {
+        prefillSelectedCalls.append(promptTokens)
+        return selectedPrefillToken
+    }
+
+    mutating func performExactThreeTokenPass(
+        currentToken: UInt16,
+        remainingTokenBudget: Int,
+        strategy: TokenSelectionStrategy
+    ) throws(GenerationError) -> ExactThreeTokenPassResult {
+        passCalls.append((currentToken, remainingTokenBudget))
+        guard !passQueue.isEmpty else {
+            throw .invalidArguments("missing fake exact three-token pass response")
         }
         let next = passQueue.removeFirst()
         XCTAssertEqual(next.currentToken, currentToken)
@@ -586,6 +641,98 @@ final class GenerationHarnessTests: XCTestCase {
         XCTAssertEqual(trace.acceptedFutureTokensPerPass, 0.0, accuracy: 1e-9)
     }
 
+    func test_exact_three_token_harness_tracks_pass_metrics_and_future_acceptance() throws {
+        let model = FakeExactThreeTokenModel(
+            vocabSize: 32,
+            selectedPrefillToken: 5,
+            passQueue: [
+                FakeExactThreeTokenPassResponse(
+                    currentToken: 5,
+                    remainingTokenBudget: 4,
+                    result: ExactThreeTokenPassResult(
+                        committedTokens: [5, 6, 7],
+                        nextCurrentToken: 8,
+                        metrics: ExactThreeTokenPassMetrics(
+                            proposerLatencyMs: 0.05,
+                            verifierTrunkLatencyMs: 1.10,
+                            verifierLogitsLatencyMs: 0.90,
+                            stateAdvanceLatencyMs: 1.15,
+                            acceptedFutureTokenCount: 2,
+                            committedExactTokenCount: 3
+                        )
+                    )
+                ),
+                FakeExactThreeTokenPassResponse(
+                    currentToken: 8,
+                    remainingTokenBudget: 1,
+                    result: ExactThreeTokenPassResult(
+                        committedTokens: [8],
+                        nextCurrentToken: 9,
+                        metrics: ExactThreeTokenPassMetrics(
+                            proposerLatencyMs: 0.02,
+                            verifierTrunkLatencyMs: 1.05,
+                            verifierLogitsLatencyMs: 0.88,
+                            stateAdvanceLatencyMs: 0,
+                            acceptedFutureTokenCount: 0,
+                            committedExactTokenCount: 1
+                        )
+                    )
+                ),
+            ]
+        )
+
+        var harness = ExactThreeTokenGenerationHarness(model: model, strategy: .argmax)
+
+        let trace = try harness.generate(promptTokens: [9], maxNewTokens: 4)
+
+        XCTAssertEqual(trace.generatedTokens, [5, 6, 7, 8])
+        XCTAssertEqual(trace.acceptedFutureTokenCounts, [2, 0])
+        XCTAssertEqual(trace.committedExactTokenCounts, [3, 1])
+        XCTAssertEqual(harness.model.resetCount, 1)
+        XCTAssertEqual(harness.model.prefillSelectedCalls, [[9]])
+        XCTAssertEqual(harness.model.passCalls.map { $0.currentToken }, [5, 8])
+        XCTAssertEqual(harness.model.passCalls.map { $0.remainingTokenBudget }, [4, 1])
+        XCTAssertEqual(trace.committedExactTokensPerPass, 2.0, accuracy: 1e-9)
+        XCTAssertEqual(trace.acceptedFutureTokensPerPass, 1.0, accuracy: 1e-9)
+    }
+
+    func test_exact_three_token_harness_rejects_inconsistent_future_acceptance() throws {
+        let model = FakeExactThreeTokenModel(
+            vocabSize: 16,
+            selectedPrefillToken: 2,
+            passQueue: [
+                FakeExactThreeTokenPassResponse(
+                    currentToken: 2,
+                    remainingTokenBudget: 3,
+                    result: ExactThreeTokenPassResult(
+                        committedTokens: [2, 4],
+                        nextCurrentToken: 6,
+                        metrics: ExactThreeTokenPassMetrics(
+                            proposerLatencyMs: 0.01,
+                            verifierTrunkLatencyMs: 1.20,
+                            verifierLogitsLatencyMs: 0.70,
+                            stateAdvanceLatencyMs: 0.2,
+                            acceptedFutureTokenCount: 2,
+                            committedExactTokenCount: 2
+                        )
+                    )
+                ),
+            ]
+        )
+
+        var harness = ExactThreeTokenGenerationHarness(model: model, strategy: .argmax)
+
+        do {
+            _ = try harness.generate(promptTokens: [1], maxNewTokens: 3)
+            XCTFail("Expected inconsistent exact three-token future acceptance to throw")
+        } catch {
+            XCTAssertEqual(
+                error,
+                .runtimeFailure("acceptedFutureTokenCount 2 must equal committed token count minus one 1")
+            )
+        }
+    }
+
     func test_exact_two_token_branch_promotion_plan_accepts_matching_future_token() {
         let plan = ExactTwoTokenBranchPromotionPlan.make(
             currentToken: 5,
@@ -654,6 +801,26 @@ final class GenerationHarnessTests: XCTestCase {
             XCTAssertEqual(
                 error,
                 .invalidArguments("exact two-token fused three-layer trunk backend requires a layerCount that is a multiple of 3")
+            )
+        }
+    }
+
+    func test_exact_two_token_branch_state_promotion_rejects_non_multiple_of_three_for_fused_three_layer_state_free_triplet_backend() {
+        let weights = makeGenerationTestRecurrentWeights(layerCount: 5)
+
+        do {
+            _ = try ANEExactTwoTokenBranchStatePromotionModel(
+                weights: weights,
+                layerCount: 5,
+                maxSequenceTokens: 32,
+                outputHeadBackend: .cpu,
+                trunkBackend: .fusedThreeLayerStateFreeTriplets
+            )
+            XCTFail("Expected non-multiple-of-three fused state-free triplet exact backend to throw")
+        } catch {
+            XCTAssertEqual(
+                error,
+                .invalidArguments("exact two-token fused three-layer state-free trunk backend requires a layerCount that is a multiple of 3")
             )
         }
     }
@@ -737,6 +904,26 @@ final class GenerationHarnessTests: XCTestCase {
         }
     }
 
+    func test_recurrent_generation_rejects_non_multiple_of_three_for_fused_three_layer_state_free_triplet_backend() {
+        let weights = makeGenerationTestRecurrentWeights(layerCount: 5)
+
+        do {
+            _ = try ANERecurrentGenerationModel(
+                weights: weights,
+                layerCount: 5,
+                maxSequenceTokens: 32,
+                outputHeadBackend: .cpu,
+                trunkBackend: .fusedThreeLayerStateFreeTriplets
+            )
+            XCTFail("Expected non-multiple-of-three fused state-free triplet layer count to throw")
+        } catch {
+            XCTAssertEqual(
+                error,
+                .invalidArguments("fused three-layer state-free recurrent trunk backend requires a layerCount that is a multiple of 3")
+            )
+        }
+    }
+
     func test_recurrent_generation_rejects_non_positive_output_head_lane_spatial() {
         let weights = makeGenerationTestRecurrentWeights(layerCount: 3)
 
@@ -798,6 +985,70 @@ final class GenerationHarnessTests: XCTestCase {
         XCTAssertEqual(trace.generatedTokens, [105, 110, 116, 32])
     }
 
+    func test_recurrent_generation_single_layer_state_free_backend_rejects_live_state_weights() {
+        let weights = makeGenerationTestStatefulRecurrentWeights(layerCount: 1)
+
+        do {
+            _ = try ANERecurrentGenerationModel(
+                weights: weights,
+                layerCount: 1,
+                maxSequenceTokens: 32,
+                outputHeadBackend: .cpu,
+                trunkBackend: .singleLayerStateFree
+            )
+            XCTFail("Expected live-state recurrent weights to be rejected by the state-free backend")
+        } catch let error as GenerationError {
+            XCTAssertEqual(
+                error,
+                .invalidArguments("single-layer state-free backend requires all recurrent Ws/Wd weights to be zero")
+            )
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+    }
+
+    func test_recurrent_generation_single_layer_state_free_backend_matches_compiled_identity_residual_local_bigram_teacher_tokens() throws {
+        let recurrentWeights = try LocalBigramArtifactBuilder.buildRecurrentWeights(
+            tokens: [35, 105, 110, 116, 32, 105, 110, 116, 32],
+            layerCount: 1,
+            vocabSize: ModelConfig.vocab,
+            recurrentTrunkMode: .compiledIdentityResidual
+        )
+        let model = try ANERecurrentGenerationModel(
+            weights: recurrentWeights,
+            layerCount: 1,
+            maxSequenceTokens: 32,
+            outputHeadBackend: .cpu,
+            trunkBackend: .singleLayerStateFree
+        )
+        var harness = DirectTokenSelectionGenerationHarness(model: model, strategy: .argmax)
+
+        let trace = try harness.generate(promptTokens: [35], maxNewTokens: 4)
+
+        XCTAssertEqual(trace.generatedTokens, [105, 110, 116, 32])
+    }
+
+    func test_recurrent_generation_fused_three_layer_state_free_backend_matches_compiled_identity_residual_local_bigram_teacher_tokens() throws {
+        let recurrentWeights = try LocalBigramArtifactBuilder.buildRecurrentWeights(
+            tokens: [35, 105, 110, 116, 32, 105, 110, 116, 32],
+            layerCount: 6,
+            vocabSize: ModelConfig.vocab,
+            recurrentTrunkMode: .compiledIdentityResidual
+        )
+        let model = try ANERecurrentGenerationModel(
+            weights: recurrentWeights,
+            layerCount: 6,
+            maxSequenceTokens: 32,
+            outputHeadBackend: .cpu,
+            trunkBackend: .fusedThreeLayerStateFreeTriplets
+        )
+        var harness = DirectTokenSelectionGenerationHarness(model: model, strategy: .argmax)
+
+        let trace = try harness.generate(promptTokens: [35], maxNewTokens: 4)
+
+        XCTAssertEqual(trace.generatedTokens, [105, 110, 116, 32])
+    }
+
     func test_exact_two_token_identity_zero_trunk_backend_matches_local_bigram_exact_contract() throws {
         let recurrentWeights = try LocalBigramArtifactBuilder.buildRecurrentWeights(
             tokens: [35, 105, 110, 116, 32, 105, 110, 116, 32],
@@ -816,6 +1067,92 @@ final class GenerationHarnessTests: XCTestCase {
             maxSequenceTokens: 32,
             outputHeadBackend: .cpu,
             trunkBackend: .identityZeroTrunk
+        )
+        var harness = ExactTwoTokenGenerationHarness(model: model, strategy: .argmax)
+
+        let trace = try harness.generate(promptTokens: [35], maxNewTokens: 4)
+
+        XCTAssertEqual(trace.generatedTokens, [105, 110, 116, 32])
+        XCTAssertEqual(trace.committedExactTokenCounts, [2, 2])
+        XCTAssertEqual(trace.acceptedFutureTokenCounts, [1, 1])
+        XCTAssertEqual(trace.committedExactTokensPerPass, 2, accuracy: 0.0001)
+        XCTAssertEqual(trace.acceptedFutureTokensPerPass, 1, accuracy: 0.0001)
+    }
+
+    func test_exact_two_token_single_layer_state_free_backend_rejects_live_state_weights() {
+        let weights = makeGenerationTestStatefulRecurrentWeights(layerCount: 1)
+
+        do {
+            _ = try ANEExactTwoTokenBranchStatePromotionModel(
+                weights: weights,
+                futureSidecar: nil,
+                layerCount: 1,
+                maxSequenceTokens: 32,
+                outputHeadBackend: .cpu,
+                trunkBackend: .singleLayerStateFree
+            )
+            XCTFail("Expected live-state recurrent weights to be rejected by the state-free exact backend")
+        } catch let error as GenerationError {
+            XCTAssertEqual(
+                error,
+                .invalidArguments("single-layer state-free backend requires all recurrent Ws/Wd weights to be zero")
+            )
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+    }
+
+    func test_exact_two_token_single_layer_state_free_backend_matches_compiled_identity_residual_local_bigram_exact_contract() throws {
+        let recurrentWeights = try LocalBigramArtifactBuilder.buildRecurrentWeights(
+            tokens: [35, 105, 110, 116, 32, 105, 110, 116, 32],
+            layerCount: 1,
+            vocabSize: ModelConfig.vocab,
+            recurrentTrunkMode: .compiledIdentityResidual
+        )
+        let futureSidecar = try LocalBigramArtifactBuilder.buildFutureSidecar(
+            tokens: [35, 105, 110, 116, 32, 105, 110, 116, 32],
+            layerCount: 1,
+            vocabSize: ModelConfig.vocab
+        )
+        let model = try ANEExactTwoTokenBranchStatePromotionModel(
+            weights: recurrentWeights,
+            futureSidecar: futureSidecar,
+            layerCount: 1,
+            maxSequenceTokens: 32,
+            outputHeadBackend: .cpu,
+            trunkBackend: .singleLayerStateFree
+        )
+        var harness = ExactTwoTokenGenerationHarness(model: model, strategy: .argmax)
+
+        let trace = try harness.generate(promptTokens: [35], maxNewTokens: 4)
+
+        XCTAssertEqual(trace.generatedTokens, [105, 110, 116, 32])
+        XCTAssertEqual(trace.committedExactTokenCounts, [2, 2])
+        XCTAssertEqual(trace.acceptedFutureTokenCounts, [1, 1])
+        XCTAssertEqual(trace.committedExactTokensPerPass, 2, accuracy: 0.0001)
+        XCTAssertEqual(trace.acceptedFutureTokensPerPass, 1, accuracy: 0.0001)
+    }
+
+    func test_exact_two_token_fused_three_layer_state_free_backend_matches_compiled_identity_residual_local_bigram_exact_contract() throws {
+        let recurrentWeights = try LocalBigramArtifactBuilder.buildRecurrentWeights(
+            tokens: [35, 105, 110, 116, 32, 105, 110, 116, 32],
+            layerCount: 6,
+            vocabSize: ModelConfig.vocab,
+            recurrentTrunkMode: .compiledIdentityResidual
+        )
+        let futureSidecar = try LocalBigramArtifactBuilder.buildFutureSidecar(
+            tokens: [35, 105, 110, 116, 32, 105, 110, 116, 32],
+            layerCount: 6,
+            vocabSize: ModelConfig.vocab,
+            recurrentTrunkMode: .compiledIdentityResidual
+        )
+        let model = try ANEExactTwoTokenBranchStatePromotionModel(
+            weights: recurrentWeights,
+            futureSidecar: futureSidecar,
+            layerCount: 6,
+            maxSequenceTokens: 32,
+            outputHeadBackend: .cpu,
+            trunkBackend: .fusedThreeLayerStateFreeTriplets
         )
         var harness = ExactTwoTokenGenerationHarness(model: model, strategy: .argmax)
 

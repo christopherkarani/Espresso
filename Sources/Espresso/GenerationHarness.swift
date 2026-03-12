@@ -16,8 +16,11 @@ public enum TokenSelectionStrategy: Sendable {
 
 public enum RecurrentGenerationTrunkBackend: Sendable {
     case singleLayer
+    case singleLayerStateFree
     case fusedTwoLayerPairs
     case fusedThreeLayerTriplets
+    case fusedThreeLayerStateFreeTriplets
+    case fusedThreeLayerThreeStepTriplets
     case identityZeroTrunk
     case identityZeroTrunkLookup
 }
@@ -181,11 +184,158 @@ struct ExactTwoTokenBranchPromotionPlan: Sendable, Equatable {
     }
 }
 
+struct ExactThreeTokenBranchPromotionPlan: Sendable, Equatable {
+    let committedTokens: [UInt16]
+    let nextCurrentToken: UInt16
+    let committedExactTokenCount: Int
+    let acceptedFutureTokenCount: Int
+    let promotedStepCount: Int
+
+    static func make(
+        currentToken: UInt16,
+        proposedFutureToken: UInt16,
+        proposedSecondFutureToken: UInt16,
+        exactNextToken: UInt16,
+        exactFutureToken: UInt16,
+        exactSecondFutureToken: UInt16,
+        remainingTokenBudget: Int
+    ) -> ExactThreeTokenBranchPromotionPlan {
+        guard remainingTokenBudget > 1, proposedFutureToken == exactNextToken else {
+            return ExactThreeTokenBranchPromotionPlan(
+                committedTokens: [currentToken],
+                nextCurrentToken: exactNextToken,
+                committedExactTokenCount: 1,
+                acceptedFutureTokenCount: 0,
+                promotedStepCount: 1
+            )
+        }
+
+        guard remainingTokenBudget > 2, proposedSecondFutureToken == exactFutureToken else {
+            return ExactThreeTokenBranchPromotionPlan(
+                committedTokens: [currentToken, exactNextToken],
+                nextCurrentToken: exactFutureToken,
+                committedExactTokenCount: 2,
+                acceptedFutureTokenCount: 1,
+                promotedStepCount: 2
+            )
+        }
+
+        return ExactThreeTokenBranchPromotionPlan(
+            committedTokens: [currentToken, exactNextToken, exactFutureToken],
+            nextCurrentToken: exactSecondFutureToken,
+            committedExactTokenCount: 3,
+            acceptedFutureTokenCount: 2,
+            promotedStepCount: 3
+        )
+    }
+}
+
 public struct ExactTwoTokenGenerationTrace: Sendable, Equatable {
     public let promptTokens: [UInt16]
     public let generatedTokens: [UInt16]
     public let prefillLatencyMs: Double
     public let passMetrics: [ExactTwoTokenPassMetrics]
+
+    public var acceptedFutureTokenCounts: [Int] {
+        passMetrics.map(\.acceptedFutureTokenCount)
+    }
+
+    public var committedExactTokenCounts: [Int] {
+        passMetrics.map(\.committedExactTokenCount)
+    }
+
+    public var totalLatencyMs: Double {
+        prefillLatencyMs + passMetrics.reduce(0) { $0 + $1.totalLatencyMs }
+    }
+
+    public var committedExactTokensPerPass: Double {
+        guard !passMetrics.isEmpty else { return 0 }
+        let total = passMetrics.reduce(0) { $0 + Double($1.committedExactTokenCount) }
+        return total / Double(passMetrics.count)
+    }
+
+    public var acceptedFutureTokensPerPass: Double {
+        guard !passMetrics.isEmpty else { return 0 }
+        let total = passMetrics.reduce(0) { $0 + Double($1.acceptedFutureTokenCount) }
+        return total / Double(passMetrics.count)
+    }
+
+    public var proposerLatencyMsPerPass: Double {
+        guard !passMetrics.isEmpty else { return 0 }
+        return passMetrics.reduce(0) { $0 + $1.proposerLatencyMs } / Double(passMetrics.count)
+    }
+
+    public var verifierTrunkLatencyMsPerPass: Double {
+        guard !passMetrics.isEmpty else { return 0 }
+        return passMetrics.reduce(0) { $0 + $1.verifierTrunkLatencyMs } / Double(passMetrics.count)
+    }
+
+    public var verifierLogitsLatencyMsPerPass: Double {
+        guard !passMetrics.isEmpty else { return 0 }
+        return passMetrics.reduce(0) { $0 + $1.verifierLogitsLatencyMs } / Double(passMetrics.count)
+    }
+
+    public var stateAdvanceLatencyMsPerPass: Double {
+        guard !passMetrics.isEmpty else { return 0 }
+        return passMetrics.reduce(0) { $0 + $1.stateAdvanceLatencyMs } / Double(passMetrics.count)
+    }
+
+    public var effectiveTokensPerSecond: Double {
+        guard totalLatencyMs > 0 else { return 0 }
+        return Double(generatedTokens.count) * 1000.0 / totalLatencyMs
+    }
+}
+
+public struct ExactThreeTokenPassMetrics: Sendable, Equatable {
+    public let proposerLatencyMs: Double
+    public let verifierTrunkLatencyMs: Double
+    public let verifierLogitsLatencyMs: Double
+    public let stateAdvanceLatencyMs: Double
+    public let acceptedFutureTokenCount: Int
+    public let committedExactTokenCount: Int
+
+    public init(
+        proposerLatencyMs: Double,
+        verifierTrunkLatencyMs: Double,
+        verifierLogitsLatencyMs: Double,
+        stateAdvanceLatencyMs: Double,
+        acceptedFutureTokenCount: Int,
+        committedExactTokenCount: Int
+    ) {
+        self.proposerLatencyMs = proposerLatencyMs
+        self.verifierTrunkLatencyMs = verifierTrunkLatencyMs
+        self.verifierLogitsLatencyMs = verifierLogitsLatencyMs
+        self.stateAdvanceLatencyMs = stateAdvanceLatencyMs
+        self.acceptedFutureTokenCount = acceptedFutureTokenCount
+        self.committedExactTokenCount = committedExactTokenCount
+    }
+
+    public var totalLatencyMs: Double {
+        proposerLatencyMs + verifierTrunkLatencyMs + verifierLogitsLatencyMs + stateAdvanceLatencyMs
+    }
+}
+
+public struct ExactThreeTokenPassResult: Sendable, Equatable {
+    public let committedTokens: [UInt16]
+    public let nextCurrentToken: UInt16
+    public let metrics: ExactThreeTokenPassMetrics
+
+    public init(
+        committedTokens: [UInt16],
+        nextCurrentToken: UInt16,
+        metrics: ExactThreeTokenPassMetrics
+    ) {
+        self.committedTokens = committedTokens
+        self.nextCurrentToken = nextCurrentToken
+        self.metrics = metrics
+    }
+}
+
+public struct ExactThreeTokenGenerationTrace: Sendable, Equatable {
+    public let promptTokens: [UInt16]
+    public let generatedTokens: [UInt16]
+    public let prefillLatencyMs: Double
+    public let passMetrics: [ExactThreeTokenPassMetrics]
 
     public var acceptedFutureTokenCounts: [Int] {
         passMetrics.map(\.acceptedFutureTokenCount)
@@ -252,6 +402,21 @@ public protocol ExactTwoTokenGeneratingLanguageModel: ~Copyable, GenerationPerfo
     ) throws(GenerationError) -> ExactTwoTokenPassResult
 }
 
+public protocol ExactThreeTokenGeneratingLanguageModel: ~Copyable, GenerationPerformanceTrackable {
+    var vocabSize: Int { get }
+
+    mutating func reset() throws(GenerationError)
+    mutating func prefillSelectedToken(
+        promptTokens: [UInt16],
+        strategy: TokenSelectionStrategy
+    ) throws(GenerationError) -> UInt16
+    mutating func performExactThreeTokenPass(
+        currentToken: UInt16,
+        remainingTokenBudget: Int,
+        strategy: TokenSelectionStrategy
+    ) throws(GenerationError) -> ExactThreeTokenPassResult
+}
+
 @inline(__always)
 private func tensorBufferIsAllZero(_ buffer: borrowing TensorBuffer) -> Bool {
     buffer.withUnsafeBufferPointer { ptr in
@@ -271,6 +436,19 @@ private func recurrentWeightsUseIdentityZeroTrunk(
               tensorBufferIsAllZero(weights.layers[idx].Ws),
               tensorBufferIsAllZero(weights.layers[idx].Wd),
               tensorBufferIsAllZero(weights.layers[idx].Wo) else {
+            return false
+        }
+    }
+    return true
+}
+
+private func recurrentWeightsUseStateFreeTrunk(
+    _ weights: borrowing RecurrentGenerationWeights,
+    layerCount: Int
+) -> Bool {
+    for idx in 0..<layerCount {
+        guard tensorBufferIsAllZero(weights.layers[idx].Ws),
+              tensorBufferIsAllZero(weights.layers[idx].Wd) else {
             return false
         }
     }
@@ -665,6 +843,102 @@ where Model: ~Copyable {
     }
 }
 
+public struct ExactThreeTokenGenerationHarness<Model: ExactThreeTokenGeneratingLanguageModel>: ~Copyable
+where Model: ~Copyable {
+    public var model: Model
+    public let strategy: TokenSelectionStrategy
+
+    public init(
+        model: consuming Model,
+        strategy: TokenSelectionStrategy = .argmax
+    ) {
+        self.model = model
+        self.strategy = strategy
+    }
+
+    public mutating func generate(
+        promptTokens: [UInt16],
+        maxNewTokens: Int
+    ) throws(GenerationError) -> ExactThreeTokenGenerationTrace {
+        guard !promptTokens.isEmpty else {
+            throw .invalidArguments("promptTokens must not be empty")
+        }
+        guard maxNewTokens > 0 else {
+            throw .invalidArguments("maxNewTokens must be > 0")
+        }
+
+        try model.reset()
+        let prefillStart = GenerationClock.now()
+        var currentToken = try model.prefillSelectedToken(
+            promptTokens: promptTokens,
+            strategy: strategy
+        )
+        let prefillLatencyMs = GenerationClock.milliseconds(start: prefillStart, end: GenerationClock.now())
+
+        var generatedTokens: [UInt16] = []
+        var passMetrics: [ExactThreeTokenPassMetrics] = []
+        generatedTokens.reserveCapacity(maxNewTokens)
+        passMetrics.reserveCapacity(maxNewTokens)
+
+        while generatedTokens.count < maxNewTokens {
+            let remainingTokenBudget = maxNewTokens - generatedTokens.count
+            let result = try model.performExactThreeTokenPass(
+                currentToken: currentToken,
+                remainingTokenBudget: remainingTokenBudget,
+                strategy: strategy
+            )
+            guard !result.committedTokens.isEmpty else {
+                throw .runtimeFailure("exact three-token pass must commit at least one token")
+            }
+            guard result.committedTokens[0] == currentToken else {
+                throw .runtimeFailure("exact three-token pass must commit current token first")
+            }
+            guard (1...min(3, remainingTokenBudget)).contains(result.committedTokens.count) else {
+                throw .runtimeFailure(
+                    "exact three-token pass committed \(result.committedTokens.count) tokens with remaining budget \(remainingTokenBudget)"
+                )
+            }
+            guard (0...2).contains(result.metrics.acceptedFutureTokenCount) else {
+                throw .runtimeFailure(
+                    "acceptedFutureTokenCount \(result.metrics.acceptedFutureTokenCount) must be in 0...2"
+                )
+            }
+            guard result.metrics.committedExactTokenCount == result.committedTokens.count else {
+                throw .runtimeFailure(
+                    "committedExactTokenCount \(result.metrics.committedExactTokenCount) must equal committed token count \(result.committedTokens.count)"
+                )
+            }
+
+            let expectedAcceptedFutureTokenCount = result.committedTokens.count - 1
+            guard result.metrics.acceptedFutureTokenCount == expectedAcceptedFutureTokenCount else {
+                throw .runtimeFailure(
+                    "acceptedFutureTokenCount \(result.metrics.acceptedFutureTokenCount) must equal committed token count minus one \(expectedAcceptedFutureTokenCount)"
+                )
+            }
+            if result.metrics.acceptedFutureTokenCount > 0 {
+                guard remainingTokenBudget > result.metrics.acceptedFutureTokenCount else {
+                    throw .runtimeFailure(
+                        "accepted future token count \(result.metrics.acceptedFutureTokenCount) requires remaining token budget > \(result.metrics.acceptedFutureTokenCount)"
+                    )
+                }
+            } else if result.metrics.stateAdvanceLatencyMs != 0 {
+                throw .runtimeFailure("stateAdvanceLatencyMs must be zero when no future token is accepted")
+            }
+
+            generatedTokens.append(contentsOf: result.committedTokens)
+            passMetrics.append(result.metrics)
+            currentToken = result.nextCurrentToken
+        }
+
+        return ExactThreeTokenGenerationTrace(
+            promptTokens: promptTokens,
+            generatedTokens: generatedTokens,
+            prefillLatencyMs: prefillLatencyMs,
+            passMetrics: passMetrics
+        )
+    }
+}
+
 public struct TwoTokenBranchCommitGenerationHarness<
     DraftModel: TwoTokenDraftingLanguageModel,
     FullModel: TwoTokenBranchVerifyingLanguageModel
@@ -845,7 +1119,10 @@ public struct ANEExactTwoTokenUpperBoundGenerationModel: ~Copyable, ExactTwoToke
     }
 }
 
-public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoTokenGeneratingLanguageModel {
+public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable,
+    ExactTwoTokenGeneratingLanguageModel,
+    ExactThreeTokenGeneratingLanguageModel
+{
     private static let futureProposerOutputHeadLaneSpatial = 32
 
     public let vocabSize: Int
@@ -858,19 +1135,27 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
     private let sharedClassifier: Bool
     private let futureRMS: TensorBuffer
     private let futureClassifier: TensorBuffer
+    private let secondFutureRMS: TensorBuffer
+    private let secondFutureClassifier: TensorBuffer
     private let hasFutureProposer: Bool
+    private let hasSecondFutureProposer: Bool
     private let stepNorm: TensorBuffer
     private let stepLogits: TensorBuffer
     private let futureNorm: TensorBuffer
     private let futureLogits: TensorBuffer
+    private let secondFutureNorm: TensorBuffer
+    private let secondFutureLogits: TensorBuffer
     private let zeroActivation: TensorBuffer
     private let pair0ActivationA: TensorBuffer
     private let pair1ActivationA: TensorBuffer
+    private let pair2ActivationA: TensorBuffer
     private let pair0ActivationB: TensorBuffer
     private let pair1ActivationB: TensorBuffer
+    private let pair2ActivationB: TensorBuffer
     private let currentProposalActivation: TensorBuffer
     private let stepRMSWorkspace: RMSNorm.Workspace
     private let futureRMSWorkspace: RMSNorm.Workspace
+    private let secondFutureRMSWorkspace: RMSNorm.Workspace
     private let outputHeadBackend: GenerationOutputHeadBackend
     private let futureOutputHeadBackend: GenerationOutputHeadBackend
     private let trunkBackend: RecurrentGenerationTrunkBackend
@@ -878,9 +1163,14 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
     private let aneRMSNormClassifierHead: ANEGenerationRMSNormClassifierHead?
     private let futureANEClassifierHead: ANEGenerationClassifierHead?
     private let futureANERMSNormClassifierHead: ANEGenerationRMSNormClassifierHead?
+    private let secondFutureANEClassifierHead: ANEGenerationClassifierHead?
+    private let secondFutureANERMSNormClassifierHead: ANEGenerationRMSNormClassifierHead?
     private var twoStepSessions: LayerStorage<RWKVStyleTwoStepRecurrentSession>
+    private var stateFreeTwoStepSessions: LayerStorage<RWKVStyleStateFreeSession>
     private var fusedPairTwoStepSessions: LayerStorage<RWKVStyleFusedTwoLayerTwoStepSession>
     private var fusedTripletTwoStepSessions: LayerStorage<RWKVStyleFusedThreeLayerTwoStepSession>
+    private var fusedTripletStateFreeTwoStepSessions: LayerStorage<RWKVStyleFusedThreeLayerStateFreeSession>
+    private var fusedTripletThreeStepSessions: LayerStorage<RWKVStyleFusedThreeLayerThreeStepSession>
     private var consumedTokens: Int
     public private(set) var compileTimeMs: Double
     private var trunkLatencyMs: Double
@@ -932,6 +1222,14 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
            !recurrentWeightsUseIdentityZeroTrunk(weights, layerCount: layerCount) {
             throw .invalidArguments("identity zero-trunk backend requires all recurrent Wx/Ws/Wd/Wo weights to be zero")
         }
+        if trunkBackend == .singleLayerStateFree,
+           !recurrentWeightsUseStateFreeTrunk(weights, layerCount: layerCount) {
+            throw .invalidArguments("single-layer state-free backend requires all recurrent Ws/Wd weights to be zero")
+        }
+        if trunkBackend == .fusedThreeLayerStateFreeTriplets,
+           !recurrentWeightsUseStateFreeTrunk(weights, layerCount: layerCount) {
+            throw .invalidArguments("fused three-layer state-free backend requires all recurrent Ws/Wd weights to be zero")
+        }
         if trunkBackend == .identityZeroTrunkLookup, futureSidecar == nil {
             throw .invalidArguments("identity zero-trunk lookup backend requires futureSidecar")
         }
@@ -939,8 +1237,11 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
         let compileStart = GenerationClock.now()
         let usesIdentityZeroTrunkLookup = trunkBackend == .identityZeroTrunkLookup
         let twoStepSessions: LayerStorage<RWKVStyleTwoStepRecurrentSession>
+        let stateFreeTwoStepSessions: LayerStorage<RWKVStyleStateFreeSession>
         let fusedPairTwoStepSessions: LayerStorage<RWKVStyleFusedTwoLayerTwoStepSession>
         let fusedTripletTwoStepSessions: LayerStorage<RWKVStyleFusedThreeLayerTwoStepSession>
+        let fusedTripletStateFreeTwoStepSessions: LayerStorage<RWKVStyleFusedThreeLayerStateFreeSession>
+        let fusedTripletThreeStepSessions: LayerStorage<RWKVStyleFusedThreeLayerThreeStepSession>
         switch trunkBackend {
         case .singleLayer:
             do {
@@ -956,10 +1257,48 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
             } catch {
                 throw .runtimeFailure("two-step recurrent kernel/session setup failed: \(error)")
             }
+            stateFreeTwoStepSessions = LayerStorage<RWKVStyleStateFreeSession>(count: 0) { _ in
+                fatalError("unreachable")
+            }
             fusedPairTwoStepSessions = LayerStorage<RWKVStyleFusedTwoLayerTwoStepSession>(count: 0) { _ in
                 fatalError("unreachable")
             }
             fusedTripletTwoStepSessions = LayerStorage<RWKVStyleFusedThreeLayerTwoStepSession>(count: 0) { _ in
+                fatalError("unreachable")
+            }
+            fusedTripletStateFreeTwoStepSessions = LayerStorage<RWKVStyleFusedThreeLayerStateFreeSession>(count: 0) { _ in
+                fatalError("unreachable")
+            }
+            fusedTripletThreeStepSessions = LayerStorage<RWKVStyleFusedThreeLayerThreeStepSession>(count: 0) { _ in
+                fatalError("unreachable")
+            }
+        case .singleLayerStateFree:
+            twoStepSessions = LayerStorage<RWKVStyleTwoStepRecurrentSession>(count: 0) { _ in
+                fatalError("unreachable")
+            }
+            do {
+                stateFreeTwoStepSessions = try LayerStorage<RWKVStyleStateFreeSession>(
+                    count: layerCount,
+                    throwingInitializer: { idx in
+                        try RWKVStyleStateFreeSession(
+                            weights: weights.layers[idx],
+                            laneSpatial: trunkLaneSpatial
+                        )
+                    }
+                )
+            } catch {
+                throw .runtimeFailure("state-free recurrent kernel/session setup failed: \(error)")
+            }
+            fusedPairTwoStepSessions = LayerStorage<RWKVStyleFusedTwoLayerTwoStepSession>(count: 0) { _ in
+                fatalError("unreachable")
+            }
+            fusedTripletTwoStepSessions = LayerStorage<RWKVStyleFusedThreeLayerTwoStepSession>(count: 0) { _ in
+                fatalError("unreachable")
+            }
+            fusedTripletStateFreeTwoStepSessions = LayerStorage<RWKVStyleFusedThreeLayerStateFreeSession>(count: 0) { _ in
+                fatalError("unreachable")
+            }
+            fusedTripletThreeStepSessions = LayerStorage<RWKVStyleFusedThreeLayerThreeStepSession>(count: 0) { _ in
                 fatalError("unreachable")
             }
         case .fusedTwoLayerPairs:
@@ -967,6 +1306,9 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
                 throw .invalidArguments("exact two-token fused pair trunk backend requires an even layerCount")
             }
             twoStepSessions = LayerStorage<RWKVStyleTwoStepRecurrentSession>(count: 0) { _ in
+                fatalError("unreachable")
+            }
+            stateFreeTwoStepSessions = LayerStorage<RWKVStyleStateFreeSession>(count: 0) { _ in
                 fatalError("unreachable")
             }
             do {
@@ -987,6 +1329,12 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
             fusedTripletTwoStepSessions = LayerStorage<RWKVStyleFusedThreeLayerTwoStepSession>(count: 0) { _ in
                 fatalError("unreachable")
             }
+            fusedTripletStateFreeTwoStepSessions = LayerStorage<RWKVStyleFusedThreeLayerStateFreeSession>(count: 0) { _ in
+                fatalError("unreachable")
+            }
+            fusedTripletThreeStepSessions = LayerStorage<RWKVStyleFusedThreeLayerThreeStepSession>(count: 0) { _ in
+                fatalError("unreachable")
+            }
         case .fusedThreeLayerTriplets:
             guard layerCount.isMultiple(of: 3) else {
                 throw .invalidArguments(
@@ -994,6 +1342,9 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
                 )
             }
             twoStepSessions = LayerStorage<RWKVStyleTwoStepRecurrentSession>(count: 0) { _ in
+                fatalError("unreachable")
+            }
+            stateFreeTwoStepSessions = LayerStorage<RWKVStyleStateFreeSession>(count: 0) { _ in
                 fatalError("unreachable")
             }
             fusedPairTwoStepSessions = LayerStorage<RWKVStyleFusedTwoLayerTwoStepSession>(count: 0) { _ in
@@ -1015,14 +1366,103 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
             } catch {
                 throw .runtimeFailure("fused three-layer two-step kernel/session setup failed: \(error)")
             }
-        case .identityZeroTrunk, .identityZeroTrunkLookup:
+            fusedTripletStateFreeTwoStepSessions = LayerStorage<RWKVStyleFusedThreeLayerStateFreeSession>(count: 0) { _ in
+                fatalError("unreachable")
+            }
+            fusedTripletThreeStepSessions = LayerStorage<RWKVStyleFusedThreeLayerThreeStepSession>(count: 0) { _ in
+                fatalError("unreachable")
+            }
+        case .fusedThreeLayerStateFreeTriplets:
+            guard layerCount.isMultiple(of: 3) else {
+                throw .invalidArguments(
+                    "exact two-token fused three-layer state-free trunk backend requires a layerCount that is a multiple of 3"
+                )
+            }
             twoStepSessions = LayerStorage<RWKVStyleTwoStepRecurrentSession>(count: 0) { _ in
+                fatalError("unreachable")
+            }
+            stateFreeTwoStepSessions = LayerStorage<RWKVStyleStateFreeSession>(count: 0) { _ in
                 fatalError("unreachable")
             }
             fusedPairTwoStepSessions = LayerStorage<RWKVStyleFusedTwoLayerTwoStepSession>(count: 0) { _ in
                 fatalError("unreachable")
             }
             fusedTripletTwoStepSessions = LayerStorage<RWKVStyleFusedThreeLayerTwoStepSession>(count: 0) { _ in
+                fatalError("unreachable")
+            }
+            do {
+                fusedTripletStateFreeTwoStepSessions = try LayerStorage<RWKVStyleFusedThreeLayerStateFreeSession>(
+                    count: layerCount / 3,
+                    throwingInitializer: { idx in
+                        let base = idx * 3
+                        return try RWKVStyleFusedThreeLayerStateFreeSession(
+                            weights0: weights.layers[base],
+                            weights1: weights.layers[base + 1],
+                            weights2: weights.layers[base + 2],
+                            laneSpatial: trunkLaneSpatial
+                        )
+                    }
+                )
+            } catch {
+                throw .runtimeFailure("fused three-layer state-free kernel/session setup failed: \(error)")
+            }
+            fusedTripletThreeStepSessions = LayerStorage<RWKVStyleFusedThreeLayerThreeStepSession>(count: 0) { _ in
+                fatalError("unreachable")
+            }
+        case .fusedThreeLayerThreeStepTriplets:
+            guard layerCount.isMultiple(of: 3) else {
+                throw .invalidArguments(
+                    "exact three-token fused three-layer trunk backend requires a layerCount that is a multiple of 3"
+                )
+            }
+            twoStepSessions = LayerStorage<RWKVStyleTwoStepRecurrentSession>(count: 0) { _ in
+                fatalError("unreachable")
+            }
+            stateFreeTwoStepSessions = LayerStorage<RWKVStyleStateFreeSession>(count: 0) { _ in
+                fatalError("unreachable")
+            }
+            fusedPairTwoStepSessions = LayerStorage<RWKVStyleFusedTwoLayerTwoStepSession>(count: 0) { _ in
+                fatalError("unreachable")
+            }
+            fusedTripletTwoStepSessions = LayerStorage<RWKVStyleFusedThreeLayerTwoStepSession>(count: 0) { _ in
+                fatalError("unreachable")
+            }
+            fusedTripletStateFreeTwoStepSessions = LayerStorage<RWKVStyleFusedThreeLayerStateFreeSession>(count: 0) { _ in
+                fatalError("unreachable")
+            }
+            do {
+                fusedTripletThreeStepSessions = try LayerStorage<RWKVStyleFusedThreeLayerThreeStepSession>(
+                    count: layerCount / 3,
+                    throwingInitializer: { idx in
+                        let base = idx * 3
+                        return try RWKVStyleFusedThreeLayerThreeStepSession(
+                            weights0: weights.layers[base],
+                            weights1: weights.layers[base + 1],
+                            weights2: weights.layers[base + 2],
+                            laneSpatial: trunkLaneSpatial
+                        )
+                    }
+                )
+            } catch {
+                throw .runtimeFailure("fused three-layer three-step kernel/session setup failed: \(error)")
+            }
+        case .identityZeroTrunk, .identityZeroTrunkLookup:
+            twoStepSessions = LayerStorage<RWKVStyleTwoStepRecurrentSession>(count: 0) { _ in
+                fatalError("unreachable")
+            }
+            stateFreeTwoStepSessions = LayerStorage<RWKVStyleStateFreeSession>(count: 0) { _ in
+                fatalError("unreachable")
+            }
+            fusedPairTwoStepSessions = LayerStorage<RWKVStyleFusedTwoLayerTwoStepSession>(count: 0) { _ in
+                fatalError("unreachable")
+            }
+            fusedTripletTwoStepSessions = LayerStorage<RWKVStyleFusedThreeLayerTwoStepSession>(count: 0) { _ in
+                fatalError("unreachable")
+            }
+            fusedTripletStateFreeTwoStepSessions = LayerStorage<RWKVStyleFusedThreeLayerStateFreeSession>(count: 0) { _ in
+                fatalError("unreachable")
+            }
+            fusedTripletThreeStepSessions = LayerStorage<RWKVStyleFusedThreeLayerThreeStepSession>(count: 0) { _ in
                 fatalError("unreachable")
             }
         }
@@ -1040,8 +1480,12 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
             : GenerationWeightCloner.cloneTensor(weights.classifier)
         let futureRMS: TensorBuffer
         let futureClassifier: TensorBuffer
+        let secondFutureRMS: TensorBuffer
+        let secondFutureClassifier: TensorBuffer
         let hasFutureProposer: Bool
+        let hasSecondFutureProposer: Bool
         if let futureSidecar {
+            let hasUpfrontSecondFutureHead = futureSidecar.hasUpfrontSecondFutureHead
             guard futureSidecar.contract.dim == ModelConfig.dim else {
                 throw .invalidArguments(
                     "futureSidecar dim \(futureSidecar.contract.dim) does not match ModelConfig.dim \(ModelConfig.dim)"
@@ -1059,11 +1503,20 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
             }
             futureRMS = consume futureSidecar.futureRMS
             futureClassifier = consume futureSidecar.futureClassifier
+            secondFutureRMS = consume futureSidecar.secondFutureRMS
+            secondFutureClassifier = consume futureSidecar.secondFutureClassifier
             hasFutureProposer = true
+            hasSecondFutureProposer = hasUpfrontSecondFutureHead
         } else {
             futureRMS = TensorBuffer(count: ModelConfig.dim, zeroed: true)
             futureClassifier = TensorBuffer(count: vocabSize * ModelConfig.dim, zeroed: true)
+            secondFutureRMS = TensorBuffer(count: 0, zeroed: true)
+            secondFutureClassifier = TensorBuffer(count: 0, zeroed: true)
             hasFutureProposer = false
+            hasSecondFutureProposer = false
+        }
+        if trunkBackend == .fusedThreeLayerThreeStepTriplets, !hasSecondFutureProposer {
+            throw .invalidArguments("exact three-token fused backend requires a sidecar with an upfront second future head")
         }
 
         let aneClassifierHead: ANEGenerationClassifierHead?
@@ -1157,6 +1610,39 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
             futureANERMSNormClassifierHead = nil
         }
 
+        let secondFutureANEClassifierHead: ANEGenerationClassifierHead?
+        switch futureOutputHeadBackend {
+        case .aneClassifier where hasSecondFutureProposer:
+            do {
+                secondFutureANEClassifierHead = try ANEGenerationClassifierHead(
+                    classifierWeights: secondFutureClassifier,
+                    vocabSize: vocabSize,
+                    laneSpatial: Self.futureProposerOutputHeadLaneSpatial
+                )
+            } catch {
+                throw .runtimeFailure("three-step ANE second future proposer setup failed: \(error)")
+            }
+        default:
+            secondFutureANEClassifierHead = nil
+        }
+
+        let secondFutureANERMSNormClassifierHead: ANEGenerationRMSNormClassifierHead?
+        switch futureOutputHeadBackend {
+        case .aneRMSNormClassifier where hasSecondFutureProposer:
+            do {
+                secondFutureANERMSNormClassifierHead = try ANEGenerationRMSNormClassifierHead(
+                    rmsFinal: secondFutureRMS,
+                    classifierWeights: secondFutureClassifier,
+                    vocabSize: vocabSize,
+                    laneSpatial: Self.futureProposerOutputHeadLaneSpatial
+                )
+            } catch {
+                throw .runtimeFailure("three-step ANE second future proposer setup failed: \(error)")
+            }
+        default:
+            secondFutureANERMSNormClassifierHead = nil
+        }
+
         self.vocabSize = vocabSize
         self.layerCount = layerCount
         self.maxSequenceTokens = maxSequenceTokens
@@ -1166,19 +1652,27 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
         self.sharedClassifier = sharedClassifier
         self.futureRMS = futureRMS
         self.futureClassifier = futureClassifier
+        self.secondFutureRMS = secondFutureRMS
+        self.secondFutureClassifier = secondFutureClassifier
         self.hasFutureProposer = hasFutureProposer
+        self.hasSecondFutureProposer = hasSecondFutureProposer
         self.stepNorm = TensorBuffer(count: ModelConfig.dim, zeroed: true)
         self.stepLogits = TensorBuffer(count: vocabSize, zeroed: true)
         self.futureNorm = TensorBuffer(count: ModelConfig.dim, zeroed: true)
         self.futureLogits = TensorBuffer(count: vocabSize, zeroed: true)
+        self.secondFutureNorm = TensorBuffer(count: ModelConfig.dim, zeroed: true)
+        self.secondFutureLogits = TensorBuffer(count: vocabSize, zeroed: true)
         self.zeroActivation = TensorBuffer(count: ModelConfig.dim, zeroed: true)
         self.pair0ActivationA = TensorBuffer(count: ModelConfig.dim, zeroed: true)
         self.pair1ActivationA = TensorBuffer(count: ModelConfig.dim, zeroed: true)
+        self.pair2ActivationA = TensorBuffer(count: ModelConfig.dim, zeroed: true)
         self.pair0ActivationB = TensorBuffer(count: ModelConfig.dim, zeroed: true)
         self.pair1ActivationB = TensorBuffer(count: ModelConfig.dim, zeroed: true)
+        self.pair2ActivationB = TensorBuffer(count: ModelConfig.dim, zeroed: true)
         self.currentProposalActivation = TensorBuffer(count: ModelConfig.dim, zeroed: true)
         self.stepRMSWorkspace = RMSNorm.Workspace(seqLen: 1)
         self.futureRMSWorkspace = RMSNorm.Workspace(seqLen: 1)
+        self.secondFutureRMSWorkspace = RMSNorm.Workspace(seqLen: 1)
         self.outputHeadBackend = outputHeadBackend
         self.futureOutputHeadBackend = futureOutputHeadBackend
         self.trunkBackend = trunkBackend
@@ -1186,9 +1680,14 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
         self.aneRMSNormClassifierHead = aneRMSNormClassifierHead
         self.futureANEClassifierHead = futureANEClassifierHead
         self.futureANERMSNormClassifierHead = futureANERMSNormClassifierHead
+        self.secondFutureANEClassifierHead = secondFutureANEClassifierHead
+        self.secondFutureANERMSNormClassifierHead = secondFutureANERMSNormClassifierHead
         self.twoStepSessions = twoStepSessions
+        self.stateFreeTwoStepSessions = stateFreeTwoStepSessions
         self.fusedPairTwoStepSessions = fusedPairTwoStepSessions
         self.fusedTripletTwoStepSessions = fusedTripletTwoStepSessions
+        self.fusedTripletStateFreeTwoStepSessions = fusedTripletStateFreeTwoStepSessions
+        self.fusedTripletThreeStepSessions = fusedTripletThreeStepSessions
         self.consumedTokens = 0
         self.compileTimeMs = GenerationClock.milliseconds(start: compileStart, end: GenerationClock.now())
         self.trunkLatencyMs = 0
@@ -1270,19 +1769,27 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
         self.sharedClassifier = sharedClassifier
         self.futureRMS = consume futureSidecar.futureRMS
         self.futureClassifier = consume futureSidecar.futureClassifier
+        self.secondFutureRMS = TensorBuffer(count: 0, zeroed: true)
+        self.secondFutureClassifier = TensorBuffer(count: 0, zeroed: true)
         self.hasFutureProposer = true
+        self.hasSecondFutureProposer = false
         self.stepNorm = TensorBuffer(count: ModelConfig.dim, zeroed: true)
         self.stepLogits = TensorBuffer(count: vocabSize, zeroed: true)
         self.futureNorm = TensorBuffer(count: ModelConfig.dim, zeroed: true)
         self.futureLogits = TensorBuffer(count: vocabSize, zeroed: true)
+        self.secondFutureNorm = TensorBuffer(count: ModelConfig.dim, zeroed: true)
+        self.secondFutureLogits = TensorBuffer(count: vocabSize, zeroed: true)
         self.zeroActivation = TensorBuffer(count: ModelConfig.dim, zeroed: true)
         self.pair0ActivationA = TensorBuffer(count: ModelConfig.dim, zeroed: true)
         self.pair1ActivationA = TensorBuffer(count: ModelConfig.dim, zeroed: true)
+        self.pair2ActivationA = TensorBuffer(count: ModelConfig.dim, zeroed: true)
         self.pair0ActivationB = TensorBuffer(count: ModelConfig.dim, zeroed: true)
         self.pair1ActivationB = TensorBuffer(count: ModelConfig.dim, zeroed: true)
+        self.pair2ActivationB = TensorBuffer(count: ModelConfig.dim, zeroed: true)
         self.currentProposalActivation = TensorBuffer(count: ModelConfig.dim, zeroed: true)
         self.stepRMSWorkspace = RMSNorm.Workspace(seqLen: 1)
         self.futureRMSWorkspace = RMSNorm.Workspace(seqLen: 1)
+        self.secondFutureRMSWorkspace = RMSNorm.Workspace(seqLen: 1)
         self.outputHeadBackend = outputHeadBackend
         self.futureOutputHeadBackend = .cpu
         self.trunkBackend = trunkBackend
@@ -1290,13 +1797,24 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
         self.aneRMSNormClassifierHead = nil
         self.futureANEClassifierHead = nil
         self.futureANERMSNormClassifierHead = nil
+        self.secondFutureANEClassifierHead = nil
+        self.secondFutureANERMSNormClassifierHead = nil
         self.twoStepSessions = LayerStorage<RWKVStyleTwoStepRecurrentSession>(count: 0) { _ in
+            fatalError("unreachable")
+        }
+        self.stateFreeTwoStepSessions = LayerStorage<RWKVStyleStateFreeSession>(count: 0) { _ in
             fatalError("unreachable")
         }
         self.fusedPairTwoStepSessions = LayerStorage<RWKVStyleFusedTwoLayerTwoStepSession>(count: 0) { _ in
             fatalError("unreachable")
         }
         self.fusedTripletTwoStepSessions = LayerStorage<RWKVStyleFusedThreeLayerTwoStepSession>(count: 0) { _ in
+            fatalError("unreachable")
+        }
+        self.fusedTripletStateFreeTwoStepSessions = LayerStorage<RWKVStyleFusedThreeLayerStateFreeSession>(count: 0) { _ in
+            fatalError("unreachable")
+        }
+        self.fusedTripletThreeStepSessions = LayerStorage<RWKVStyleFusedThreeLayerThreeStepSession>(count: 0) { _ in
             fatalError("unreachable")
         }
         self.consumedTokens = 0
@@ -1321,6 +1839,14 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
                     throw .runtimeFailure("two-step recurrent reset failed at layer \(idx): \(error)")
                 }
             }
+        case .singleLayerStateFree:
+            for idx in 0..<stateFreeTwoStepSessions.count {
+                do {
+                    try stateFreeTwoStepSessions[idx].reset()
+                } catch {
+                    throw .runtimeFailure("state-free recurrent reset failed at layer \(idx): \(error)")
+                }
+            }
         case .identityZeroTrunk, .identityZeroTrunkLookup:
             break
         case .fusedTwoLayerPairs:
@@ -1339,11 +1865,29 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
                     throw .runtimeFailure("fused three-layer two-step recurrent reset failed at triplet \(idx): \(error)")
                 }
             }
+        case .fusedThreeLayerStateFreeTriplets:
+            for idx in 0..<fusedTripletStateFreeTwoStepSessions.count {
+                do {
+                    try fusedTripletStateFreeTwoStepSessions[idx].reset()
+                } catch {
+                    throw .runtimeFailure("fused three-layer state-free recurrent reset failed at triplet \(idx): \(error)")
+                }
+            }
+        case .fusedThreeLayerThreeStepTriplets:
+            for idx in 0..<fusedTripletThreeStepSessions.count {
+                do {
+                    try fusedTripletThreeStepSessions[idx].reset()
+                } catch {
+                    throw .runtimeFailure("fused three-layer three-step recurrent reset failed at triplet \(idx): \(error)")
+                }
+            }
         }
         pair0ActivationA.zero()
         pair1ActivationA.zero()
+        pair2ActivationA.zero()
         pair0ActivationB.zero()
         pair1ActivationB.zero()
+        pair2ActivationB.zero()
         currentProposalActivation.zero()
         consumedTokens = 0
         trunkLatencyMs = 0
@@ -1385,6 +1929,10 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
                 currentToken: currentToken,
                 remainingTokenBudget: remainingTokenBudget
             )
+        }
+
+        if trunkBackend == .fusedThreeLayerThreeStepTriplets {
+            throw .runtimeFailure("three-step trunk backend requires ExactThreeTokenGenerationHarness")
         }
 
         let proposerStart = GenerationClock.now()
@@ -1443,6 +1991,80 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
         )
     }
 
+    public mutating func performExactThreeTokenPass(
+        currentToken: UInt16,
+        remainingTokenBudget: Int,
+        strategy: TokenSelectionStrategy
+    ) throws(GenerationError) -> ExactThreeTokenPassResult {
+        guard remainingTokenBudget > 0 else {
+            throw .invalidArguments("remainingTokenBudget must be > 0")
+        }
+        guard trunkBackend == .fusedThreeLayerThreeStepTriplets else {
+            throw .runtimeFailure("exact three-token pass requires fused three-layer three-step trunk backend")
+        }
+
+        let proposerStart = GenerationClock.now()
+        let proposedFutureToken = try selectProposedFutureToken(
+            currentToken: currentToken,
+            strategy: strategy
+        )
+        let proposedSecondFutureToken = remainingTokenBudget > 2
+            ? try selectSecondProposedFutureToken(strategy: strategy)
+            : .zero
+        let proposerLatencyMs = GenerationClock.milliseconds(start: proposerStart, end: GenerationClock.now())
+
+        if remainingTokenBudget == 1 {
+            let exactNextToken = try runCommittedSingleToken(token: currentToken, strategy: strategy)
+            return ExactThreeTokenPassResult(
+                committedTokens: [currentToken],
+                nextCurrentToken: exactNextToken,
+                metrics: ExactThreeTokenPassMetrics(
+                    proposerLatencyMs: proposerLatencyMs,
+                    verifierTrunkLatencyMs: lastSingleTokenTrunkLatencyMs,
+                    verifierLogitsLatencyMs: lastSingleTokenLogitsLatencyMs,
+                    stateAdvanceLatencyMs: 0,
+                    acceptedFutureTokenCount: 0,
+                    committedExactTokenCount: 1
+                )
+            )
+        }
+
+        let prepared = try prepareExactThreeTokenTrio(
+            currentToken: currentToken,
+            proposedFutureToken: proposedFutureToken,
+            proposedSecondFutureToken: proposedSecondFutureToken,
+            strategy: strategy
+        )
+        let plan = ExactThreeTokenBranchPromotionPlan.make(
+            currentToken: currentToken,
+            proposedFutureToken: proposedFutureToken,
+            proposedSecondFutureToken: proposedSecondFutureToken,
+            exactNextToken: prepared.exactNextToken,
+            exactFutureToken: prepared.exactFutureToken,
+            exactSecondFutureToken: prepared.exactSecondFutureToken,
+            remainingTokenBudget: remainingTokenBudget
+        )
+        let stateAdvanceLatencyMs = try promotePreparedPair(stepCount: plan.promotedStepCount)
+        captureProposalActivationForNextPass(
+            sourcePairIsA: prepared.sourcePairIsA,
+            committedStepCount: plan.promotedStepCount
+        )
+        consumedTokens += plan.promotedStepCount
+
+        return ExactThreeTokenPassResult(
+            committedTokens: plan.committedTokens,
+            nextCurrentToken: plan.nextCurrentToken,
+            metrics: ExactThreeTokenPassMetrics(
+                proposerLatencyMs: proposerLatencyMs,
+                verifierTrunkLatencyMs: prepared.trunkLatencyMs,
+                verifierLogitsLatencyMs: prepared.logitsLatencyMs,
+                stateAdvanceLatencyMs: stateAdvanceLatencyMs,
+                acceptedFutureTokenCount: plan.acceptedFutureTokenCount,
+                committedExactTokenCount: plan.committedExactTokenCount
+            )
+        )
+    }
+
     private mutating func runCommittedSingleToken(
         token: UInt16,
         strategy: TokenSelectionStrategy
@@ -1465,6 +2087,22 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
             return exactNextToken
         }
 
+        if trunkBackend == .fusedThreeLayerThreeStepTriplets {
+            try Self.writeTokenEmbedding(token, embedding: embedding, into: pair0ActivationA)
+            pair1ActivationA.zero()
+            pair2ActivationA.zero()
+            let prepared = try prepareActivationTrio(strategy: strategy)
+            let stateAdvanceLatencyMs = try promotePreparedPair(stepCount: 1)
+            captureProposalActivationForNextPass(
+                sourcePairIsA: prepared.sourcePairIsA,
+                committedStepCount: 1
+            )
+            consumedTokens += 1
+            lastSingleTokenTrunkLatencyMs = prepared.trunkLatencyMs + stateAdvanceLatencyMs
+            lastSingleTokenLogitsLatencyMs = prepared.logitsLatencyMs
+            return prepared.exactNextToken
+        }
+
         try Self.writeTokenEmbedding(token, embedding: embedding, into: pair0ActivationA)
         pair1ActivationA.zero()
         let prepared = try prepareActivationPair(strategy: strategy)
@@ -1479,6 +2117,15 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
     private struct PreparedExactTwoTokenPair {
         let exactNextToken: UInt16
         let exactFutureToken: UInt16
+        let trunkLatencyMs: Double
+        let logitsLatencyMs: Double
+        let sourcePairIsA: Bool
+    }
+
+    private struct PreparedExactThreeTokenTrio {
+        let exactNextToken: UInt16
+        let exactFutureToken: UInt16
+        let exactSecondFutureToken: UInt16
         let trunkLatencyMs: Double
         let logitsLatencyMs: Double
         let sourcePairIsA: Bool
@@ -1502,6 +2149,33 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
         try Self.writeTokenEmbedding(currentToken, embedding: embedding, into: pair0ActivationA)
         try Self.writeTokenEmbedding(proposedFutureToken, embedding: embedding, into: pair1ActivationA)
         return try prepareActivationPair(strategy: strategy)
+    }
+
+    private mutating func prepareExactThreeTokenTrio(
+        currentToken: UInt16,
+        proposedFutureToken: UInt16,
+        proposedSecondFutureToken: UInt16,
+        strategy: TokenSelectionStrategy
+    ) throws(GenerationError) -> PreparedExactThreeTokenTrio {
+        guard Int(currentToken) < vocabSize else {
+            throw .invalidArguments("token \(currentToken) exceeds vocab size \(vocabSize)")
+        }
+        guard Int(proposedFutureToken) < vocabSize else {
+            throw .invalidArguments("proposedFutureToken \(proposedFutureToken) exceeds vocab size \(vocabSize)")
+        }
+        guard Int(proposedSecondFutureToken) < vocabSize else {
+            throw .invalidArguments(
+                "proposedSecondFutureToken \(proposedSecondFutureToken) exceeds vocab size \(vocabSize)"
+            )
+        }
+        guard consumedTokens + 2 < maxSequenceTokens else {
+            throw .invalidArguments("three-step recurrent generation overflow at maxSequenceTokens \(maxSequenceTokens)")
+        }
+
+        try Self.writeTokenEmbedding(currentToken, embedding: embedding, into: pair0ActivationA)
+        try Self.writeTokenEmbedding(proposedFutureToken, embedding: embedding, into: pair1ActivationA)
+        try Self.writeTokenEmbedding(proposedSecondFutureToken, embedding: embedding, into: pair2ActivationA)
+        return try prepareActivationTrio(strategy: strategy)
     }
 
     private mutating func prepareActivationPair(
@@ -1534,6 +2208,38 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
                     }
                 } catch {
                     throw .runtimeFailure("two-step recurrent prepare failed at layer \(idx): \(error)")
+                }
+                sourcePairIsA.toggle()
+            }
+        case .singleLayerStateFree:
+            for idx in 0..<stateFreeTwoStepSessions.count {
+                var timings = StepTimingBreakdown()
+                do {
+                    if sourcePairIsA {
+                        try stateFreeTwoStepSessions[idx].step(
+                            tokenInput: pair0ActivationA,
+                            output: pair0ActivationB,
+                            timings: &timings
+                        )
+                        try stateFreeTwoStepSessions[idx].step(
+                            tokenInput: pair1ActivationA,
+                            output: pair1ActivationB,
+                            timings: &timings
+                        )
+                    } else {
+                        try stateFreeTwoStepSessions[idx].step(
+                            tokenInput: pair0ActivationB,
+                            output: pair0ActivationA,
+                            timings: &timings
+                        )
+                        try stateFreeTwoStepSessions[idx].step(
+                            tokenInput: pair1ActivationB,
+                            output: pair1ActivationA,
+                            timings: &timings
+                        )
+                    }
+                } catch {
+                    throw .runtimeFailure("state-free recurrent prepare failed at layer \(idx): \(error)")
                 }
                 sourcePairIsA.toggle()
             }
@@ -1591,6 +2297,40 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
                 }
                 sourcePairIsA.toggle()
             }
+        case .fusedThreeLayerStateFreeTriplets:
+            for idx in 0..<fusedTripletStateFreeTwoStepSessions.count {
+                var timings = StepTimingBreakdown()
+                do {
+                    if sourcePairIsA {
+                        try fusedTripletStateFreeTwoStepSessions[idx].step(
+                            tokenInput: pair0ActivationA,
+                            output: pair0ActivationB,
+                            timings: &timings
+                        )
+                        try fusedTripletStateFreeTwoStepSessions[idx].step(
+                            tokenInput: pair1ActivationA,
+                            output: pair1ActivationB,
+                            timings: &timings
+                        )
+                    } else {
+                        try fusedTripletStateFreeTwoStepSessions[idx].step(
+                            tokenInput: pair0ActivationB,
+                            output: pair0ActivationA,
+                            timings: &timings
+                        )
+                        try fusedTripletStateFreeTwoStepSessions[idx].step(
+                            tokenInput: pair1ActivationB,
+                            output: pair1ActivationA,
+                            timings: &timings
+                        )
+                    }
+                } catch {
+                    throw .runtimeFailure("fused three-layer state-free recurrent prepare failed at triplet \(idx): \(error)")
+                }
+                sourcePairIsA.toggle()
+            }
+        case .fusedThreeLayerThreeStepTriplets:
+            throw .runtimeFailure("three-step trunk backend requires prepareActivationTrio")
         }
 
         let trunkLatencyMs = GenerationClock.milliseconds(start: trunkStart, end: GenerationClock.now())
@@ -1646,6 +2386,104 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
         )
     }
 
+    private mutating func prepareActivationTrio(
+        strategy: TokenSelectionStrategy
+    ) throws(GenerationError) -> PreparedExactThreeTokenTrio {
+        let trunkStart = GenerationClock.now()
+        var sourcePairIsA = true
+
+        switch trunkBackend {
+        case .fusedThreeLayerThreeStepTriplets:
+            for idx in 0..<fusedTripletThreeStepSessions.count {
+                var timings = StepTimingBreakdown()
+                do {
+                    if sourcePairIsA {
+                        try fusedTripletThreeStepSessions[idx].prepare(
+                            tokenInput0: pair0ActivationA,
+                            tokenInput1: pair1ActivationA,
+                            tokenInput2: pair2ActivationA,
+                            output0: pair0ActivationB,
+                            output1: pair1ActivationB,
+                            output2: pair2ActivationB,
+                            timings: &timings
+                        )
+                    } else {
+                        try fusedTripletThreeStepSessions[idx].prepare(
+                            tokenInput0: pair0ActivationB,
+                            tokenInput1: pair1ActivationB,
+                            tokenInput2: pair2ActivationB,
+                            output0: pair0ActivationA,
+                            output1: pair1ActivationA,
+                            output2: pair2ActivationA,
+                            timings: &timings
+                        )
+                    }
+                } catch {
+                    throw .runtimeFailure("fused three-layer three-step recurrent prepare failed at triplet \(idx): \(error)")
+                }
+                sourcePairIsA.toggle()
+            }
+        default:
+            throw .runtimeFailure("prepareActivationTrio requires fused three-layer three-step trunk backend")
+        }
+
+        let trunkLatencyMs = GenerationClock.milliseconds(start: trunkStart, end: GenerationClock.now())
+        self.trunkLatencyMs += trunkLatencyMs
+
+        let logitsStart = GenerationClock.now()
+        let exactNextToken: UInt16
+        let exactFutureToken: UInt16
+        let exactSecondFutureToken: UInt16
+        if sourcePairIsA {
+            (exactNextToken, exactFutureToken, exactSecondFutureToken) = try Self.selectTokenTripleFromPreparedActivations(
+                pair0ActivationA,
+                pair1ActivationA,
+                pair2ActivationA,
+                strategy: strategy,
+                outputHeadBackend: outputHeadBackend,
+                rmsFinal: rmsFinal,
+                stepNorm: stepNorm,
+                stepLogits: stepLogits,
+                embedding: embedding,
+                classifier: classifier,
+                sharedClassifier: sharedClassifier,
+                aneClassifierHead: aneClassifierHead,
+                aneRMSNormClassifierHead: aneRMSNormClassifierHead,
+                vocabSize: vocabSize,
+                stepRMSWorkspace: stepRMSWorkspace
+            )
+        } else {
+            (exactNextToken, exactFutureToken, exactSecondFutureToken) = try Self.selectTokenTripleFromPreparedActivations(
+                pair0ActivationB,
+                pair1ActivationB,
+                pair2ActivationB,
+                strategy: strategy,
+                outputHeadBackend: outputHeadBackend,
+                rmsFinal: rmsFinal,
+                stepNorm: stepNorm,
+                stepLogits: stepLogits,
+                embedding: embedding,
+                classifier: classifier,
+                sharedClassifier: sharedClassifier,
+                aneClassifierHead: aneClassifierHead,
+                aneRMSNormClassifierHead: aneRMSNormClassifierHead,
+                vocabSize: vocabSize,
+                stepRMSWorkspace: stepRMSWorkspace
+            )
+        }
+        let logitsLatencyMs = GenerationClock.milliseconds(start: logitsStart, end: GenerationClock.now())
+        self.logitsLatencyMs += logitsLatencyMs
+
+        return PreparedExactThreeTokenTrio(
+            exactNextToken: exactNextToken,
+            exactFutureToken: exactFutureToken,
+            exactSecondFutureToken: exactSecondFutureToken,
+            trunkLatencyMs: trunkLatencyMs,
+            logitsLatencyMs: logitsLatencyMs,
+            sourcePairIsA: sourcePairIsA
+        )
+    }
+
     private mutating func promotePreparedPair(stepCount: Int) throws(GenerationError) -> Double {
         let start = GenerationClock.now()
         switch trunkBackend {
@@ -1657,6 +2495,8 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
                     throw .runtimeFailure("two-step recurrent state promotion failed at layer \(idx): \(error)")
                 }
             }
+        case .singleLayerStateFree:
+            break
         case .identityZeroTrunk, .identityZeroTrunkLookup:
             break
         case .fusedTwoLayerPairs:
@@ -1673,6 +2513,16 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
                     try fusedTripletTwoStepSessions[idx].promotePreparedState(commitCount: stepCount)
                 } catch {
                     throw .runtimeFailure("fused three-layer two-step recurrent state promotion failed at triplet \(idx): \(error)")
+                }
+            }
+        case .fusedThreeLayerStateFreeTriplets:
+            break
+        case .fusedThreeLayerThreeStepTriplets:
+            for idx in 0..<fusedTripletThreeStepSessions.count {
+                do {
+                    try fusedTripletThreeStepSessions[idx].promotePreparedState(commitCount: stepCount)
+                } catch {
+                    throw .runtimeFailure("fused three-layer three-step recurrent state promotion failed at triplet \(idx): \(error)")
                 }
             }
         }
@@ -1842,6 +2692,33 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
         )
     }
 
+    private mutating func selectSecondProposedFutureToken(
+        strategy: TokenSelectionStrategy
+    ) throws(GenerationError) -> UInt16 {
+        guard hasSecondFutureProposer else {
+            throw .runtimeFailure("second future proposer requested without a loaded upfront second future head")
+        }
+        guard hasCurrentProposalActivation else {
+            throw .runtimeFailure("second future proposer requested before a committed activation was prepared")
+        }
+
+        return try Self.selectTokenFromActivation(
+            currentProposalActivation,
+            strategy: strategy,
+            outputHeadBackend: futureOutputHeadBackend,
+            rmsFinal: secondFutureRMS,
+            stepNorm: secondFutureNorm,
+            stepLogits: secondFutureLogits,
+            embedding: embedding,
+            classifier: secondFutureClassifier,
+            sharedClassifier: false,
+            aneClassifierHead: secondFutureANEClassifierHead,
+            aneRMSNormClassifierHead: secondFutureANERMSNormClassifierHead,
+            vocabSize: vocabSize,
+            stepRMSWorkspace: secondFutureRMSWorkspace
+        )
+    }
+
     private mutating func captureProposalActivationForNextPass(
         sourcePairIsA: Bool,
         committedStepCount: Int
@@ -1851,10 +2728,14 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
             Self.copyActivation(pair0ActivationA, into: currentProposalActivation)
         case (true, 2):
             Self.copyActivation(pair1ActivationA, into: currentProposalActivation)
+        case (true, 3):
+            Self.copyActivation(pair2ActivationA, into: currentProposalActivation)
         case (false, 1):
             Self.copyActivation(pair0ActivationB, into: currentProposalActivation)
         case (false, 2):
             Self.copyActivation(pair1ActivationB, into: currentProposalActivation)
+        case (false, 3):
+            Self.copyActivation(pair2ActivationB, into: currentProposalActivation)
         default:
             return
         }
@@ -2010,6 +2891,72 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
             ),
             try Self.selectTokenFromActivation(
                 activationB,
+                strategy: strategy,
+                outputHeadBackend: outputHeadBackend,
+                rmsFinal: rmsFinal,
+                stepNorm: stepNorm,
+                stepLogits: stepLogits,
+                embedding: embedding,
+                classifier: classifier,
+                sharedClassifier: sharedClassifier,
+                aneClassifierHead: aneClassifierHead,
+                aneRMSNormClassifierHead: aneRMSNormClassifierHead,
+                vocabSize: vocabSize,
+                stepRMSWorkspace: stepRMSWorkspace
+            )
+        )
+    }
+
+    private static func selectTokenTripleFromPreparedActivations(
+        _ activationA: borrowing TensorBuffer,
+        _ activationB: borrowing TensorBuffer,
+        _ activationC: borrowing TensorBuffer,
+        strategy: TokenSelectionStrategy,
+        outputHeadBackend: GenerationOutputHeadBackend,
+        rmsFinal: borrowing TensorBuffer,
+        stepNorm: borrowing TensorBuffer,
+        stepLogits: borrowing TensorBuffer,
+        embedding: borrowing TensorBuffer,
+        classifier: borrowing TensorBuffer,
+        sharedClassifier: Bool,
+        aneClassifierHead: ANEGenerationClassifierHead?,
+        aneRMSNormClassifierHead: ANEGenerationRMSNormClassifierHead?,
+        vocabSize: Int,
+        stepRMSWorkspace: borrowing RMSNorm.Workspace
+    ) throws(GenerationError) -> (UInt16, UInt16, UInt16) {
+        (
+            try Self.selectTokenFromActivation(
+                activationA,
+                strategy: strategy,
+                outputHeadBackend: outputHeadBackend,
+                rmsFinal: rmsFinal,
+                stepNorm: stepNorm,
+                stepLogits: stepLogits,
+                embedding: embedding,
+                classifier: classifier,
+                sharedClassifier: sharedClassifier,
+                aneClassifierHead: aneClassifierHead,
+                aneRMSNormClassifierHead: aneRMSNormClassifierHead,
+                vocabSize: vocabSize,
+                stepRMSWorkspace: stepRMSWorkspace
+            ),
+            try Self.selectTokenFromActivation(
+                activationB,
+                strategy: strategy,
+                outputHeadBackend: outputHeadBackend,
+                rmsFinal: rmsFinal,
+                stepNorm: stepNorm,
+                stepLogits: stepLogits,
+                embedding: embedding,
+                classifier: classifier,
+                sharedClassifier: sharedClassifier,
+                aneClassifierHead: aneClassifierHead,
+                aneRMSNormClassifierHead: aneRMSNormClassifierHead,
+                vocabSize: vocabSize,
+                stepRMSWorkspace: stepRMSWorkspace
+            ),
+            try Self.selectTokenFromActivation(
+                activationC,
                 strategy: strategy,
                 outputHeadBackend: outputHeadBackend,
                 rmsFinal: rmsFinal,
@@ -2898,8 +3845,10 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
     private let sharedClassifier: Bool
     private let trunkBackend: RecurrentGenerationTrunkBackend
     private var singleLayerSessions: LayerStorage<RWKVStyleRecurrentSession>
+    private var stateFreeSingleLayerSessions: LayerStorage<RWKVStyleStateFreeSession>
     private var fusedPairSessions: LayerStorage<RWKVStyleFusedTwoLayerSession>
     private var fusedTripletSessions: LayerStorage<RWKVStyleFusedThreeLayerSession>
+    private var fusedTripletStateFreeSessions: LayerStorage<RWKVStyleFusedThreeLayerStateFreeSession>
     private let stepNorm: TensorBuffer
     private let stepLogits: TensorBuffer
     private let stepRMSWorkspace: RMSNorm.Workspace
@@ -2907,6 +3856,8 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
     private let cpuExactStagedHead: CPUStagedExactGenerationOutputHead?
     private let aneClassifierHead: ANEGenerationClassifierHead?
     private let aneRMSNormClassifierHead: ANEGenerationRMSNormClassifierHead?
+    private let stateResetSentinelValue: Float?
+    private let stateResetSentinelChannel: Int?
     private var activationA: TensorBuffer
     private var activationB: TensorBuffer
     private var currentActivationIsA: Bool
@@ -2930,7 +3881,9 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
         outputHeadBackend: GenerationOutputHeadBackend = .cpu,
         trunkBackend: RecurrentGenerationTrunkBackend = .singleLayer,
         trunkLaneSpatial: Int = RWKVStyleRecurrentKernelSet.defaultLaneSpatial,
-        outputHeadLaneSpatial: Int = 32
+        outputHeadLaneSpatial: Int = 32,
+        stateResetSentinelValue: Float? = nil,
+        stateResetSentinelChannel: Int? = nil
     ) throws(GenerationError) {
         guard layerCount > 0 else {
             throw .invalidArguments("layerCount must be > 0")
@@ -2944,15 +3897,43 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
         if trunkBackend == .fusedThreeLayerTriplets, !layerCount.isMultiple(of: 3) {
             throw .invalidArguments("fused three-layer recurrent trunk backend requires a layerCount that is a multiple of 3")
         }
+        if trunkBackend == .fusedThreeLayerStateFreeTriplets, !layerCount.isMultiple(of: 3) {
+            throw .invalidArguments(
+                "fused three-layer state-free recurrent trunk backend requires a layerCount that is a multiple of 3"
+            )
+        }
         if (trunkBackend == .identityZeroTrunk || trunkBackend == .identityZeroTrunkLookup),
            !recurrentWeightsUseIdentityZeroTrunk(weights, layerCount: layerCount) {
             throw .invalidArguments("identity zero-trunk backend requires all recurrent Wx/Ws/Wd/Wo weights to be zero")
+        }
+        if trunkBackend == .singleLayerStateFree,
+           !recurrentWeightsUseStateFreeTrunk(weights, layerCount: layerCount) {
+            throw .invalidArguments("single-layer state-free backend requires all recurrent Ws/Wd weights to be zero")
+        }
+        if trunkBackend == .fusedThreeLayerStateFreeTriplets,
+           !recurrentWeightsUseStateFreeTrunk(weights, layerCount: layerCount) {
+            throw .invalidArguments("fused three-layer state-free backend requires all recurrent Ws/Wd weights to be zero")
         }
         guard trunkLaneSpatial > 0 else {
             throw .invalidArguments("recurrent trunk laneSpatial must be > 0")
         }
         guard outputHeadLaneSpatial > 0 else {
             throw .invalidArguments("generation output-head laneSpatial must be > 0")
+        }
+        if stateResetSentinelValue == nil || stateResetSentinelChannel == nil {
+            guard stateResetSentinelValue == nil && stateResetSentinelChannel == nil else {
+                throw .invalidArguments("state reset sentinel value and channel must be provided together")
+            }
+        }
+        if let stateResetSentinelValue {
+            guard stateResetSentinelValue.isFinite, stateResetSentinelValue > 0 else {
+                throw .invalidArguments("state reset sentinel value must be finite and > 0")
+            }
+        }
+        if let stateResetSentinelChannel {
+            guard (0..<ModelConfig.dim).contains(stateResetSentinelChannel) else {
+                throw .invalidArguments("state reset sentinel channel must be within 0..<ModelConfig.dim")
+            }
         }
         guard maxSequenceTokens > 0 else {
             throw .invalidArguments("maxSequenceTokens must be > 0")
@@ -2970,6 +3951,12 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
             trunkBackend: trunkBackend,
             laneSpatial: trunkLaneSpatial
         )
+        let stateFreeSingleLayerSessions = try Self.compileStateFreeSingleLayerSessions(
+            weights: weights,
+            layerCount: layerCount,
+            trunkBackend: trunkBackend,
+            laneSpatial: trunkLaneSpatial
+        )
         let fusedPairSessions = try Self.compileFusedPairSessions(
             weights: weights,
             layerCount: layerCount,
@@ -2977,6 +3964,12 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
             laneSpatial: trunkLaneSpatial
         )
         let fusedTripletSessions = try Self.compileFusedTripletSessions(
+            weights: weights,
+            layerCount: layerCount,
+            trunkBackend: trunkBackend,
+            laneSpatial: trunkLaneSpatial
+        )
+        let fusedTripletStateFreeSessions = try Self.compileFusedTripletStateFreeSessions(
             weights: weights,
             layerCount: layerCount,
             trunkBackend: trunkBackend,
@@ -3022,8 +4015,10 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
         self.sharedClassifier = sharedClassifier
         self.trunkBackend = trunkBackend
         self.singleLayerSessions = singleLayerSessions
+        self.stateFreeSingleLayerSessions = stateFreeSingleLayerSessions
         self.fusedPairSessions = fusedPairSessions
         self.fusedTripletSessions = fusedTripletSessions
+        self.fusedTripletStateFreeSessions = fusedTripletStateFreeSessions
         self.stepNorm = TensorBuffer(count: ModelConfig.dim, zeroed: true)
         self.stepLogits = TensorBuffer(count: vocabSize, zeroed: true)
         self.stepRMSWorkspace = RMSNorm.Workspace(seqLen: 1)
@@ -3031,6 +4026,8 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
         self.cpuExactStagedHead = cpuExactStagedHead
         self.aneClassifierHead = aneClassifierHead
         self.aneRMSNormClassifierHead = aneRMSNormClassifierHead
+        self.stateResetSentinelValue = stateResetSentinelValue
+        self.stateResetSentinelChannel = stateResetSentinelChannel
         self.activationA = TensorBuffer(count: ModelConfig.dim, zeroed: true)
         self.activationB = TensorBuffer(count: ModelConfig.dim, zeroed: true)
         self.currentActivationIsA = true
@@ -3061,6 +4058,24 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
             })
         } catch {
             throw .runtimeFailure("recurrent kernel/session setup failed: \(error)")
+        }
+    }
+
+    private static func compileStateFreeSingleLayerSessions(
+        weights: borrowing RecurrentGenerationWeights,
+        layerCount: Int,
+        trunkBackend: RecurrentGenerationTrunkBackend,
+        laneSpatial: Int
+    ) throws(GenerationError) -> LayerStorage<RWKVStyleStateFreeSession> {
+        guard trunkBackend == .singleLayerStateFree else {
+            return emptyLayerStorage(RWKVStyleStateFreeSession.self)
+        }
+        do {
+            return try LayerStorage<RWKVStyleStateFreeSession>(count: layerCount, throwingInitializer: { idx in
+                try RWKVStyleStateFreeSession(weights: weights.layers[idx], laneSpatial: laneSpatial)
+            })
+        } catch {
+            throw .runtimeFailure("state-free recurrent kernel/session setup failed: \(error)")
         }
     }
 
@@ -3114,6 +4129,33 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
             )
         } catch {
             throw .runtimeFailure("fused three-layer recurrent kernel/session setup failed: \(error)")
+        }
+    }
+
+    private static func compileFusedTripletStateFreeSessions(
+        weights: borrowing RecurrentGenerationWeights,
+        layerCount: Int,
+        trunkBackend: RecurrentGenerationTrunkBackend,
+        laneSpatial: Int
+    ) throws(GenerationError) -> LayerStorage<RWKVStyleFusedThreeLayerStateFreeSession> {
+        guard trunkBackend == .fusedThreeLayerStateFreeTriplets else {
+            return emptyLayerStorage(RWKVStyleFusedThreeLayerStateFreeSession.self)
+        }
+        do {
+            return try LayerStorage<RWKVStyleFusedThreeLayerStateFreeSession>(
+                count: layerCount / 3,
+                throwingInitializer: { tripletIdx in
+                    let base = tripletIdx * 3
+                    return try RWKVStyleFusedThreeLayerStateFreeSession(
+                        weights0: weights.layers[base],
+                        weights1: weights.layers[base + 1],
+                        weights2: weights.layers[base + 2],
+                        laneSpatial: laneSpatial
+                    )
+                }
+            )
+        } catch {
+            throw .runtimeFailure("fused three-layer state-free kernel/session setup failed: \(error)")
         }
     }
 
@@ -3221,8 +4263,20 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
             for idx in 0..<singleLayerSessions.count {
                 do {
                     try singleLayerSessions[idx].reset()
+                    try applyStateResetSentinel(
+                        to: singleLayerSessions[idx].handles.stateIn,
+                        laneSpatial: singleLayerSessions[idx].handles.laneSpatial
+                    )
                 } catch {
                     throw .runtimeFailure("recurrent reset failed at layer \(idx): \(error)")
+                }
+            }
+        case .singleLayerStateFree:
+            for idx in 0..<stateFreeSingleLayerSessions.count {
+                do {
+                    try stateFreeSingleLayerSessions[idx].reset()
+                } catch {
+                    throw .runtimeFailure("state-free recurrent reset failed at layer \(idx): \(error)")
                 }
             }
         case .identityZeroTrunk, .identityZeroTrunkLookup:
@@ -3231,6 +4285,14 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
             for idx in 0..<fusedPairSessions.count {
                 do {
                     try fusedPairSessions[idx].reset()
+                    try applyStateResetSentinel(
+                        to: fusedPairSessions[idx].handles.stateIn0,
+                        laneSpatial: fusedPairSessions[idx].handles.laneSpatial
+                    )
+                    try applyStateResetSentinel(
+                        to: fusedPairSessions[idx].handles.stateIn1,
+                        laneSpatial: fusedPairSessions[idx].handles.laneSpatial
+                    )
                 } catch {
                     throw .runtimeFailure("fused recurrent reset failed at pair \(idx): \(error)")
                 }
@@ -3239,10 +4301,32 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
             for idx in 0..<fusedTripletSessions.count {
                 do {
                     try fusedTripletSessions[idx].reset()
+                    try applyStateResetSentinel(
+                        to: fusedTripletSessions[idx].handles.stateIn0,
+                        laneSpatial: fusedTripletSessions[idx].handles.laneSpatial
+                    )
+                    try applyStateResetSentinel(
+                        to: fusedTripletSessions[idx].handles.stateIn1,
+                        laneSpatial: fusedTripletSessions[idx].handles.laneSpatial
+                    )
+                    try applyStateResetSentinel(
+                        to: fusedTripletSessions[idx].handles.stateIn2,
+                        laneSpatial: fusedTripletSessions[idx].handles.laneSpatial
+                    )
                 } catch {
                     throw .runtimeFailure("fused three-layer recurrent reset failed at triplet \(idx): \(error)")
                 }
             }
+        case .fusedThreeLayerStateFreeTriplets:
+            for idx in 0..<fusedTripletStateFreeSessions.count {
+                do {
+                    try fusedTripletStateFreeSessions[idx].reset()
+                } catch {
+                    throw .runtimeFailure("fused three-layer state-free recurrent reset failed at triplet \(idx): \(error)")
+                }
+            }
+        case .fusedThreeLayerThreeStepTriplets:
+            throw .invalidArguments("three-step triplet trunk backend is exact-only and not supported by direct recurrent generation")
         }
         activationA.zero()
         activationB.zero()
@@ -3250,6 +4334,31 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
         consumedTokens = 0
         trunkLatencyMs = 0
         logitsLatencyMs = 0
+    }
+
+    private func applyStateResetSentinel(
+        to surface: IOSurfaceRef,
+        laneSpatial: Int
+    ) throws(GenerationError) {
+        guard let stateResetSentinelValue, let stateResetSentinelChannel else {
+            return
+        }
+        var sentinel = Array(repeating: Float(0), count: ModelConfig.dim)
+        sentinel[stateResetSentinelChannel] = stateResetSentinelValue
+        do {
+            try sentinel.withUnsafeBufferPointer { src in
+                try SurfaceIO.writeFP16SpatialSlice(
+                    to: surface,
+                    channelOffset: 0,
+                    spatialIndex: 0,
+                    spatial: laneSpatial,
+                    data: src,
+                    channels: ModelConfig.dim
+                )
+            }
+        } catch {
+            throw .runtimeFailure("recurrent state sentinel write failed: \(error)")
+        }
     }
 
     public mutating func prefill(promptTokens: [UInt16]) throws(GenerationError) -> [Float] {
@@ -3347,6 +4456,28 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
                 }
                 sourceIsA.toggle()
             }
+        case .singleLayerStateFree:
+            for idx in 0..<stateFreeSingleLayerSessions.count {
+                var timings = StepTimingBreakdown()
+                do {
+                    if sourceIsA {
+                        try stateFreeSingleLayerSessions[idx].step(
+                            tokenInput: activationA,
+                            output: activationB,
+                            timings: &timings
+                        )
+                    } else {
+                        try stateFreeSingleLayerSessions[idx].step(
+                            tokenInput: activationB,
+                            output: activationA,
+                            timings: &timings
+                        )
+                    }
+                } catch {
+                    throw .runtimeFailure("state-free recurrent step failed at layer \(idx): \(error)")
+                }
+                sourceIsA.toggle()
+            }
         case .identityZeroTrunk, .identityZeroTrunkLookup:
             sourceIsA = true
         case .fusedTwoLayerPairs:
@@ -3377,6 +4508,30 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
                 }
                 sourceIsA.toggle()
             }
+        case .fusedThreeLayerStateFreeTriplets:
+            for idx in 0..<fusedTripletStateFreeSessions.count {
+                var timings = StepTimingBreakdown()
+                do {
+                    if sourceIsA {
+                        try fusedTripletStateFreeSessions[idx].step(
+                            tokenInput: activationA,
+                            output: activationB,
+                            timings: &timings
+                        )
+                    } else {
+                        try fusedTripletStateFreeSessions[idx].step(
+                            tokenInput: activationB,
+                            output: activationA,
+                            timings: &timings
+                        )
+                    }
+                } catch {
+                    throw .runtimeFailure("fused three-layer state-free recurrent step failed at triplet \(idx): \(error)")
+                }
+                sourceIsA.toggle()
+            }
+        case .fusedThreeLayerThreeStepTriplets:
+            throw .invalidArguments("three-step triplet trunk backend is exact-only and not supported by direct recurrent generation")
         }
 
         currentActivationIsA = sourceIsA

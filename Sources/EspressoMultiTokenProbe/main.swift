@@ -10,8 +10,14 @@ private enum RunMode: String {
     case compileInitOnly = "compile-init-only"
 }
 
+private enum ExactHorizon: Int {
+    case two = 2
+    case three = 3
+}
+
 private struct Options {
     var mode: RunMode = .compare
+    var exactHorizon: ExactHorizon = .two
     var warmup: Int = 3
     var iterations: Int = 20
     var maxNewTokens: Int = 8
@@ -41,6 +47,12 @@ private struct Options {
                     fatal("Expected --mode compare|compile-init-only")
                 }
                 options.mode = mode
+            case "--exact-horizon":
+                idx += 1
+                guard idx < argv.count, let raw = Int(argv[idx]), let horizon = ExactHorizon(rawValue: raw) else {
+                    fatal("Expected --exact-horizon 2|3")
+                }
+                options.exactHorizon = horizon
             case "--warmup":
                 idx += 1
                 options.warmup = parsePositiveInt(argv, idx: idx, flag: "--warmup")
@@ -65,13 +77,13 @@ private struct Options {
             case "--control-backend":
                 idx += 1
                 guard idx < argv.count else {
-                    fatal("Expected --control-backend single|fused-pair|fused-triplet|identity-zero-trunk|identity-zero-trunk-lookup")
+                    fatal("Expected --control-backend single|single-layer-state-free|fused-pair|fused-triplet|fused-three-layer-state-free-triplet|identity-zero-trunk|identity-zero-trunk-lookup")
                 }
                 options.controlBackend = parseControlBackend(argv[idx])
             case "--two-step-backend":
                 idx += 1
                 guard idx < argv.count else {
-                    fatal("Expected --two-step-backend single|fused-pair|fused-triplet|identity-zero-trunk|identity-zero-trunk-lookup")
+                    fatal("Expected --two-step-backend single|single-layer-state-free|fused-pair|fused-triplet|fused-three-layer-state-free-triplet|fused-three-step-triplet|identity-zero-trunk|identity-zero-trunk-lookup")
                 }
                 options.twoStepBackend = parseControlBackend(argv[idx])
             case "--output-head-backend":
@@ -135,11 +147,28 @@ private struct Options {
         if options.controlBackend == .fusedThreeLayerTriplets, !options.layerCount.isMultiple(of: 3) {
             fatal("fused-triplet control backend requires --layer-count multiple of 3")
         }
+        if options.controlBackend == .fusedThreeLayerStateFreeTriplets, !options.layerCount.isMultiple(of: 3) {
+            fatal("fused-three-layer-state-free-triplet control backend requires --layer-count multiple of 3")
+        }
+        if options.controlBackend == .fusedThreeLayerThreeStepTriplets {
+            fatal("fused-three-step-triplet is only valid for --two-step-backend with --exact-horizon 3")
+        }
         if options.twoStepBackend == .fusedTwoLayerPairs, !options.layerCount.isMultiple(of: 2) {
             fatal("fused-pair two-step backend requires even --layer-count")
         }
         if options.twoStepBackend == .fusedThreeLayerTriplets, !options.layerCount.isMultiple(of: 3) {
             fatal("fused-triplet two-step backend requires --layer-count multiple of 3")
+        }
+        if options.twoStepBackend == .fusedThreeLayerStateFreeTriplets, !options.layerCount.isMultiple(of: 3) {
+            fatal("fused-three-layer-state-free-triplet two-step backend requires --layer-count multiple of 3")
+        }
+        if options.twoStepBackend == .fusedThreeLayerThreeStepTriplets {
+            if !options.layerCount.isMultiple(of: 3) {
+                fatal("fused-three-step-triplet exact backend requires --layer-count multiple of 3")
+            }
+            if options.exactHorizon != .three {
+                fatal("fused-three-step-triplet exact backend requires --exact-horizon 3")
+            }
         }
 
         return options
@@ -205,10 +234,16 @@ private func parseControlBackend(_ raw: String) -> RecurrentGenerationTrunkBacke
     switch raw {
     case "single":
         return .singleLayer
+    case "single-layer-state-free":
+        return .singleLayerStateFree
     case "fused-pair":
         return .fusedTwoLayerPairs
     case "fused-triplet":
         return .fusedThreeLayerTriplets
+    case "fused-three-layer-state-free-triplet":
+        return .fusedThreeLayerStateFreeTriplets
+    case "fused-three-step-triplet":
+        return .fusedThreeLayerThreeStepTriplets
     case "identity-zero-trunk":
         return .identityZeroTrunk
     case "identity-zero-trunk-lookup":
@@ -235,6 +270,7 @@ private func printUsageAndExit() -> Never {
     let usage = """
     Usage: espresso-multitoken-probe [options]
       --mode compare|compile-init-only
+      --exact-horizon 2|3
       --input echo|recurrent-checkpoint
       --recurrent-checkpoint PATH
       --future-sidecar PATH
@@ -247,8 +283,8 @@ private func printUsageAndExit() -> Never {
       --max-new-tokens N
       --max-sequence-tokens N
       --layer-count N
-      --control-backend single|fused-pair|fused-triplet|identity-zero-trunk|identity-zero-trunk-lookup
-      --two-step-backend single|fused-pair|fused-triplet|identity-zero-trunk|identity-zero-trunk-lookup
+      --control-backend single|single-layer-state-free|fused-pair|fused-triplet|fused-three-layer-state-free-triplet|identity-zero-trunk|identity-zero-trunk-lookup
+      --two-step-backend single|single-layer-state-free|fused-pair|fused-triplet|fused-three-layer-state-free-triplet|fused-three-step-triplet|identity-zero-trunk|identity-zero-trunk-lookup
       --output-head-backend cpu|ane-classifier|ane-rmsnorm-classifier
       --trunk-lane-spatial N
       --output-head-lane-spatial N
@@ -362,6 +398,61 @@ where Model: ExactTwoTokenGeneratingLanguageModel & GenerationPerformanceTrackab
     )
 }
 
+private func benchmarkExactThreeTokenHarness<Model>(
+    harness: inout ExactThreeTokenGenerationHarness<Model>,
+    promptTokens: [UInt16],
+    maxNewTokens: Int,
+    warmup: Int,
+    iterations: Int
+) throws -> ExactThreeTokenBenchmarkSample
+where Model: ExactThreeTokenGeneratingLanguageModel & GenerationPerformanceTrackable, Model: ~Copyable {
+    var tokenLatencies: [Double] = []
+    var throughput: [Double] = []
+    var committedExactTokensPerPass: [Double] = []
+    var acceptedFutureTokensPerPass: [Double] = []
+    var proposerMsPerPass: [Double] = []
+    var verifierTrunkMsPerPass: [Double] = []
+    var verifierLogitsMsPerPass: [Double] = []
+    var stateAdvanceMsPerPass: [Double] = []
+
+    tokenLatencies.reserveCapacity(iterations)
+    throughput.reserveCapacity(iterations)
+    committedExactTokensPerPass.reserveCapacity(iterations)
+    acceptedFutureTokensPerPass.reserveCapacity(iterations)
+    proposerMsPerPass.reserveCapacity(iterations)
+    verifierTrunkMsPerPass.reserveCapacity(iterations)
+    verifierLogitsMsPerPass.reserveCapacity(iterations)
+    stateAdvanceMsPerPass.reserveCapacity(iterations)
+
+    let compileTimeMs = harness.model.performanceSnapshot.compileTimeMs
+
+    for iter in 0..<(warmup + iterations) {
+        let trace = try harness.generate(promptTokens: promptTokens, maxNewTokens: maxNewTokens)
+        if iter >= warmup {
+            tokenLatencies.append(trace.totalLatencyMs / Double(maxNewTokens))
+            throughput.append(trace.effectiveTokensPerSecond)
+            committedExactTokensPerPass.append(trace.committedExactTokensPerPass)
+            acceptedFutureTokensPerPass.append(trace.acceptedFutureTokensPerPass)
+            proposerMsPerPass.append(trace.proposerLatencyMsPerPass)
+            verifierTrunkMsPerPass.append(trace.verifierTrunkLatencyMsPerPass)
+            verifierLogitsMsPerPass.append(trace.verifierLogitsLatencyMsPerPass)
+            stateAdvanceMsPerPass.append(trace.stateAdvanceLatencyMsPerPass)
+        }
+    }
+
+    return ExactThreeTokenBenchmarkSample(
+        medianTokenMs: median(tokenLatencies),
+        medianTokensPerSecond: median(throughput),
+        compileTimeMs: compileTimeMs,
+        medianCommittedExactTokensPerPass: median(committedExactTokensPerPass),
+        medianAcceptedFutureTokensPerPass: median(acceptedFutureTokensPerPass),
+        medianProposerMsPerPass: median(proposerMsPerPass),
+        medianVerifierTrunkMsPerPass: median(verifierTrunkMsPerPass),
+        medianVerifierLogitsMsPerPass: median(verifierLogitsMsPerPass),
+        medianStateAdvanceMsPerPass: median(stateAdvanceMsPerPass)
+    )
+}
+
 private func measureRecurrentControlCompileInitOnly(options: Options) throws -> CompileInitBenchmarkSample {
     let plan = try options.validatedProbeConfiguration()
     let weights = try loadRecurrentGenerationWeights(input: plan.input, layerCount: options.layerCount)
@@ -382,15 +473,14 @@ private func measureRecurrentControlCompileInitOnly(options: Options) throws -> 
     )
 }
 
-private func measureTwoStepCompileInitOnly(options: Options) throws -> CompileInitBenchmarkSample {
-    let plan = try options.validatedProbeConfiguration()
-    let weights = try loadRecurrentGenerationWeights(input: plan.input, layerCount: options.layerCount)
-    let start = mach_absolute_time()
-    let model: ANEExactTwoTokenBranchStatePromotionModel
-    if let futureSidecarPath = options.futureSidecarPath {
-        let futureSidecar = try TwoStepStudentCheckpoint.load(path: futureSidecarPath)
+private func makeExactGenerationModel(
+    options: Options,
+    weights: consuming RecurrentGenerationWeights,
+    futureSidecar: consuming TwoStepStudentSidecar?
+) throws -> ANEExactTwoTokenBranchStatePromotionModel {
+    if let futureSidecar {
         if options.twoStepBackend == .identityZeroTrunkLookup {
-            model = try ANEExactTwoTokenBranchStatePromotionModel(
+            return try ANEExactTwoTokenBranchStatePromotionModel(
                 owningLookupWeights: weights,
                 futureSidecar: futureSidecar,
                 layerCount: options.layerCount,
@@ -400,21 +490,10 @@ private func measureTwoStepCompileInitOnly(options: Options) throws -> CompileIn
                 trunkLaneSpatial: options.trunkLaneSpatial,
                 outputHeadLaneSpatial: options.outputHeadLaneSpatial
             )
-        } else {
-            model = try ANEExactTwoTokenBranchStatePromotionModel(
-                weights: weights,
-                futureSidecar: futureSidecar,
-                layerCount: options.layerCount,
-                maxSequenceTokens: options.maxSequenceTokens,
-                outputHeadBackend: options.outputHeadBackend,
-                trunkBackend: options.twoStepBackend,
-                trunkLaneSpatial: options.trunkLaneSpatial,
-                outputHeadLaneSpatial: options.outputHeadLaneSpatial
-            )
         }
-    } else {
-        model = try ANEExactTwoTokenBranchStatePromotionModel(
+        return try ANEExactTwoTokenBranchStatePromotionModel(
             weights: weights,
+            futureSidecar: futureSidecar,
             layerCount: options.layerCount,
             maxSequenceTokens: options.maxSequenceTokens,
             outputHeadBackend: options.outputHeadBackend,
@@ -423,6 +502,24 @@ private func measureTwoStepCompileInitOnly(options: Options) throws -> CompileIn
             outputHeadLaneSpatial: options.outputHeadLaneSpatial
         )
     }
+
+    return try ANEExactTwoTokenBranchStatePromotionModel(
+        weights: weights,
+        layerCount: options.layerCount,
+        maxSequenceTokens: options.maxSequenceTokens,
+        outputHeadBackend: options.outputHeadBackend,
+        trunkBackend: options.twoStepBackend,
+        trunkLaneSpatial: options.trunkLaneSpatial,
+        outputHeadLaneSpatial: options.outputHeadLaneSpatial
+    )
+}
+
+private func measureTwoStepCompileInitOnly(options: Options) throws -> CompileInitBenchmarkSample {
+    let plan = try options.validatedProbeConfiguration()
+    let weights = try loadRecurrentGenerationWeights(input: plan.input, layerCount: options.layerCount)
+    let start = mach_absolute_time()
+    let futureSidecar = try options.futureSidecarPath.map { try TwoStepStudentCheckpoint.load(path: $0) }
+    let model = try makeExactGenerationModel(options: options, weights: weights, futureSidecar: futureSidecar)
     let wallInitMs = machMilliseconds(mach_absolute_time() - start)
     return CompileInitBenchmarkSample(
         wallInitMs: wallInitMs,
@@ -445,6 +542,7 @@ private func compileOnlyPayload(options: Options) throws -> [String: Any] {
 
     return [
         "mode": options.mode.rawValue,
+        "exact_horizon": options.exactHorizon.rawValue,
         "control_backend": describe(options.controlBackend),
         "two_step_backend": describe(options.twoStepBackend),
         "input_mode": describe(plan.input),
@@ -488,52 +586,74 @@ private func comparePayload(options: Options) throws -> [String: Any] {
     printStderr("Starting two-step model init")
     let twoStepWeights = try loadRecurrentGenerationWeights(input: plan.input, layerCount: options.layerCount)
     let twoStepInitStart = mach_absolute_time()
-    let twoStepModel: ANEExactTwoTokenBranchStatePromotionModel
-    if let futureSidecarPath = options.futureSidecarPath {
-        let futureSidecar = try TwoStepStudentCheckpoint.load(path: futureSidecarPath)
-        if options.twoStepBackend == .identityZeroTrunkLookup {
-            twoStepModel = try ANEExactTwoTokenBranchStatePromotionModel(
-                owningLookupWeights: twoStepWeights,
-                futureSidecar: futureSidecar,
-                layerCount: options.layerCount,
-                maxSequenceTokens: options.maxSequenceTokens,
-                outputHeadBackend: options.outputHeadBackend,
-                trunkBackend: options.twoStepBackend,
-                trunkLaneSpatial: options.trunkLaneSpatial,
-                outputHeadLaneSpatial: options.outputHeadLaneSpatial
-            )
-        } else {
-            twoStepModel = try ANEExactTwoTokenBranchStatePromotionModel(
-                weights: twoStepWeights,
-                futureSidecar: futureSidecar,
-                layerCount: options.layerCount,
-                maxSequenceTokens: options.maxSequenceTokens,
-                outputHeadBackend: options.outputHeadBackend,
-                trunkBackend: options.twoStepBackend,
-                trunkLaneSpatial: options.trunkLaneSpatial,
-                outputHeadLaneSpatial: options.outputHeadLaneSpatial
-            )
-        }
-    } else {
-        twoStepModel = try ANEExactTwoTokenBranchStatePromotionModel(
-            weights: twoStepWeights,
-            layerCount: options.layerCount,
-            maxSequenceTokens: options.maxSequenceTokens,
-            outputHeadBackend: options.outputHeadBackend,
-            trunkBackend: options.twoStepBackend,
-            trunkLaneSpatial: options.trunkLaneSpatial,
-            outputHeadLaneSpatial: options.outputHeadLaneSpatial
-        )
-    }
+    let futureSidecar = try options.futureSidecarPath.map { try TwoStepStudentCheckpoint.load(path: $0) }
+    let twoStepModel = try makeExactGenerationModel(options: options, weights: twoStepWeights, futureSidecar: futureSidecar)
     let twoStepInitMs = machMilliseconds(mach_absolute_time() - twoStepInitStart)
     printStderr(String(format: "Two-step model init done in %.3f ms", twoStepInitMs))
-    var twoStepHarness = ExactTwoTokenGenerationHarness(model: twoStepModel, strategy: .argmax)
 
     printStderr("Running parity trace")
     let controlParityTrace = try controlHarness.generate(promptTokens: prompt, maxNewTokens: options.maxNewTokens)
-    let twoStepParityTrace = try twoStepHarness.generate(promptTokens: prompt, maxNewTokens: options.maxNewTokens)
-    let exactParity = controlParityTrace.generatedTokens == twoStepParityTrace.generatedTokens
-    printStderr("Parity status: \(exactParity ? "match" : "mismatch")")
+    let exactPayload: [String: Any]
+    let exactParity: Bool
+    let exactMedianTokenMs: Double
+    switch options.exactHorizon {
+    case .two:
+        var twoStepHarness = ExactTwoTokenGenerationHarness(model: twoStepModel, strategy: .argmax)
+        let twoStepParityTrace = try twoStepHarness.generate(promptTokens: prompt, maxNewTokens: options.maxNewTokens)
+        exactParity = controlParityTrace.generatedTokens == twoStepParityTrace.generatedTokens
+        printStderr("Parity status: \(exactParity ? "match" : "mismatch")")
+        printStderr("Benchmarking two-step")
+        let twoStep = try benchmarkExactTwoTokenHarness(
+            harness: &twoStepHarness,
+            promptTokens: prompt,
+            maxNewTokens: options.maxNewTokens,
+            warmup: options.warmup,
+            iterations: options.iterations
+        )
+        printStderr(String(format: "Two-step median %.6f ms/token", twoStep.medianTokenMs))
+        exactMedianTokenMs = twoStep.medianTokenMs
+        exactPayload = [
+            "init_wall_ms": twoStepInitMs,
+            "reported_compile_ms": twoStep.compileTimeMs,
+            "median_ms_per_token": twoStep.medianTokenMs,
+            "median_tokens_per_second": twoStep.medianTokensPerSecond,
+            "median_committed_exact_tokens_per_pass": twoStep.medianCommittedExactTokensPerPass,
+            "median_accepted_future_tokens_per_pass": twoStep.medianAcceptedFutureTokensPerPass,
+            "median_proposer_ms_per_pass": twoStep.medianProposerMsPerPass,
+            "median_verifier_trunk_ms_per_pass": twoStep.medianVerifierTrunkMsPerPass,
+            "median_verifier_logits_ms_per_pass": twoStep.medianVerifierLogitsMsPerPass,
+            "median_state_advance_ms_per_pass": twoStep.medianStateAdvanceMsPerPass,
+            "generated_tokens": twoStepParityTrace.generatedTokens.map(Int.init),
+        ]
+    case .three:
+        var exactHarness = ExactThreeTokenGenerationHarness(model: twoStepModel, strategy: .argmax)
+        let exactParityTrace = try exactHarness.generate(promptTokens: prompt, maxNewTokens: options.maxNewTokens)
+        exactParity = controlParityTrace.generatedTokens == exactParityTrace.generatedTokens
+        printStderr("Parity status: \(exactParity ? "match" : "mismatch")")
+        printStderr("Benchmarking exact horizon 3")
+        let exact = try benchmarkExactThreeTokenHarness(
+            harness: &exactHarness,
+            promptTokens: prompt,
+            maxNewTokens: options.maxNewTokens,
+            warmup: options.warmup,
+            iterations: options.iterations
+        )
+        printStderr(String(format: "Exact horizon 3 median %.6f ms/token", exact.medianTokenMs))
+        exactMedianTokenMs = exact.medianTokenMs
+        exactPayload = [
+            "init_wall_ms": twoStepInitMs,
+            "reported_compile_ms": exact.compileTimeMs,
+            "median_ms_per_token": exact.medianTokenMs,
+            "median_tokens_per_second": exact.medianTokensPerSecond,
+            "median_committed_exact_tokens_per_pass": exact.medianCommittedExactTokensPerPass,
+            "median_accepted_future_tokens_per_pass": exact.medianAcceptedFutureTokensPerPass,
+            "median_proposer_ms_per_pass": exact.medianProposerMsPerPass,
+            "median_verifier_trunk_ms_per_pass": exact.medianVerifierTrunkMsPerPass,
+            "median_verifier_logits_ms_per_pass": exact.medianVerifierLogitsMsPerPass,
+            "median_state_advance_ms_per_pass": exact.medianStateAdvanceMsPerPass,
+            "generated_tokens": exactParityTrace.generatedTokens.map(Int.init),
+        ]
+    }
 
     printStderr("Benchmarking control")
     let control = try benchmarkDirectSelectionHarness(
@@ -544,16 +664,6 @@ private func comparePayload(options: Options) throws -> [String: Any] {
         iterations: options.iterations
     )
     printStderr(String(format: "Control median %.6f ms/token", control.medianTokenMs))
-
-    printStderr("Benchmarking two-step")
-    let twoStep = try benchmarkExactTwoTokenHarness(
-        harness: &twoStepHarness,
-        promptTokens: prompt,
-        maxNewTokens: options.maxNewTokens,
-        warmup: options.warmup,
-        iterations: options.iterations
-    )
-    printStderr(String(format: "Two-step median %.6f ms/token", twoStep.medianTokenMs))
 
     let coreML: GenerationBenchmarkSample?
     if let request = plan.coreMLRequest {
@@ -573,6 +683,7 @@ private func comparePayload(options: Options) throws -> [String: Any] {
 
     var payload: [String: Any] = [
         "mode": options.mode.rawValue,
+        "exact_horizon": options.exactHorizon.rawValue,
         "control_backend": describe(options.controlBackend),
         "two_step_backend": describe(options.twoStepBackend),
         "input_mode": describe(plan.input),
@@ -593,20 +704,12 @@ private func comparePayload(options: Options) throws -> [String: Any] {
             "median_logits_ms_per_token": control.medianLogitsMsPerToken,
             "generated_tokens": controlParityTrace.generatedTokens.map(Int.init),
         ],
-        "two_step": [
-            "init_wall_ms": twoStepInitMs,
-            "reported_compile_ms": twoStep.compileTimeMs,
-            "median_ms_per_token": twoStep.medianTokenMs,
-            "median_tokens_per_second": twoStep.medianTokensPerSecond,
-            "median_committed_exact_tokens_per_pass": twoStep.medianCommittedExactTokensPerPass,
-            "median_accepted_future_tokens_per_pass": twoStep.medianAcceptedFutureTokensPerPass,
-            "median_proposer_ms_per_pass": twoStep.medianProposerMsPerPass,
-            "median_verifier_trunk_ms_per_pass": twoStep.medianVerifierTrunkMsPerPass,
-            "median_verifier_logits_ms_per_pass": twoStep.medianVerifierLogitsMsPerPass,
-            "median_state_advance_ms_per_pass": twoStep.medianStateAdvanceMsPerPass,
-            "generated_tokens": twoStepParityTrace.generatedTokens.map(Int.init),
-        ],
     ]
+    if options.exactHorizon == .two {
+        payload["two_step"] = exactPayload
+    } else {
+        payload["exact"] = exactPayload
+    }
     if let request = plan.coreMLRequest, let coreML {
         payload["coreml"] = [
             "model_path": request.modelPath,
@@ -618,7 +721,11 @@ private func comparePayload(options: Options) throws -> [String: Any] {
             "median_trunk_ms_per_token": coreML.medianTrunkMsPerToken,
             "median_logits_ms_per_token": coreML.medianLogitsMsPerToken,
         ]
-        payload["two_step_speedup_vs_coreml"] = coreML.medianTokenMs / twoStep.medianTokenMs
+        if options.exactHorizon == .two {
+            payload["two_step_speedup_vs_coreml"] = coreML.medianTokenMs / exactMedianTokenMs
+        } else {
+            payload["exact_speedup_vs_coreml"] = coreML.medianTokenMs / exactMedianTokenMs
+        }
         payload["control_speedup_vs_coreml"] = coreML.medianTokenMs / control.medianTokenMs
     }
     return payload
@@ -627,8 +734,11 @@ private func comparePayload(options: Options) throws -> [String: Any] {
 private func describe(_ backend: RecurrentGenerationTrunkBackend) -> String {
     switch backend {
     case .singleLayer: return "single"
+    case .singleLayerStateFree: return "single-layer-state-free"
     case .fusedTwoLayerPairs: return "fused-pair"
     case .fusedThreeLayerTriplets: return "fused-triplet"
+    case .fusedThreeLayerStateFreeTriplets: return "fused-three-layer-state-free-triplet"
+    case .fusedThreeLayerThreeStepTriplets: return "fused-three-step-triplet"
     case .identityZeroTrunk: return "identity-zero-trunk"
     case .identityZeroTrunkLookup: return "identity-zero-trunk-lookup"
     }

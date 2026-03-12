@@ -115,6 +115,54 @@ final class RealArtifactPipelineTests: XCTestCase {
         XCTAssertEqual(trace.acceptedFutureTokensPerPass, 0, accuracy: 0.0001)
     }
 
+    func test_offline_exact_acceptance_evaluator_reports_three_exact_tokens_per_pass_when_two_future_tokens_match() throws {
+        var teacher = StubExactModel(sequence: [10, 11, 12, 13, 14, 15, 16])
+        var student = StubFutureProposingModel(
+            sequence: [10, 11, 12, 13, 14, 15, 16],
+            futureProposals: [11, 14],
+            secondFutureProposals: [12, 15]
+        )
+
+        let trace = try OfflineExactAcceptanceEvaluator.evaluateThreeToken(
+            teacher: &teacher,
+            student: &student,
+            promptTokens: [0],
+            maxNewTokens: 6,
+            strategy: .argmax
+        )
+
+        XCTAssertEqual(trace.generatedTokens, [10, 11, 12, 13, 14, 15])
+        XCTAssertEqual(trace.committedExactTokenCounts, [3, 3])
+        XCTAssertEqual(trace.acceptedFutureTokenCounts, [2, 2])
+        XCTAssertTrue(trace.parityMatchedAllCommittedTokens)
+        XCTAssertEqual(trace.committedExactTokensPerPass, 3, accuracy: 0.0001)
+        XCTAssertEqual(trace.acceptedFutureTokensPerPass, 2, accuracy: 0.0001)
+    }
+
+    func test_offline_exact_acceptance_evaluator_three_token_path_falls_back_when_second_future_token_misses() throws {
+        var teacher = StubExactModel(sequence: [10, 11, 12, 13, 14, 15])
+        var student = StubFutureProposingModel(
+            sequence: [10, 11, 12, 13, 14, 15],
+            futureProposals: [11, 13],
+            secondFutureProposals: [99]
+        )
+
+        let trace = try OfflineExactAcceptanceEvaluator.evaluateThreeToken(
+            teacher: &teacher,
+            student: &student,
+            promptTokens: [0],
+            maxNewTokens: 4,
+            strategy: .argmax
+        )
+
+        XCTAssertEqual(trace.generatedTokens, [10, 11, 12, 13])
+        XCTAssertEqual(trace.committedExactTokenCounts, [2, 2])
+        XCTAssertEqual(trace.acceptedFutureTokenCounts, [1, 1])
+        XCTAssertTrue(trace.parityMatchedAllCommittedTokens)
+        XCTAssertEqual(trace.committedExactTokensPerPass, 2, accuracy: 0.0001)
+        XCTAssertEqual(trace.acceptedFutureTokensPerPass, 1, accuracy: 0.0001)
+    }
+
     func test_local_text_token_dataset_builder_encodes_utf8_bytes_and_separators() throws {
         let directory = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("local-text-corpus-\(UUID().uuidString)", isDirectory: true)
@@ -199,6 +247,104 @@ final class RealArtifactPipelineTests: XCTestCase {
         XCTAssertEqual(trace.acceptedFutureTokensPerPass, 1, accuracy: 0.0001)
     }
 
+    func test_local_bigram_artifact_builder_supports_exact_three_token_offline_acceptance_on_real_token_transitions() throws {
+        let artifacts = try LocalBigramArtifactBuilder.build(
+            tokens: [0, 1, 0, 1, 0, 1, 0, 2],
+            layerCount: 1,
+            vocabSize: 4,
+            maxAcceptedFutureTokens: 2
+        )
+        var teacher = try CPURecurrentGenerationModel(
+            weights: artifacts.recurrentWeights,
+            layerCount: 1
+        )
+        var student = try CPURecurrentGenerationModel(
+            weights: artifacts.recurrentWeights,
+            layerCount: 1,
+            futureSidecar: artifacts.futureSidecar
+        )
+
+        let trace = try OfflineExactAcceptanceEvaluator.evaluateThreeToken(
+            teacher: &teacher,
+            student: &student,
+            promptTokens: [0],
+            maxNewTokens: 6,
+            strategy: .argmax
+        )
+
+        XCTAssertEqual(trace.generatedTokens, [1, 0, 1, 0, 1, 0])
+        XCTAssertTrue(trace.parityMatchedAllCommittedTokens)
+        XCTAssertEqual(trace.committedExactTokenCounts, [3, 3])
+        XCTAssertEqual(trace.acceptedFutureTokenCounts, [2, 2])
+        XCTAssertEqual(trace.committedExactTokensPerPass, 3, accuracy: 0.0001)
+        XCTAssertEqual(trace.acceptedFutureTokensPerPass, 2, accuracy: 0.0001)
+    }
+
+    func test_local_bigram_artifact_builder_compiled_identity_residual_mode_supports_exact_three_token_offline_acceptance() throws {
+        let artifacts = try LocalBigramArtifactBuilder.build(
+            tokens: [0, 1, 0, 1, 0, 1, 0, 2],
+            layerCount: 3,
+            vocabSize: 4,
+            maxAcceptedFutureTokens: 2,
+            recurrentTrunkMode: .compiledIdentityResidual
+        )
+        var teacher = try CPURecurrentGenerationModel(
+            weights: artifacts.recurrentWeights,
+            layerCount: 3
+        )
+        var student = try CPURecurrentGenerationModel(
+            weights: artifacts.recurrentWeights,
+            layerCount: 3,
+            futureSidecar: artifacts.futureSidecar
+        )
+
+        let trace = try OfflineExactAcceptanceEvaluator.evaluateThreeToken(
+            teacher: &teacher,
+            student: &student,
+            promptTokens: [0],
+            maxNewTokens: 6,
+            strategy: .argmax
+        )
+
+        var wx00: Float = 0
+        var wo00: Float = 0
+        artifacts.recurrentWeights.layers[0].Wx.withUnsafePointer { ptr in
+            wx00 = ptr[0]
+        }
+        artifacts.recurrentWeights.layers[0].Wo.withUnsafePointer { ptr in
+            wo00 = ptr[0]
+        }
+
+        XCTAssertEqual(wx00, 1, accuracy: 0.0001)
+        XCTAssertEqual(wo00, 0.25, accuracy: 0.0001)
+        XCTAssertEqual(trace.generatedTokens, [1, 0, 1, 0, 1, 0])
+        XCTAssertTrue(trace.parityMatchedAllCommittedTokens)
+        XCTAssertEqual(trace.committedExactTokenCounts, [3, 3])
+        XCTAssertEqual(trace.acceptedFutureTokenCounts, [2, 2])
+    }
+
+    func test_local_bigram_artifact_builder_three_step_sidecar_proposes_upfront_second_future_token() throws {
+        let artifacts = try LocalBigramArtifactBuilder.build(
+            tokens: [0, 1, 0, 1, 0, 1, 0, 2],
+            layerCount: 1,
+            vocabSize: 4,
+            maxAcceptedFutureTokens: 2
+        )
+        XCTAssertEqual(artifacts.futureSidecar.contract.horizon, 3)
+        XCTAssertTrue(artifacts.futureSidecar.hasUpfrontSecondFutureHead)
+
+        var student = try CPURecurrentGenerationModel(
+            weights: artifacts.recurrentWeights,
+            layerCount: 1,
+            futureSidecar: artifacts.futureSidecar
+        )
+
+        let current = try student.prefillSelectedToken(promptTokens: [0], strategy: .argmax)
+        XCTAssertEqual(current, 1)
+        XCTAssertEqual(try student.proposeFutureToken(strategy: .argmax), 0)
+        XCTAssertEqual(try student.proposeUpfrontSecondFutureToken(strategy: .argmax), 1)
+    }
+
     func test_local_real_artifact_pipeline_exports_manifest_and_runs_offline_gate_from_saved_artifacts() throws {
         let datasetPath = Self.makeTempBinaryPath(prefix: "local-real-artifact-dataset")
         let prefix = NSTemporaryDirectory() + "/local-real-artifact-\(UUID().uuidString)"
@@ -225,6 +371,7 @@ final class RealArtifactPipelineTests: XCTestCase {
         XCTAssertEqual(manifest.promptToken, 0)
         XCTAssertEqual(manifest.tokenCount, 8)
         XCTAssertEqual(manifest.layerCount, 1)
+        XCTAssertEqual(manifest.recurrentTrunkMode, .zero)
         XCTAssertTrue(FileManager.default.fileExists(atPath: manifest.generationModelPath))
         XCTAssertTrue(FileManager.default.fileExists(atPath: manifest.recurrentCheckpointPath))
         XCTAssertTrue(FileManager.default.fileExists(atPath: manifest.futureSidecarPath))
@@ -240,6 +387,88 @@ final class RealArtifactPipelineTests: XCTestCase {
         XCTAssertTrue(trace.parityMatchedAllCommittedTokens)
         XCTAssertEqual(trace.committedExactTokenCounts, [2, 2])
         XCTAssertEqual(trace.acceptedFutureTokenCounts, [1, 1])
+    }
+
+    func test_local_real_artifact_pipeline_exports_compiled_identity_residual_recurrent_mode() throws {
+        let datasetPath = Self.makeTempBinaryPath(prefix: "local-real-artifact-compiled-id-dataset")
+        let prefix = NSTemporaryDirectory() + "/local-real-artifact-compiled-id-\(UUID().uuidString)"
+        defer {
+            try? FileManager.default.removeItem(atPath: datasetPath)
+            try? FileManager.default.removeItem(atPath: "\(prefix).generation.bin")
+            try? FileManager.default.removeItem(atPath: "\(prefix).recurrent.bin")
+            try? FileManager.default.removeItem(atPath: "\(prefix).future-sidecar.bin")
+            try? FileManager.default.removeItem(atPath: "\(prefix).manifest.json")
+        }
+
+        try LocalTextTokenDatasetBuilder.writeUInt16Dataset(
+            tokens: [0, 1, 0, 1, 0, 1, 0, 2],
+            to: datasetPath
+        )
+
+        let manifest = try LocalRealArtifactPipeline.exportLocalBigramArtifacts(
+            datasetPath: datasetPath,
+            prefix: prefix,
+            layerCount: 1,
+            vocabSize: ModelConfig.vocab,
+            recurrentTrunkMode: .compiledIdentityResidual
+        )
+        let recurrentWeights = try RecurrentGenerationWeightStore.load(from: manifest.recurrentCheckpointPath)
+
+        var wx00: Float = 0
+        var wo00: Float = 0
+        recurrentWeights.layers[0].Wx.withUnsafePointer { ptr in
+            wx00 = ptr[0]
+        }
+        recurrentWeights.layers[0].Wo.withUnsafePointer { ptr in
+            wo00 = ptr[0]
+        }
+
+        XCTAssertEqual(manifest.recurrentTrunkMode, .compiledIdentityResidual)
+        XCTAssertEqual(wx00, 1, accuracy: 0.0001)
+        XCTAssertEqual(wo00, 0.25, accuracy: 0.0001)
+        XCTAssertTrue(Self.floats(recurrentWeights.layers[0].Ws).allSatisfy { $0 == 0 })
+        XCTAssertTrue(Self.floats(recurrentWeights.layers[0].Wd).allSatisfy { $0 == 0 })
+    }
+
+    func test_local_real_artifact_pipeline_offline_acceptance_gate_supports_three_token_mode_from_saved_artifacts() throws {
+        let datasetPath = Self.makeTempBinaryPath(prefix: "local-real-artifact-k3-dataset")
+        let prefix = NSTemporaryDirectory() + "/local-real-artifact-k3-\(UUID().uuidString)"
+        defer {
+            try? FileManager.default.removeItem(atPath: datasetPath)
+            try? FileManager.default.removeItem(atPath: "\(prefix).generation.bin")
+            try? FileManager.default.removeItem(atPath: "\(prefix).recurrent.bin")
+            try? FileManager.default.removeItem(atPath: "\(prefix).future-sidecar.bin")
+            try? FileManager.default.removeItem(atPath: "\(prefix).manifest.json")
+        }
+
+        try LocalTextTokenDatasetBuilder.writeUInt16Dataset(
+            tokens: [0, 1, 0, 1, 0, 1, 0, 2],
+            to: datasetPath
+        )
+
+        let manifest = try LocalRealArtifactPipeline.exportLocalBigramArtifacts(
+            datasetPath: datasetPath,
+            prefix: prefix,
+            layerCount: 1,
+            vocabSize: ModelConfig.vocab,
+            maxAcceptedFutureTokens: 2
+        )
+
+        let trace = try LocalRealArtifactPipeline.offlineAcceptanceGate(
+            recurrentCheckpointPath: manifest.recurrentCheckpointPath,
+            futureSidecarPath: manifest.futureSidecarPath,
+            promptTokens: [manifest.promptToken],
+            maxNewTokens: 6,
+            maxAcceptedFutureTokens: 2
+        )
+
+        let sidecar = try TwoStepStudentCheckpoint.load(path: manifest.futureSidecarPath)
+        XCTAssertEqual(sidecar.contract.horizon, 3)
+        XCTAssertTrue(sidecar.hasUpfrontSecondFutureHead)
+        XCTAssertTrue(trace.parityMatchedAllCommittedTokens)
+        XCTAssertEqual(trace.generatedTokens, [1, 0, 1, 0, 1, 0])
+        XCTAssertEqual(trace.committedExactTokenCounts, [3, 3])
+        XCTAssertEqual(trace.acceptedFutureTokenCounts, [2, 2])
     }
 
     private struct StubExactModel: DirectTokenSelectingLanguageModel {
@@ -297,17 +526,25 @@ final class RealArtifactPipelineTests: XCTestCase {
         let vocabSize: Int = 32_000
         private let sequence: [UInt16]
         private let futureProposals: [UInt16]
+        private let secondFutureProposals: [UInt16]
         private var nextIndex = 0
         private var proposalIndex = 0
+        private var secondProposalIndex = 0
 
-        init(sequence: [UInt16], futureProposals: [UInt16]) {
+        init(
+            sequence: [UInt16],
+            futureProposals: [UInt16],
+            secondFutureProposals: [UInt16] = []
+        ) {
             self.sequence = sequence
             self.futureProposals = futureProposals
+            self.secondFutureProposals = secondFutureProposals
         }
 
         mutating func reset() throws(GenerationError) {
             nextIndex = 0
             proposalIndex = 0
+            secondProposalIndex = 0
         }
 
         mutating func prefill(promptTokens: [UInt16]) throws(GenerationError) -> [Float] {
@@ -350,6 +587,15 @@ final class RealArtifactPipelineTests: XCTestCase {
             precondition(proposalIndex < futureProposals.count)
             let proposal = futureProposals[proposalIndex]
             proposalIndex += 1
+            return proposal
+        }
+
+        mutating func proposeUpfrontSecondFutureToken(
+            strategy: TokenSelectionStrategy
+        ) throws(GenerationError) -> UInt16 {
+            precondition(secondProposalIndex < secondFutureProposals.count)
+            let proposal = secondFutureProposals[secondProposalIndex]
+            secondProposalIndex += 1
             return proposal
         }
     }
