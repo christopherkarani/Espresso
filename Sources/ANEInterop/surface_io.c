@@ -1119,15 +1119,12 @@ bool ane_interop_io_argmax_batch_fp16_spatial_parallel(
         const _Float16 *srcF16 = (const _Float16 *)base;
         const _Float16 *src_offset = srcF16 + (size_t)ch_off * spatialSz;
 
-        /* Allocate per-block partial results */
-        _Float16 *all_values = (_Float16 *)malloc((size_t)n_blocks * spatial * sizeof(_Float16));
-        uint16_t *all_indices = (uint16_t *)malloc((size_t)n_blocks * spatial * sizeof(uint16_t));
-        argmax_block_ctx *ctxs = (argmax_block_ctx *)malloc((size_t)n_blocks * sizeof(argmax_block_ctx));
-
-        if (!all_values || !all_indices || !ctxs) {
-            free(all_values); free(all_indices); free(ctxs);
-            goto cleanup;
-        }
+        /* Stack-allocated per-block partial results.
+         * Max: 8 blocks × 512 spatial = 4096 entries × 2 bytes = 8KB each. */
+        _Float16 all_values[8 * 512];
+        uint16_t all_indices[8 * 512];
+        argmax_block_ctx ctxs_arr[8];
+        argmax_block_ctx *ctxs = ctxs_arr;  /* pointer for block capture */
 
         /* Set up blocks: partition channels evenly */
         int chPerBlock = channels / n_blocks;
@@ -1162,9 +1159,6 @@ bool ane_interop_io_argmax_batch_fp16_spatial_parallel(
             out_values[s] = (float)bestVal;
         }
 
-        free(all_values);
-        free(all_indices);
-        free(ctxs);
         ok = true;
     }
 

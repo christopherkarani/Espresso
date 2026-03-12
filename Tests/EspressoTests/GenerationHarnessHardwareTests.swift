@@ -1889,7 +1889,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
 
         let argmaxResults = try SurfaceIO.argmaxBatchFP16SpatialParallel(
             from: headOut, channelOffset: 0, spatial: laneSpatial,
-            channels: vocabSize, streamCount: streamCount, nBlocks: 4
+            channels: vocabSize, streamCount: streamCount, nBlocks: 8
         )
         for streamIdx in 0..<streamCount {
             tokens[streamIdx] = UInt16(argmaxResults[streamIdx].index)
@@ -2380,7 +2380,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
             )
             let _ = try SurfaceIO.argmaxBatchFP16SpatialParallel(
                 from: headOut, channelOffset: 0, spatial: laneSpatial,
-                channels: vocabSize, streamCount: streamCount, nBlocks: 4
+                channels: vocabSize, streamCount: streamCount, nBlocks: 8
             )
         }
 
@@ -2412,9 +2412,20 @@ final class GenerationHarnessHardwareTests: XCTestCase {
             let t = GenerationClock.now()
             let _ = try SurfaceIO.argmaxBatchFP16SpatialParallel(
                 from: headOut, channelOffset: 0, spatial: laneSpatial,
-                channels: vocabSize, streamCount: streamCount, nBlocks: 4
+                channels: vocabSize, streamCount: streamCount, nBlocks: 8
             )
             par4Us.append(machMicroseconds(GenerationClock.now() - t))
+        }
+
+        // Parallel argmax n=8
+        var par8Us: [Double] = []
+        for _ in 0..<iterations {
+            let t = GenerationClock.now()
+            let _ = try SurfaceIO.argmaxBatchFP16SpatialParallel(
+                from: headOut, channelOffset: 0, spatial: laneSpatial,
+                channels: vocabSize, streamCount: streamCount, nBlocks: 8
+            )
+            par8Us.append(machMicroseconds(GenerationClock.now() - t))
         }
 
         // Correctness check: serial and parallel must agree
@@ -2424,11 +2435,17 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         )
         let par4Result = try SurfaceIO.argmaxBatchFP16SpatialParallel(
             from: headOut, channelOffset: 0, spatial: laneSpatial,
-            channels: vocabSize, streamCount: streamCount, nBlocks: 4
+            channels: vocabSize, streamCount: streamCount, nBlocks: 8
+        )
+        let par8Result = try SurfaceIO.argmaxBatchFP16SpatialParallel(
+            from: headOut, channelOffset: 0, spatial: laneSpatial,
+            channels: vocabSize, streamCount: streamCount, nBlocks: 8
         )
         for i in 0..<streamCount {
             XCTAssertEqual(serialResult[i].index, par4Result[i].index,
-                           "Parallel argmax mismatch at lane \(i)")
+                           "Parallel_4 argmax mismatch at lane \(i)")
+            XCTAssertEqual(serialResult[i].index, par8Result[i].index,
+                           "Parallel_8 argmax mismatch at lane \(i)")
         }
 
         func median(_ arr: [Double]) -> Double {
@@ -2439,10 +2456,12 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         let sMedian = median(serialUs)
         let p2Median = median(par2Us)
         let p4Median = median(par4Us)
+        let p8Median = median(par8Us)
         print("argmax @\(streamCount) streams, \(vocabSize) vocab, \(iterations) iterations:")
         print("  serial:     \(String(format: "%.1f", sMedian)) µs")
         print("  parallel_2: \(String(format: "%.1f", p2Median)) µs (\(String(format: "%+.1f", p2Median - sMedian)) µs, \(String(format: "%.1f", (sMedian - p2Median) / sMedian * 100))% faster)")
         print("  parallel_4: \(String(format: "%.1f", p4Median)) µs (\(String(format: "%+.1f", p4Median - sMedian)) µs, \(String(format: "%.1f", (sMedian - p4Median) / sMedian * 100))% faster)")
+        print("  parallel_8: \(String(format: "%.1f", p8Median)) µs (\(String(format: "%+.1f", p8Median - sMedian)) µs, \(String(format: "%.1f", (sMedian - p8Median) / sMedian * 100))% faster)")
     }
 
     // MARK: - MIL op ANE compile probes (argmax alternatives)
@@ -3342,7 +3361,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
 
             let argmaxResults = try SurfaceIO.argmaxBatchFP16SpatialParallel(
                 from: headOut, channelOffset: 0, spatial: laneSpatial,
-                channels: vocabSize, streamCount: streamCount, nBlocks: 4
+                channels: vocabSize, streamCount: streamCount, nBlocks: 8
             )
             for i in 0..<streamCount { tokens[i] = UInt16(argmaxResults[i].index) }
             t2 = GenerationClock.now(); argmaxUs.append(machMicroseconds(t2 - t))
