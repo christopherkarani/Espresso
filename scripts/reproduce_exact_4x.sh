@@ -141,9 +141,18 @@ if [[ "$DRY_RUN" == "1" ]]; then
   echo "probe=$PROBE"
   echo "coreml_model=$COREML_MODEL"
   echo "jq=$(command -v jq)"
+  echo "jq_version=$(jq --version 2>/dev/null || echo unknown)"
   echo "input_mode=$INPUT_MODE"
+  echo "control_backend=$CONTROL_BACKEND"
+  echo "two_step_backend=$TWO_STEP_BACKEND"
+  echo "output_head_backend=$OUTPUT_HEAD_BACKEND"
   echo "repeats=$REPEATS warmup=$WARMUP iterations=$ITERATIONS"
-  echo "layer_count=$LAYER_COUNT max_new_tokens=$MAX_NEW_TOKENS"
+  echo "layer_count=$LAYER_COUNT max_new_tokens=$MAX_NEW_TOKENS max_sequence_tokens=$MAX_SEQUENCE_TOKENS"
+  echo "prompt_token=$PROMPT_TOKEN"
+  echo "recurrent_checkpoint=${RECURRENT_CHECKPOINT:-<none>}"
+  echo "future_sidecar=${FUTURE_SIDECAR:-<none>}"
+  echo "generation_model=${GENERATION_MODEL:-<none>}"
+  echo "results_dir=$RESULTS_DIR"
   exit 0
 fi
 
