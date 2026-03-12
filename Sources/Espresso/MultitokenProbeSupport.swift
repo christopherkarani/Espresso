@@ -10,19 +10,25 @@ public struct GenerationBenchmarkSample: Sendable, Equatable {
     public let compileTimeMs: Double
     public let medianTrunkMsPerToken: Double
     public let medianLogitsMsPerToken: Double
+    public let p95TokenMs: Double
+    public let p99TokenMs: Double
 
     public init(
         medianTokenMs: Double,
         medianTokensPerSecond: Double,
         compileTimeMs: Double,
         medianTrunkMsPerToken: Double,
-        medianLogitsMsPerToken: Double
+        medianLogitsMsPerToken: Double,
+        p95TokenMs: Double = 0,
+        p99TokenMs: Double = 0
     ) {
         self.medianTokenMs = medianTokenMs
         self.medianTokensPerSecond = medianTokensPerSecond
         self.compileTimeMs = compileTimeMs
         self.medianTrunkMsPerToken = medianTrunkMsPerToken
         self.medianLogitsMsPerToken = medianLogitsMsPerToken
+        self.p95TokenMs = p95TokenMs
+        self.p99TokenMs = p99TokenMs
     }
 }
 
@@ -36,6 +42,8 @@ public struct ExactTwoTokenBenchmarkSample: Sendable, Equatable {
     public let medianVerifierTrunkMsPerPass: Double
     public let medianVerifierLogitsMsPerPass: Double
     public let medianStateAdvanceMsPerPass: Double
+    public let p95TokenMs: Double
+    public let p99TokenMs: Double
 
     public init(
         medianTokenMs: Double,
@@ -46,7 +54,9 @@ public struct ExactTwoTokenBenchmarkSample: Sendable, Equatable {
         medianProposerMsPerPass: Double,
         medianVerifierTrunkMsPerPass: Double,
         medianVerifierLogitsMsPerPass: Double,
-        medianStateAdvanceMsPerPass: Double
+        medianStateAdvanceMsPerPass: Double,
+        p95TokenMs: Double = 0,
+        p99TokenMs: Double = 0
     ) {
         self.medianTokenMs = medianTokenMs
         self.medianTokensPerSecond = medianTokensPerSecond
@@ -57,6 +67,8 @@ public struct ExactTwoTokenBenchmarkSample: Sendable, Equatable {
         self.medianVerifierTrunkMsPerPass = medianVerifierTrunkMsPerPass
         self.medianVerifierLogitsMsPerPass = medianVerifierLogitsMsPerPass
         self.medianStateAdvanceMsPerPass = medianStateAdvanceMsPerPass
+        self.p95TokenMs = p95TokenMs
+        self.p99TokenMs = p99TokenMs
     }
 }
 
@@ -325,7 +337,9 @@ where Model: AutoregressiveLanguageModel & GenerationPerformanceTrackable, Model
         medianTokensPerSecond: GenerationMetrics.median(throughput),
         compileTimeMs: compileTimeMs,
         medianTrunkMsPerToken: GenerationMetrics.median(trunkLatencies),
-        medianLogitsMsPerToken: GenerationMetrics.median(logitsLatencies)
+        medianLogitsMsPerToken: GenerationMetrics.median(logitsLatencies),
+        p95TokenMs: GenerationMetrics.percentile(tokenLatencies, at: 95),
+        p99TokenMs: GenerationMetrics.percentile(tokenLatencies, at: 99)
     )
 }
 

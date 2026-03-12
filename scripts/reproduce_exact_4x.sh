@@ -136,11 +136,25 @@ committed_tokens_per_pass="$(jq -s 'map(.two_step.median_committed_exact_tokens_
 accepted_future_tokens_per_pass="$(jq -s 'map(.two_step.median_accepted_future_tokens_per_pass) | sort | .[((length - 1) / 2 | floor)]' "$RESULTS_DIR"/run-*.json)"
 all_parity_match="$(jq -s 'all(.[]; .parity_status == "match")' "$RESULTS_DIR"/run-*.json)"
 
+# p95/p99 tail latency (median-of-per-run-percentiles across repeats)
+two_step_p95_ms="$(jq -s 'map(.two_step.p95_ms_per_token // empty) | if length == 0 then "n/a" else sort | .[((length - 1) / 2 | floor)] end' "$RESULTS_DIR"/run-*.json)"
+two_step_p99_ms="$(jq -s 'map(.two_step.p99_ms_per_token // empty) | if length == 0 then "n/a" else sort | .[((length - 1) / 2 | floor)] end' "$RESULTS_DIR"/run-*.json)"
+control_p95_ms="$(jq -s 'map(.control.p95_ms_per_token // empty) | if length == 0 then "n/a" else sort | .[((length - 1) / 2 | floor)] end' "$RESULTS_DIR"/run-*.json)"
+control_p99_ms="$(jq -s 'map(.control.p99_ms_per_token // empty) | if length == 0 then "n/a" else sort | .[((length - 1) / 2 | floor)] end' "$RESULTS_DIR"/run-*.json)"
+coreml_p95_ms="$(jq -s 'map(.coreml.p95_ms_per_token // empty) | if length == 0 then "n/a" else sort | .[((length - 1) / 2 | floor)] end' "$RESULTS_DIR"/run-*.json)"
+coreml_p99_ms="$(jq -s 'map(.coreml.p99_ms_per_token // empty) | if length == 0 then "n/a" else sort | .[((length - 1) / 2 | floor)] end' "$RESULTS_DIR"/run-*.json)"
+
 {
   echo "results_dir=$RESULTS_DIR"
   echo "two_step_median_ms_per_token=$two_step_median_ms"
+  echo "two_step_p95_ms_per_token=$two_step_p95_ms"
+  echo "two_step_p99_ms_per_token=$two_step_p99_ms"
   echo "control_median_ms_per_token=$control_median_ms"
+  echo "control_p95_ms_per_token=$control_p95_ms"
+  echo "control_p99_ms_per_token=$control_p99_ms"
   echo "coreml_median_ms_per_token=$coreml_median_ms"
+  echo "coreml_p95_ms_per_token=$coreml_p95_ms"
+  echo "coreml_p99_ms_per_token=$coreml_p99_ms"
   echo "two_step_speedup_vs_coreml=$speedup_median"
   echo "committed_exact_tokens_per_pass=$committed_tokens_per_pass"
   echo "accepted_future_tokens_per_pass=$accepted_future_tokens_per_pass"

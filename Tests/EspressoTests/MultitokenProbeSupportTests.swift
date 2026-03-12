@@ -80,6 +80,57 @@ final class MultitokenProbeSupportTests: XCTestCase {
         }
     }
 
+    // MARK: - GenerationMetrics.percentile tests
+
+    func test_percentile_returns_zero_for_empty_array() {
+        XCTAssertEqual(GenerationMetrics.percentile([], at: 50), 0)
+        XCTAssertEqual(GenerationMetrics.percentile([], at: 95), 0)
+        XCTAssertEqual(GenerationMetrics.percentile([], at: 99), 0)
+    }
+
+    func test_percentile_returns_single_value_for_singleton() {
+        XCTAssertEqual(GenerationMetrics.percentile([42.0], at: 0), 42.0)
+        XCTAssertEqual(GenerationMetrics.percentile([42.0], at: 50), 42.0)
+        XCTAssertEqual(GenerationMetrics.percentile([42.0], at: 100), 42.0)
+    }
+
+    func test_percentile_50_matches_median_for_odd_count() {
+        let values = [1.0, 3.0, 5.0, 7.0, 9.0]
+        let p50 = GenerationMetrics.percentile(values, at: 50)
+        let med = GenerationMetrics.median(values)
+        XCTAssertEqual(p50, med, accuracy: 1e-12)
+    }
+
+    func test_percentile_p95_and_p99_on_known_distribution() {
+        // 20 values: 1.0, 2.0, ..., 20.0
+        let values = (1...20).map(Double.init)
+        // NumPy linear percentile at 95: rank = 0.95 * 19 = 18.05
+        // lower=18 (value 19.0), upper=19 (value 20.0), frac=0.05
+        // expected = 19.0 + 0.05 * 1.0 = 19.05
+        let p95 = GenerationMetrics.percentile(values, at: 95)
+        XCTAssertEqual(p95, 19.05, accuracy: 1e-12)
+
+        // p99: rank = 0.99 * 19 = 18.81
+        // lower=18 (value 19.0), upper=19 (value 20.0), frac=0.81
+        // expected = 19.0 + 0.81 * 1.0 = 19.81
+        let p99 = GenerationMetrics.percentile(values, at: 99)
+        XCTAssertEqual(p99, 19.81, accuracy: 1e-12)
+    }
+
+    func test_percentile_boundaries() {
+        let values = [10.0, 20.0, 30.0]
+        XCTAssertEqual(GenerationMetrics.percentile(values, at: 0), 10.0, accuracy: 1e-12)
+        XCTAssertEqual(GenerationMetrics.percentile(values, at: 100), 30.0, accuracy: 1e-12)
+    }
+
+    func test_percentile_handles_unsorted_input() {
+        let values = [9.0, 1.0, 5.0, 3.0, 7.0]
+        let p50 = GenerationMetrics.percentile(values, at: 50)
+        XCTAssertEqual(p50, 5.0, accuracy: 1e-12)
+    }
+
+    // MARK: - Helpers
+
     private func makeTestRecurrentWeights(
         layerCount: Int,
         sharedClassifier: Bool

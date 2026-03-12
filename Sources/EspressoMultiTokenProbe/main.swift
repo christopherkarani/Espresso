@@ -265,6 +265,17 @@ private func median(_ values: [Double]) -> Double {
     return sorted[mid]
 }
 
+private func percentile(_ values: [Double], at p: Double) -> Double {
+    guard !values.isEmpty else { return 0 }
+    let sorted = values.sorted()
+    guard sorted.count > 1 else { return sorted[0] }
+    let rank = p / 100.0 * Double(sorted.count - 1)
+    let lower = Int(rank)
+    let upper = min(lower + 1, sorted.count - 1)
+    let fraction = rank - Double(lower)
+    return sorted[lower] + fraction * (sorted[upper] - sorted[lower])
+}
+
 
 private func benchmarkDirectSelectionHarness<Model>(
     harness: inout DirectTokenSelectionGenerationHarness<Model>,
@@ -301,7 +312,9 @@ where Model: DirectTokenSelectingLanguageModel & GenerationPerformanceTrackable,
         medianTokensPerSecond: median(throughput),
         compileTimeMs: compileTimeMs,
         medianTrunkMsPerToken: median(trunkLatencies),
-        medianLogitsMsPerToken: median(logitsLatencies)
+        medianLogitsMsPerToken: median(logitsLatencies),
+        p95TokenMs: percentile(tokenLatencies, at: 95),
+        p99TokenMs: percentile(tokenLatencies, at: 99)
     )
 }
 
@@ -356,7 +369,9 @@ where Model: ExactTwoTokenGeneratingLanguageModel & GenerationPerformanceTrackab
         medianProposerMsPerPass: median(proposerMsPerPass),
         medianVerifierTrunkMsPerPass: median(verifierTrunkMsPerPass),
         medianVerifierLogitsMsPerPass: median(verifierLogitsMsPerPass),
-        medianStateAdvanceMsPerPass: median(stateAdvanceMsPerPass)
+        medianStateAdvanceMsPerPass: median(stateAdvanceMsPerPass),
+        p95TokenMs: percentile(tokenLatencies, at: 95),
+        p99TokenMs: percentile(tokenLatencies, at: 99)
     )
 }
 
@@ -562,6 +577,8 @@ private func comparePayload(options: Options) throws -> [String: Any] {
             "median_tokens_per_second": control.medianTokensPerSecond,
             "median_trunk_ms_per_token": control.medianTrunkMsPerToken,
             "median_logits_ms_per_token": control.medianLogitsMsPerToken,
+            "p95_ms_per_token": control.p95TokenMs,
+            "p99_ms_per_token": control.p99TokenMs,
             "generated_tokens": controlParityTrace.generatedTokens.map(Int.init),
         ],
         "two_step": [
@@ -575,6 +592,8 @@ private func comparePayload(options: Options) throws -> [String: Any] {
             "median_verifier_trunk_ms_per_pass": twoStep.medianVerifierTrunkMsPerPass,
             "median_verifier_logits_ms_per_pass": twoStep.medianVerifierLogitsMsPerPass,
             "median_state_advance_ms_per_pass": twoStep.medianStateAdvanceMsPerPass,
+            "p95_ms_per_token": twoStep.p95TokenMs,
+            "p99_ms_per_token": twoStep.p99TokenMs,
             "generated_tokens": twoStepParityTrace.generatedTokens.map(Int.init),
         ],
     ]
@@ -588,6 +607,8 @@ private func comparePayload(options: Options) throws -> [String: Any] {
             "reported_compile_ms": coreML.compileTimeMs,
             "median_trunk_ms_per_token": coreML.medianTrunkMsPerToken,
             "median_logits_ms_per_token": coreML.medianLogitsMsPerToken,
+            "p95_ms_per_token": coreML.p95TokenMs,
+            "p99_ms_per_token": coreML.p99TokenMs,
         ]
         payload["two_step_speedup_vs_coreml"] = coreML.medianTokenMs / twoStep.medianTokenMs
         payload["control_speedup_vs_coreml"] = coreML.medianTokenMs / control.medianTokenMs
