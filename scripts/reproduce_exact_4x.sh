@@ -194,9 +194,17 @@ fi
 
 # Collect valid run JSONs (skip empty or malformed files from failed runs)
 valid_runs=()
+valid_outer_elapsed=()
 for f in "$RESULTS_DIR"/run-*.json; do
   if jq -e '.two_step.median_ms_per_token' "$f" >/dev/null 2>&1; then
     valid_runs+=("$f")
+    # Collect matching outer elapsed_s file
+    elapsed_file="${f%.json}.elapsed_s"
+    if [[ -f "$elapsed_file" ]]; then
+      valid_outer_elapsed+=("$(cat "$elapsed_file")")
+    else
+      valid_outer_elapsed+=("null")
+    fi
   fi
 done
 
@@ -315,6 +323,7 @@ jq -s \
   --argjson total_elapsed_s "$total_benchmark_elapsed" \
   --arg hw_model "$(sysctl -n hw.model 2>/dev/null || echo unknown)" \
   --arg load_avg "$(sysctl -n vm.loadavg 2>/dev/null || echo unknown)" \
+  --argjson outer_elapsed "$(printf '%s\n' "${valid_outer_elapsed[@]}" | jq -s '.')" \
 '{
   results_dir: $dir,
   timestamp: $ts,
@@ -416,7 +425,9 @@ jq -s \
   per_run_parity: (map(.parity_status)),
   per_run_timestamps: (map(.probe_timestamp // null)),
   per_run_wall_elapsed_s: (map(.probe_wall_elapsed_s // null)),
-  sum_probe_wall_elapsed_s: (map(.probe_wall_elapsed_s // 0) | add)
+  per_run_outer_elapsed_s: $outer_elapsed,
+  sum_probe_wall_elapsed_s: (map(.probe_wall_elapsed_s // 0) | add),
+  sum_outer_elapsed_s: ($outer_elapsed | map(. // 0) | add)
 }' "${valid_runs[@]}" > "$RESULTS_DIR/summary.json"
 
 # Reproducibility gate: warn on high cross-run variance or parity failure
