@@ -306,8 +306,18 @@ if [[ "$DRY_RUN" == "1" ]]; then
   echo "cv_threshold=$CV_THRESHOLD"
   echo "duration_budget_s=$DURATION_BUDGET_S"
   echo "chip=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo unknown)"
+  echo "hw_model=$(sysctl -n hw.model 2>/dev/null || echo unknown)"
+  echo "ncpu=$(sysctl -n hw.ncpu 2>/dev/null || echo unknown)"
+  echo "physical_memory_gb=$(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1073741824 ))"
+  echo "macos_version=$(sw_vers -productVersion 2>/dev/null || echo unknown)"
+  echo "macos_build=$(sw_vers -buildVersion 2>/dev/null || echo unknown)"
   echo "power_source=$(pmset -g batt 2>/dev/null | head -1 | sed "s/.*'\(.*\)'.*/\1/" || echo unknown)"
   echo "thermal_pressure=$(pmset -g therm 2>/dev/null | grep -i 'cpu.*speed' | head -1 || echo unknown)"
+  echo "load_average=$(sysctl -n vm.loadavg 2>/dev/null || echo unknown)"
+  echo "memory_free_pct=$(sysctl -n kern.memorystatus_level 2>/dev/null || echo unknown)"
+  echo "disk_free_mb=$(df -m "$RESULTS_DIR" 2>/dev/null | awk 'NR==2{print $4}' || echo unknown)"
+  echo "probe_arch=$probe_arch"
+  echo "host_arch=$host_arch"
   exit 0
 fi
 
