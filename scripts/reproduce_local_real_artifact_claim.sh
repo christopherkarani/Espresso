@@ -68,6 +68,11 @@ swift run espresso-train \
   --text-root "$ROOT/tasks" \
   --max-corpus-bytes "$MAX_CORPUS_BYTES"
 
+if [[ ! -s "$DATASET_PATH" ]]; then
+  echo "FATAL: dataset build succeeded but $DATASET_PATH is missing or empty" >&2
+  exit 1
+fi
+
 echo "Exporting local bigram artifacts into $ARTIFACT_PREFIX.*"
 swift run espresso-train \
   --data "$DATASET_PATH" \
@@ -75,6 +80,13 @@ swift run espresso-train \
   --artifact-layer-count "$LAYER_COUNT" \
   --offline-acceptance-json "$OFFLINE_GATE_JSON" \
   --gate-max-new-tokens "$MAX_NEW_TOKENS"
+
+for expected_artifact in "$ARTIFACT_PREFIX.manifest.json" "$ARTIFACT_PREFIX.recurrent.bin" "$ARTIFACT_PREFIX.generation.bin" "$ARTIFACT_PREFIX.future-sidecar.bin"; do
+  if [[ ! -s "$expected_artifact" ]]; then
+    echo "FATAL: artifact export succeeded but $expected_artifact is missing or empty" >&2
+    exit 1
+  fi
+done
 
 PROMPT_TOKEN="$(jq -r '.promptToken' "$ARTIFACT_PREFIX.manifest.json")"
 
