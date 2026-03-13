@@ -231,6 +231,7 @@ fi
       "harness_load_average_end=\(.host.load_average_end | na)",
       "harness_power_source=\(.host.power_source | na)",
       "harness_swift_version=\(.toolchain.swift_version | na)",
+      "harness_jq_version=\(.toolchain.jq_version | na)",
       "harness_ncpu=\(.host.ncpu | na)",
       "harness_physical_memory_gb=\(.host.physical_memory_gb | na)",
       "harness_control_init_wall_ms=\(.init_times.control_init_wall_ms | na)",
