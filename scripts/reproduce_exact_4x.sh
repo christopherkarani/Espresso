@@ -880,6 +880,20 @@ if [[ -n "$iter_mismatch" ]]; then
   gate_warnings="${gate_warnings}ITERATION_COUNT_MISMATCH: some runs measured ${iter_mismatch} iterations (expected ${ITERATIONS})\n"
 fi
 
+# Raw latency array length vs measured_iteration_count (detect probe data corruption)
+latency_len_mismatch="$(jq -s '
+  [.[] | {
+    mic: (.measured_iteration_count // 0),
+    ctrl: (.control.raw_token_latencies_ms // [] | length),
+    two: (.two_step.raw_token_latencies_ms // [] | length)
+  } | select(.ctrl != .mic or .two != .mic)] |
+  if length > 0 then "raw latency array lengths differ from measured_iteration_count" else empty end
+' "${valid_runs[@]}" 2>/dev/null || echo "")"
+if [[ -n "$latency_len_mismatch" ]]; then
+  gate_status="warn"
+  gate_warnings="${gate_warnings}DATA_INTEGRITY: $latency_len_mismatch\n"
+fi
+
 # Timestamp monotonicity check (detect clock skew or out-of-order execution)
 ts_nonmono="$(jq -s '
   [.[] | .probe_timestamp // null] | map(select(. != null)) |
