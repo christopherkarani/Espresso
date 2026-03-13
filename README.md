@@ -1,3 +1,11 @@
+<p align="center">
+  <img src="banner.svg" alt="Espresso Banner" width="800">
+</p>
+
+<p align="center">
+  <img src="demo.gif" alt="Espresso Demo" width="800">
+</p>
+
 # Espresso
 
 Backpropagation and exact token generation on Apple's Neural Engine via reverse-engineered private APIs.
@@ -76,9 +84,15 @@ Conventions: Swift 6.2 strict concurrency across all targets. `~Copyable` move-o
 
 The decode program compiles once and gets reused across all steps -- no per-token recompilation. KV cache state lives in IOSurface buffers managed by the runtime, not marshaled through CoreML's prediction API. Each recurrent step takes the previous hidden state, produces the next, and commits two exact tokens with verified parity. The CoreML baseline uses the same 6-layer model shape with `.cpuAndNeuralEngine` for a matched comparison.
 
+## Disclaimer
+
+> **App Store**: Apps that use private ANE APIs (`_ANEClient`, `_ANEInMemoryModel`, etc.) **will be rejected** during App Store review. Apple explicitly prohibits the use of private/undocumented APIs in App Store submissions.
+>
+> **Outside the App Store**: Usage is perfectly fine for apps distributed outside the App Store -- including internal tools, research software, sideloaded apps, enterprise distribution, and open-source projects. There are no restrictions on using private APIs in these contexts.
+
 ## Caveats
 
-This project uses undocumented private Apple APIs (`_ANEClient`, `_ANEInMemoryModel`) discovered through runtime introspection for research and educational purposes. It is not suitable for App Store distribution. Results are hardware- and OS-sensitive. The benchmark runs on a local artifact family built by this repo, not a pretrained production model, and the 4.76x speedup is specific to this exact decode contract. This project is not affiliated with or endorsed by Apple Inc.
+This project uses undocumented private Apple APIs (`_ANEClient`, `_ANEInMemoryModel`) discovered through runtime introspection for research and educational purposes. Results are hardware- and OS-sensitive. The benchmark runs on a local artifact family built by this repo, not a pretrained production model, and the 4.76x speedup is specific to this exact decode contract. This project is not affiliated with or endorsed by Apple Inc.
 
 ## Further reading
 
