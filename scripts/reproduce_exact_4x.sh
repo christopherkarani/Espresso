@@ -151,6 +151,10 @@ case "$INPUT_MODE" in
 esac
 
 mkdir -p "$RESULTS_DIR"
+if [[ ! -w "$RESULTS_DIR" ]]; then
+  echo "FATAL: RESULTS_DIR ($RESULTS_DIR) is not writable" >&2
+  exit 1
+fi
 
 # Fail if results directory already has data from a previous invocation
 if ls "$RESULTS_DIR"/run-*.json >/dev/null 2>&1 || [[ -f "$RESULTS_DIR/summary.json" ]]; then
