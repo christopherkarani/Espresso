@@ -191,6 +191,7 @@ fi
       "harness_control_speedup_min=\(.control_speedup_min | na)",
       "harness_control_speedup_max=\(.control_speedup_max | na)",
       "harness_control_speedup_cv=\(.control_speedup_cv | na)",
+      "harness_control_speedup_iqr=\(.control_speedup_iqr | na)",
       "harness_total_elapsed_s=\(.total_elapsed_s | na)",
       "harness_requested_repeats=\(.requested_repeats | na)",
       "harness_valid_runs=\(.valid_runs)",
