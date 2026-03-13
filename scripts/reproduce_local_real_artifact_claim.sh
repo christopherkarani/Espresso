@@ -48,11 +48,14 @@ trap cleanup_on_interrupt INT TERM
 
 git_commit_start="$(git -C "$ROOT" rev-parse HEAD)"
 
+git_dirty="$(git -C "$ROOT" status --porcelain 2>/dev/null | head -1)"
+
 echo "=== Espresso Claim Reproduction ==="
 echo "claim_version=$CLAIM_VERSION"
 echo "timestamp=$(date -Iseconds)"
 echo "git_commit=$git_commit_start"
 echo "git_branch=$(git -C "$ROOT" rev-parse --abbrev-ref HEAD)"
+echo "git_dirty=$([ -n "$git_dirty" ] && echo "true" || echo "false")"
 echo "results_dir=$RESULTS_DIR"
 echo ""
 
@@ -131,6 +134,7 @@ fi
   echo "timestamp=$(date -Iseconds)"
   echo "git_commit=$(git -C "$ROOT" rev-parse HEAD)"
   echo "git_branch=$(git -C "$ROOT" rev-parse --abbrev-ref HEAD)"
+  echo "git_dirty=$([ -n "$git_dirty" ] && echo "true" || echo "false")"
   echo "results_dir=$RESULTS_DIR"
   echo "dataset=$DATASET_PATH"
   echo "dataset_sha256=$(shasum -a 256 "$DATASET_PATH" | awk '{print $1}')"
