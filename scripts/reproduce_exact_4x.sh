@@ -720,6 +720,13 @@ if [[ -n "$os_version_mismatch" ]]; then
   gate_warnings="${gate_warnings}OS_VERSION_MISMATCH: runs report different OS versions: ${os_version_mismatch}\n"
 fi
 
+# Process ID uniqueness check (detect shared processes)
+pid_dupes="$(jq -s 'map(.process_id // null) | map(select(. != null)) | group_by(.) | map(select(length > 1) | .[0]) | if length > 0 then . else empty end' "${valid_runs[@]}" 2>/dev/null || echo "")"
+if [[ -n "$pid_dupes" ]]; then
+  gate_status="fail"
+  gate_warnings="${gate_warnings}PID_COLLISION: multiple runs share process IDs: ${pid_dupes}\n"
+fi
+
 # Contract field consistency checks — gate fail on any mismatch
 check_contract_field() {
   local field="$1" expected="$2" jq_type="${3:-string}"
