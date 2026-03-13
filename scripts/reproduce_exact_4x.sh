@@ -962,7 +962,7 @@ fi
 
 if [[ "$all_parity_match" != "true" ]]; then
   gate_status="fail"
-  parity_detail="$(jq -s '[.[] | {run: input_line_number, status: .parity_status, match_count: (.parity_match_count // "n/a"), total: (.parity_total // "n/a")} | select(.status != "match")] | map("\(.run): \(.match_count)/\(.total)") | join(", ")' "${valid_runs[@]}" 2>/dev/null || echo "detail unavailable")"
+  parity_detail="$(jq -s '[to_entries[] | {run: (.key + 1), status: .value.parity_status, match_count: (.value.parity_match_count // "n/a"), total: (.value.parity_total // "n/a")} | select(.status != "match")] | map("\(.run): \(.match_count)/\(.total)") | join(", ")' "${valid_runs[@]}" 2>/dev/null || echo "detail unavailable")"
   gate_warnings="${gate_warnings}PARITY_MISMATCH: not all runs produced matching tokens (${parity_detail})\n"
 fi
 
