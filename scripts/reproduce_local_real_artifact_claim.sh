@@ -35,6 +35,16 @@ TWO_STEP_BACKEND="${TWO_STEP_BACKEND:-identity-zero-trunk}"
 OUTPUT_HEAD_BACKEND="${OUTPUT_HEAD_BACKEND:-ane-rmsnorm-classifier}"
 DRY_RUN="${DRY_RUN:-0}"
 
+# Early validation of claim-level parameters (mirrors harness validation)
+if [[ "$REPEATS" -lt 3 || $((REPEATS % 2)) -ne 1 ]]; then
+  echo "REPEATS must be an odd integer >= 3 (got: $REPEATS)" >&2
+  exit 1
+fi
+if [[ "$LAYER_COUNT" -lt 1 ]]; then
+  echo "LAYER_COUNT must be >= 1 (got: $LAYER_COUNT)" >&2
+  exit 1
+fi
+
 mkdir -p "$RESULTS_DIR"
 # Check for stale claim data in the results directory
 if [[ -f "$RESULTS_DIR/claim-summary.txt" ]]; then
