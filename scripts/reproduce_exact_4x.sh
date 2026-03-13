@@ -503,6 +503,7 @@ jq -s \
   per_run_prompt_tokens: (map(.prompt_token // null)),
   per_run_max_new_tokens: (map(.max_new_tokens // null)),
   per_run_max_sequence_tokens: (map(.max_sequence_tokens // null)),
+  per_run_hostnames: (map(.hostname // null)),
   per_run_warmup: (map(.warmup // null)),
   per_run_iterations: (map(.iterations // null)),
   results_dir: $dir,
