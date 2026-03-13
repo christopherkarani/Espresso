@@ -364,6 +364,15 @@ fi
     if [[ -n "$offline_committed" && -n "$harness_committed" && "$offline_committed" != "$harness_committed" ]]; then
       echo "WARNING: token accounting mismatch: offline committed=$offline_committed harness committed=$harness_committed"
     fi
+    # Cross-validate claim-level contract params match harness contract
+    harness_contract_layer="$(jq -r '.benchmark_contract.layer_count // empty' "$PUBLIC_RESULTS_DIR/summary.json" 2>/dev/null || true)"
+    if [[ -n "$harness_contract_layer" && "$harness_contract_layer" != "$LAYER_COUNT" ]]; then
+      echo "WARNING: claim LAYER_COUNT=$LAYER_COUNT but harness contract layer_count=$harness_contract_layer"
+    fi
+    harness_contract_max_new="$(jq -r '.benchmark_contract.max_new_tokens // empty' "$PUBLIC_RESULTS_DIR/summary.json" 2>/dev/null || true)"
+    if [[ -n "$harness_contract_max_new" && "$harness_contract_max_new" != "$MAX_NEW_TOKENS" ]]; then
+      echo "WARNING: claim MAX_NEW_TOKENS=$MAX_NEW_TOKENS but harness contract max_new_tokens=$harness_contract_max_new"
+    fi
   fi
   # Validate that all critical artifact files still exist and are non-empty
   missing_artifacts=""
