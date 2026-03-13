@@ -315,3 +315,9 @@ cycle	timestamp	hypothesis	result	commit	notes
 315	2026-03-13T05:10:22Z	harness-elapsed	claim	add harness_elapsed_s to claim-summary for full decomposition	pass
 316	2026-03-13T05:11:17Z	lane-spatial-claim	claim	extract lane spatial per-run arrays into claim-summary	pass
 317	2026-03-13T05:12:19Z	nan-inf-check	harness	add NaN/Infinity detection for critical latency fields	pass
+318	2026-03-13T05:13:13Z	version-bump	harness+claim	HARNESS_VERSION=8, CLAIM_VERSION=7	pass
+319	2026-03-13T05:14:08Z	harness-version-xval	claim	cross-validate harness_version matches expected=8	pass
+320	2026-03-13T05:14:59Z	test-suite	verify	405 tests pass, 0 failures, 121 skipped	pass
+321	2026-03-13T05:15:34Z	probe-version-xval	claim	cross-validate probe_version=7 in claim script	pass
+322	2026-03-13T05:16:33Z	stale-claim-check	claim	add stale claim-summary.txt check at start	pass
+323	2026-03-13T05:17:17Z	coremltools-ver	claim	record python and coremltools versions in claim-summary	pass
