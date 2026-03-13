@@ -215,6 +215,15 @@ if ! [[ "$PROMPT_TOKEN" =~ ^[0-9]+$ ]]; then
   exit 1
 fi
 
+# Cross-validate promptToken is within vocab range
+manifest_vocab_size="$(jq -r '.vocabSize // empty' "$ARTIFACT_PREFIX.manifest.json" 2>/dev/null || true)"
+if [[ -n "$manifest_vocab_size" && "$manifest_vocab_size" =~ ^[0-9]+$ ]]; then
+  if [[ "$PROMPT_TOKEN" -ge "$manifest_vocab_size" ]]; then
+    echo "FATAL: promptToken=$PROMPT_TOKEN is >= vocabSize=$manifest_vocab_size" >&2
+    exit 1
+  fi
+fi
+
 # Cross-validate manifest layerCount matches the claim contract
 manifest_layer_count="$(jq -r '.layerCount // empty' "$ARTIFACT_PREFIX.manifest.json" 2>/dev/null || true)"
 if [[ -n "$manifest_layer_count" && "$manifest_layer_count" != "$LAYER_COUNT" ]]; then
