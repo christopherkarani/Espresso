@@ -142,6 +142,9 @@ esac
 
 mkdir -p "$RESULTS_DIR"
 
+# Capture git HEAD at harness start for drift detection
+GIT_COMMIT_START="$(git -C "$ROOT" rev-parse HEAD)"
+
 # Signal trap: mark results as interrupted for regression diagnosis
 cleanup_on_interrupt() {
   echo ""
@@ -153,7 +156,7 @@ trap cleanup_on_interrupt INT TERM
 {
   echo "harness_version=$HARNESS_VERSION"
   echo "timestamp=$(date -Iseconds)"
-  echo "git_commit=$(git -C "$ROOT" rev-parse HEAD)"
+  echo "git_commit=$GIT_COMMIT_START"
   echo "git_branch=$(git -C "$ROOT" rev-parse --abbrev-ref HEAD)"
   echo "swift_version=$(swift --version | tr '\n' ' ')"
   echo "uname=$(uname -a)"
@@ -457,7 +460,7 @@ jq -s \
   --argjson harness_version "$HARNESS_VERSION" \
   --arg dir "$RESULTS_DIR" \
   --arg ts "$(date -Iseconds)" \
-  --arg commit "$(git -C "$ROOT" rev-parse HEAD)" \
+  --arg commit "$GIT_COMMIT_START" \
   --arg branch "$(git -C "$ROOT" rev-parse --abbrev-ref HEAD)" \
   --arg input_mode "$INPUT_MODE" \
   --argjson warmup "$WARMUP" \
@@ -827,6 +830,13 @@ cold_compile="$(jq -s '
 ' "${valid_runs[@]}" 2>/dev/null || echo "")"
 if [[ -n "$cold_compile" ]]; then
   gate_warnings="${gate_warnings}COLD_COMPILE: ${cold_compile}\n"
+fi
+
+# Git HEAD drift detection: warn if HEAD changed during benchmark
+GIT_COMMIT_END="$(git -C "$ROOT" rev-parse HEAD)"
+if [[ "$GIT_COMMIT_END" != "$GIT_COMMIT_START" ]]; then
+  gate_status="warn"
+  gate_warnings="${gate_warnings}GIT_DRIFT: HEAD changed during benchmark (start=${GIT_COMMIT_START} end=${GIT_COMMIT_END})\n"
 fi
 
 # Speedup floor: warn if any run shows two_step slower than coreml
