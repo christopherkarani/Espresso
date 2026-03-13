@@ -292,6 +292,12 @@ fi
     if [[ "$offline_parity" == "match" && "$harness_parity" != "true" ]]; then
       echo "WARNING: offline gate shows parity=match but harness shows all_parity_match=$harness_parity"
     fi
+    # Cross-validate token accounting
+    offline_committed="$(jq -r '.committed_exact_tokens_per_pass' "$OFFLINE_GATE_JSON" 2>/dev/null || echo "")"
+    harness_committed="$(jq -r '.token_accounting.committed_exact_tokens_per_pass' "$PUBLIC_RESULTS_DIR/summary.json" 2>/dev/null || echo "")"
+    if [[ -n "$offline_committed" && -n "$harness_committed" && "$offline_committed" != "$harness_committed" ]]; then
+      echo "WARNING: token accounting mismatch: offline committed=$offline_committed harness committed=$harness_committed"
+    fi
   fi
   claim_elapsed_s=$(( $(date +%s) - claim_start_epoch ))
   echo "claim_total_elapsed_s=$claim_elapsed_s"
