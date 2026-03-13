@@ -341,3 +341,4 @@ cycle	timestamp	hypothesis	result	commit	notes
 341	2026-03-13T05:34:43Z	claim	validate CoreML model directory structure before harness invocation	scripts/reproduce_local_real_artifact_claim.sh	committed
 342	2026-03-13T05:35:54Z	harness	fix disk_free_mb_end always 0 in summary.json — assignment moved before jq aggregation	scripts/reproduce_exact_4x.sh	committed
 343	2026-03-13T05:36:30Z	claim	cross-validate manifest layerCount against claim LAYER_COUNT	scripts/reproduce_local_real_artifact_claim.sh	committed
+344	2026-03-13T05:36:56Z	claim	warn if dataset bytes exceed 2x MAX_CORPUS_BYTES — bound sanity check	scripts/reproduce_local_real_artifact_claim.sh	committed
