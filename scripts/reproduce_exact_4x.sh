@@ -714,18 +714,20 @@ if [[ -n "$layer_count_mismatch" ]]; then
   gate_warnings="${gate_warnings}LAYER_COUNT_MISMATCH: runs reported layer counts inconsistent with contract ($LAYER_COUNT): ${layer_count_mismatch}\n"
 fi
 
-# Token parameter consistency checks
-for token_field in max_new_tokens max_sequence_tokens; do
+# Numeric contract parameter consistency checks
+for token_field in max_new_tokens max_sequence_tokens warmup iterations; do
   case "$token_field" in
     max_new_tokens) expected="$MAX_NEW_TOKENS" ;;
     max_sequence_tokens) expected="$MAX_SEQUENCE_TOKENS" ;;
+    warmup) expected="$WARMUP" ;;
+    iterations) expected="$ITERATIONS" ;;
   esac
   token_mismatch="$(jq -s --argjson expected "$expected" --arg field "$token_field" \
     'map(.[$field] // null) | map(select(. != null and . != $expected)) | if length > 0 then . else empty end' \
     "${valid_runs[@]}" 2>/dev/null || echo "")"
   if [[ -n "$token_mismatch" ]]; then
     gate_status="fail"
-    gate_warnings="${gate_warnings}TOKEN_PARAM_MISMATCH: ${token_field} inconsistent with contract (${expected}): ${token_mismatch}\n"
+    gate_warnings="${gate_warnings}CONTRACT_PARAM_MISMATCH: ${token_field} inconsistent with contract (${expected}): ${token_mismatch}\n"
   fi
 done
 
