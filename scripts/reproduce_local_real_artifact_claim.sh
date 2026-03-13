@@ -148,6 +148,11 @@ LAYER_COUNT="$LAYER_COUNT" \
     echo "harness_requested_repeats=$(jq -r '.requested_repeats // "n/a"' "$PUBLIC_RESULTS_DIR/summary.json")"
     echo "harness_valid_runs=$(jq -r '.valid_runs' "$PUBLIC_RESULTS_DIR/summary.json")"
     echo "harness_failed_runs=$(jq -r '.failed_runs // 0' "$PUBLIC_RESULTS_DIR/summary.json")"
+    echo "harness_probe_sha256=$(jq -r '.artifact_hashes.probe_sha256 // "n/a"' "$PUBLIC_RESULTS_DIR/summary.json")"
+    echo "harness_coreml_model_sha256=$(jq -r '.artifact_hashes.coreml_model_sha256 // "n/a"' "$PUBLIC_RESULTS_DIR/summary.json")"
+    echo "harness_recurrent_sha256=$(jq -r '.artifact_hashes.recurrent_checkpoint_sha256 // "n/a"' "$PUBLIC_RESULTS_DIR/summary.json")"
+    echo "harness_sidecar_sha256=$(jq -r '.artifact_hashes.future_sidecar_sha256 // "n/a"' "$PUBLIC_RESULTS_DIR/summary.json")"
+    echo "harness_generation_sha256=$(jq -r '.artifact_hashes.generation_model_sha256 // "n/a"' "$PUBLIC_RESULTS_DIR/summary.json")"
   fi
   # Propagate gate status from inner harness (prefer JSON source)
   if [[ -f "$PUBLIC_RESULTS_DIR/summary.json" ]]; then
