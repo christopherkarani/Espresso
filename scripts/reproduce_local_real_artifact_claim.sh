@@ -46,7 +46,10 @@ cleanup_on_interrupt() {
 trap cleanup_on_interrupt INT TERM
 
 echo "=== Espresso Claim Reproduction ==="
+echo "claim_version=$CLAIM_VERSION"
 echo "timestamp=$(date -Iseconds)"
+echo "git_commit=$(git -C "$ROOT" rev-parse HEAD)"
+echo "git_branch=$(git -C "$ROOT" rev-parse --abbrev-ref HEAD)"
 echo "results_dir=$RESULTS_DIR"
 echo ""
 
@@ -108,6 +111,9 @@ LAYER_COUNT="$LAYER_COUNT" \
 
 {
   echo "claim_version=$CLAIM_VERSION"
+  echo "timestamp=$(date -Iseconds)"
+  echo "git_commit=$(git -C "$ROOT" rev-parse HEAD)"
+  echo "git_branch=$(git -C "$ROOT" rev-parse --abbrev-ref HEAD)"
   echo "results_dir=$RESULTS_DIR"
   echo "dataset=$DATASET_PATH"
   echo "dataset_sha256=$(shasum -a 256 "$DATASET_PATH" | awk '{print $1}')"
