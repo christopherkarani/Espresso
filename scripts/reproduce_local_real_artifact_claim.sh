@@ -12,7 +12,7 @@ set -euo pipefail
 # docs/releases/2026-03-11-non-echo-exact-decode.md.
 
 # Bump this when the claim-summary output contract changes.
-CLAIM_VERSION=5
+CLAIM_VERSION=6
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RESULTS_DIR="${RESULTS_DIR:-$ROOT/results/real-artifact-$(date +%Y%m%d-%H%M%S)}"
