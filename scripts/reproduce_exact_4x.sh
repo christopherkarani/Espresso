@@ -508,6 +508,7 @@ jq -s \
   per_run_max_new_tokens: (map(.max_new_tokens // null)),
   per_run_max_sequence_tokens: (map(.max_sequence_tokens // null)),
   per_run_hostnames: (map(.hostname // null)),
+  per_run_os_versions: (map(.os_version // null)),
   per_run_warmup: (map(.warmup // null)),
   per_run_iterations: (map(.iterations // null)),
   results_dir: $dir,
@@ -699,6 +700,13 @@ hostname_mismatch="$(jq -s 'map(.hostname // null) | map(select(. != null)) | un
 if [[ -n "$hostname_mismatch" ]]; then
   gate_status="fail"
   gate_warnings="${gate_warnings}HOSTNAME_MISMATCH: runs executed on different hosts: ${hostname_mismatch}\n"
+fi
+
+# OS version consistency check
+os_version_mismatch="$(jq -s 'map(.os_version // null) | map(select(. != null)) | unique | if length > 1 then . else empty end' "${valid_runs[@]}" 2>/dev/null || echo "")"
+if [[ -n "$os_version_mismatch" ]]; then
+  gate_status="warn"
+  gate_warnings="${gate_warnings}OS_VERSION_MISMATCH: runs report different OS versions: ${os_version_mismatch}\n"
 fi
 
 # Contract field consistency checks — gate fail on any mismatch
