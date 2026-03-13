@@ -730,6 +730,13 @@ if [[ -n "$debug_runs" ]]; then
   gate_warnings="${gate_warnings}DEBUG_BUILD: ${debug_runs} run(s) used debug build configuration — results are not representative\n"
 fi
 
+# Build configuration consistency check
+build_config_mismatch="$(jq -s 'map(.build_configuration // null) | map(select(. != null)) | unique | if length > 1 then . else empty end' "${valid_runs[@]}" 2>/dev/null || echo "")"
+if [[ -n "$build_config_mismatch" ]]; then
+  gate_status="warn"
+  gate_warnings="${gate_warnings}BUILD_CONFIG_MISMATCH: runs used different build configurations: ${build_config_mismatch}\n"
+fi
+
 # Probe version consistency check
 probe_version_mismatch="$(jq -s 'map(.probe_version // null) | unique | if length > 1 then . else empty end' "${valid_runs[@]}" 2>/dev/null || echo "")"
 if [[ -n "$probe_version_mismatch" ]]; then
