@@ -46,10 +46,12 @@ cleanup_on_interrupt() {
 }
 trap cleanup_on_interrupt INT TERM
 
+git_commit_start="$(git -C "$ROOT" rev-parse HEAD)"
+
 echo "=== Espresso Claim Reproduction ==="
 echo "claim_version=$CLAIM_VERSION"
 echo "timestamp=$(date -Iseconds)"
-echo "git_commit=$(git -C "$ROOT" rev-parse HEAD)"
+echo "git_commit=$git_commit_start"
 echo "git_branch=$(git -C "$ROOT" rev-parse --abbrev-ref HEAD)"
 echo "results_dir=$RESULTS_DIR"
 echo ""
@@ -256,6 +258,11 @@ fi
   fi
   claim_elapsed_s=$(( $(date +%s) - claim_start_epoch ))
   echo "claim_total_elapsed_s=$claim_elapsed_s"
+  git_commit_end="$(git -C "$ROOT" rev-parse HEAD)"
+  echo "git_commit_end=$git_commit_end"
+  if [[ "$git_commit_end" != "$git_commit_start" ]]; then
+    echo "WARNING: git HEAD changed during claim run (start=$git_commit_start end=$git_commit_end)"
+  fi
   echo "harness_exit_code=$harness_exit"
 } | tee "$RESULTS_DIR/claim-summary.txt"
 
