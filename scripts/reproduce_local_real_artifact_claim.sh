@@ -60,6 +60,30 @@ echo "results_dir=$RESULTS_DIR"
 echo "disk_free_mb_start=$(df -m "$RESULTS_DIR" 2>/dev/null | awk 'NR==2{print $4}' || echo unknown)"
 echo ""
 
+if [[ "$DRY_RUN" == "1" ]]; then
+  echo "=== DRY_RUN: claim-level contract ==="
+  echo "layer_count=$LAYER_COUNT"
+  echo "repeats=$REPEATS"
+  echo "warmup=$WARMUP"
+  echo "iterations=$ITERATIONS"
+  echo "max_new_tokens=$MAX_NEW_TOKENS"
+  echo "max_sequence_tokens=$MAX_SEQUENCE_TOKENS"
+  echo "max_corpus_bytes=$MAX_CORPUS_BYTES"
+  echo "control_backend=$CONTROL_BACKEND"
+  echo "two_step_backend=$TWO_STEP_BACKEND"
+  echo "output_head_backend=$OUTPUT_HEAD_BACKEND"
+  echo "coremltools_python=$COREMLTOOLS_PYTHON"
+  echo "chip=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo unknown)"
+  echo "ncpu=$(sysctl -n hw.ncpu 2>/dev/null || echo unknown)"
+  echo "physical_memory_gb=$(sysctl -n hw.memsize 2>/dev/null | awk '{printf "%.1f", $1/1073741824}' || echo unknown)"
+  echo "power_source=$(pmset -g batt 2>/dev/null | head -1 | sed "s/.*'\(.*\)'.*/\1/" || echo unknown)"
+  echo "thermal_pressure=$(pmset -g therm 2>/dev/null | grep -i 'cpu.*speed' | head -1 || echo unknown)"
+  echo "macos_version=$(sw_vers -productVersion 2>/dev/null || echo unknown)"
+  echo "swift_version=$(swift --version 2>/dev/null | head -1 || echo unknown)"
+  echo "=== DRY_RUN: skipping pipeline (dataset build, artifact export, CoreML gen, harness) ==="
+  exit 0
+fi
+
 dataset_build_start=$(date +%s)
 echo "Building local text dataset into $DATASET_PATH"
 swift run espresso-train \
