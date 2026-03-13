@@ -684,63 +684,35 @@ if [[ -n "$probe_version_mismatch" ]]; then
   gate_warnings="${gate_warnings}PROBE_VERSION_MISMATCH: runs used different probe versions: ${probe_version_mismatch}\n"
 fi
 
-# Input mode consistency check (contract integrity)
-input_mode_mismatch="$(jq -s --arg expected "$INPUT_MODE" 'map(.input_mode // null) | map(select(. != $expected)) | if length > 0 then . else empty end' "${valid_runs[@]}" 2>/dev/null || echo "")"
-if [[ -n "$input_mode_mismatch" ]]; then
-  gate_status="fail"
-  gate_warnings="${gate_warnings}INPUT_MODE_MISMATCH: runs reported input modes inconsistent with contract ($INPUT_MODE): ${input_mode_mismatch}\n"
-fi
-
-# Backend consistency checks (contract integrity)
-for backend_field in control_backend two_step_backend output_head_backend; do
-  case "$backend_field" in
-    control_backend) expected="$CONTROL_BACKEND" ;;
-    two_step_backend) expected="$TWO_STEP_BACKEND" ;;
-    output_head_backend) expected="$OUTPUT_HEAD_BACKEND" ;;
-  esac
-  backend_mismatch="$(jq -s --arg expected "$expected" --arg field "$backend_field" \
-    'map(.[$field] // null) | map(select(. != $expected)) | if length > 0 then . else empty end' \
-    "${valid_runs[@]}" 2>/dev/null || echo "")"
-  if [[ -n "$backend_mismatch" ]]; then
-    gate_status="fail"
-    gate_warnings="${gate_warnings}BACKEND_MISMATCH: ${backend_field} inconsistent with contract (${expected}): ${backend_mismatch}\n"
+# Contract field consistency checks — gate fail on any mismatch
+check_contract_field() {
+  local field="$1" expected="$2" jq_type="${3:-string}"
+  local mismatch=""
+  if [[ "$jq_type" == "number" ]]; then
+    mismatch="$(jq -s --argjson expected "$expected" --arg field "$field" \
+      'map(.[$field] // null) | map(select(. != null and . != $expected)) | if length > 0 then . else empty end' \
+      "${valid_runs[@]}" 2>/dev/null || echo "")"
+  else
+    mismatch="$(jq -s --arg expected "$expected" --arg field "$field" \
+      'map(.[$field] // null) | map(select(. != null and . != $expected)) | if length > 0 then . else empty end' \
+      "${valid_runs[@]}" 2>/dev/null || echo "")"
   fi
-done
-
-# Layer count consistency check
-layer_count_mismatch="$(jq -s --argjson expected "$LAYER_COUNT" \
-  'map(.layer_count // null) | map(select(. != $expected)) | if length > 0 then . else empty end' \
-  "${valid_runs[@]}" 2>/dev/null || echo "")"
-if [[ -n "$layer_count_mismatch" ]]; then
-  gate_status="fail"
-  gate_warnings="${gate_warnings}LAYER_COUNT_MISMATCH: runs reported layer counts inconsistent with contract ($LAYER_COUNT): ${layer_count_mismatch}\n"
-fi
-
-# Numeric contract parameter consistency checks
-for token_field in max_new_tokens max_sequence_tokens warmup iterations; do
-  case "$token_field" in
-    max_new_tokens) expected="$MAX_NEW_TOKENS" ;;
-    max_sequence_tokens) expected="$MAX_SEQUENCE_TOKENS" ;;
-    warmup) expected="$WARMUP" ;;
-    iterations) expected="$ITERATIONS" ;;
-  esac
-  token_mismatch="$(jq -s --argjson expected "$expected" --arg field "$token_field" \
-    'map(.[$field] // null) | map(select(. != null and . != $expected)) | if length > 0 then . else empty end' \
-    "${valid_runs[@]}" 2>/dev/null || echo "")"
-  if [[ -n "$token_mismatch" ]]; then
+  if [[ -n "$mismatch" ]]; then
     gate_status="fail"
-    gate_warnings="${gate_warnings}CONTRACT_PARAM_MISMATCH: ${token_field} inconsistent with contract (${expected}): ${token_mismatch}\n"
+    gate_warnings="${gate_warnings}CONTRACT_MISMATCH: ${field} inconsistent with contract (${expected}): ${mismatch}\n"
   fi
-done
+}
 
-# Prompt token consistency check
-prompt_token_mismatch="$(jq -s --argjson expected "$PROMPT_TOKEN" \
-  'map(.prompt_token // null) | map(select(. != null and . != $expected)) | if length > 0 then . else empty end' \
-  "${valid_runs[@]}" 2>/dev/null || echo "")"
-if [[ -n "$prompt_token_mismatch" ]]; then
-  gate_status="fail"
-  gate_warnings="${gate_warnings}PROMPT_TOKEN_MISMATCH: runs reported prompt tokens inconsistent with contract ($PROMPT_TOKEN): ${prompt_token_mismatch}\n"
-fi
+check_contract_field input_mode "$INPUT_MODE"
+check_contract_field control_backend "$CONTROL_BACKEND"
+check_contract_field two_step_backend "$TWO_STEP_BACKEND"
+check_contract_field output_head_backend "$OUTPUT_HEAD_BACKEND"
+check_contract_field layer_count "$LAYER_COUNT" number
+check_contract_field max_new_tokens "$MAX_NEW_TOKENS" number
+check_contract_field max_sequence_tokens "$MAX_SEQUENCE_TOKENS" number
+check_contract_field warmup "$WARMUP" number
+check_contract_field iterations "$ITERATIONS" number
+check_contract_field prompt_token "$PROMPT_TOKEN" number
 
 # Generated token count check (detect premature termination)
 short_gen="$(jq -s --argjson expected "$MAX_NEW_TOKENS" \
