@@ -147,6 +147,11 @@ if ! jq -e '.committed_exact_tokens_per_pass and .accepted_future_tokens_per_pas
   echo "FATAL: offline gate JSON missing token accounting fields" >&2
   exit 1
 fi
+offline_parity_val="$(jq -r '.parity_status' "$OFFLINE_GATE_JSON")"
+if [[ "$offline_parity_val" != "match" && "$offline_parity_val" != "mismatch" ]]; then
+  echo "FATAL: offline gate parity_status has unexpected value: '$offline_parity_val' (expected match|mismatch)" >&2
+  exit 1
+fi
 
 PROMPT_TOKEN="$(jq -r '.promptToken' "$ARTIFACT_PREFIX.manifest.json")"
 if ! [[ "$PROMPT_TOKEN" =~ ^[0-9]+$ ]]; then
