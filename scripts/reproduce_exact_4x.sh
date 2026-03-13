@@ -685,6 +685,13 @@ if [[ -n "$probe_version_mismatch" ]]; then
   gate_warnings="${gate_warnings}PROBE_VERSION_MISMATCH: runs used different probe versions: ${probe_version_mismatch}\n"
 fi
 
+# Hostname consistency check
+hostname_mismatch="$(jq -s 'map(.hostname // null) | map(select(. != null)) | unique | if length > 1 then . else empty end' "${valid_runs[@]}" 2>/dev/null || echo "")"
+if [[ -n "$hostname_mismatch" ]]; then
+  gate_status="fail"
+  gate_warnings="${gate_warnings}HOSTNAME_MISMATCH: runs executed on different hosts: ${hostname_mismatch}\n"
+fi
+
 # Contract field consistency checks — gate fail on any mismatch
 check_contract_field() {
   local field="$1" expected="$2" jq_type="${3:-string}"
