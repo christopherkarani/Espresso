@@ -93,6 +93,10 @@ if [[ "$DRY_RUN" == "1" ]]; then
   echo "thermal_pressure=$(pmset -g therm 2>/dev/null | grep -i 'cpu.*speed' | head -1 || echo unknown)"
   echo "macos_version=$(sw_vers -productVersion 2>/dev/null || echo unknown)"
   echo "swift_version=$(swift --version 2>/dev/null | head -1 || echo unknown)"
+  echo "hostname=$(hostname 2>/dev/null || echo unknown)"
+  echo "claim_pid=$$"
+  echo "memory_free_pct=$(sysctl -n kern.memorystatus_level 2>/dev/null || echo unknown)"
+  echo "disk_free_mb=$(df -m "$RESULTS_DIR" 2>/dev/null | awk 'NR==2{print $4}' || echo unknown)"
   echo "=== DRY_RUN: skipping pipeline (dataset build, artifact export, CoreML gen, harness) ==="
   exit 0
 fi
