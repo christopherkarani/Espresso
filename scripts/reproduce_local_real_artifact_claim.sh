@@ -83,6 +83,10 @@ if ! command -v jq &>/dev/null; then
 fi
 
 mkdir -p "$RESULTS_DIR"
+if [[ ! -w "$RESULTS_DIR" ]]; then
+  echo "FATAL: RESULTS_DIR ($RESULTS_DIR) is not writable" >&2
+  exit 1
+fi
 # Check for stale claim data in the results directory
 if [[ -f "$RESULTS_DIR/claim-summary.txt" ]]; then
   echo "FATAL: results directory $RESULTS_DIR already contains claim-summary.txt — stale data would contaminate results. Use a clean directory." >&2
