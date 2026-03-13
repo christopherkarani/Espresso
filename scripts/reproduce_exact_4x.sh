@@ -367,6 +367,9 @@ for f in "$RESULTS_DIR"/run-*.json; do
   fi
 done
 
+# Capture disk free at end of benchmark runs (before aggregation, so summary.json gets the real value)
+DISK_FREE_MB_END="$(df -m "$RESULTS_DIR" 2>/dev/null | awk 'NR==2{print $4}' || echo 0)"
+
 # Collect valid run JSONs (skip empty or malformed files from failed runs)
 valid_runs=()
 valid_outer_elapsed=()
@@ -764,7 +767,7 @@ if [[ -n "$load_start_1m" && -n "$load_end_1m" && "$load_start_1m" != "unknown" 
 fi
 
 # Disk space check: warn if free space dropped below 512MB
-DISK_FREE_MB_END="$(df -m "$RESULTS_DIR" 2>/dev/null | awk 'NR==2{print $4}' || echo 0)"
+# DISK_FREE_MB_END was captured earlier (before aggregation) so summary.json gets the real value
 if [[ "$DISK_FREE_MB_END" -lt 512 ]] 2>/dev/null; then
   gate_warnings="${gate_warnings}LOW_DISK_SPACE: only ${DISK_FREE_MB_END}MB free (started with ${DISK_FREE_MB_START}MB) — results may be unreliable\n"
 fi
