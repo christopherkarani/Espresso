@@ -81,7 +81,7 @@ swift run espresso-train \
   --offline-acceptance-json "$OFFLINE_GATE_JSON" \
   --gate-max-new-tokens "$MAX_NEW_TOKENS"
 
-for expected_artifact in "$ARTIFACT_PREFIX.manifest.json" "$ARTIFACT_PREFIX.recurrent.bin" "$ARTIFACT_PREFIX.generation.bin" "$ARTIFACT_PREFIX.future-sidecar.bin"; do
+for expected_artifact in "$ARTIFACT_PREFIX.manifest.json" "$ARTIFACT_PREFIX.recurrent.bin" "$ARTIFACT_PREFIX.generation.bin" "$ARTIFACT_PREFIX.future-sidecar.bin" "$OFFLINE_GATE_JSON"; do
   if [[ ! -s "$expected_artifact" ]]; then
     echo "FATAL: artifact export succeeded but $expected_artifact is missing or empty" >&2
     exit 1
