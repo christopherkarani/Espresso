@@ -191,9 +191,13 @@ if [[ $harness_exit -eq 1 ]]; then
 fi
 
 # Validate harness produced a valid summary.json
+EXPECTED_HARNESS_VERSION=8
 if [[ -f "$PUBLIC_RESULTS_DIR/summary.json" ]]; then
-  if ! jq -e '.harness_version' "$PUBLIC_RESULTS_DIR/summary.json" >/dev/null 2>&1; then
+  actual_hv="$(jq -r '.harness_version // empty' "$PUBLIC_RESULTS_DIR/summary.json" 2>/dev/null || true)"
+  if [[ -z "$actual_hv" ]]; then
     echo "WARNING: harness summary.json missing harness_version field" >&2
+  elif [[ "$actual_hv" != "$EXPECTED_HARNESS_VERSION" ]]; then
+    echo "WARNING: harness version mismatch: expected=$EXPECTED_HARNESS_VERSION actual=$actual_hv" >&2
   fi
 fi
 
