@@ -252,6 +252,8 @@ CONTRACT_HASH="$(printf '%s\n' \
 if [[ "$DRY_RUN" == "1" ]]; then
   echo "=== Dry Run: All prerequisites validated ==="
   echo "harness_version=$HARNESS_VERSION"
+  echo "git_commit=$GIT_COMMIT_START"
+  echo "git_branch=$(git -C "$ROOT" rev-parse --abbrev-ref HEAD)"
   echo "contract_hash=$CONTRACT_HASH"
   echo "probe=$PROBE"
   echo "probe_sha256=$PROBE_SHA256"
