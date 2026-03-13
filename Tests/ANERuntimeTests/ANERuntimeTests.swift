@@ -805,6 +805,132 @@ final class ANERuntimeTests: XCTestCase {
         )
     }
 
+    func test_compile_with_retry_retries_until_attempt_succeeds() throws {
+        var attemptCount = 0
+        var sleepCalls: [Int] = []
+        let handle = try ANEKernel.compileWithRetry(
+            checkBudget: false,
+            compileAttempt: {
+                defer { attemptCount += 1 }
+                if attemptCount < 2 {
+                    return nil
+                }
+                return OpaquePointer(bitPattern: 0x1)
+            },
+            lastCompileError: { ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE },
+            sleepAfterFailedAttempt: { sleepCalls.append($0) },
+            writeRetryNotice: { _ in }
+        )
+
+        XCTAssertEqual(handle, OpaquePointer(bitPattern: 0x1))
+        XCTAssertEqual(attemptCount, 3)
+        XCTAssertEqual(sleepCalls, [0, 1])
+    }
+
+    func test_compile_with_retry_stops_without_sleep_for_non_retryable_error() throws {
+        var attemptCount = 0
+        var slept = false
+        let handle = try ANEKernel.compileWithRetry(
+            checkBudget: false,
+            compileAttempt: {
+                attemptCount += 1
+                return nil
+            },
+            lastCompileError: { ANE_INTEROP_COMPILE_ERROR_INVALID_ARGUMENTS },
+            sleepAfterFailedAttempt: { _ in slept = true },
+            writeRetryNotice: { _ in }
+        )
+
+        XCTAssertNil(handle)
+        XCTAssertEqual(attemptCount, 1)
+        XCTAssertFalse(slept)
+    }
+
+    func test_compile_with_retry_releases_budget_gate_before_sleeping() throws {
+        final class AttemptState: @unchecked Sendable {
+            private let lock = NSLock()
+            private var firstAttemptCount = 0
+            private(set) var secondAttemptCount = 0
+
+            func firstCompileAttempt() -> OpaquePointer? {
+                lock.lock()
+                defer {
+                    firstAttemptCount += 1
+                    lock.unlock()
+                }
+                if firstAttemptCount == 0 {
+                    return nil
+                }
+                return OpaquePointer(bitPattern: 0x11)
+            }
+
+            func secondCompileAttempt() -> OpaquePointer? {
+                lock.lock()
+                secondAttemptCount += 1
+                lock.unlock()
+                return OpaquePointer(bitPattern: 0x22)
+            }
+        }
+
+        let previous = CompileBudget.currentCount
+        defer { try? CompileBudget.setCount(previous) }
+        try CompileBudget.setCount(0)
+
+        let firstSleepStarted = expectation(description: "first compile entered retry sleep")
+        let secondCompileEntered = expectation(description: "second compile entered while first slept")
+        let allowFirstRetryToContinue = DispatchSemaphore(value: 0)
+        let firstThreadDone = DispatchSemaphore(value: 0)
+        let secondThreadDone = DispatchSemaphore(value: 0)
+        let attemptState = AttemptState()
+
+        DispatchQueue.global().async {
+            defer { firstThreadDone.signal() }
+            do {
+                _ = try ANEKernel.compileWithRetry(
+                    checkBudget: true,
+                    compileAttempt: attemptState.firstCompileAttempt,
+                    lastCompileError: { ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE },
+                    sleepAfterFailedAttempt: { _ in
+                        firstSleepStarted.fulfill()
+                        _ = allowFirstRetryToContinue.wait(timeout: .now() + 2.0)
+                    },
+                    writeRetryNotice: { _ in }
+                )
+            } catch {
+                XCTFail("unexpected first compile error: \(error)")
+            }
+        }
+
+        wait(for: [firstSleepStarted], timeout: 2.0)
+
+        DispatchQueue.global().async {
+            defer {
+                secondThreadDone.signal()
+            }
+            do {
+                _ = try ANEKernel.compileWithRetry(
+                    checkBudget: true,
+                    compileAttempt: {
+                        secondCompileEntered.fulfill()
+                        return attemptState.secondCompileAttempt()
+                    },
+                    lastCompileError: { ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE },
+                    sleepAfterFailedAttempt: { _ in XCTFail("second compile should not sleep") },
+                    writeRetryNotice: { _ in }
+                )
+            } catch {
+                XCTFail("unexpected second compile error: \(error)")
+            }
+        }
+
+        wait(for: [secondCompileEntered], timeout: 2.0)
+        allowFirstRetryToContinue.signal()
+
+        XCTAssertEqual(firstThreadDone.wait(timeout: .now() + 2.0), .success)
+        XCTAssertEqual(secondThreadDone.wait(timeout: .now() + 2.0), .success)
+        XCTAssertEqual(attemptState.secondAttemptCount, 1)
+    }
+
     func test_compile_budget_boundary_allows_only_one_concurrent_compile() throws {
         try requireANEHardwareTestsEnabled()
 

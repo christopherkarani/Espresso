@@ -57,7 +57,8 @@ enum ResultsFormatter {
         lines.append("----------")
         lines.append(
             formatted(
-                "ANE Direct: %.3f TFLOPS | %.2f%% peak utilization | %.2f forward passes/sec",
+                "%@: %.3f TFLOPS | %.2f%% peak utilization | %.2f forward passes/sec",
+                aneResult.label as NSString,
                 aneTFLOPS,
                 aneUtilization,
                 aneForwardPassesPerSecond
@@ -78,8 +79,8 @@ enum ResultsFormatter {
             )
         }
         lines.append("")
-        lines.append("Time Breakdown (ANE Direct, avg ms)")
-        lines.append("-----------------------------------")
+        lines.append("Time Breakdown (\(aneResult.label), avg ms)")
+        lines.append(String(repeating: "-", count: max(20, 20 + aneResult.label.count)))
         let totalTime = aneTimingBreakdown.ane + aneTimingBreakdown.io + aneTimingBreakdown.elem
         lines.append(
             timeBreakdownRow(label: "ANE compute", value: aneTimingBreakdown.ane, total: totalTime)
@@ -101,9 +102,10 @@ enum ResultsFormatter {
                 let ratio = entry.result.median > 0 ? entry.result.median / aneResult.median : 0
                 lines.append(
                     formatted(
-                        "%@: median %.3f ms | ANE speedup %.2fx",
+                        "%@: median %.3f ms | vs %@ %.2fx",
                         entry.label,
                         entry.result.median,
+                        aneResult.label as NSString,
                         ratio
                     )
                 )
@@ -159,16 +161,14 @@ enum ResultsFormatter {
         }
         if let inferenceResult {
             report += "\n"
-            report += formatInferenceOnlyReport(
+            report += formatInferenceComparisonSection(
+                trainingResult: aneResult,
                 inferenceResult: inferenceResult,
                 inferenceTimingBreakdown: inferenceTimingBreakdown,
                 inferenceCompileTimeMs: inferenceCompileTimeMs,
                 coreMLResults: coreMLResults,
                 coreMLLoadTimeMs: coreMLLoadTimeMs,
-                flopsPerPass: flopsPerPass,
-                nLayers: nLayers,
-                thermalBefore: nil,
-                thermalAfter: nil
+                flopsPerPass: flopsPerPass
             )
         }
         return report
@@ -230,6 +230,79 @@ enum ResultsFormatter {
         return report
     }
 
+    private static func formatInferenceComparisonSection(
+        trainingResult: BenchmarkResult,
+        inferenceResult: BenchmarkResult,
+        inferenceTimingBreakdown: (ane: Double, io: Double, elem: Double)?,
+        inferenceCompileTimeMs: Double?,
+        coreMLResults: [(label: String, result: BenchmarkResult)]?,
+        coreMLLoadTimeMs: Double?,
+        flopsPerPass: Double
+    ) -> String {
+        let inferenceTFLOPS = FLOPCalculator.sustainedTFLOPS(flops: flopsPerPass, latencyMs: inferenceResult.median)
+        let inferenceUtilization = FLOPCalculator.aneUtilization(sustainedTFLOPS: inferenceTFLOPS)
+        let inferenceForwardPassesPerSecond = inferenceResult.median > 0 ? 1_000.0 / inferenceResult.median : 0
+        let trainingToInferenceSpeedup = inferenceResult.median > 0 ? trainingResult.median / inferenceResult.median : 0
+
+        var lines: [String] = []
+        lines.append("Inference Comparison")
+        lines.append("--------------------")
+        if let inferenceCompileTimeMs {
+            lines.append(formatted("Inference compile time: %.3f ms", inferenceCompileTimeMs))
+        }
+        lines.append(tableHeader())
+        lines.append(tableRow(label: inferenceResult.label, result: inferenceResult))
+        for entry in coreMLResults ?? [] {
+            lines.append(tableRow(label: entry.label, result: entry.result))
+        }
+        lines.append("")
+        lines.append(
+            formatted(
+                "%@: %.3f TFLOPS | %.2f%% peak utilization | %.2f forward passes/sec",
+                inferenceResult.label as NSString,
+                inferenceTFLOPS,
+                inferenceUtilization,
+                inferenceForwardPassesPerSecond
+            )
+        )
+        lines.append(
+            formatted(
+                "Training vs inference speedup: %.2fx",
+                trainingToInferenceSpeedup
+            )
+        )
+        if let breakdown = inferenceTimingBreakdown {
+            let total = breakdown.ane + breakdown.io + breakdown.elem
+            lines.append("")
+            lines.append("Time Breakdown (\(inferenceResult.label), avg ms)")
+            lines.append(String(repeating: "-", count: max(20, 20 + inferenceResult.label.count)))
+            lines.append(timeBreakdownRow(label: "ANE compute", value: breakdown.ane, total: total))
+            lines.append(timeBreakdownRow(label: "IO", value: breakdown.io, total: total))
+            lines.append(timeBreakdownRow(label: "CPU", value: breakdown.elem, total: total))
+        }
+        if let coreMLResults, !coreMLResults.isEmpty {
+            lines.append("")
+            lines.append("Core ML Comparison (vs inference)")
+            lines.append("-------------------------------")
+            if let coreMLLoadTimeMs {
+                lines.append(formatted("Core ML load time (.all): %.3f ms", coreMLLoadTimeMs))
+            }
+            for entry in coreMLResults {
+                let ratio = entry.result.median > 0 ? entry.result.median / inferenceResult.median : 0
+                lines.append(
+                    formatted(
+                        "%@: median %.3f ms | vs %@ %.2fx",
+                        entry.label,
+                        entry.result.median,
+                        inferenceResult.label as NSString,
+                        ratio
+                    )
+                )
+            }
+        }
+        return lines.joined(separator: "\n") + "\n"
+    }
+
     static func formatDecodeReport(
         decodeResult: BenchmarkResult,
         decodeTimingBreakdown: (ane: Double, io: Double, elem: Double)?,
@@ -266,6 +339,34 @@ enum ResultsFormatter {
         if let coreMLLoadTimeMs {
             lines.append("")
             lines.append(formatted("Core ML decode load time: %.3f ms", coreMLLoadTimeMs))
+        }
+        if let coreMLDecodeResults, !coreMLDecodeResults.isEmpty {
+            lines.append("")
+            lines.append("Core ML Decode Comparison")
+            lines.append("------------------------")
+            for entry in coreMLDecodeResults {
+                let speedup = entry.result.median > 0 ? entry.result.median / decodeResult.median : 0
+                lines.append(
+                    formatted(
+                        "%@: median %.3f ms/token | %@ speedup %.2fx",
+                        entry.label,
+                        entry.result.median,
+                        decodeResult.label as NSString,
+                        speedup
+                    )
+                )
+            }
+            if let fastest = coreMLDecodeResults.min(by: { $0.result.median < $1.result.median })?.result {
+                let strictSpeedup = fastest.median > 0 ? fastest.median / decodeResult.median : 0
+                lines.append(
+                    formatted(
+                        "Fastest Core ML decode median %.3f ms/token | %@ speedup %.2fx",
+                        fastest.median,
+                        decodeResult.label as NSString,
+                        strictSpeedup
+                    )
+                )
+            }
         }
         return lines.joined(separator: "\n") + "\n"
     }

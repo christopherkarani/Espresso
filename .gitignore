@@ -55,6 +55,12 @@ scripts/package_espresso_bench_app.sh
 docs/
 prompts/
 scripts/
+!scripts/
+scripts/*
+!scripts/ensure_coreml_model.sh
+!scripts/generate_coreml_model.py
+!scripts/reproduce_local_real_artifact_claim.sh
+!scripts/run_power_benchmark.sh
 tasks/
 AGENTS.md
 CLAUDE.md

@@ -10,6 +10,7 @@ TIMESTAMP="$(date +%Y-%m-%d-%H%M%S)"
 RESULTS_DIR="benchmarks/results/power-${TIMESTAMP}"
 BENCH="./.build/release/espresso-bench"
 ENSURE_COREML_MODEL="./scripts/ensure_coreml_model.sh"
+POWER_PID=""
 
 usage() {
   cat <<'EOF'
@@ -24,7 +25,7 @@ EOF
 }
 
 prepare_coreml_model() {
-  if [[ -f "${MODEL_PATH}" ]]; then
+  if [[ -e "${MODEL_PATH}" ]]; then
     return 0
   fi
 
@@ -40,6 +41,16 @@ prepare_coreml_model() {
     --weight-mode "${COREML_WEIGHT_MODE}"
 }
 
+cleanup_powermetrics() {
+  if [[ -n "${POWER_PID}" ]]; then
+    kill "${POWER_PID}" >/dev/null 2>&1 || true
+    wait "${POWER_PID}" >/dev/null 2>&1 || true
+    POWER_PID=""
+  fi
+}
+
+trap cleanup_powermetrics EXIT INT TERM
+
 run_case() {
   local label="$1"
   shift
@@ -53,7 +64,7 @@ run_case() {
     --sample-interval 1000 \
     -n 60 \
     >"${power_log}" 2>&1 &
-  local power_pid=$!
+  POWER_PID=$!
 
   "${BENCH}" \
     --sustained \
@@ -64,7 +75,7 @@ run_case() {
     --output "${RESULTS_DIR}/${label}" \
     "${bench_args[@]}"
 
-  wait "${power_pid}" || true
+  cleanup_powermetrics
   echo "powermetrics log: ${power_log}"
   echo
 }

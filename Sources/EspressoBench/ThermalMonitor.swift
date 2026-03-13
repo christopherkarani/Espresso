@@ -32,10 +32,12 @@ enum ThermalMonitor {
             try body()
 
             let now = ContinuousClock.now
-            while now >= nextSampleTime {
-                let elapsed = durationMs(nextSampleTime - start) / 1_000.0
+            if now >= nextSampleTime {
+                let elapsed = durationMs(now - start) / 1_000.0
                 samples.append((time: elapsed, state: currentState()))
-                nextSampleTime += .seconds(1)
+                repeat {
+                    nextSampleTime += .seconds(1)
+                } while now >= nextSampleTime
             }
         }
 

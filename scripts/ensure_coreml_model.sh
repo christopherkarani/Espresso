@@ -7,6 +7,7 @@ OUTPUT_PATH=""
 LAYER_COUNT=1
 WEIGHT_MODE="random"
 COREMLTOOLS_VENV="${COREMLTOOLS_VENV:-/tmp/coremltools312-install-venv}"
+GENERATOR_SCRIPT="${ROOT}/scripts/generate_coreml_model.py"
 
 usage() {
   cat <<'EOF'
@@ -58,6 +59,10 @@ done
 }
 [[ "$OUTPUT_PATH" == *.mlpackage ]] || {
   echo "--output must end with .mlpackage" >&2
+  exit 1
+}
+[[ -f "$GENERATOR_SCRIPT" ]] || {
+  echo "Missing Core ML generator script: $GENERATOR_SCRIPT" >&2
   exit 1
 }
 
@@ -132,7 +137,7 @@ echo "  layers=${LAYER_COUNT}"
 echo "  weight_mode=${WEIGHT_MODE}"
 echo "  output=${OUTPUT_PATH}"
 
-"${PYTHON_BIN}" "${ROOT}/scripts/generate_coreml_model.py" \
+"${PYTHON_BIN}" "${GENERATOR_SCRIPT}" \
   --layers "${LAYER_COUNT}" \
   --weight-mode "${WEIGHT_MODE}" \
   --output "${OUTPUT_PATH}"
