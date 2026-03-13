@@ -58,6 +58,7 @@ echo "git_branch=$(git -C "$ROOT" rev-parse --abbrev-ref HEAD)"
 echo "git_dirty=$([ -n "$git_dirty" ] && echo "true" || echo "false")"
 echo "results_dir=$RESULTS_DIR"
 echo "disk_free_mb_start=$(df -m "$RESULTS_DIR" 2>/dev/null | awk 'NR==2{print $4}' || echo unknown)"
+echo "memory_free_pct_start=$(sysctl -n kern.memorystatus_level 2>/dev/null || echo unknown)"
 echo ""
 
 if [[ "$DRY_RUN" == "1" ]]; then
@@ -491,6 +492,7 @@ fi
     echo "WARNING: artifact file(s) missing or empty at claim time: $missing_artifacts"
   fi
   echo "disk_free_mb_end=$(df -m "$RESULTS_DIR" 2>/dev/null | awk 'NR==2{print $4}' || echo unknown)"
+  echo "memory_free_pct_end=$(sysctl -n kern.memorystatus_level 2>/dev/null || echo unknown)"
   claim_elapsed_s=$(( $(date +%s) - claim_start_epoch ))
   echo "claim_total_elapsed_s=$claim_elapsed_s"
   git_commit_end="$(git -C "$ROOT" rev-parse HEAD)"
