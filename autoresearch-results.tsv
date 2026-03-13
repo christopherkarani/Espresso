@@ -335,3 +335,6 @@ cycle	timestamp	hypothesis	result	commit	notes
 335	2026-03-13T05:25:54Z	git-commit-xval	claim	cross-validate git_commit between claim and harness	pass
 336	2026-03-13T05:26:17Z	gate-token-check	claim	validate offline gate token accounting fields exist	pass
 337	2026-03-13T05:27:09Z	test-suite	verify	405 tests pass, 0 failures, 121 skipped	pass
+338	2026-03-13T05:28:11Z	jq-error-guard	claim	add error handling for jq extraction from summary.json	pass
+339	2026-03-13T05:28:38Z	parity-val-check	claim	validate offline gate parity_status is match|mismatch	pass
+340	2026-03-13T05:29:33Z	test-suite	verify	405 tests pass, 0 failures, 121 skipped	pass
