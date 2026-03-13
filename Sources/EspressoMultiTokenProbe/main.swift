@@ -459,6 +459,8 @@ private func compileOnlyPayload(options: Options) throws -> [String: Any] {
         "layer_count": options.layerCount,
         "output_head_backend": describe(options.outputHeadBackend),
         "max_sequence_tokens": options.maxSequenceTokens,
+        "trunk_lane_spatial": options.trunkLaneSpatial,
+        "output_head_lane_spatial": options.outputHeadLaneSpatial,
         "control": [
             "init_wall_ms": control.wallInitMs,
             "reported_compile_ms": control.reportedCompileTimeMs,
@@ -591,6 +593,8 @@ private func comparePayload(options: Options) throws -> [String: Any] {
         "iterations": options.iterations,
         "max_new_tokens": options.maxNewTokens,
         "max_sequence_tokens": options.maxSequenceTokens,
+        "trunk_lane_spatial": options.trunkLaneSpatial,
+        "output_head_lane_spatial": options.outputHeadLaneSpatial,
         "prompt_tokens": prompt.map(Int.init),
         "parity_status": exactParity ? "match" : "mismatch",
         "parity_match_count": parityMatchCount,
