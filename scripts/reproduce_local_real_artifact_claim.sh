@@ -510,6 +510,12 @@ fi
     if [[ -n "$harness_contract_input" && "$harness_contract_input" != "recurrent-checkpoint" ]]; then
       echo "WARNING: expected input_mode=recurrent-checkpoint but harness used input_mode=$harness_contract_input"
     fi
+    # Cross-validate hostname: claim pipeline must run on same host as harness
+    claim_hostname="$(hostname 2>/dev/null || echo "")"
+    harness_hostnames="$(jq -r '.per_run_hostnames // [] | map(select(. != null)) | unique | join(",")' "$PUBLIC_RESULTS_DIR/summary.json" 2>/dev/null || true)"
+    if [[ -n "$claim_hostname" && -n "$harness_hostnames" && "$harness_hostnames" != *"$claim_hostname"* ]]; then
+      echo "WARNING: claim hostname=$claim_hostname not found in harness hostnames=$harness_hostnames"
+    fi
     # Cross-validate artifact hashes: claim exports vs harness inputs
     claim_recurrent_sha="$(shasum -a 256 "$ARTIFACT_PREFIX.recurrent.bin" 2>/dev/null | awk '{print $1}')"
     harness_recurrent_sha="$(jq -r '.artifact_hashes.recurrent_checkpoint_sha256 // empty' "$PUBLIC_RESULTS_DIR/summary.json" 2>/dev/null || true)"
