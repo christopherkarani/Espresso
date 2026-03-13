@@ -281,6 +281,7 @@ fi
       "harness_per_run_coreml_medians_ms=\(.coreml.per_run_medians_ms // [] | tojson)",
       "harness_per_run_coreml_p95s_ms=\(.coreml.per_run_p95s_ms // [] | tojson)",
       "harness_total_elapsed_s=\(.total_elapsed_s | na)",
+      "harness_probe_build_elapsed_s=\(.probe_build_elapsed_s | na)",
       "harness_requested_repeats=\(.requested_repeats | na)",
       "harness_valid_runs=\(.valid_runs)",
       "harness_failed_runs=\(.failed_runs // 0)",

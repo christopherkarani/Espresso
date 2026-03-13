@@ -201,8 +201,11 @@ trap cleanup_on_interrupt INT TERM
   echo "memory_free_pct=$(sysctl -n kern.memorystatus_level 2>/dev/null || echo unknown)"
 } > "$RESULTS_DIR/metadata.txt"
 
+build_start_epoch=$(date +%s)
 echo "Building release probe into $SCRATCH_PATH"
 swift build -c release --product espresso-multitoken-probe --scratch-path "$SCRATCH_PATH"
+PROBE_BUILD_ELAPSED_S=$(( $(date +%s) - build_start_epoch ))
+echo "Probe build completed in ${PROBE_BUILD_ELAPSED_S}s"
 
 if [[ ! -x "$PROBE" ]]; then
   echo "FATAL: Probe binary not found or not executable at $PROBE" >&2
@@ -498,6 +501,7 @@ jq -s \
   --argjson requested_repeats "$REPEATS" \
   --argjson failed "$failed_runs" \
   --argjson total_elapsed_s "$total_benchmark_elapsed" \
+  --argjson probe_build_elapsed_s "$PROBE_BUILD_ELAPSED_S" \
   --arg hw_model "$(sysctl -n hw.model 2>/dev/null || echo unknown)" \
   --arg load_avg "$LOAD_START" \
   --arg macos_version "$(sw_vers -productVersion 2>/dev/null || echo unknown)" \
@@ -570,6 +574,7 @@ jq -s \
     future_sidecar_sha256: (if $sidecar_sha256 == "" then null else $sidecar_sha256 end),
     generation_model_sha256: (if $generation_sha256 == "" then null else $generation_sha256 end)
   },
+  probe_build_elapsed_s: $probe_build_elapsed_s,
   requested_repeats: $requested_repeats,
   valid_runs: (length),
   failed_runs: $failed,
