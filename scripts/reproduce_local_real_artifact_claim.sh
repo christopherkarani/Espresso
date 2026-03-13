@@ -159,6 +159,13 @@ if ! [[ "$PROMPT_TOKEN" =~ ^[0-9]+$ ]]; then
   exit 1
 fi
 
+# Cross-validate manifest layerCount matches the claim contract
+manifest_layer_count="$(jq -r '.layerCount // empty' "$ARTIFACT_PREFIX.manifest.json" 2>/dev/null || true)"
+if [[ -n "$manifest_layer_count" && "$manifest_layer_count" != "$LAYER_COUNT" ]]; then
+  echo "FATAL: manifest layerCount=$manifest_layer_count does not match claim LAYER_COUNT=$LAYER_COUNT" >&2
+  exit 1
+fi
+
 if [[ ! -x "$COREMLTOOLS_PYTHON" ]]; then
   PY312="${PY312:-/opt/homebrew/opt/python@3.12/bin/python3.12}"
   if [[ ! -x "$PY312" ]]; then
