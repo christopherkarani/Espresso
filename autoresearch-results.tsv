@@ -363,3 +363,4 @@ cycle	timestamp	hypothesis	result	commit	notes
 363	2026-03-13T13:05:12Z	harness	extend NaN/Infinity check from 5 to 19 timing fields	scripts/reproduce_exact_4x.sh	committed
 364	2026-03-13T13:06:19Z	claim	cross-validate manifest tokenCount against dataset byte count	scripts/reproduce_local_real_artifact_claim.sh	committed
 365	2026-03-13T13:07:13Z	harness	verify probe binary architecture matches host (arm64/x86_64)	scripts/reproduce_exact_4x.sh	committed
+366	2026-03-13T13:07:37Z	verify	DRY_RUN smoke test — claim script DRY_RUN passes, harness needs CoreML model	-	verified
