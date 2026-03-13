@@ -748,6 +748,15 @@ if [[ -n "$short_gen" ]]; then
   gate_warnings="${gate_warnings}SHORT_GENERATION: some runs generated fewer than max_new_tokens ($MAX_NEW_TOKENS) tokens\n"
 fi
 
+# Iteration count consistency (detect early termination)
+iter_mismatch="$(jq -s --argjson expected "$ITERATIONS" \
+  'map(.measured_iteration_count // null) | map(select(. != null and . != $expected)) | if length > 0 then . else empty end' \
+  "${valid_runs[@]}" 2>/dev/null || echo "")"
+if [[ -n "$iter_mismatch" ]]; then
+  gate_status="warn"
+  gate_warnings="${gate_warnings}ITERATION_COUNT_MISMATCH: some runs measured ${iter_mismatch} iterations (expected ${ITERATIONS})\n"
+fi
+
 # Timestamp monotonicity check (detect clock skew or out-of-order execution)
 ts_nonmono="$(jq -s '
   [.[] | .probe_timestamp // null] | map(select(. != null)) |
