@@ -9210,4 +9210,235 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         } // end for includeRMS
     }
 
+    // MARK: - Cycle 25: GPUPipelinedHead Production Test
+
+    func test_cycle25_gpu_pipelined_head_on_hardware() throws {
+        try requireGenerationHardware()
+
+        let dim = ModelConfig.dim
+        let layerCount = 6
+        let bneck = 64
+        let streamCount = 16384
+        let trunkGroups = 16
+        let warmup = 10
+        let iters = 60
+
+        let weights = makeEchoRecurrentGenerationWeights(layerCount: layerCount)
+        let vocabSize = weights.vocabSize
+
+        let wF16 = UnsafeMutablePointer<Float16>.allocate(capacity: vocabSize * bneck)
+        defer { wF16.deallocate() }
+        for i in 0..<(vocabSize * bneck) { wF16[i] = Float16.random(in: -0.01...0.01) }
+        let wBuf = UnsafeBufferPointer(start: wF16, count: vocabSize * bneck)
+
+        let rmsGammaFp16 = UnsafeMutablePointer<Float16>.allocate(capacity: dim)
+        defer { rmsGammaFp16.deallocate() }
+        weights.rmsFinal.withUnsafePointer { src in
+            for i in 0..<dim { rmsGammaFp16[i] = Float16(src[i]) }
+        }
+        let projWFp16 = UnsafeMutablePointer<Float16>.allocate(capacity: dim * bneck)
+        defer { projWFp16.deallocate() }
+        for i in 0..<(dim * bneck) { projWFp16[i] = Float16.random(in: -0.01...0.01) }
+
+        let embFp16 = UnsafeMutablePointer<Float16>.allocate(capacity: vocabSize * dim)
+        defer { embFp16.deallocate() }
+        weights.embedding.withUnsafePointer { src in
+            for i in 0..<(vocabSize * dim) { embFp16[i] = Float16(src[i]) }
+        }
+
+        let aneQueue = DispatchQueue(label: "ane.eval.c25", qos: .userInteractive)
+
+        print("=== Cycle 25: GPUPipelinedHead (3L NoRMS + GPU embed) ===")
+
+        do {
+            // 3L NoRMS — 1 triplet per pipeline slot
+            var trA = try LayerStorage<RWKVStyleFusedThreeLayerSession>(
+                count: 1,
+                throwingInitializer: { _ in
+                    try RWKVStyleFusedThreeLayerSession(
+                        weights0: weights.layers[0], weights1: weights.layers[1],
+                        weights2: weights.layers[2], laneSpatial: streamCount,
+                        groups: trunkGroups, includeRMSNorm: false)
+                })
+            for i in 0..<3 { try trA[0].kernels.step.rebindInput(at: 1+i, to: trA[0].kernels.step.outputSurface(at: 1+i)) }
+            let trunkOutA = trA[0].handles.xOut
+            let t0xInA = trA[0].handles.xIn
+
+            var trB = try LayerStorage<RWKVStyleFusedThreeLayerSession>(
+                count: 1,
+                throwingInitializer: { _ in
+                    try RWKVStyleFusedThreeLayerSession(
+                        weights0: weights.layers[0], weights1: weights.layers[1],
+                        weights2: weights.layers[2], laneSpatial: streamCount,
+                        groups: trunkGroups, includeRMSNorm: false)
+                })
+            for i in 0..<3 { try trB[0].kernels.step.rebindInput(at: 1+i, to: trB[0].kernels.step.outputSurface(at: 1+i)) }
+            let trunkOutB = trB[0].handles.xOut
+            let t0xInB = trB[0].handles.xIn
+
+            // GPUPipelinedHead (RMSNorm + proj + expand + argmax + embed, single CB)
+            let headA = try GPUPipelinedHead(
+                rmsGamma: UnsafeBufferPointer(start: rmsGammaFp16, count: dim),
+                wProject: UnsafeBufferPointer(start: projWFp16, count: dim * bneck),
+                wExpand: wBuf,
+                embeddingFP16: UnsafeBufferPointer(start: embFp16, count: vocabSize * dim),
+                dim: dim, bottleneck: bneck, vocabSize: vocabSize, spatial: streamCount)
+            let headB = try GPUPipelinedHead(
+                rmsGamma: UnsafeBufferPointer(start: rmsGammaFp16, count: dim),
+                wProject: UnsafeBufferPointer(start: projWFp16, count: dim * bneck),
+                wExpand: wBuf,
+                embeddingFP16: UnsafeBufferPointer(start: embFp16, count: vocabSize * dim),
+                dim: dim, bottleneck: bneck, vocabSize: vocabSize, spatial: streamCount)
+
+            // CPU embed for initial priming
+            func cpuEmbWrite(_ surface: IOSurfaceRef) throws {
+                let tokens = Array(repeating: UInt16(0), count: streamCount)
+                try weights.embedding.withUnsafePointer { embPtr in
+                    try tokens.withUnsafeBufferPointer { tokenBuf in
+                        try SurfaceIO.writeEmbeddingBatchFP16(
+                            to: surface, channelOffset: 0, spatial: streamCount,
+                            embeddingTable: embPtr, dim: dim,
+                            tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount)
+                    }
+                }
+            }
+
+            // Prime
+            try cpuEmbWrite(t0xInA)
+            try cpuEmbWrite(t0xInB)
+            try trA[0].kernels.step.eval()
+            _ = try headA.runAndEmbed(trunkSurface: trunkOutA, embedSurface: t0xInA)
+            try trB[0].kernels.step.eval()
+
+            // Pipelined benchmark
+            var pipeUs: [Double] = []
+            var headUs: [Double] = []
+            var aneWaitUs: [Double] = []
+            for iter in 0..<(warmup + iters) {
+                let s = GenerationClock.now()
+                var aneError: (any Error)?
+
+                let g1 = DispatchGroup()
+                g1.enter()
+                aneQueue.async { defer { g1.leave() }
+                    do { try trB[0].kernels.step.eval() } catch { aneError = error }
+                }
+                let hs = mach_absolute_time()
+                _ = try headA.runAndEmbed(trunkSurface: trunkOutA, embedSurface: t0xInA)
+                let he = mach_absolute_time()
+                let ws = mach_absolute_time()
+                g1.wait()
+                let we = mach_absolute_time()
+                if let e = aneError { throw e }
+
+                let g2 = DispatchGroup()
+                g2.enter()
+                aneQueue.async { defer { g2.leave() }
+                    do { try trA[0].kernels.step.eval() } catch { aneError = error }
+                }
+                let hs2 = mach_absolute_time()
+                _ = try headB.runAndEmbed(trunkSurface: trunkOutB, embedSurface: t0xInB)
+                let he2 = mach_absolute_time()
+                let ws2 = mach_absolute_time()
+                g2.wait()
+                let we2 = mach_absolute_time()
+                if let e = aneError { throw e }
+
+                let elapsed = machMilliseconds(GenerationClock.now() - s) * 1000
+                if iter >= warmup {
+                    pipeUs.append(elapsed)
+                    headUs.append(machMilliseconds(he - hs) * 1000 + machMilliseconds(he2 - hs2) * 1000)
+                    aneWaitUs.append(machMilliseconds(we - ws) * 1000 + machMilliseconds(we2 - ws2) * 1000)
+                }
+            }
+
+            func med(_ a: [Double]) -> Double { let s = a.sorted(); return s[s.count / 2] }
+
+            // ---- A/B control: same ANE config, GPUFullHeadArgmax + CPU embed ----
+            let controlA = try GPUFullHeadArgmax(
+                rmsGamma: UnsafeBufferPointer(start: rmsGammaFp16, count: dim),
+                wProject: UnsafeBufferPointer(start: projWFp16, count: dim * bneck),
+                wExpand: wBuf, dim: dim, bottleneck: bneck, vocabSize: vocabSize, spatial: streamCount)
+            let controlB = try GPUFullHeadArgmax(
+                rmsGamma: UnsafeBufferPointer(start: rmsGammaFp16, count: dim),
+                wProject: UnsafeBufferPointer(start: projWFp16, count: dim * bneck),
+                wExpand: wBuf, dim: dim, bottleneck: bneck, vocabSize: vocabSize, spatial: streamCount)
+
+            var tokensA = Array(repeating: UInt16(0), count: streamCount)
+            var tokensB = Array(repeating: UInt16(0), count: streamCount)
+
+            try cpuEmbWrite(t0xInA)
+            try cpuEmbWrite(t0xInB)
+            try trA[0].kernels.step.eval()
+            do { let r = try controlA.run(trunkSurface: trunkOutA); for i in 0..<streamCount { tokensA[i] = r[i] } }
+            try weights.embedding.withUnsafePointer { embPtr in
+                try tokensA.withUnsafeBufferPointer { tBuf in
+                    try SurfaceIO.writeEmbeddingBatchFP16(
+                        to: t0xInA, channelOffset: 0, spatial: streamCount,
+                        embeddingTable: embPtr, dim: dim,
+                        tokenIDs: tBuf.baseAddress!, streamCount: streamCount)
+                }
+            }
+            try trB[0].kernels.step.eval()
+
+            var ctrlUs: [Double] = []
+            for iter in 0..<(warmup + iters) {
+                let s = GenerationClock.now()
+                var aneError: (any Error)?
+
+                let g1 = DispatchGroup()
+                g1.enter()
+                aneQueue.async { defer { g1.leave() }
+                    do { try trB[0].kernels.step.eval() } catch { aneError = error }
+                }
+                let rA = try controlA.run(trunkSurface: trunkOutA)
+                for i in 0..<streamCount { tokensA[i] = rA[i] }
+                try weights.embedding.withUnsafePointer { embPtr in
+                    try tokensA.withUnsafeBufferPointer { tBuf in
+                        try SurfaceIO.writeEmbeddingBatchFP16(
+                            to: t0xInA, channelOffset: 0, spatial: streamCount,
+                            embeddingTable: embPtr, dim: dim,
+                            tokenIDs: tBuf.baseAddress!, streamCount: streamCount)
+                    }
+                }
+                g1.wait()
+                if let e = aneError { throw e }
+
+                let g2 = DispatchGroup()
+                g2.enter()
+                aneQueue.async { defer { g2.leave() }
+                    do { try trA[0].kernels.step.eval() } catch { aneError = error }
+                }
+                let rB = try controlB.run(trunkSurface: trunkOutB)
+                for i in 0..<streamCount { tokensB[i] = rB[i] }
+                try weights.embedding.withUnsafePointer { embPtr in
+                    try tokensB.withUnsafeBufferPointer { tBuf in
+                        try SurfaceIO.writeEmbeddingBatchFP16(
+                            to: t0xInB, channelOffset: 0, spatial: streamCount,
+                            embeddingTable: embPtr, dim: dim,
+                            tokenIDs: tBuf.baseAddress!, streamCount: streamCount)
+                    }
+                }
+                g2.wait()
+                if let e = aneError { throw e }
+
+                let elapsed = machMilliseconds(GenerationClock.now() - s) * 1000
+                if iter >= warmup { ctrlUs.append(elapsed) }
+            }
+
+            let cMed = ctrlUs.sorted()[ctrlUs.count / 2]
+            let cTps = Double(streamCount * 2) / (cMed / 1000.0) * 1000.0
+
+            let medUs = pipeUs.sorted()[pipeUs.count / 2]
+            let tps = Double(streamCount * 2) / (medUs / 1000.0) * 1000.0
+            print("  GPUPipelinedHead:  median two-step=\(String(format: "%.3f", medUs / 1000)) ms, \(String(format: "%.0f", tps)) TPS")
+            print("    full-head=\(String(format: "%.1f", med(headUs))) µs, ANE-wait=\(String(format: "%.1f", med(aneWaitUs))) µs")
+            print("  Control (CPU embed): median two-step=\(String(format: "%.3f", cMed / 1000)) ms, \(String(format: "%.0f", cTps)) TPS")
+            print("  A/B delta: \(String(format: "%+.0f", tps - cTps)) TPS (\(String(format: "%+.1f", (tps/cTps - 1) * 100))%)")
+
+        } catch {
+            print("  FAILED: \(error)")
+        }
+    }
+
 }

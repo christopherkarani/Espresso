@@ -458,6 +458,7 @@ public final class GPUFullHeadArgmax {
 
     // MARK: - RMSNorm Shader
 
+    internal static func publicRmsNormSource(dim: Int) -> String { rmsNormSource(dim: dim) }
     private static func rmsNormSource(dim: Int) -> String {
         """
         #include <metal_stdlib>
@@ -488,6 +489,292 @@ public final class GPUFullHeadArgmax {
             for (uint c = 0; c < DIM; c++) {
                 float v = float(x[c * spatial + s]);
                 x[c * spatial + s] = half(v * rms_inv * float(gamma[c]));
+            }
+        }
+        """
+    }
+}
+
+/// GPU full pipeline head: RMSNorm → proj → expand → argmax → embed write.
+/// All stages execute in a single Metal command buffer. The embed write places
+/// token embeddings directly into an ANE input IOSurface in channel-first layout,
+/// eliminating the CPU embed write roundtrip.
+///
+/// Input: trunk IOSurface [1, dim, 1, spatial] (ANE output), embed IOSurface [1, dim, 1, spatial] (ANE input)
+/// Output: token IDs (uint16, still returned for verification/generation tracking)
+public final class GPUPipelinedHead {
+
+    private let device: MTLDevice
+    private let commandQueue: MTLCommandQueue
+    private let rmsNormPipeline: MTLComputePipelineState
+    private let argmaxPipeline: MTLComputePipelineState
+    private let embedPipeline: MTLComputePipelineState
+    private let projMatmul: MPSMatrixMultiplication
+    private let expandMatmul: MPSMatrixMultiplication
+
+    private let trunkBuffer: MTLBuffer      // [dim, spatial] fp16
+    private let gammaBuffer: MTLBuffer      // [dim] fp16
+    private let projWBuffer: MTLBuffer      // [dim, bneck] fp16
+    private let projOutBuffer: MTLBuffer    // [spatial, bneck] fp16
+    private let expandWBuffer: MTLBuffer    // [vocab, bneck] fp16
+    private let logitsBuffer: MTLBuffer     // [spatial, vocab] fp16
+    private let outputBuffer: MTLBuffer     // [spatial] uint16
+    private let embeddingBuffer: MTLBuffer  // [vocab, dim] fp16
+
+    public let dim: Int
+    public let bottleneck: Int
+    public let vocabSize: Int
+    public let spatial: Int
+
+    public init(
+        rmsGamma: UnsafeBufferPointer<Float16>,
+        wProject: UnsafeBufferPointer<Float16>,
+        wExpand: UnsafeBufferPointer<Float16>,
+        embeddingFP16: UnsafeBufferPointer<Float16>,
+        dim: Int,
+        bottleneck: Int,
+        vocabSize: Int,
+        spatial: Int
+    ) throws(MetalExpansionArgmaxError) {
+        guard dim > 0, bottleneck > 0, vocabSize > 0, spatial > 0 else {
+            throw .invalidArguments("all dimensions must be > 0")
+        }
+        guard rmsGamma.count >= dim else { throw .invalidArguments("rmsGamma too small") }
+        guard wProject.count >= dim * bottleneck else { throw .invalidArguments("wProject too small") }
+        guard wExpand.count >= vocabSize * bottleneck else { throw .invalidArguments("wExpand too small") }
+        guard embeddingFP16.count >= vocabSize * dim else { throw .invalidArguments("embeddingFP16 too small") }
+
+        guard let device = MTLCreateSystemDefaultDevice() else { throw .metalUnavailable }
+        guard let queue = device.makeCommandQueue() else { throw .commandQueueUnavailable }
+
+        // Compile RMSNorm kernel
+        let rmsLib: MTLLibrary
+        do { rmsLib = try device.makeLibrary(source: GPUFullHeadArgmax.publicRmsNormSource(dim: dim), options: nil) }
+        catch { throw .libraryBuildFailed("RMSNorm: \(error)") }
+        guard let rmsFn = rmsLib.makeFunction(name: "rms_norm_channelfirst") else {
+            throw .libraryBuildFailed("missing rms_norm_channelfirst")
+        }
+        let rmsPSO: MTLComputePipelineState
+        do { rmsPSO = try device.makeComputePipelineState(function: rmsFn) }
+        catch { throw .pipelineBuildFailed("RMSNorm: \(error)") }
+
+        // Compile argmax kernel
+        let argLib: MTLLibrary
+        do { argLib = try device.makeLibrary(source: MPSExpansionArgmax.argmaxShaderSource, options: nil) }
+        catch { throw .libraryBuildFailed("argmax: \(error)") }
+        guard let argFn = argLib.makeFunction(name: "row_argmax_fp16") else {
+            throw .libraryBuildFailed("missing row_argmax_fp16")
+        }
+        let argPSO: MTLComputePipelineState
+        do { argPSO = try device.makeComputePipelineState(function: argFn) }
+        catch { throw .pipelineBuildFailed("argmax: \(error)") }
+
+        // Compile embed write kernel
+        let embedLib: MTLLibrary
+        do { embedLib = try device.makeLibrary(source: Self.embedSource(dim: dim), options: nil) }
+        catch { throw .libraryBuildFailed("embed: \(error)") }
+        guard let embedFn = embedLib.makeFunction(name: "embed_write_channelfirst") else {
+            throw .libraryBuildFailed("missing embed_write_channelfirst")
+        }
+        let embedPSO: MTLComputePipelineState
+        do { embedPSO = try device.makeComputePipelineState(function: embedFn) }
+        catch { throw .pipelineBuildFailed("embed: \(error)") }
+
+        // MPS matmuls
+        let projMM = MPSMatrixMultiplication(
+            device: device, transposeLeft: true, transposeRight: true,
+            resultRows: spatial, resultColumns: bottleneck, interiorColumns: dim,
+            alpha: 1.0, beta: 0.0)
+        let expandMM = MPSMatrixMultiplication(
+            device: device, transposeLeft: false, transposeRight: true,
+            resultRows: spatial, resultColumns: vocabSize, interiorColumns: bottleneck,
+            alpha: 1.0, beta: 0.0)
+
+        // Allocate buffers
+        let trunkSize = dim * spatial * MemoryLayout<Float16>.stride
+        guard let trunkBuf = device.makeBuffer(length: trunkSize, options: .storageModeShared) else {
+            throw .bufferAllocationFailed
+        }
+        guard let gammaBuf = device.makeBuffer(bytes: rmsGamma.baseAddress!, length: dim * 2, options: .storageModeShared) else {
+            throw .bufferAllocationFailed
+        }
+        let projWSize = dim * bottleneck * MemoryLayout<Float16>.stride
+        guard let projWBuf = device.makeBuffer(bytes: wProject.baseAddress!, length: projWSize, options: .storageModeShared) else {
+            throw .bufferAllocationFailed
+        }
+        let projOutSize = spatial * bottleneck * MemoryLayout<Float16>.stride
+        guard let projOutBuf = device.makeBuffer(length: projOutSize, options: .storageModeShared) else {
+            throw .bufferAllocationFailed
+        }
+        let expandWSize = vocabSize * bottleneck * MemoryLayout<Float16>.stride
+        guard let expandWBuf = device.makeBuffer(bytes: wExpand.baseAddress!, length: expandWSize, options: .storageModeShared) else {
+            throw .bufferAllocationFailed
+        }
+        let logitsSize = spatial * vocabSize * MemoryLayout<Float16>.stride
+        guard let logitsBuf = device.makeBuffer(length: logitsSize, options: .storageModeShared) else {
+            throw .bufferAllocationFailed
+        }
+        guard let outBuf = device.makeBuffer(length: spatial * 2, options: .storageModeShared) else {
+            throw .bufferAllocationFailed
+        }
+        let embSize = vocabSize * dim * MemoryLayout<Float16>.stride
+        guard let embBuf = device.makeBuffer(bytes: embeddingFP16.baseAddress!, length: embSize, options: .storageModeShared) else {
+            throw .bufferAllocationFailed
+        }
+
+        self.device = device
+        self.commandQueue = queue
+        self.rmsNormPipeline = rmsPSO
+        self.argmaxPipeline = argPSO
+        self.embedPipeline = embedPSO
+        self.projMatmul = projMM
+        self.expandMatmul = expandMM
+        self.trunkBuffer = trunkBuf
+        self.gammaBuffer = gammaBuf
+        self.projWBuffer = projWBuf
+        self.projOutBuffer = projOutBuf
+        self.expandWBuffer = expandWBuf
+        self.logitsBuffer = logitsBuf
+        self.outputBuffer = outBuf
+        self.embeddingBuffer = embBuf
+        self.dim = dim
+        self.bottleneck = bottleneck
+        self.vocabSize = vocabSize
+        self.spatial = spatial
+    }
+
+    /// Run full pipeline: RMSNorm → proj → expand → argmax → embed write.
+    /// Writes embedded tokens directly to `embedSurface` in channel-first layout.
+    /// Returns pointer to token IDs (internal buffer, valid until next call).
+    public func runAndEmbed(
+        trunkSurface: IOSurfaceRef,
+        embedSurface: IOSurfaceRef
+    ) throws(MetalExpansionArgmaxError) -> UnsafeBufferPointer<UInt16> {
+        let trunkBytes = dim * spatial * MemoryLayout<Float16>.stride
+
+        // Copy trunk output to GPU buffer
+        let lockStatus = IOSurfaceLock(trunkSurface, [.readOnly], nil)
+        guard lockStatus == 0 else { throw .surfaceLockFailed(lockStatus) }
+        memcpy(trunkBuffer.contents(), IOSurfaceGetBaseAddress(trunkSurface), trunkBytes)
+        IOSurfaceUnlock(trunkSurface, [.readOnly], nil)
+
+        // Bind embed surface as Metal buffer
+        let embedLock = IOSurfaceLock(embedSurface, [], nil)
+        guard embedLock == 0 else { throw .surfaceLockFailed(embedLock) }
+        guard let embedOutBuffer = device.makeBuffer(
+            bytesNoCopy: IOSurfaceGetBaseAddress(embedSurface),
+            length: trunkBytes, options: .storageModeShared, deallocator: nil
+        ) else {
+            IOSurfaceUnlock(embedSurface, [], nil)
+            throw .bufferBindingFailed
+        }
+
+        guard let cb = commandQueue.makeCommandBuffer() else {
+            IOSurfaceUnlock(embedSurface, [], nil)
+            throw .commandBufferUnavailable
+        }
+
+        // 1. GPU RMSNorm in-place
+        guard let rmsEnc = cb.makeComputeCommandEncoder() else {
+            IOSurfaceUnlock(embedSurface, [], nil)
+            throw .commandEncoderUnavailable
+        }
+        rmsEnc.setComputePipelineState(rmsNormPipeline)
+        rmsEnc.setBuffer(trunkBuffer, offset: 0, index: 0)
+        rmsEnc.setBuffer(gammaBuffer, offset: 0, index: 1)
+        var dims = (UInt32(dim), UInt32(spatial))
+        withUnsafeBytes(of: &dims) { rmsEnc.setBytes($0.baseAddress!, length: $0.count, index: 2) }
+        let rmsTpg = min(256, Int(rmsNormPipeline.maxTotalThreadsPerThreadgroup))
+        rmsEnc.dispatchThreadgroups(
+            MTLSize(width: (spatial + rmsTpg - 1) / rmsTpg, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: rmsTpg, height: 1, depth: 1))
+        rmsEnc.endEncoding()
+
+        // 2. MPS projection
+        let trunkDesc = MPSMatrixDescriptor(rows: dim, columns: spatial, rowBytes: spatial * 2, dataType: .float16)
+        let projWDesc = MPSMatrixDescriptor(rows: bottleneck, columns: dim, rowBytes: dim * 2, dataType: .float16)
+        let projOutDesc = MPSMatrixDescriptor(rows: spatial, columns: bottleneck, rowBytes: bottleneck * 2, dataType: .float16)
+        let trunkMat = MPSMatrix(buffer: trunkBuffer, descriptor: trunkDesc)
+        let projWMat = MPSMatrix(buffer: projWBuffer, descriptor: projWDesc)
+        let projOutMat = MPSMatrix(buffer: projOutBuffer, descriptor: projOutDesc)
+        projMatmul.encode(commandBuffer: cb, leftMatrix: trunkMat, rightMatrix: projWMat, resultMatrix: projOutMat)
+
+        // 3. MPS expansion
+        let projDesc2 = MPSMatrixDescriptor(rows: spatial, columns: bottleneck, rowBytes: bottleneck * 2, dataType: .float16)
+        let expandWDesc = MPSMatrixDescriptor(rows: vocabSize, columns: bottleneck, rowBytes: bottleneck * 2, dataType: .float16)
+        let logitsDesc = MPSMatrixDescriptor(rows: spatial, columns: vocabSize, rowBytes: vocabSize * 2, dataType: .float16)
+        let projMat2 = MPSMatrix(buffer: projOutBuffer, descriptor: projDesc2)
+        let expandWMat = MPSMatrix(buffer: expandWBuffer, descriptor: expandWDesc)
+        let logitsMat = MPSMatrix(buffer: logitsBuffer, descriptor: logitsDesc)
+        expandMatmul.encode(commandBuffer: cb, leftMatrix: projMat2, rightMatrix: expandWMat, resultMatrix: logitsMat)
+
+        // 4. GPU argmax
+        guard let argEnc = cb.makeComputeCommandEncoder() else {
+            IOSurfaceUnlock(embedSurface, [], nil)
+            throw .commandEncoderUnavailable
+        }
+        argEnc.setComputePipelineState(argmaxPipeline)
+        argEnc.setBuffer(logitsBuffer, offset: 0, index: 0)
+        argEnc.setBuffer(outputBuffer, offset: 0, index: 1)
+        var vocabU32 = UInt32(vocabSize)
+        argEnc.setBytes(&vocabU32, length: 4, index: 2)
+        let argTpg = min(256, Int(argmaxPipeline.maxTotalThreadsPerThreadgroup))
+        argEnc.dispatchThreadgroups(
+            MTLSize(width: spatial, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: argTpg, height: 1, depth: 1))
+        argEnc.endEncoding()
+
+        // 5. GPU embed write to ANE input surface
+        guard let embedEnc = cb.makeComputeCommandEncoder() else {
+            IOSurfaceUnlock(embedSurface, [], nil)
+            throw .commandEncoderUnavailable
+        }
+        embedEnc.setComputePipelineState(embedPipeline)
+        embedEnc.setBuffer(outputBuffer, offset: 0, index: 0)
+        embedEnc.setBuffer(embeddingBuffer, offset: 0, index: 1)
+        embedEnc.setBuffer(embedOutBuffer, offset: 0, index: 2)
+        var sp = UInt32(spatial)
+        embedEnc.setBytes(&sp, length: 4, index: 3)
+        let embedTpg = min(256, Int(embedPipeline.maxTotalThreadsPerThreadgroup))
+        embedEnc.dispatchThreadgroups(
+            MTLSize(width: (spatial + embedTpg - 1) / embedTpg, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: embedTpg, height: 1, depth: 1))
+        embedEnc.endEncoding()
+
+        cb.commit()
+        cb.waitUntilCompleted()
+        IOSurfaceUnlock(embedSurface, [], nil)
+
+        if cb.status != .completed {
+            throw .commandExecutionFailed(cb.error?.localizedDescription ?? "status=\(cb.status.rawValue)")
+        }
+
+        return UnsafeBufferPointer(start: outputBuffer.contents().assumingMemoryBound(to: UInt16.self), count: spatial)
+    }
+
+    // MARK: - Embed Write Shader
+
+    private static func embedSource(dim: Int) -> String {
+        """
+        #include <metal_stdlib>
+        using namespace metal;
+
+        #define DIM \(dim)
+
+        /// Write token embeddings to ANE input surface in channel-first [dim, spatial] layout.
+        /// One thread per spatial lane. Reads token ID, gathers embedding, scatters to output.
+        kernel void embed_write_channelfirst(
+            const device ushort *tokenIds [[buffer(0)]],
+            const device half *embTable [[buffer(1)]],
+            device half *output [[buffer(2)]],
+            constant uint &spatial [[buffer(3)]],
+            uint lane [[thread_position_in_grid]]
+        ) {
+            if (lane >= spatial) return;
+            uint tokenId = uint(tokenIds[lane]);
+            const device half *emb = embTable + tokenId * DIM;
+            for (uint c = 0; c < DIM; c++) {
+                output[c * spatial + lane] = emb[c];
             }
         }
         """
@@ -970,3 +1257,4 @@ public final class MetalExpansionArgmax {
         """
     }
 }
+
