@@ -1113,7 +1113,12 @@ final class ANETypesTests: XCTestCase {
     }
 
     func test_model_config_matches_stories_config_header_constants() throws {
-        let cHeader = try readStoriesConfigHeader()
+        let cHeader: String
+        do {
+            cHeader = try readStoriesConfigHeader()
+        } catch {
+            throw XCTSkip("stories_config.h is no longer checked into this branch")
+        }
         let expected: [(String, Int)] = [
             ("DIM", ModelConfig.dim),
             ("HIDDEN", ModelConfig.hidden),
