@@ -193,6 +193,7 @@ trap cleanup_on_interrupt INT TERM
   echo "macos_version=$(sw_vers -productVersion 2>/dev/null || echo unknown)"
   echo "macos_build=$(sw_vers -buildVersion 2>/dev/null || echo unknown)"
   echo "power_source=$(pmset -g batt 2>/dev/null | head -1 | sed "s/.*'\(.*\)'.*/\1/" || echo unknown)"
+  echo "memory_free_pct=$(sysctl -n kern.memorystatus_level 2>/dev/null || echo unknown)"
 } > "$RESULTS_DIR/metadata.txt"
 
 echo "Building release probe into $SCRATCH_PATH"
@@ -735,6 +736,12 @@ fi
 DISK_FREE_MB_END="$(df -m "$RESULTS_DIR" 2>/dev/null | awk 'NR==2{print $4}' || echo 0)"
 if [[ "$DISK_FREE_MB_END" -lt 512 ]] 2>/dev/null; then
   gate_warnings="${gate_warnings}LOW_DISK_SPACE: only ${DISK_FREE_MB_END}MB free (started with ${DISK_FREE_MB_START}MB) — results may be unreliable\n"
+fi
+
+# Memory pressure check: warn if system memory is critically low
+MEMORY_FREE_PCT_END="$(sysctl -n kern.memorystatus_level 2>/dev/null || echo 100)"
+if [[ "$MEMORY_FREE_PCT_END" -lt 20 ]] 2>/dev/null; then
+  gate_warnings="${gate_warnings}LOW_MEMORY: system memory free at ${MEMORY_FREE_PCT_END}% — swapping may affect benchmark timing\n"
 fi
 
 if [[ ${#valid_runs[@]} -lt $MIN_VALID_RUNS ]]; then
