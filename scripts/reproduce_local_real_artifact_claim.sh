@@ -163,6 +163,7 @@ if [[ ! -e "$COREML_MODEL" ]]; then
 fi
 
 echo "Running public recurrent-checkpoint harness"
+harness_start_epoch=$(date +%s)
 harness_exit=0
 RESULTS_DIR="$PUBLIC_RESULTS_DIR" \
 INPUT_MODE="recurrent-checkpoint" \
@@ -182,6 +183,7 @@ MAX_SEQUENCE_TOKENS="$MAX_SEQUENCE_TOKENS" \
 LAYER_COUNT="$LAYER_COUNT" \
 DRY_RUN="$DRY_RUN" \
 "$ROOT/scripts/reproduce_exact_4x.sh" || harness_exit=$?
+harness_elapsed_s=$(( $(date +%s) - harness_start_epoch ))
 # Exit code 2 = gate fail (parity), 1 = runtime error, 0 = pass/warn
 if [[ $harness_exit -eq 1 ]]; then
   echo "FATAL: Inner harness failed with runtime error (exit 1)" >&2
@@ -206,6 +208,7 @@ fi
   echo "dataset_build_elapsed_s=$dataset_build_elapsed_s"
   echo "artifact_export_elapsed_s=$artifact_export_elapsed_s"
   echo "coreml_gen_elapsed_s=$coreml_gen_elapsed_s"
+  echo "harness_elapsed_s=$harness_elapsed_s"
   echo "dataset_sha256=$(shasum -a 256 "$DATASET_PATH" | awk '{print $1}')"
   dataset_bytes="$(wc -c < "$DATASET_PATH" | tr -d ' ')"
   echo "dataset_bytes=$dataset_bytes"
