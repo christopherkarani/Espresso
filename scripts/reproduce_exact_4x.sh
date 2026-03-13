@@ -643,7 +643,7 @@ fi
 # Merge gate status and outlier info into summary.json
 gate_warnings_json="[]"
 if [[ -n "$gate_warnings" ]]; then
-  gate_warnings_json="$(printf '%b' "$gate_warnings" | sed '/^$/d' | jq -R -s 'split("\n") | map(select(. != ""))')"
+  gate_warnings_json="$(printf '%b' "$gate_warnings" | sed '/^$/d' | jq -nR '[inputs | select(length > 0)]')"
 fi
 gate_json="$(jq -n \
   --arg status "$gate_status" \
