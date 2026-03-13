@@ -474,6 +474,7 @@ speedup_iqr="$(jq -s 'map(.two_step_speedup_vs_coreml) | sort | if length < 4 th
   echo "two_step_speedup_iqr=$speedup_iqr"
   echo "control_speedup_vs_coreml=$control_speedup"
   echo "total_elapsed_s=$total_benchmark_elapsed"
+  echo "probe_build_elapsed_s=$PROBE_BUILD_ELAPSED_S"
   echo "committed_exact_tokens_per_pass=$committed_tokens_per_pass"
   echo "accepted_future_tokens_per_pass=$accepted_future_tokens_per_pass"
   echo "all_parity_match=$all_parity_match"
