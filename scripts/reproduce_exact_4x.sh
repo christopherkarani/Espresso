@@ -400,6 +400,7 @@ coreml_stddev_ms="$(jq -s 'map(.coreml.median_ms_per_token) | (length) as $n | (
 coreml_iqr_ms="$(jq -s 'map(.coreml.median_ms_per_token) | sort | if length < 4 then (last - first) else (.[((length * 3 / 4) | floor)] - .[((length / 4) | floor)]) end' "${valid_runs[@]}")"
 speedup_mean="$(jq -s 'map(.two_step_speedup_vs_coreml) | add / length' "${valid_runs[@]}")"
 speedup_stddev="$(jq -s 'map(.two_step_speedup_vs_coreml) | (length) as $n | (add / $n) as $mean | (map(. - $mean | . * .) | add / $n | sqrt)' "${valid_runs[@]}")"
+speedup_iqr="$(jq -s 'map(.two_step_speedup_vs_coreml) | sort | if length < 4 then (last - first) else (.[((length * 3 / 4) | floor)] - .[((length / 4) | floor)]) end' "${valid_runs[@]}")"
 
 {
   echo "harness_version=$HARNESS_VERSION"
@@ -441,6 +442,7 @@ speedup_stddev="$(jq -s 'map(.two_step_speedup_vs_coreml) | (length) as $n | (ad
   echo "two_step_speedup_mean=$speedup_mean"
   echo "two_step_speedup_stddev=$speedup_stddev"
   echo "two_step_speedup_cv=$speedup_cv"
+  echo "two_step_speedup_iqr=$speedup_iqr"
   echo "control_speedup_vs_coreml=$control_speedup"
   echo "total_elapsed_s=$total_benchmark_elapsed"
   echo "committed_exact_tokens_per_pass=$committed_tokens_per_pass"
@@ -636,6 +638,7 @@ jq -s \
   two_step_speedup_mean: (map(.two_step_speedup_vs_coreml) | add / length),
   two_step_speedup_stddev: (map(.two_step_speedup_vs_coreml) | (length) as $n | (add / $n) as $mean | (map(. - $mean | . * .) | add / $n | sqrt)),
   two_step_speedup_cv: (map(.two_step_speedup_vs_coreml) | (length) as $n | (add / $n) as $mean | if $mean == 0 then 0 else (map(. - $mean | . * .) | add / $n | sqrt) / $mean end),
+  two_step_speedup_iqr: (map(.two_step_speedup_vs_coreml) | sort | if length < 4 then (last - first) else (.[((length * 3 / 4) | floor)] - .[((length / 4) | floor)]) end),
   per_run_speedups: (map(.two_step_speedup_vs_coreml)),
   control_speedup_vs_coreml: (map(.control_speedup_vs_coreml // null) | if all(. != null) then sort | .[((length - 1) / 2 | floor)] else null end),
   control_speedup_min: (map(.control_speedup_vs_coreml // null) | map(select(. != null)) | if length > 0 then min else null end),
