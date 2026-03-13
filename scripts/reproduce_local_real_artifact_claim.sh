@@ -482,6 +482,10 @@ fi
     if [[ -n "$harness_contract_prompt" && "$harness_contract_prompt" != "$PROMPT_TOKEN" ]]; then
       echo "WARNING: claim PROMPT_TOKEN=$PROMPT_TOKEN but harness contract prompt_token=$harness_contract_prompt"
     fi
+    harness_contract_input="$(jq -r '.benchmark_contract.input_mode // empty' "$PUBLIC_RESULTS_DIR/summary.json" 2>/dev/null || true)"
+    if [[ -n "$harness_contract_input" && "$harness_contract_input" != "recurrent-checkpoint" ]]; then
+      echo "WARNING: expected input_mode=recurrent-checkpoint but harness used input_mode=$harness_contract_input"
+    fi
     # Cross-validate artifact hashes: claim exports vs harness inputs
     claim_recurrent_sha="$(shasum -a 256 "$ARTIFACT_PREFIX.recurrent.bin" 2>/dev/null | awk '{print $1}')"
     harness_recurrent_sha="$(jq -r '.artifact_hashes.recurrent_checkpoint_sha256 // empty' "$PUBLIC_RESULTS_DIR/summary.json" 2>/dev/null || true)"
