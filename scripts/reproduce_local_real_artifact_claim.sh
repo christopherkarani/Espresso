@@ -125,7 +125,8 @@ echo "git_commit=$git_commit_start"
 echo "git_branch=$(git -C "$ROOT" rev-parse --abbrev-ref HEAD)"
 echo "git_dirty=$([ -n "$git_dirty" ] && echo "true" || echo "false")"
 echo "results_dir=$RESULTS_DIR"
-echo "disk_free_mb_start=$(df -m "$RESULTS_DIR" 2>/dev/null | awk 'NR==2{print $4}' || echo unknown)"
+disk_free_mb_start="$(df -m "$RESULTS_DIR" 2>/dev/null | awk 'NR==2{print $4}' || echo unknown)"
+echo "disk_free_mb_start=$disk_free_mb_start"
 echo "swift_version=$(swift --version 2>/dev/null | head -1 || echo unknown)"
 echo "hostname=$(hostname 2>/dev/null || echo unknown)"
 echo "macos_version=$(sw_vers -productVersion 2>/dev/null || echo unknown)"
@@ -755,6 +756,12 @@ fi
   disk_end="$(df -m "$RESULTS_DIR" 2>/dev/null | awk 'NR==2{print $4}' || echo 0)"
   if [[ "$disk_end" -lt 512 ]] 2>/dev/null; then
     echo "CLAIM_WARNING: LOW_DISK_SPACE — only ${disk_end}MB free at claim end"
+  fi
+  if [[ "$disk_free_mb_start" =~ ^[0-9]+$ && "$disk_end" =~ ^[0-9]+$ ]]; then
+    claim_disk_drop=$((disk_free_mb_start - disk_end))
+    if [[ "$claim_disk_drop" -gt 2048 ]] 2>/dev/null; then
+      echo "CLAIM_WARNING: DISK_DRIFT — free disk dropped ${claim_disk_drop}MB during claim (start=${disk_free_mb_start}MB end=${disk_end}MB)"
+    fi
   fi
   if [[ "$power_source_start" != "$power_source_end" && "$power_source_start" != "unknown" && "$power_source_end" != "unknown" ]]; then
     echo "CLAIM_WARNING: POWER_DRIFT — power source changed during claim (start='$power_source_start', end='$power_source_end')"
