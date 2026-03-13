@@ -647,6 +647,11 @@ if [[ "$power_source" != "AC Power" && "$power_source" != "unknown" ]]; then
   gate_warnings="${gate_warnings}BATTERY_POWER: running on '${power_source}' — frequency scaling may reduce reproducibility\n"
 fi
 
+DURATION_BUDGET_S="${DURATION_BUDGET_S:-600}"
+if [[ "$total_benchmark_elapsed" -gt "$DURATION_BUDGET_S" ]]; then
+  gate_warnings="${gate_warnings}LONG_DURATION: total ${total_benchmark_elapsed}s exceeds budget ${DURATION_BUDGET_S}s — thermal throttling may affect results\n"
+fi
+
 if [[ $failed_runs -gt 0 ]]; then
   gate_status="warn"
   gate_warnings="${gate_warnings}FAILED_RUNS: ${failed_runs}/${REPEATS} runs failed\n"
