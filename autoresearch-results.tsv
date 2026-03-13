@@ -332,3 +332,6 @@ cycle	timestamp	hypothesis	result	commit	notes
 332	2026-03-13T05:22:53Z	warning-count	claim	append claim_warning_count to claim-summary	pass
 333	2026-03-13T05:23:26Z	pipeline-decomp	claim	add pipeline_sum_s and pipeline_overhead_s to claim-summary	pass
 334	2026-03-13T05:24:16Z	test-suite	verify	405 tests pass, 0 failures, 121 skipped	pass
+335	2026-03-13T05:25:54Z	git-commit-xval	claim	cross-validate git_commit between claim and harness	pass
+336	2026-03-13T05:26:17Z	gate-token-check	claim	validate offline gate token accounting fields exist	pass
+337	2026-03-13T05:27:09Z	test-suite	verify	405 tests pass, 0 failures, 121 skipped	pass
