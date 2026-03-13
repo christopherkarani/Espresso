@@ -306,3 +306,12 @@ cycle	timestamp	hypothesis	result	commit	notes
 306	2026-03-13T05:03:16Z	artifact-sizes	claim	add byte sizes for all 5 artifact files in claim-summary	pass
 307	2026-03-13T05:04:42Z	artifact-sha-xval	claim	cross-validate 3 artifact SHA256s between claim and harness	pass
 308	2026-03-13T05:05:09Z	input-mode-xval	claim	cross-validate harness input_mode=recurrent-checkpoint	pass
+309	2026-03-13T05:06:55Z	lane-spatial-check	harness	add lane_spatial aggregation + consistency checks	pass
+310	2026-03-13T05:07:24Z	latency-len-check	harness	validate raw latency array lengths match measured_iteration_count	pass
+311	2026-03-13T05:07:57Z	coreml-latency-len	harness	extend raw latency length check to CoreML path	pass
+312	2026-03-13T05:08:20Z	neg-latency-check	harness	add negative latency detection across all 3 paths	pass
+313	2026-03-13T05:08:43Z	zero-latency-check	harness	add zero latency detection across all 3 paths	pass
+314	2026-03-13T05:09:37Z	test-suite	verify	405 tests pass, 0 failures, 121 skipped	pass
+315	2026-03-13T05:10:22Z	harness-elapsed	claim	add harness_elapsed_s to claim-summary for full decomposition	pass
+316	2026-03-13T05:11:17Z	lane-spatial-claim	claim	extract lane spatial per-run arrays into claim-summary	pass
+317	2026-03-13T05:12:19Z	nan-inf-check	harness	add NaN/Infinity detection for critical latency fields	pass
