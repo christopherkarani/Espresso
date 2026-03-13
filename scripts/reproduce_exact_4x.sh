@@ -306,9 +306,10 @@ if [[ -n "$GENERATION_MODEL" ]]; then
   COMMON_ARGS+=(--generation-model "$GENERATION_MODEL")
 fi
 
-# Capture pre-benchmark thermal and load for drift comparison
+# Capture pre-benchmark thermal, load, and disk for drift comparison
 THERMAL_START="$(pmset -g therm 2>/dev/null | grep -i 'cpu.*speed' | head -1 || echo unknown)"
 LOAD_START="$(sysctl -n vm.loadavg 2>/dev/null || echo unknown)"
+DISK_FREE_MB_START="$(df -m "$RESULTS_DIR" 2>/dev/null | awk 'NR==2{print $4}' || echo 0)"
 
 failed_runs=0
 benchmark_start_epoch=$(date +%s)
@@ -728,6 +729,12 @@ if [[ -n "$load_start_1m" && -n "$load_end_1m" && "$load_start_1m" != "unknown" 
     '($e | tonumber) > ([$s | tonumber, 1.0] | max) * 2' <<< 'null' >/dev/null 2>&1; then
     gate_warnings="${gate_warnings}LOAD_DRIFT: 1-min load average increased significantly (start=${load_start_1m} end=${load_end_1m})\n"
   fi
+fi
+
+# Disk space check: warn if free space dropped below 512MB
+DISK_FREE_MB_END="$(df -m "$RESULTS_DIR" 2>/dev/null | awk 'NR==2{print $4}' || echo 0)"
+if [[ "$DISK_FREE_MB_END" -lt 512 ]] 2>/dev/null; then
+  gate_warnings="${gate_warnings}LOW_DISK_SPACE: only ${DISK_FREE_MB_END}MB free (started with ${DISK_FREE_MB_START}MB) — results may be unreliable\n"
 fi
 
 if [[ ${#valid_runs[@]} -lt $MIN_VALID_RUNS ]]; then
