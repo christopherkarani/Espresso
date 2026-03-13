@@ -255,3 +255,7 @@ cycle	timestamp	hypothesis	result	commit	notes
 254	2026-03-13T04:58:58+03:00	d4037fb	valid run files in claim	scripts/reproduce_local_real_artifact_claim.sh	pass
 255	2026-03-13T04:59:22+03:00	b470ff2	per-run timestamps/probe versions in claim	scripts/reproduce_local_real_artifact_claim.sh	pass
 256	2026-03-13T05:00:22+03:00	-	test suite checkpoint: 405 pass, 0 fail	-	pass
+257	2026-03-13T05:01:47+03:00	cac7ee5	control speedup floor gate warning	scripts/reproduce_exact_4x.sh	pass
+258	2026-03-13T05:02:09+03:00	-	status assessment: deep diminishing returns	-	pass
+259	2026-03-13T05:02:45+03:00	6d03a7c	per-run input modes/layer counts in claim	scripts/reproduce_local_real_artifact_claim.sh	pass
+260	2026-03-13T05:03:57+03:00	-	test suite checkpoint: 405 pass, 0 fail	-	pass
