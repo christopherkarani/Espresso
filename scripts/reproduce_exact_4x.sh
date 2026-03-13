@@ -132,6 +132,7 @@ cleanup_on_interrupt() {
 trap cleanup_on_interrupt INT TERM
 
 {
+  echo "harness_version=$HARNESS_VERSION"
   echo "timestamp=$(date -Iseconds)"
   echo "git_commit=$(git -C "$ROOT" rev-parse HEAD)"
   echo "git_branch=$(git -C "$ROOT" rev-parse --abbrev-ref HEAD)"
@@ -207,6 +208,7 @@ fi
 
 if [[ "$DRY_RUN" == "1" ]]; then
   echo "=== Dry Run: All prerequisites validated ==="
+  echo "harness_version=$HARNESS_VERSION"
   echo "probe=$PROBE"
   echo "coreml_model=$COREML_MODEL"
   echo "jq=$(command -v jq)"
