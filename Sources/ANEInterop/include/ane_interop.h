@@ -216,6 +216,7 @@ bool ane_interop_io_write_embedding_batch_fp16(
     int ch_off,
     int spatial,
     const float *embedding_table,
+    int vocab_size,
     int dim,
     const uint16_t *token_ids,
     int stream_count);
