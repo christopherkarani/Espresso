@@ -339,8 +339,8 @@ for run in $(seq 1 "$REPEATS"); do
     echo "WARNING: Run $run exited with code $run_exit" >&2
     echo "  stderr tail: $(tail -3 "$RESULTS_DIR/run-$run.stderr.log")" >&2
     failed_runs=$((failed_runs + 1))
-  elif ! jq -e '.two_step.median_ms_per_token and .control.median_ms_per_token and .coreml.median_ms_per_token' "$RESULTS_DIR/run-$run.json" >/dev/null 2>&1; then
-    echo "WARNING: Run $run produced invalid JSON (missing required median fields)" >&2
+  elif ! jq -e 'type == "object" and .two_step.median_ms_per_token and .control.median_ms_per_token and .coreml.median_ms_per_token' "$RESULTS_DIR/run-$run.json" >/dev/null 2>&1; then
+    echo "WARNING: Run $run produced invalid JSON (not an object or missing required median fields)" >&2
     failed_runs=$((failed_runs + 1))
   fi
 done
@@ -375,7 +375,7 @@ valid_runs=()
 valid_outer_elapsed=()
 valid_stderr_lines=()
 for f in "$RESULTS_DIR"/run-*.json; do
-  if jq -e '.two_step.median_ms_per_token and .control.median_ms_per_token and .coreml.median_ms_per_token and .probe_version and .parity_status' "$f" >/dev/null 2>&1; then
+  if jq -e 'type == "object" and .two_step.median_ms_per_token and .control.median_ms_per_token and .coreml.median_ms_per_token and .probe_version and .parity_status' "$f" >/dev/null 2>&1; then
     valid_runs+=("$f")
     # Collect matching outer elapsed_s file
     elapsed_file="${f%.json}.elapsed_s"
