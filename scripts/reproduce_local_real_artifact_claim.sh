@@ -113,6 +113,7 @@ LAYER_COUNT="$LAYER_COUNT" \
   echo "dataset_sha256=$(shasum -a 256 "$DATASET_PATH" | awk '{print $1}')"
   echo "artifact_prefix=$ARTIFACT_PREFIX"
   echo "offline_gate_json=$OFFLINE_GATE_JSON"
+  echo "offline_gate_sha256=$(shasum -a 256 "$OFFLINE_GATE_JSON" | awk '{print $1}')"
   echo "coreml_model=$COREML_MODEL"
   echo "prompt_token=$PROMPT_TOKEN"
   echo "offline_committed_exact_tokens_per_pass=$(jq -r '.committed_exact_tokens_per_pass' "$OFFLINE_GATE_JSON")"
