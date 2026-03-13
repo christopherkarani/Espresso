@@ -140,6 +140,9 @@ fi
   echo "dataset_sha256=$(shasum -a 256 "$DATASET_PATH" | awk '{print $1}')"
   dataset_bytes="$(wc -c < "$DATASET_PATH" | tr -d ' ')"
   echo "dataset_bytes=$dataset_bytes"
+  if (( dataset_bytes % 2 != 0 )); then
+    echo "WARNING: dataset file has odd byte count ($dataset_bytes) — expected uint16 encoding"
+  fi
   echo "dataset_tokens=$((dataset_bytes / 2))"
   echo "max_corpus_bytes=$MAX_CORPUS_BYTES"
   echo "artifact_prefix=$ARTIFACT_PREFIX"
