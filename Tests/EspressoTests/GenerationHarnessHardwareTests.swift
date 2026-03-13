@@ -8721,7 +8721,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
 
         print("=== Projection-only head + Metal expansion pipeline ===")
 
-        for streamCount in [2048, 4096, 8192] {
+        for streamCount in [4096, 8192, 16384] {
             let trunkGroups = 16
 
             // Pipeline A: trunk + projection-only head

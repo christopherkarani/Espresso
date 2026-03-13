@@ -6,7 +6,7 @@
 
 #if defined(__aarch64__) || defined(__arm64__)
 #include <arm_neon.h>
-#define ARGMAX_MAX_NVECS 1024  /* supports up to spatial=8192 */
+#define ARGMAX_MAX_NVECS 2048  /* supports up to spatial=16384 */
 #endif
 
 #include "ane_interop.h"
@@ -480,9 +480,9 @@ bool ane_interop_io_write_embedding_batch_fp16(
          * convert float32→fp16 in 8-wide NEON vectors, writing a contiguous
          * row per channel. Much better cache behavior than per-stream scattered writes.
          */
-        if (stream_count > 0 && (stream_count % 8) == 0 && stream_count <= 8192) {
+        if (stream_count > 0 && (stream_count % 8) == 0 && stream_count <= 16384) {
             /* Pre-compute row pointers for each stream (avoid repeated multiply in inner loop) */
-            const float *embRows[8192];
+            const float *embRows[16384];
             for (int s = 0; s < stream_count; s++) {
                 embRows[s] = embedding_table + (size_t)token_ids[s] * (size_t)dim;
             }
@@ -1091,7 +1091,7 @@ bool ane_interop_io_argmax_batch_fp16_spatial_parallel(
     if (!surface || !out_indices || !out_values) return false;
     if (ch_off < 0 || spatial <= 0 || channels <= 0 || stream_count <= 0) return false;
     if (stream_count > spatial) return false;
-    if (spatial > 8192 || (spatial % 8) != 0) {
+    if (spatial > 16384 || (spatial % 8) != 0) {
         return ane_interop_io_argmax_batch_fp16_spatial(
             surface, ch_off, spatial, channels, stream_count,
             out_indices, out_values);
@@ -1194,7 +1194,7 @@ bool ane_interop_io_argmax_batch_fp16_spatial_nolock(
     if (n_blocks <= 1) n_blocks = 1;
     if (n_blocks > 32) n_blocks = 32;
     if (channels < n_blocks * 2) n_blocks = 1;
-    if (spatial > 8192 || (spatial % 8) != 0) n_blocks = 1;
+    if (spatial > 16384 || (spatial % 8) != 0) n_blocks = 1;
 
     /* No lock — caller guarantees coherency */
     const void *base = IOSurfaceGetBaseAddress(surface);
@@ -1369,7 +1369,7 @@ bool ane_interop_fused_expansion_argmax_fp16(
     if (!proj_surface || !expansion_weights_fp16 || !out_indices || !out_values) return false;
     if (spatial <= 0 || bottleneck <= 0 || groups <= 0 || vocab_size <= 0) return false;
     if (stream_count <= 0 || stream_count > spatial) return false;
-    if (spatial > 8192 || (spatial % 8) != 0) return false;
+    if (spatial > 16384 || (spatial % 8) != 0) return false;
     if (bottleneck % groups != 0 || vocab_size % groups != 0) return false;
     if (n_blocks <= 1) n_blocks = 1;
     if (n_blocks > 32) n_blocks = 32;
