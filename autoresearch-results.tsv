@@ -352,3 +352,4 @@ cycle	timestamp	hypothesis	result	commit	notes
 352	2026-03-13T05:43:01Z	harness+claim	add memory_free_pct_end to summary.json and fix gate null-handling	scripts/reproduce_exact_4x.sh,scripts/reproduce_local_real_artifact_claim.sh	committed
 353	2026-03-13T05:50:31Z	claim	cross-validate harness valid_runs count against REPEATS	scripts/reproduce_local_real_artifact_claim.sh	committed
 354	2026-03-13T12:56:49Z	harness	unify end-of-benchmark environment capture — consistent timing for summary.json and gates	scripts/reproduce_exact_4x.sh	committed
+355	2026-03-13T12:57:26Z	harness	capture memory_free_pct_start at benchmark start — consistent timing	scripts/reproduce_exact_4x.sh	committed
