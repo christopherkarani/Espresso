@@ -885,8 +885,9 @@ latency_len_mismatch="$(jq -s '
   [.[] | {
     mic: (.measured_iteration_count // 0),
     ctrl: (.control.raw_token_latencies_ms // [] | length),
-    two: (.two_step.raw_token_latencies_ms // [] | length)
-  } | select(.ctrl != .mic or .two != .mic)] |
+    two: (.two_step.raw_token_latencies_ms // [] | length),
+    cml: (.coreml.raw_token_latencies_ms // null | if . != null then length else null end)
+  } | select(.ctrl != .mic or .two != .mic or (.cml != null and .cml != .mic))] |
   if length > 0 then "raw latency array lengths differ from measured_iteration_count" else empty end
 ' "${valid_runs[@]}" 2>/dev/null || echo "")"
 if [[ -n "$latency_len_mismatch" ]]; then
