@@ -158,6 +158,7 @@ trap cleanup_on_interrupt INT TERM
   echo "timestamp=$(date -Iseconds)"
   echo "git_commit=$GIT_COMMIT_START"
   echo "git_branch=$(git -C "$ROOT" rev-parse --abbrev-ref HEAD)"
+  echo "git_dirty=$(git -C "$ROOT" status --porcelain 2>/dev/null | head -1 | grep -c . || echo 0)"
   echo "swift_version=$(swift --version | tr '\n' ' ')"
   echo "uname=$(uname -a)"
   echo "input_mode=$INPUT_MODE"
