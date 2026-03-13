@@ -149,6 +149,9 @@ fi
   echo "output_head_backend=$OUTPUT_HEAD_BACKEND"
   echo "public_summary=$PUBLIC_RESULTS_DIR/summary.txt"
   echo "public_summary_json=$PUBLIC_RESULTS_DIR/summary.json"
+  if [[ -f "$PUBLIC_RESULTS_DIR/summary.json" ]]; then
+    echo "summary_json_sha256=$(shasum -a 256 "$PUBLIC_RESULTS_DIR/summary.json" | awk '{print $1}')"
+  fi
   # Propagate key metrics from inner harness summary if available
   # Extract all harness metrics from summary.json in a single jq call
   if [[ -f "$PUBLIC_RESULTS_DIR/summary.json" ]]; then
