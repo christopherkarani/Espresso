@@ -269,6 +269,20 @@ if [[ -n "$GENERATION_MODEL" ]]; then
   COMMON_ARGS+=(--generation-model "$GENERATION_MODEL")
 fi
 
+# Canonical contract hash for fast cross-run equality comparison
+CONTRACT_HASH="$(printf '%s\n' \
+  "input_mode=$INPUT_MODE" \
+  "control_backend=$CONTROL_BACKEND" \
+  "two_step_backend=$TWO_STEP_BACKEND" \
+  "output_head_backend=$OUTPUT_HEAD_BACKEND" \
+  "warmup=$WARMUP" \
+  "iterations=$ITERATIONS" \
+  "max_new_tokens=$MAX_NEW_TOKENS" \
+  "max_sequence_tokens=$MAX_SEQUENCE_TOKENS" \
+  "layer_count=$LAYER_COUNT" \
+  "prompt_token=$PROMPT_TOKEN" \
+  | shasum -a 256 | awk '{print $1}')"
+
 failed_runs=0
 benchmark_start_epoch=$(date +%s)
 for run in $(seq 1 "$REPEATS"); do
@@ -456,6 +470,7 @@ jq -s \
   --argjson outer_elapsed "$(printf '%s\n' "${valid_outer_elapsed[@]}" | jq -s '.')" \
   --argjson prompt_token "${PROMPT_TOKEN:-null}" \
   --argjson stderr_lines "$(printf '%s\n' "${valid_stderr_lines[@]}" | jq -s '.')" \
+  --arg contract_hash "$CONTRACT_HASH" \
   --arg probe_sha256 "$PROBE_SHA256" \
   --arg coreml_sha256 "${COREML_MODEL_SHA256:-}" \
   --arg recurrent_sha256 "${RECURRENT_SHA256:-}" \
@@ -473,6 +488,7 @@ jq -s \
   host: {hw_model: $hw_model, chip: $chip, ncpu: $ncpu, physical_memory_gb: $physical_memory_gb, thermal_pressure: $thermal_pressure, load_average: $load_avg, macos_version: $macos_version, macos_build: $macos_build, power_source: $power_source},
   toolchain: {swift_version: $swift_version, jq_version: $jq_version},
   benchmark_contract: {
+    contract_hash: $contract_hash,
     input_mode: $input_mode,
     control_backend: $control_backend,
     two_step_backend: $two_step_backend,
