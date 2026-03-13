@@ -472,7 +472,7 @@ jq -s \
   --argjson failed "$failed_runs" \
   --argjson total_elapsed_s "$total_benchmark_elapsed" \
   --arg hw_model "$(sysctl -n hw.model 2>/dev/null || echo unknown)" \
-  --arg load_avg "$(sysctl -n vm.loadavg 2>/dev/null || echo unknown)" \
+  --arg load_avg "$LOAD_START" \
   --arg macos_version "$(sw_vers -productVersion 2>/dev/null || echo unknown)" \
   --arg macos_build "$(sw_vers -buildVersion 2>/dev/null || echo unknown)" \
   --arg power_source "$(pmset -g batt 2>/dev/null | head -1 | sed "s/.*'\(.*\)'.*/\1/" || echo unknown)" \
