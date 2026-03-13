@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Bump this when the harness summary.json contract changes (new fields, renamed keys, etc.).
-HARNESS_VERSION=5
+HARNESS_VERSION=6
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRATCH_PATH="${SCRATCH_PATH:-/tmp/espresso-ane-multitoken-release}"
