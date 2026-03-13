@@ -770,6 +770,17 @@ if [[ -n "$ts_nonmono" ]]; then
   gate_warnings="${gate_warnings}TIMESTAMP_ORDER: probe timestamps are not strictly increasing ($ts_nonmono)\n"
 fi
 
+# Per-run wall-time variance: warn if any run took >2x the median
+wall_outlier="$(jq -s 'map(.probe_wall_elapsed_s // null) | map(select(. != null)) |
+  if length < 3 then empty
+  else sort | .[((length - 1) / 2 | floor)] as $med |
+    map(select(. > $med * 2)) |
+    if length > 0 then "runs with >2x median wall time: \(.)" else empty end
+  end' "${valid_runs[@]}" 2>/dev/null || echo "")"
+if [[ -n "$wall_outlier" ]]; then
+  gate_warnings="${gate_warnings}WALL_TIME_OUTLIER: ${wall_outlier}\n"
+fi
+
 if [[ "$all_parity_match" != "true" ]]; then
   gate_status="fail"
   parity_detail="$(jq -s '[.[] | {run: input_line_number, status: .parity_status, match_count: (.parity_match_count // "n/a"), total: (.parity_total // "n/a")} | select(.status != "match")] | map("\(.run): \(.match_count)/\(.total)") | join(", ")' "${valid_runs[@]}" 2>/dev/null || echo "detail unavailable")"
