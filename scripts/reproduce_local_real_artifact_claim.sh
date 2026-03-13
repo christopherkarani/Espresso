@@ -250,6 +250,8 @@ fi
       "harness_control_init_wall_ms=\(.init_times.control_init_wall_ms | na)",
       "harness_two_step_init_wall_ms=\(.init_times.two_step_init_wall_ms | na)",
       "harness_coreml_compile_ms=\(.init_times.coreml_compile_ms | na)",
+      "harness_control_reported_compile_ms=\(.init_times.control_reported_compile_ms | na)",
+      "harness_two_step_reported_compile_ms=\(.init_times.two_step_reported_compile_ms | na)",
       "harness_control_init_wall_min_ms=\(.init_times.control_init_wall_min_ms | na)",
       "harness_control_init_wall_max_ms=\(.init_times.control_init_wall_max_ms | na)",
       "harness_two_step_init_wall_min_ms=\(.init_times.two_step_init_wall_min_ms | na)",
