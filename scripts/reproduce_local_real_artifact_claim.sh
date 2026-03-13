@@ -509,6 +509,11 @@ fi
     if [[ -n "$offline_committed" && -n "$harness_committed" && "$offline_committed" != "$harness_committed" ]]; then
       echo "WARNING: token accounting mismatch: offline committed=$offline_committed harness committed=$harness_committed"
     fi
+    offline_accepted="$(jq -r '.accepted_future_tokens_per_pass' "$OFFLINE_GATE_JSON" 2>/dev/null || echo "")"
+    harness_accepted="$(jq -r '.token_accounting.accepted_future_tokens_per_pass' "$PUBLIC_RESULTS_DIR/summary.json" 2>/dev/null || echo "")"
+    if [[ -n "$offline_accepted" && -n "$harness_accepted" && "$offline_accepted" != "$harness_accepted" ]]; then
+      echo "WARNING: token accounting mismatch: offline accepted_future=$offline_accepted harness accepted_future=$harness_accepted"
+    fi
     # Cross-validate claim-level contract params match harness contract
     harness_contract_layer="$(jq -r '.benchmark_contract.layer_count // empty' "$PUBLIC_RESULTS_DIR/summary.json" 2>/dev/null || true)"
     if [[ -n "$harness_contract_layer" && "$harness_contract_layer" != "$LAYER_COUNT" ]]; then
