@@ -278,7 +278,7 @@ fi
   # Propagate key metrics from inner harness summary if available
   # Extract all harness metrics from summary.json in a single jq call
   if [[ -f "$PUBLIC_RESULTS_DIR/summary.json" ]]; then
-    jq -r '
+    if ! jq -r '
       def na: . // "n/a";
       "harness_version=\(.harness_version | na)",
       "harness_git_commit=\(.git_commit | na)",
@@ -458,7 +458,9 @@ fi
       "harness_outlier_coreml=\(.reproducibility.outlier_detail.coreml.count // 0)",
       "harness_outlier_speedup=\(.reproducibility.outlier_detail.speedup.count // 0)",
       "harness_gate_warnings=\(.reproducibility.warnings // [] | tojson)"
-    ' "$PUBLIC_RESULTS_DIR/summary.json"
+    ' "$PUBLIC_RESULTS_DIR/summary.json"; then
+      echo "WARNING: jq extraction from summary.json failed — harness metrics may be incomplete"
+    fi
   elif [[ -f "$PUBLIC_RESULTS_DIR/summary.txt" ]]; then
     gate_line="$(grep '^gate_status=' "$PUBLIC_RESULTS_DIR/summary.txt" || true)"
     if [[ -n "$gate_line" ]]; then
