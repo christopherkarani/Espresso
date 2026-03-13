@@ -521,7 +521,10 @@ jq -s \
     control_reported_compile_ms: (map(.control.reported_compile_ms // null) | if all(. != null) then sort | .[((length - 1) / 2 | floor)] else null end),
     two_step_init_wall_ms: (map(.two_step.init_wall_ms // null) | if all(. != null) then sort | .[((length - 1) / 2 | floor)] else null end),
     two_step_reported_compile_ms: (map(.two_step.reported_compile_ms // null) | if all(. != null) then sort | .[((length - 1) / 2 | floor)] else null end),
-    coreml_compile_ms: (map(.coreml.reported_compile_ms // null) | if all(. != null) then sort | .[((length - 1) / 2 | floor)] else null end)
+    coreml_compile_ms: (map(.coreml.reported_compile_ms // null) | if all(. != null) then sort | .[((length - 1) / 2 | floor)] else null end),
+    per_run_control_init_wall_ms: (map(.control.init_wall_ms // null)),
+    per_run_two_step_init_wall_ms: (map(.two_step.init_wall_ms // null)),
+    per_run_coreml_compile_ms: (map(.coreml.reported_compile_ms // null))
   },
   two_step: {
     median_ms_per_token: (map(.two_step.median_ms_per_token) | sort | .[((length - 1) / 2 | floor)]),
