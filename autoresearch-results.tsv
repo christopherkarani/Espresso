@@ -346,3 +346,4 @@ cycle	timestamp	hypothesis	result	commit	notes
 346	2026-03-13T05:38:12Z	claim	record CoreML model file count and total bytes in claim summary	scripts/reproduce_local_real_artifact_claim.sh	committed
 347	2026-03-13T05:38:50Z	harness	add top-level JSON object type check to run validation	scripts/reproduce_exact_4x.sh	committed
 348	2026-03-13T05:39:41Z	test	test suite verification — 405 pass, 0 fail	-	verified
+349	2026-03-13T05:40:37Z	harness+claim	add power_source_end to summary.json host object and claim extraction	scripts/reproduce_exact_4x.sh,scripts/reproduce_local_real_artifact_claim.sh	committed
