@@ -627,6 +627,12 @@ CV_THRESHOLD="${CV_THRESHOLD:-0.10}"
 gate_status="pass"
 gate_warnings=""
 
+# Environment quality warnings (non-failing)
+power_source="$(pmset -g batt 2>/dev/null | head -1 | sed "s/.*'\(.*\)'.*/\1/" || echo unknown)"
+if [[ "$power_source" != "AC Power" && "$power_source" != "unknown" ]]; then
+  gate_warnings="${gate_warnings}BATTERY_POWER: running on '${power_source}' — frequency scaling may reduce reproducibility\n"
+fi
+
 if [[ $failed_runs -gt 0 ]]; then
   gate_status="warn"
   gate_warnings="${gate_warnings}FAILED_RUNS: ${failed_runs}/${REPEATS} runs failed\n"
