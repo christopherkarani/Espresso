@@ -550,6 +550,11 @@ fi
     if [[ -n "$harness_contract_input" && "$harness_contract_input" != "recurrent-checkpoint" ]]; then
       echo "WARNING: expected input_mode=recurrent-checkpoint but harness used input_mode=$harness_contract_input"
     fi
+    # Cross-validate valid run count against requested repeats
+    harness_valid="$(jq -r '.valid_runs // empty' "$PUBLIC_RESULTS_DIR/summary.json" 2>/dev/null || true)"
+    if [[ -n "$harness_valid" && "$harness_valid" != "$REPEATS" ]]; then
+      echo "WARNING: harness completed $harness_valid valid runs out of $REPEATS requested"
+    fi
     # Cross-validate git commit: claim and harness should be on the same commit
     harness_git="$(jq -r '.git_commit // empty' "$PUBLIC_RESULTS_DIR/summary.json" 2>/dev/null || true)"
     if [[ -n "$harness_git" && "$harness_git" != "$git_commit_start" ]]; then
