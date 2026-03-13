@@ -688,6 +688,12 @@ jq -s \
   outer_elapsed_range_s: ($outer_elapsed | map(select(. != null)) | if length >= 2 then (max - min) else null end)
 }' "${valid_runs[@]}" > "$RESULTS_DIR/summary.json"
 
+# Validate summary.json was written correctly
+if [[ ! -s "$RESULTS_DIR/summary.json" ]] || ! jq -e '.valid_runs' "$RESULTS_DIR/summary.json" >/dev/null 2>&1; then
+  echo "FATAL: summary.json is empty or malformed after aggregation" >&2
+  exit 1
+fi
+
 # Reproducibility gate: warn on high cross-run variance or parity failure
 gate_status="pass"
 gate_warnings=""
