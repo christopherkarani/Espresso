@@ -399,6 +399,7 @@ fi
       "harness_ncpu=\(.host.ncpu | na)",
       "harness_physical_memory_gb=\(.host.physical_memory_gb | na)",
       "harness_memory_free_pct=\(.host.memory_free_pct | na)",
+      "harness_memory_free_pct_end=\(.host.memory_free_pct_end | na)",
       "harness_disk_free_mb_start=\(.host.disk_free_mb_start | na)",
       "harness_disk_free_mb_end=\(.host.disk_free_mb_end | na)",
       "harness_control_init_wall_ms=\(.init_times.control_init_wall_ms | na)",

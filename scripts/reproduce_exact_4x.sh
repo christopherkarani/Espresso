@@ -371,6 +371,7 @@ done
 # Capture end-of-benchmark environment (before aggregation, so summary.json gets real values)
 DISK_FREE_MB_END="$(df -m "$RESULTS_DIR" 2>/dev/null | awk 'NR==2{print $4}' || echo 0)"
 POWER_SOURCE_END="$(pmset -g batt 2>/dev/null | head -1 | sed "s/.*'\(.*\)'.*/\1/" || echo unknown)"
+MEMORY_FREE_PCT_END="$(sysctl -n kern.memorystatus_level 2>/dev/null || echo null)"
 
 # Collect valid run JSONs (skip empty or malformed files from failed runs)
 valid_runs=()
@@ -536,6 +537,7 @@ jq -s \
   --arg thermal_pressure_end "$(pmset -g therm 2>/dev/null | grep -i 'cpu.*speed' | head -1 || echo unknown)" \
   --arg load_avg_end "$(sysctl -n vm.loadavg 2>/dev/null || echo unknown)" \
   --argjson memory_free_pct "$(sysctl -n kern.memorystatus_level 2>/dev/null || echo null)" \
+  --argjson memory_free_pct_end "${MEMORY_FREE_PCT_END:-null}" \
   --argjson disk_free_mb_start "${DISK_FREE_MB_START:-0}" \
   --argjson disk_free_mb_end "${DISK_FREE_MB_END:-0}" \
   --arg swift_version "$(swift --version 2>/dev/null | head -1 || echo unknown)" \
@@ -575,7 +577,7 @@ jq -s \
   timestamp: $ts,
   git_commit: $commit,
   git_branch: $branch,
-  host: {hw_model: $hw_model, chip: $chip, ncpu: $ncpu, physical_memory_gb: $physical_memory_gb, thermal_pressure: $thermal_pressure, thermal_pressure_end: $thermal_pressure_end, load_average: $load_avg, load_average_end: $load_avg_end, memory_free_pct: $memory_free_pct, disk_free_mb_start: $disk_free_mb_start, disk_free_mb_end: $disk_free_mb_end, macos_version: $macos_version, macos_build: $macos_build, power_source: $power_source, power_source_end: $power_source_end},
+  host: {hw_model: $hw_model, chip: $chip, ncpu: $ncpu, physical_memory_gb: $physical_memory_gb, thermal_pressure: $thermal_pressure, thermal_pressure_end: $thermal_pressure_end, load_average: $load_avg, load_average_end: $load_avg_end, memory_free_pct: $memory_free_pct, memory_free_pct_end: $memory_free_pct_end, disk_free_mb_start: $disk_free_mb_start, disk_free_mb_end: $disk_free_mb_end, macos_version: $macos_version, macos_build: $macos_build, power_source: $power_source, power_source_end: $power_source_end},
   toolchain: {swift_version: $swift_version, jq_version: $jq_version},
   benchmark_contract: {
     contract_hash: $contract_hash,
@@ -778,8 +780,10 @@ if [[ "$DISK_FREE_MB_END" -lt 512 ]] 2>/dev/null; then
 fi
 
 # Memory pressure check: warn if system memory is critically low
-MEMORY_FREE_PCT_END="$(sysctl -n kern.memorystatus_level 2>/dev/null || echo 100)"
-if [[ "$MEMORY_FREE_PCT_END" -lt 20 ]] 2>/dev/null; then
+# MEMORY_FREE_PCT_END was captured earlier (before aggregation); fallback to 100 for gate comparison
+mem_end_gate="${MEMORY_FREE_PCT_END:-100}"
+[[ "$mem_end_gate" == "null" ]] && mem_end_gate=100
+if [[ "$mem_end_gate" -lt 20 ]] 2>/dev/null; then
   gate_warnings="${gate_warnings}LOW_MEMORY: system memory free at ${MEMORY_FREE_PCT_END}% — swapping may affect benchmark timing\n"
 fi
 
