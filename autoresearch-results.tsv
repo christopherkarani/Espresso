@@ -239,3 +239,11 @@ cycle	timestamp	hypothesis	result	commit	notes
 238	2026-03-13T04:48:58+03:00	0ef1db6	debug build gate warning	scripts/reproduce_exact_4x.sh	pass
 239	2026-03-13T04:49:29+03:00	b8ec554	per-run build config in summary/claim	scripts	pass
 240	2026-03-13T04:50:22+03:00	-	test suite checkpoint: 405 pass, 0 fail	-	pass
+241	2026-03-13T04:51:06+03:00	629caa1	commit TSV through cycle 240	autoresearch-results.tsv	pass
+242	2026-03-13T04:51:25+03:00	f84e6d3	build config consistency gate check	scripts/reproduce_exact_4x.sh	pass
+243	2026-03-13T04:51:57+03:00	d9b83b8	validate harness_version in summary.json	scripts/reproduce_local_real_artifact_claim.sh	pass
+244	2026-03-13T04:52:45+03:00	84312f6	reported compile times in claim	scripts/reproduce_local_real_artifact_claim.sh	pass
+245	2026-03-13T04:53:13+03:00	8eaa105	per-run generated token counts in claim	scripts/reproduce_local_real_artifact_claim.sh	pass
+246	2026-03-13T04:54:06+03:00	-	test suite checkpoint: 405 pass, 0 fail	-	pass
+247	2026-03-13T04:54:32+03:00	0e2793f	per-run token accounting in claim	scripts/reproduce_local_real_artifact_claim.sh	pass
+248	2026-03-13T04:55:08+03:00	7ff4336	per-run p95 latency arrays in claim	scripts/reproduce_local_real_artifact_claim.sh	pass
