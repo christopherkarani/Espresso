@@ -189,6 +189,30 @@ public struct ANEKernel: ~Copyable {
             }
         }
 
+        func compileHandleWithRetry() -> OpaquePointer? {
+            var attemptIndex = 0
+
+            while true {
+                if let handle = compileHandle() {
+                    return handle
+                }
+
+                let lastCompileError = ane_interop_last_compile_error()
+                guard ANECompileRetryPolicy.shouldRetry(
+                    lastCompileError: lastCompileError,
+                    attemptIndex: attemptIndex
+                ) else {
+                    return nil
+                }
+
+                Self.writeCompileRetryNotice(
+                    ANECompileRetryPolicy.retryNotice(afterFailedAttempt: attemptIndex)
+                )
+                ANECompileRetryPolicy.sleepAfterFailedAttempt(attemptIndex)
+                attemptIndex += 1
+            }
+        }
+
         let rawHandle: OpaquePointer?
         if checkBudget {
             CompileGate.lock.lock()
@@ -196,15 +220,22 @@ public struct ANEKernel: ~Copyable {
             if CompileBudget.isExhausted {
                 throw .compileBudgetExhausted
             }
-            rawHandle = compileHandle()
+            rawHandle = compileHandleWithRetry()
         } else {
-            rawHandle = compileHandle()
+            rawHandle = compileHandleWithRetry()
         }
 
         guard let rawHandle else {
             throw Self.mapInteropCompileError()
         }
         self.handle = rawHandle
+    }
+
+    private static func writeCompileRetryNotice(_ message: String) {
+        guard let data = (message + "\n").data(using: .utf8) else {
+            return
+        }
+        FileHandle.standardError.write(data)
     }
 
     /// Convenience: single-input, single-output kernel (most common case).

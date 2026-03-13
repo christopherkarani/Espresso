@@ -127,6 +127,11 @@ let package = Package(
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         .testTarget(
+            name: "EspressoBenchAppTests",
+            dependencies: ["EspressoBenchApp"],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
             name: "CrossValidationTests",
             dependencies: ["ANERuntime", "CPUOps", "ANETypes", "Espresso", "MILGenerator"],
             path: "Tests/CrossValidationTests",

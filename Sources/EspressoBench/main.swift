@@ -921,6 +921,10 @@ if opts.inferenceOnly {
                 },
             ]
         }
+        summaryJSON["thermal"] = [
+            "before": thermalBefore,
+            "after": thermalAfter,
+        ]
         let manifest = artifactManifest(artifacts + ["summary.json"])
         summaryJSON["artifacts"] = manifest
         summaryJSON["artifact_count"] = manifest.count
@@ -1105,6 +1109,12 @@ do {
                     "metrics": benchmarkStats(entry.result),
                 ] as [String: Any]
             },
+        ]
+    }
+    if let thermalBefore, let thermalAfter {
+        summaryJSON["thermal"] = [
+            "before": thermalBefore,
+            "after": thermalAfter,
         ]
     }
     let manifest = artifactManifest(artifacts + ["summary.json"])

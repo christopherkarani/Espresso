@@ -738,6 +738,73 @@ final class ANERuntimeTests: XCTestCase {
         }
     }
 
+    func test_compile_retry_policy_retries_only_generic_compiler_failures() {
+        XCTAssertTrue(
+            ANECompileRetryPolicy.shouldRetry(
+                lastCompileError: ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE,
+                attemptIndex: 0
+            )
+        )
+        XCTAssertTrue(
+            ANECompileRetryPolicy.shouldRetry(
+                lastCompileError: ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE,
+                attemptIndex: 1
+            )
+        )
+        XCTAssertFalse(
+            ANECompileRetryPolicy.shouldRetry(
+                lastCompileError: ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE,
+                attemptIndex: ANECompileRetryPolicy.maxAttempts - 1
+            )
+        )
+        XCTAssertFalse(
+            ANECompileRetryPolicy.shouldRetry(
+                lastCompileError: ANE_INTEROP_COMPILE_ERROR_INVALID_ARGUMENTS,
+                attemptIndex: 0
+            )
+        )
+        XCTAssertFalse(
+            ANECompileRetryPolicy.shouldRetry(
+                lastCompileError: ANE_INTEROP_COMPILE_ERROR_SURFACE_ALLOCATION_FAILED,
+                attemptIndex: 0
+            )
+        )
+    }
+
+    func test_compile_retry_policy_backoff_is_bounded() {
+        XCTAssertEqual(
+            ANECompileRetryPolicy.delayMicroseconds(afterFailedAttempt: 0),
+            ANECompileRetryPolicy.initialDelayMicroseconds
+        )
+        XCTAssertEqual(
+            ANECompileRetryPolicy.delayMicroseconds(afterFailedAttempt: 1),
+            200_000
+        )
+        XCTAssertEqual(
+            ANECompileRetryPolicy.delayMicroseconds(afterFailedAttempt: 2),
+            400_000
+        )
+        XCTAssertEqual(
+            ANECompileRetryPolicy.delayMicroseconds(afterFailedAttempt: 5),
+            ANECompileRetryPolicy.maxDelayMicroseconds
+        )
+    }
+
+    func test_compile_retry_policy_notice_reports_next_attempt() {
+        XCTAssertEqual(
+            ANECompileRetryPolicy.retryNotice(afterFailedAttempt: 0),
+            "ANE compile retrying (2/5) after transient compiler failure"
+        )
+        XCTAssertEqual(
+            ANECompileRetryPolicy.retryNotice(afterFailedAttempt: 1),
+            "ANE compile retrying (3/5) after transient compiler failure"
+        )
+        XCTAssertEqual(
+            ANECompileRetryPolicy.retryNotice(afterFailedAttempt: 3),
+            "ANE compile retrying (5/5) after transient compiler failure"
+        )
+    }
+
     func test_compile_budget_boundary_allows_only_one_concurrent_compile() throws {
         try requireANEHardwareTestsEnabled()
 

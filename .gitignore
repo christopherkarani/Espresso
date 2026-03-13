@@ -42,3 +42,8 @@ artifacts/benchmarks/*
 !artifacts/benchmarks/exact-decode-non-echo/latest.csv
 !artifacts/benchmarks/exact-decode-non-echo/latest.md
 scripts/__pycache__/
+
+# Local macOS benchmark app source (kept local for now)
+Sources/EspressoBenchApp/
+Tests/EspressoBenchAppTests/
+scripts/package_espresso_bench_app.sh
