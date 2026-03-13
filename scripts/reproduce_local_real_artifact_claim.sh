@@ -261,6 +261,8 @@ fi
       "harness_last_run_timestamp=\(.last_run_timestamp | na)",
       "harness_per_run_wall_elapsed_s=\(.per_run_wall_elapsed_s // [] | tojson)",
       "harness_per_run_outer_elapsed_s=\(.per_run_outer_elapsed_s // [] | tojson)",
+      "harness_sum_probe_wall_elapsed_s=\(.sum_probe_wall_elapsed_s | na)",
+      "harness_sum_outer_elapsed_s=\(.sum_outer_elapsed_s | na)",
       "harness_probe_wall_range_s=\(.probe_wall_range_s | na)",
       "harness_outer_elapsed_range_s=\(.outer_elapsed_range_s | na)",
       "harness_gate_status=\(.reproducibility.gate_status // "unknown")",
