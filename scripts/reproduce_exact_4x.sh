@@ -589,6 +589,8 @@ jq -s \
   per_run_parity_match_count: (map(.parity_match_count // null)),
   parity_total: (map(.parity_total // null) | .[0]),
   per_run_timestamps: (map(.probe_timestamp // null)),
+  first_run_timestamp: (map(.probe_timestamp // null) | map(select(. != null)) | sort | first // null),
+  last_run_timestamp: (map(.probe_timestamp // null) | map(select(. != null)) | sort | last // null),
   valid_run_files: $run_files,
   per_run_wall_elapsed_s: (map(.probe_wall_elapsed_s // null)),
   per_run_outer_elapsed_s: $outer_elapsed,
