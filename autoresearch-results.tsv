@@ -343,3 +343,4 @@ cycle	timestamp	hypothesis	result	commit	notes
 343	2026-03-13T05:36:30Z	claim	cross-validate manifest layerCount against claim LAYER_COUNT	scripts/reproduce_local_real_artifact_claim.sh	committed
 344	2026-03-13T05:36:56Z	claim	warn if dataset bytes exceed 2x MAX_CORPUS_BYTES — bound sanity check	scripts/reproduce_local_real_artifact_claim.sh	committed
 345	2026-03-13T05:37:40Z	harness	fix parity detail run numbering — input_line_number broken in jq -s mode	scripts/reproduce_exact_4x.sh	committed
+346	2026-03-13T05:38:12Z	claim	record CoreML model file count and total bytes in claim summary	scripts/reproduce_local_real_artifact_claim.sh	committed
