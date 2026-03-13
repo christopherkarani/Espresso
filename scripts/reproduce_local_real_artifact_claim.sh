@@ -150,69 +150,70 @@ fi
   echo "public_summary=$PUBLIC_RESULTS_DIR/summary.txt"
   echo "public_summary_json=$PUBLIC_RESULTS_DIR/summary.json"
   # Propagate key metrics from inner harness summary if available
+  # Extract all harness metrics from summary.json in a single jq call
   if [[ -f "$PUBLIC_RESULTS_DIR/summary.json" ]]; then
-    echo "harness_version=$(jq -r '.harness_version // "n/a"' "$PUBLIC_RESULTS_DIR/summary.json")"
-    echo "harness_probe_version=$(jq -r '.probe_version // "n/a"' "$PUBLIC_RESULTS_DIR/summary.json")"
-    echo "harness_two_step_median_ms=$(jq -r '.two_step.median_ms_per_token' "$PUBLIC_RESULTS_DIR/summary.json")"
-    echo "harness_two_step_p95_ms=$(jq -r '.two_step.p95_ms_per_token // "n/a"' "$PUBLIC_RESULTS_DIR/summary.json")"
-    echo "harness_two_step_p99_ms=$(jq -r '.two_step.p99_ms_per_token // "n/a"' "$PUBLIC_RESULTS_DIR/summary.json")"
-    echo "harness_coreml_median_ms=$(jq -r '.coreml.median_ms_per_token' "$PUBLIC_RESULTS_DIR/summary.json")"
-    echo "harness_coreml_p95_ms=$(jq -r '.coreml.p95_ms_per_token // "n/a"' "$PUBLIC_RESULTS_DIR/summary.json")"
-    echo "harness_coreml_p99_ms=$(jq -r '.coreml.p99_ms_per_token // "n/a"' "$PUBLIC_RESULTS_DIR/summary.json")"
-    echo "harness_speedup_median=$(jq -r '.two_step_speedup_vs_coreml' "$PUBLIC_RESULTS_DIR/summary.json")"
-    echo "harness_speedup_min=$(jq -r '.two_step_speedup_min' "$PUBLIC_RESULTS_DIR/summary.json")"
-    echo "harness_speedup_max=$(jq -r '.two_step_speedup_max' "$PUBLIC_RESULTS_DIR/summary.json")"
-    echo "harness_all_parity=$(jq -r '.all_parity_match' "$PUBLIC_RESULTS_DIR/summary.json")"
-    echo "harness_parity_total=$(jq -r '.parity_total // "n/a"' "$PUBLIC_RESULTS_DIR/summary.json")"
-    echo "harness_parity_match_counts=$(jq -c '.per_run_parity_match_count // []' "$PUBLIC_RESULTS_DIR/summary.json")"
-    echo "harness_two_step_cv=$(jq -r '.two_step.cv' "$PUBLIC_RESULTS_DIR/summary.json")"
-    echo "harness_control_median_ms=$(jq -r '.control.median_ms_per_token' "$PUBLIC_RESULTS_DIR/summary.json")"
-    echo "harness_control_p95_ms=$(jq -r '.control.p95_ms_per_token // "n/a"' "$PUBLIC_RESULTS_DIR/summary.json")"
-    echo "harness_control_p99_ms=$(jq -r '.control.p99_ms_per_token // "n/a"' "$PUBLIC_RESULTS_DIR/summary.json")"
-    echo "harness_control_cv=$(jq -r '.control.cv' "$PUBLIC_RESULTS_DIR/summary.json")"
-    echo "harness_coreml_cv=$(jq -r '.coreml.cv' "$PUBLIC_RESULTS_DIR/summary.json")"
-    echo "harness_speedup_cv=$(jq -r '.two_step_speedup_cv // "n/a"' "$PUBLIC_RESULTS_DIR/summary.json")"
-    echo "harness_two_step_mean_ms=$(jq -r '.two_step.mean_ms_per_token // "n/a"' "$PUBLIC_RESULTS_DIR/summary.json")"
-    echo "harness_two_step_stddev_ms=$(jq -r '.two_step.stddev_ms_per_token // "n/a"' "$PUBLIC_RESULTS_DIR/summary.json")"
-    echo "harness_two_step_iqr_ms=$(jq -r '.two_step.iqr_ms // "n/a"' "$PUBLIC_RESULTS_DIR/summary.json")"
-    echo "harness_control_mean_ms=$(jq -r '.control.mean_ms_per_token // "n/a"' "$PUBLIC_RESULTS_DIR/summary.json")"
-    echo "harness_control_stddev_ms=$(jq -r '.control.stddev_ms_per_token // "n/a"' "$PUBLIC_RESULTS_DIR/summary.json")"
-    echo "harness_control_iqr_ms=$(jq -r '.control.iqr_ms // "n/a"' "$PUBLIC_RESULTS_DIR/summary.json")"
-    echo "harness_coreml_mean_ms=$(jq -r '.coreml.mean_ms_per_token // "n/a"' "$PUBLIC_RESULTS_DIR/summary.json")"
-    echo "harness_coreml_stddev_ms=$(jq -r '.coreml.stddev_ms_per_token // "n/a"' "$PUBLIC_RESULTS_DIR/summary.json")"
-    echo "harness_coreml_iqr_ms=$(jq -r '.coreml.iqr_ms // "n/a"' "$PUBLIC_RESULTS_DIR/summary.json")"
-    echo "harness_speedup_mean=$(jq -r '.two_step_speedup_mean // "n/a"' "$PUBLIC_RESULTS_DIR/summary.json")"
-    echo "harness_speedup_stddev=$(jq -r '.two_step_speedup_stddev // "n/a"' "$PUBLIC_RESULTS_DIR/summary.json")"
-    echo "harness_control_speedup=$(jq -r '.control_speedup_vs_coreml // "n/a"' "$PUBLIC_RESULTS_DIR/summary.json")"
-    echo "harness_control_speedup_min=$(jq -r '.control_speedup_min // "n/a"' "$PUBLIC_RESULTS_DIR/summary.json")"
-    echo "harness_control_speedup_max=$(jq -r '.control_speedup_max // "n/a"' "$PUBLIC_RESULTS_DIR/summary.json")"
-    echo "harness_control_speedup_cv=$(jq -r '.control_speedup_cv // "n/a"' "$PUBLIC_RESULTS_DIR/summary.json")"
-    echo "harness_total_elapsed_s=$(jq -r '.total_elapsed_s // "n/a"' "$PUBLIC_RESULTS_DIR/summary.json")"
-    echo "harness_requested_repeats=$(jq -r '.requested_repeats // "n/a"' "$PUBLIC_RESULTS_DIR/summary.json")"
-    echo "harness_valid_runs=$(jq -r '.valid_runs' "$PUBLIC_RESULTS_DIR/summary.json")"
-    echo "harness_failed_runs=$(jq -r '.failed_runs // 0' "$PUBLIC_RESULTS_DIR/summary.json")"
-    echo "harness_probe_sha256=$(jq -r '.artifact_hashes.probe_sha256 // "n/a"' "$PUBLIC_RESULTS_DIR/summary.json")"
-    echo "harness_coreml_model_sha256=$(jq -r '.artifact_hashes.coreml_model_sha256 // "n/a"' "$PUBLIC_RESULTS_DIR/summary.json")"
-    echo "harness_recurrent_sha256=$(jq -r '.artifact_hashes.recurrent_checkpoint_sha256 // "n/a"' "$PUBLIC_RESULTS_DIR/summary.json")"
-    echo "harness_sidecar_sha256=$(jq -r '.artifact_hashes.future_sidecar_sha256 // "n/a"' "$PUBLIC_RESULTS_DIR/summary.json")"
-    echo "harness_generation_sha256=$(jq -r '.artifact_hashes.generation_model_sha256 // "n/a"' "$PUBLIC_RESULTS_DIR/summary.json")"
-    echo "harness_chip=$(jq -r '.host.chip // "n/a"' "$PUBLIC_RESULTS_DIR/summary.json")"
-    echo "harness_thermal_pressure=$(jq -r '.host.thermal_pressure // "n/a"' "$PUBLIC_RESULTS_DIR/summary.json")"
-    echo "harness_power_source=$(jq -r '.host.power_source // "n/a"' "$PUBLIC_RESULTS_DIR/summary.json")"
-    echo "harness_total_stderr_lines=$(jq -r '.per_run_stderr_lines // [] | add // 0' "$PUBLIC_RESULTS_DIR/summary.json")"
-    echo "harness_contract_hash=$(jq -r '.benchmark_contract.contract_hash // "n/a"' "$PUBLIC_RESULTS_DIR/summary.json")"
-    echo "harness_probe_wall_range_s=$(jq -r '.probe_wall_range_s // "n/a"' "$PUBLIC_RESULTS_DIR/summary.json")"
-    echo "harness_outer_elapsed_range_s=$(jq -r '.outer_elapsed_range_s // "n/a"' "$PUBLIC_RESULTS_DIR/summary.json")"
-  fi
-  # Propagate gate status from inner harness (prefer JSON source)
-  if [[ -f "$PUBLIC_RESULTS_DIR/summary.json" ]]; then
-    echo "harness_gate_status=$(jq -r '.reproducibility.gate_status // "unknown"' "$PUBLIC_RESULTS_DIR/summary.json")"
-    echo "harness_outlier_count=$(jq -r '.reproducibility.outlier_count // 0' "$PUBLIC_RESULTS_DIR/summary.json")"
-    echo "harness_outlier_two_step=$(jq -r '.reproducibility.outlier_detail.two_step.count // 0' "$PUBLIC_RESULTS_DIR/summary.json")"
-    echo "harness_outlier_control=$(jq -r '.reproducibility.outlier_detail.control.count // 0' "$PUBLIC_RESULTS_DIR/summary.json")"
-    echo "harness_outlier_coreml=$(jq -r '.reproducibility.outlier_detail.coreml.count // 0' "$PUBLIC_RESULTS_DIR/summary.json")"
-    echo "harness_outlier_speedup=$(jq -r '.reproducibility.outlier_detail.speedup.count // 0' "$PUBLIC_RESULTS_DIR/summary.json")"
-    echo "harness_gate_warnings=$(jq -c '.reproducibility.warnings // []' "$PUBLIC_RESULTS_DIR/summary.json")"
+    jq -r '
+      def na: . // "n/a";
+      "harness_version=\(.harness_version | na)",
+      "harness_probe_version=\(.probe_version | na)",
+      "harness_two_step_median_ms=\(.two_step.median_ms_per_token)",
+      "harness_two_step_p95_ms=\(.two_step.p95_ms_per_token | na)",
+      "harness_two_step_p99_ms=\(.two_step.p99_ms_per_token | na)",
+      "harness_coreml_median_ms=\(.coreml.median_ms_per_token)",
+      "harness_coreml_p95_ms=\(.coreml.p95_ms_per_token | na)",
+      "harness_coreml_p99_ms=\(.coreml.p99_ms_per_token | na)",
+      "harness_speedup_median=\(.two_step_speedup_vs_coreml)",
+      "harness_speedup_min=\(.two_step_speedup_min)",
+      "harness_speedup_max=\(.two_step_speedup_max)",
+      "harness_all_parity=\(.all_parity_match)",
+      "harness_parity_total=\(.parity_total | na)",
+      "harness_parity_match_counts=\(.per_run_parity_match_count // [] | tojson)",
+      "harness_two_step_cv=\(.two_step.cv)",
+      "harness_control_median_ms=\(.control.median_ms_per_token)",
+      "harness_control_p95_ms=\(.control.p95_ms_per_token | na)",
+      "harness_control_p99_ms=\(.control.p99_ms_per_token | na)",
+      "harness_control_cv=\(.control.cv)",
+      "harness_coreml_cv=\(.coreml.cv)",
+      "harness_speedup_cv=\(.two_step_speedup_cv | na)",
+      "harness_two_step_mean_ms=\(.two_step.mean_ms_per_token | na)",
+      "harness_two_step_stddev_ms=\(.two_step.stddev_ms_per_token | na)",
+      "harness_two_step_iqr_ms=\(.two_step.iqr_ms | na)",
+      "harness_control_mean_ms=\(.control.mean_ms_per_token | na)",
+      "harness_control_stddev_ms=\(.control.stddev_ms_per_token | na)",
+      "harness_control_iqr_ms=\(.control.iqr_ms | na)",
+      "harness_coreml_mean_ms=\(.coreml.mean_ms_per_token | na)",
+      "harness_coreml_stddev_ms=\(.coreml.stddev_ms_per_token | na)",
+      "harness_coreml_iqr_ms=\(.coreml.iqr_ms | na)",
+      "harness_speedup_mean=\(.two_step_speedup_mean | na)",
+      "harness_speedup_stddev=\(.two_step_speedup_stddev | na)",
+      "harness_control_speedup=\(.control_speedup_vs_coreml | na)",
+      "harness_control_speedup_min=\(.control_speedup_min | na)",
+      "harness_control_speedup_max=\(.control_speedup_max | na)",
+      "harness_control_speedup_cv=\(.control_speedup_cv | na)",
+      "harness_total_elapsed_s=\(.total_elapsed_s | na)",
+      "harness_requested_repeats=\(.requested_repeats | na)",
+      "harness_valid_runs=\(.valid_runs)",
+      "harness_failed_runs=\(.failed_runs // 0)",
+      "harness_probe_sha256=\(.artifact_hashes.probe_sha256 | na)",
+      "harness_coreml_model_sha256=\(.artifact_hashes.coreml_model_sha256 | na)",
+      "harness_recurrent_sha256=\(.artifact_hashes.recurrent_checkpoint_sha256 | na)",
+      "harness_sidecar_sha256=\(.artifact_hashes.future_sidecar_sha256 | na)",
+      "harness_generation_sha256=\(.artifact_hashes.generation_model_sha256 | na)",
+      "harness_chip=\(.host.chip | na)",
+      "harness_thermal_pressure=\(.host.thermal_pressure | na)",
+      "harness_power_source=\(.host.power_source | na)",
+      "harness_total_stderr_lines=\(.per_run_stderr_lines // [] | add // 0)",
+      "harness_contract_hash=\(.benchmark_contract.contract_hash | na)",
+      "harness_probe_wall_range_s=\(.probe_wall_range_s | na)",
+      "harness_outer_elapsed_range_s=\(.outer_elapsed_range_s | na)",
+      "harness_gate_status=\(.reproducibility.gate_status // "unknown")",
+      "harness_outlier_count=\(.reproducibility.outlier_count // 0)",
+      "harness_outlier_two_step=\(.reproducibility.outlier_detail.two_step.count // 0)",
+      "harness_outlier_control=\(.reproducibility.outlier_detail.control.count // 0)",
+      "harness_outlier_coreml=\(.reproducibility.outlier_detail.coreml.count // 0)",
+      "harness_outlier_speedup=\(.reproducibility.outlier_detail.speedup.count // 0)",
+      "harness_gate_warnings=\(.reproducibility.warnings // [] | tojson)"
+    ' "$PUBLIC_RESULTS_DIR/summary.json"
   elif [[ -f "$PUBLIC_RESULTS_DIR/summary.txt" ]]; then
     gate_line="$(grep '^gate_status=' "$PUBLIC_RESULTS_DIR/summary.txt" || true)"
     if [[ -n "$gate_line" ]]; then
