@@ -120,6 +120,7 @@ LAYER_COUNT="$LAYER_COUNT" \
   echo "public_summary_json=$PUBLIC_RESULTS_DIR/summary.json"
   # Propagate key metrics from inner harness summary if available
   if [[ -f "$PUBLIC_RESULTS_DIR/summary.json" ]]; then
+    echo "harness_version=$(jq -r '.harness_version // "n/a"' "$PUBLIC_RESULTS_DIR/summary.json")"
     echo "harness_probe_version=$(jq -r '.probe_version // "n/a"' "$PUBLIC_RESULTS_DIR/summary.json")"
     echo "harness_two_step_median_ms=$(jq -r '.two_step.median_ms_per_token' "$PUBLIC_RESULTS_DIR/summary.json")"
     echo "harness_two_step_p95_ms=$(jq -r '.two_step.p95_ms_per_token // "n/a"' "$PUBLIC_RESULTS_DIR/summary.json")"
