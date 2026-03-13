@@ -56,6 +56,11 @@ if [[ "$MAX_SEQUENCE_TOKENS" -lt 1 ]]; then
   exit 1
 fi
 
+if [[ "$MAX_SEQUENCE_TOKENS" -lt $((MAX_NEW_TOKENS + 1)) ]]; then
+  echo "MAX_SEQUENCE_TOKENS ($MAX_SEQUENCE_TOKENS) must be >= MAX_NEW_TOKENS + 1 ($((MAX_NEW_TOKENS + 1)))" >&2
+  exit 1
+fi
+
 if ! [[ "$PROMPT_TOKEN" =~ ^[0-9]+$ ]]; then
   echo "PROMPT_TOKEN must be a non-negative integer (got: $PROMPT_TOKEN)" >&2
   exit 1
