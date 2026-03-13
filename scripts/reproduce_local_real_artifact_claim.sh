@@ -180,6 +180,9 @@ fi
     echo "harness_thermal_pressure=$(jq -r '.host.thermal_pressure // "n/a"' "$PUBLIC_RESULTS_DIR/summary.json")"
     echo "harness_power_source=$(jq -r '.host.power_source // "n/a"' "$PUBLIC_RESULTS_DIR/summary.json")"
     echo "harness_total_stderr_lines=$(jq -r '.per_run_stderr_lines // [] | add // 0' "$PUBLIC_RESULTS_DIR/summary.json")"
+    echo "harness_contract_hash=$(jq -r '.benchmark_contract.contract_hash // "n/a"' "$PUBLIC_RESULTS_DIR/summary.json")"
+    echo "harness_probe_wall_range_s=$(jq -r '.probe_wall_range_s // "n/a"' "$PUBLIC_RESULTS_DIR/summary.json")"
+    echo "harness_outer_elapsed_range_s=$(jq -r '.outer_elapsed_range_s // "n/a"' "$PUBLIC_RESULTS_DIR/summary.json")"
   fi
   # Propagate gate status from inner harness (prefer JSON source)
   if [[ -f "$PUBLIC_RESULTS_DIR/summary.json" ]]; then
