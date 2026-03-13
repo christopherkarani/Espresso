@@ -370,6 +370,51 @@ public enum SurfaceIO {
         return FP16ArgmaxResult(index: Int(index32), value: value)
     }
 
+    /// Argmax with a known max-value hint from a reduce_max output surface.
+    ///
+    /// Reads the max fp16 value from `hintSurface` at channel 0, spatial `hintSpatialIndex`,
+    /// then scans the logits surface comparing against the hint with early exit on first match.
+    public static func argmaxFP16SpatialSliceWithHint(
+        from surface: IOSurfaceRef,
+        channelOffset: Int,
+        spatialIndex: Int,
+        spatial: Int,
+        channels: Int,
+        hintSurface: IOSurfaceRef,
+        hintSpatialIndex: Int,
+        hintSpatial: Int
+    ) throws(SurfaceIOError) -> FP16ArgmaxResult {
+        let chOff32 = try checkedNonNegativeInt32(channelOffset)
+        let spatialIndex32 = try checkedNonNegativeInt32(spatialIndex)
+        let spatial32 = try checkedNonNegativeInt32(spatial)
+        let channels32 = try checkedNonNegativeInt32(channels)
+        let hintSpatialIndex32 = try checkedNonNegativeInt32(hintSpatialIndex)
+        let hintSpatial32 = try checkedNonNegativeInt32(hintSpatial)
+        guard spatial > 0, channels > 0, spatialIndex < spatial else {
+            throw .argumentOutOfRange
+        }
+        guard hintSpatial > 0, hintSpatialIndex < hintSpatial else {
+            throw .argumentOutOfRange
+        }
+
+        var index32: Int32 = 0
+        var value: Float = 0
+        let ok = ane_interop_io_argmax_fp16_spatial_slice_with_hint(
+            surface,
+            chOff32,
+            spatialIndex32,
+            spatial32,
+            channels32,
+            hintSurface,
+            hintSpatialIndex32,
+            hintSpatial32,
+            &index32,
+            &value
+        )
+        guard ok else { throw .interopCallFailed }
+        return FP16ArgmaxResult(index: Int(index32), value: value)
+    }
+
     public static func copyFP16Batched(dst: IOSurfaceRef,
                                        src: IOSurfaceRef,
                                        spatial: Int,

@@ -14,6 +14,9 @@ public enum GenerationOutputHeadBackend: Sendable {
     case cpuThenANE
     /// Vocabulary-partitioned argmax with Cauchy-Schwarz pruning.
     case cpuPartitionedArgmax
+    /// FP16 tiled classifier: converts FP16 weights in L2-sized tiles, runs sgemm on L2-resident FP32 data.
+    /// Halves DRAM bandwidth for classifier weights compared to full FP32 sgemm.
+    case cpuFP16Tiled
 }
 
 // MARK: - Deferred ANE head
@@ -192,6 +195,82 @@ enum ANEGenerationOutputHeadIO {
         }
     }
 
+    static func argmaxSingleTokenLogitsWithHint(
+        from surface: IOSurfaceRef,
+        vocabSize: Int,
+        laneSpatial: Int,
+        hintSurface: IOSurfaceRef
+    ) throws(GenerationError) -> UInt16 {
+        do {
+            let result = try SurfaceIO.argmaxFP16SpatialSliceWithHint(
+                from: surface,
+                channelOffset: 0,
+                spatialIndex: 0,
+                spatial: laneSpatial,
+                channels: vocabSize,
+                hintSurface: hintSurface,
+                hintSpatialIndex: 0,
+                hintSpatial: laneSpatial
+            )
+            guard let token = UInt16(exactly: result.index) else {
+                throw GenerationError.invalidArguments(
+                    "selected token index \(result.index) exceeds UInt16 range"
+                )
+            }
+            return token
+        } catch let error as GenerationError {
+            throw error
+        } catch {
+            throw .runtimeFailure("ANE output-head argmax with hint failed: \(error)")
+        }
+    }
+
+    static func argmaxTokenPairLogitsWithHint(
+        from surface: IOSurfaceRef,
+        vocabSize: Int,
+        laneSpatial: Int,
+        hintSurface: IOSurfaceRef
+    ) throws(GenerationError) -> (UInt16, UInt16) {
+        guard laneSpatial >= 2 else {
+            throw .invalidArguments("ANE output-head pair argmax requires laneSpatial >= 2")
+        }
+
+        func convert(_ result: SurfaceIO.FP16ArgmaxResult) throws(GenerationError) -> UInt16 {
+            guard let token = UInt16(exactly: result.index) else {
+                throw .invalidArguments("selected token index \(result.index) exceeds UInt16 range")
+            }
+            return token
+        }
+
+        do {
+            let first = try SurfaceIO.argmaxFP16SpatialSliceWithHint(
+                from: surface,
+                channelOffset: 0,
+                spatialIndex: 0,
+                spatial: laneSpatial,
+                channels: vocabSize,
+                hintSurface: hintSurface,
+                hintSpatialIndex: 0,
+                hintSpatial: laneSpatial
+            )
+            let second = try SurfaceIO.argmaxFP16SpatialSliceWithHint(
+                from: surface,
+                channelOffset: 0,
+                spatialIndex: 1,
+                spatial: laneSpatial,
+                channels: vocabSize,
+                hintSurface: hintSurface,
+                hintSpatialIndex: 1,
+                hintSpatial: laneSpatial
+            )
+            return (try convert(first), try convert(second))
+        } catch let error as GenerationError {
+            throw error
+        } catch {
+            throw .runtimeFailure("ANE output-head pair argmax with hint failed: \(error)")
+        }
+    }
+
     static func argmaxTokenPairLogits(
         from surface: IOSurfaceRef,
         vocabSize: Int,
@@ -345,6 +424,8 @@ final class ANEGenerationRMSNormClassifierHead {
     let kernelSet: GenerationRMSNormClassifierKernelSet
     let inputSurface: IOSurfaceRef
     let outputSurface: IOSurfaceRef
+    /// Second output surface from the ANE reduce_max: [1, 1, 1, laneSpatial].
+    let maxValSurface: IOSurfaceRef
     let vocabSize: Int
     let laneSpatial: Int
 
@@ -363,6 +444,7 @@ final class ANEGenerationRMSNormClassifierHead {
             )
             self.inputSurface = try kernelSet.rmsNormClassifier.inputSurface(at: 0)
             self.outputSurface = try kernelSet.rmsNormClassifier.outputSurface(at: 0)
+            self.maxValSurface = try kernelSet.rmsNormClassifier.outputSurface(at: 1)
             self.kernelSet = kernelSet
             self.vocabSize = vocabSize
             self.laneSpatial = laneSpatial
@@ -416,10 +498,11 @@ final class ANEGenerationRMSNormClassifierHead {
             throw .runtimeFailure("ANE fused output-head eval failed: \(error)")
         }
 
-        return try ANEGenerationOutputHeadIO.argmaxSingleTokenLogits(
+        return try ANEGenerationOutputHeadIO.argmaxSingleTokenLogitsWithHint(
             from: outputSurface,
             vocabSize: vocabSize,
-            laneSpatial: laneSpatial
+            laneSpatial: laneSpatial,
+            hintSurface: maxValSurface
         )
     }
 
@@ -440,10 +523,11 @@ final class ANEGenerationRMSNormClassifierHead {
             throw .runtimeFailure("ANE fused output-head pair eval failed: \(error)")
         }
 
-        return try ANEGenerationOutputHeadIO.argmaxTokenPairLogits(
+        return try ANEGenerationOutputHeadIO.argmaxTokenPairLogitsWithHint(
             from: outputSurface,
             vocabSize: vocabSize,
-            laneSpatial: laneSpatial
+            laneSpatial: laneSpatial,
+            hintSurface: maxValSurface
         )
     }
 }

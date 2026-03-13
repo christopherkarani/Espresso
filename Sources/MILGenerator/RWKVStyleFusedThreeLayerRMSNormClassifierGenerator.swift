@@ -23,7 +23,7 @@ public struct RWKVStyleFusedThreeLayerRMSNormClassifierGenerator: MILProgramGene
 
     public var outputByteSizes: [Int] {
         let stateBytes = inputBytes
-        return [stateBytes, stateBytes, stateBytes, stateBytes, vocabSize * laneSpatial * 2]
+        return [stateBytes, stateBytes, stateBytes, stateBytes, vocabSize * laneSpatial * 2, 1 * laneSpatial * 2]
     }
 
     public var milText: String {
@@ -35,7 +35,7 @@ public struct RWKVStyleFusedThreeLayerRMSNormClassifierGenerator: MILProgramGene
 
         let stepReturn = "    } -> (xNext,stateOut0,stateOut1,stateOut2);"
         let headStart = "        tensor<fp16, [1,\(ModelConfig.dim),1,\(laneSpatial)]> sq = mul(x=x,y=x)[name=string(\"sq\")];"
-        let headReturn = "    } -> (logits);"
+        let headReturn = "    } -> (logits,maxVal);"
 
         guard let stepReturnRange = stepText.range(of: stepReturn),
               let headStartRange = headText.range(of: headStart),
@@ -54,7 +54,7 @@ public struct RWKVStyleFusedThreeLayerRMSNormClassifierGenerator: MILProgramGene
         var combined = stepText
         combined.replaceSubrange(
             stepReturnRange,
-            with: headBody + "    } -> (xNext,stateOut0,stateOut1,stateOut2,logits);"
+            with: headBody + "    } -> (xNext,stateOut0,stateOut1,stateOut2,logits,maxVal);"
         )
         return combined
     }

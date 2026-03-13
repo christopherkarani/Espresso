@@ -199,10 +199,10 @@ bool ane_interop_io_write_fp16_spatial_slice(IOSurfaceRef surface,
     if (bytes > IOSurfaceGetAllocSize(surface)) goto cleanup;
 
     _Float16 *dstF16 = (_Float16 *)base;
-    for (int c = 0; c < channels; c++) {
-        size_t idx = (size_t)(ch_off + c) * spatialSz + (size_t)spatial_index;
-        dstF16[idx] = (_Float16)data[c];
-    }
+    const size_t baseIdx = (size_t)ch_off * spatialSz + (size_t)spatial_index;
+    // Use NEON-vectorized strided scatter: FP32 -> FP16 with stride = spatial.
+    ane_interop_neon_scatter_f32_to_f16(dstF16 + baseIdx, data,
+                                         channels, (int)spatialSz);
     ok = true;
 
 cleanup:
@@ -241,10 +241,10 @@ bool ane_interop_io_read_fp16_spatial_slice(IOSurfaceRef surface,
     if (bytes > IOSurfaceGetAllocSize(surface)) goto cleanup;
 
     const _Float16 *srcF16 = (const _Float16 *)base;
-    for (int c = 0; c < channels; c++) {
-        size_t idx = (size_t)(ch_off + c) * spatialSz + (size_t)spatial_index;
-        data[c] = (float)srcF16[idx];
-    }
+    const size_t baseIdx = (size_t)ch_off * spatialSz + (size_t)spatial_index;
+    // Use NEON-vectorized strided gather: FP16 -> FP32 with stride = spatial.
+    ane_interop_neon_gather_f16_to_f32(data, srcF16 + baseIdx,
+                                        channels, (int)spatialSz);
     ok = true;
 
 cleanup:
@@ -286,149 +286,113 @@ bool ane_interop_io_argmax_fp16_spatial_slice(IOSurfaceRef surface,
     const _Float16 *srcF16 = (const _Float16 *)base;
     const size_t baseIdx = (size_t)ch_off * spatialSz + (size_t)spatial_index;
     const size_t stride = spatialSz;
+
     int bestIndex = 0;
-    _Float16 bestValue = srcF16[baseIdx];
-    int c = 1;
-    const _Float16 *cursor = srcF16 + baseIdx + stride;
+    float bestValueF32 = 0.0f;
 
-    if (channels >= 8) {
-        _Float16 bestValue0 = srcF16[baseIdx];
-        _Float16 bestValue1 = srcF16[baseIdx + stride];
-        _Float16 bestValue2 = srcF16[baseIdx + stride * 2];
-        _Float16 bestValue3 = srcF16[baseIdx + stride * 3];
-        _Float16 bestValue4 = srcF16[baseIdx + stride * 4];
-        _Float16 bestValue5 = srcF16[baseIdx + stride * 5];
-        _Float16 bestValue6 = srcF16[baseIdx + stride * 6];
-        _Float16 bestValue7 = srcF16[baseIdx + stride * 7];
-        int bestIndex0 = 0;
-        int bestIndex1 = 1;
-        int bestIndex2 = 2;
-        int bestIndex3 = 3;
-        int bestIndex4 = 4;
-        int bestIndex5 = 5;
-        int bestIndex6 = 6;
-        int bestIndex7 = 7;
-
-        c = 8;
-        cursor = srcF16 + baseIdx + stride * 8;
-        for (; c + 7 < channels; c += 8) {
-            _Float16 value0 = cursor[0];
-            _Float16 value1 = cursor[stride];
-            _Float16 value2 = cursor[stride * 2];
-            _Float16 value3 = cursor[stride * 3];
-            _Float16 value4 = cursor[stride * 4];
-            _Float16 value5 = cursor[stride * 5];
-            _Float16 value6 = cursor[stride * 6];
-            _Float16 value7 = cursor[stride * 7];
-
-            if (value0 > bestValue0) {
-                bestValue0 = value0;
-                bestIndex0 = c;
-            }
-            if (value1 > bestValue1) {
-                bestValue1 = value1;
-                bestIndex1 = c + 1;
-            }
-            if (value2 > bestValue2) {
-                bestValue2 = value2;
-                bestIndex2 = c + 2;
-            }
-            if (value3 > bestValue3) {
-                bestValue3 = value3;
-                bestIndex3 = c + 3;
-            }
-            if (value4 > bestValue4) {
-                bestValue4 = value4;
-                bestIndex4 = c + 4;
-            }
-            if (value5 > bestValue5) {
-                bestValue5 = value5;
-                bestIndex5 = c + 5;
-            }
-            if (value6 > bestValue6) {
-                bestValue6 = value6;
-                bestIndex6 = c + 6;
-            }
-            if (value7 > bestValue7) {
-                bestValue7 = value7;
-                bestIndex7 = c + 7;
-            }
-
-            cursor += stride * 8;
-        }
-
-        bestValue = bestValue0;
-        bestIndex = bestIndex0;
-        if (bestValue1 > bestValue || (bestValue1 == bestValue && bestIndex1 < bestIndex)) {
-            bestValue = bestValue1;
-            bestIndex = bestIndex1;
-        }
-        if (bestValue2 > bestValue || (bestValue2 == bestValue && bestIndex2 < bestIndex)) {
-            bestValue = bestValue2;
-            bestIndex = bestIndex2;
-        }
-        if (bestValue3 > bestValue || (bestValue3 == bestValue && bestIndex3 < bestIndex)) {
-            bestValue = bestValue3;
-            bestIndex = bestIndex3;
-        }
-        if (bestValue4 > bestValue || (bestValue4 == bestValue && bestIndex4 < bestIndex)) {
-            bestValue = bestValue4;
-            bestIndex = bestIndex4;
-        }
-        if (bestValue5 > bestValue || (bestValue5 == bestValue && bestIndex5 < bestIndex)) {
-            bestValue = bestValue5;
-            bestIndex = bestIndex5;
-        }
-        if (bestValue6 > bestValue || (bestValue6 == bestValue && bestIndex6 < bestIndex)) {
-            bestValue = bestValue6;
-            bestIndex = bestIndex6;
-        }
-        if (bestValue7 > bestValue || (bestValue7 == bestValue && bestIndex7 < bestIndex)) {
-            bestValue = bestValue7;
-            bestIndex = bestIndex7;
-        }
-    } else {
-        for (; c + 3 < channels; c += 4) {
-            _Float16 value0 = cursor[0];
-            _Float16 value1 = cursor[stride];
-            _Float16 value2 = cursor[stride * 2];
-            _Float16 value3 = cursor[stride * 3];
-
-            if (value0 > bestValue) {
-                bestValue = value0;
-                bestIndex = c;
-            }
-            if (value1 > bestValue) {
-                bestValue = value1;
-                bestIndex = c + 1;
-            }
-            if (value2 > bestValue) {
-                bestValue = value2;
-                bestIndex = c + 2;
-            }
-            if (value3 > bestValue) {
-                bestValue = value3;
-                bestIndex = c + 3;
-            }
-
-            cursor += stride * 4;
-        }
-    }
-
-    for (; c < channels; c++, cursor += stride) {
-        _Float16 value = *cursor;
-        if (value > bestValue) {
-            bestValue = value;
-            bestIndex = c;
-        }
-    }
+    // Delegate to NEON-vectorized strided argmax.
+    ane_interop_neon_argmax_f16_strided(srcF16 + baseIdx, channels,
+                                        (int)stride, &bestIndex, &bestValueF32);
 
     *out_index = bestIndex;
-    *out_value = (float)bestValue;
+    *out_value = bestValueF32;
     ok = true;
 
 cleanup:
     IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+    return ok;
+}
+
+bool ane_interop_io_argmax_fp16_spatial_slice_with_hint(
+    IOSurfaceRef surface,
+    int ch_off,
+    int spatial_index,
+    int spatial,
+    int channels,
+    IOSurfaceRef hint_surface,
+    int hint_spatial_index,
+    int hint_spatial,
+    int *out_index,
+    float *out_value) {
+    if (!surface || !hint_surface) return false;
+    if (!out_index || !out_value) return false;
+    if (ch_off < 0 || spatial_index < 0 || spatial <= 0 || channels <= 0) return false;
+    if (spatial_index >= spatial) return false;
+    if (channels > INT_MAX - ch_off) return false;
+    if (hint_spatial_index < 0 || hint_spatial <= 0) return false;
+    if (hint_spatial_index >= hint_spatial) return false;
+
+    size_t spatialSz = (size_t)spatial;
+    size_t maxCh = (size_t)(ch_off + channels - 1);
+    size_t maxIdxElems;
+    size_t elemCount;
+    if (mul_size_overflow(maxCh, spatialSz, &maxIdxElems)) return false;
+    if (add_size_overflow(maxIdxElems, (size_t)spatial_index, &maxIdxElems)) return false;
+    if (add_size_overflow(maxIdxElems, 1, &elemCount)) return false;
+    size_t logitsBytes;
+    if (mul_size_overflow(elemCount, sizeof(_Float16), &logitsBytes)) return false;
+
+    size_t hintBytes;
+    if (mul_size_overflow((size_t)hint_spatial, sizeof(_Float16), &hintBytes)) return false;
+
+    bool lockedHint = false;
+    bool lockedLogits = false;
+    bool ok = false;
+
+    /* Read the max hint value from the reduce_max output surface. */
+    if (IOSurfaceLock(hint_surface, kIOSurfaceLockReadOnly, NULL) != kIOReturnSuccess) return false;
+    lockedHint = true;
+
+    const void *hintBase = IOSurfaceGetBaseAddress(hint_surface);
+    if (!hintBase) goto cleanup_h;
+    if (hintBytes > IOSurfaceGetAllocSize(hint_surface)) goto cleanup_h;
+
+    _Float16 maxHint = ((const _Float16 *)hintBase)[(size_t)hint_spatial_index];
+
+    IOSurfaceUnlock(hint_surface, kIOSurfaceLockReadOnly, NULL);
+    lockedHint = false;
+
+    /* Scan the logits surface with early exit on first match. */
+    if (IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL) != kIOReturnSuccess) goto cleanup_h;
+    lockedLogits = true;
+
+    {
+        const void *base = IOSurfaceGetBaseAddress(surface);
+        if (!base) goto cleanup_h;
+        if (logitsBytes > IOSurfaceGetAllocSize(surface)) goto cleanup_h;
+
+        const _Float16 *srcF16 = (const _Float16 *)base;
+        const size_t baseIdx = (size_t)ch_off * spatialSz + (size_t)spatial_index;
+        const size_t stride = spatialSz;
+
+        for (int c = 0; c < channels; c++) {
+            size_t idx = baseIdx + (size_t)c * stride;
+            if (srcF16[idx] == maxHint) {
+                *out_index = c;
+                *out_value = (float)maxHint;
+                ok = true;
+                goto cleanup_h;
+            }
+        }
+
+        /* Fallback: full scan if no exact fp16 match (should not happen). */
+        int bestIndex = 0;
+        _Float16 bestValue = srcF16[baseIdx];
+        for (int c = 1; c < channels; c++) {
+            size_t idx = baseIdx + (size_t)c * stride;
+            if (srcF16[idx] > bestValue) {
+                bestValue = srcF16[idx];
+                bestIndex = c;
+            }
+        }
+        *out_index = bestIndex;
+        *out_value = (float)bestValue;
+        ok = true;
+    }
+
+cleanup_h:
+    if (lockedLogits) IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+    if (lockedHint) IOSurfaceUnlock(hint_surface, kIOSurfaceLockReadOnly, NULL);
     return ok;
 }
 
