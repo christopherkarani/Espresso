@@ -259,6 +259,7 @@ if [[ "$DRY_RUN" == "1" ]]; then
   echo "probe=$PROBE"
   echo "probe_sha256=$PROBE_SHA256"
   echo "coreml_model=$COREML_MODEL"
+  echo "coreml_model_sha256=${COREML_MODEL_SHA256:-n/a}"
   echo "jq=$(command -v jq)"
   echo "jq_version=$(jq --version 2>/dev/null || echo unknown)"
   echo "input_mode=$INPUT_MODE"
