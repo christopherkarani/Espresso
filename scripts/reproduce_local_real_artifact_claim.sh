@@ -36,6 +36,11 @@ OUTPUT_HEAD_BACKEND="${OUTPUT_HEAD_BACKEND:-ane-rmsnorm-classifier}"
 DRY_RUN="${DRY_RUN:-0}"
 
 mkdir -p "$RESULTS_DIR"
+# Check for stale claim data in the results directory
+if [[ -f "$RESULTS_DIR/claim-summary.txt" ]]; then
+  echo "FATAL: results directory $RESULTS_DIR already contains claim-summary.txt — stale data would contaminate results. Use a clean directory." >&2
+  exit 1
+fi
 claim_start_epoch=$(date +%s)
 
 # Signal trap: mark results as interrupted for regression diagnosis
