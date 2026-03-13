@@ -20,7 +20,23 @@ public struct TensorBufferFP16: ~Copyable {
         case mmapped(mappedSize: Int)
     }
 
+    /// Total element count (rows × cols).
+    public var count: Int { rows * cols }
+
     // MARK: - Initializers
+
+    /// Creates a zero-element sentinel buffer (no allocation beyond 1 byte).
+    public init() {
+        self.rows = 0
+        self.cols = 0
+        let raw = UnsafeMutableRawPointer.allocate(
+            byteCount: 1,
+            alignment: TensorBuffer.allocationAlignment
+        )
+        self.rawStorage = raw
+        self.baseAddress = UnsafePointer(raw.bindMemory(to: UInt16.self, capacity: 0))
+        self.storageKind = .owned
+    }
 
     /// Creates an FP16 buffer by quantizing an FP32 source buffer.
     ///

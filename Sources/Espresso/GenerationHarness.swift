@@ -1740,7 +1740,7 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
             token = try aneRMSNormClassifierHead.selectArgmax(rawInput: activation)
         case .cpuExactStaged, .cpuExactClustered:
             throw .runtimeFailure("two-step branch-state promotion model does not support staged CPU output heads")
-        case .cpuThenANE, .cpuPartitionedArgmax:
+        case .cpuThenANE, .cpuPartitionedArgmax, .cpuFP16Tiled:
             // Fall through to CPU sgemm path for now
             stepLogits.withUnsafeMutablePointer { logitsPtr in
                 classifierPointer(
@@ -2301,7 +2301,7 @@ public struct ANEDirectGenerationModel: ~Copyable, DirectTokenSelectingLanguageM
         classifier: borrowing TensorBuffer
     ) throws(GenerationError) -> ANEGenerationClassifierHead? {
         switch outputHeadBackend {
-        case .cpu, .cpuExactStaged, .cpuExactClustered, .cpuThenANE, .cpuPartitionedArgmax:
+        case .cpu, .cpuExactStaged, .cpuExactClustered, .cpuThenANE, .cpuPartitionedArgmax, .cpuFP16Tiled:
             return nil
         case .aneClassifier:
             if sharedClassifier {
@@ -2321,7 +2321,7 @@ public struct ANEDirectGenerationModel: ~Copyable, DirectTokenSelectingLanguageM
         classifier: borrowing TensorBuffer
     ) throws(GenerationError) -> CPUStagedExactGenerationOutputHead? {
         switch outputHeadBackend {
-        case .cpu, .aneClassifier, .aneRMSNormClassifier, .cpuThenANE, .cpuPartitionedArgmax:
+        case .cpu, .aneClassifier, .aneRMSNormClassifier, .cpuThenANE, .cpuPartitionedArgmax, .cpuFP16Tiled:
             return nil
         case .cpuExactStaged:
             if sharedClassifier {
@@ -2361,7 +2361,7 @@ public struct ANEDirectGenerationModel: ~Copyable, DirectTokenSelectingLanguageM
         classifier: borrowing TensorBuffer
     ) throws(GenerationError) -> ANEGenerationRMSNormClassifierHead? {
         switch outputHeadBackend {
-        case .cpu, .cpuExactStaged, .cpuExactClustered, .aneClassifier, .cpuThenANE, .cpuPartitionedArgmax:
+        case .cpu, .cpuExactStaged, .cpuExactClustered, .aneClassifier, .cpuThenANE, .cpuPartitionedArgmax, .cpuFP16Tiled:
             return nil
         case .aneRMSNormClassifier:
             if sharedClassifier {
@@ -2540,7 +2540,7 @@ public struct ANEDirectGenerationModel: ~Copyable, DirectTokenSelectingLanguageM
 
         stepLogits.zero()
         switch outputHeadBackend {
-        case .cpu, .cpuExactStaged, .cpuExactClustered, .cpuThenANE, .cpuPartitionedArgmax:
+        case .cpu, .cpuExactStaged, .cpuExactClustered, .cpuThenANE, .cpuPartitionedArgmax, .cpuFP16Tiled:
             stepLogits.withUnsafeMutablePointer { logitsPtr in
                 classifierPointer { clsPtr in
                     stepNorm.withUnsafePointer { normPtr in
@@ -2647,7 +2647,7 @@ public struct ANEDirectGenerationModel: ~Copyable, DirectTokenSelectingLanguageM
                 throw .runtimeFailure("ANE fused output-head backend requested without compiled head")
             }
             token = try aneRMSNormClassifierHead.selectArgmax(rawInput: xCur)
-        case .cpuThenANE, .cpuPartitionedArgmax:
+        case .cpuThenANE, .cpuPartitionedArgmax, .cpuFP16Tiled:
             // Fall through to CPU sgemm path
             stepLogits.zero()
             stepLogits.withUnsafeMutablePointer { logitsPtr in
@@ -2772,6 +2772,7 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
     private let blockMaxNorms: [Float]
     private let partitionedLogitsScratch: TensorBuffer
     private let deferredANEHead: DeferredANEHead?
+    private let classifierFP16: TensorBufferFP16
 
     public var performanceSnapshot: GenerationPerformanceSnapshot {
         GenerationPerformanceSnapshot(
@@ -2936,6 +2937,26 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
             deferredANEHead = nil
         }
 
+        // FP16 tiled classifier weights
+        let classifierFP16: TensorBufferFP16
+        if outputHeadBackend == .cpuFP16Tiled {
+            if sharedClassifier {
+                classifierFP16 = TensorBufferFP16(
+                    quantizing: embedding,
+                    rows: vocabSize,
+                    cols: ModelConfig.dim
+                )
+            } else {
+                classifierFP16 = TensorBufferFP16(
+                    quantizing: classifier,
+                    rows: vocabSize,
+                    cols: ModelConfig.dim
+                )
+            }
+        } else {
+            classifierFP16 = TensorBufferFP16()
+        }
+
         self.vocabSize = vocabSize
         self.layerCount = layerCount
         self.maxSequenceTokens = maxSequenceTokens
@@ -2964,6 +2985,7 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
         self.blockMaxNorms = blockMaxNorms
         self.partitionedLogitsScratch = partitionedLogitsScratch
         self.deferredANEHead = deferredANEHead
+        self.classifierFP16 = classifierFP16
     }
 
     private static func emptyLayerStorage<Element: ~Copyable>(_: Element.Type = Element.self) -> LayerStorage<Element> {
@@ -3052,7 +3074,7 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
         laneSpatial: Int
     ) throws(GenerationError) -> ANEGenerationClassifierHead? {
         switch outputHeadBackend {
-        case .cpu, .cpuExactStaged, .cpuExactClustered, .cpuThenANE, .cpuPartitionedArgmax:
+        case .cpu, .cpuExactStaged, .cpuExactClustered, .cpuThenANE, .cpuPartitionedArgmax, .cpuFP16Tiled:
             return nil
         case .aneClassifier:
             if sharedClassifier {
@@ -3080,7 +3102,7 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
         classifier: borrowing TensorBuffer
     ) throws(GenerationError) -> CPUStagedExactGenerationOutputHead? {
         switch outputHeadBackend {
-        case .cpu, .aneClassifier, .aneRMSNormClassifier, .cpuThenANE, .cpuPartitionedArgmax:
+        case .cpu, .aneClassifier, .aneRMSNormClassifier, .cpuThenANE, .cpuPartitionedArgmax, .cpuFP16Tiled:
             return nil
         case .cpuExactStaged:
             if sharedClassifier {
@@ -3121,7 +3143,7 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
         laneSpatial: Int
     ) throws(GenerationError) -> ANEGenerationRMSNormClassifierHead? {
         switch outputHeadBackend {
-        case .cpu, .cpuExactStaged, .cpuExactClustered, .aneClassifier, .cpuThenANE, .cpuPartitionedArgmax:
+        case .cpu, .cpuExactStaged, .cpuExactClustered, .aneClassifier, .cpuThenANE, .cpuPartitionedArgmax, .cpuFP16Tiled:
             return nil
         case .aneRMSNormClassifier:
             if sharedClassifier {
@@ -3346,7 +3368,7 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
 
         stepLogits.zero()
         switch outputHeadBackend {
-        case .cpu, .cpuExactStaged, .cpuExactClustered, .cpuThenANE, .cpuPartitionedArgmax:
+        case .cpu, .cpuExactStaged, .cpuExactClustered, .cpuThenANE, .cpuPartitionedArgmax, .cpuFP16Tiled:
             stepLogits.withUnsafeMutablePointer { logitsPtr in
                 classifierPointer { clsPtr in
                     stepNorm.withUnsafePointer { normPtr in
@@ -3531,6 +3553,21 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
                             )
                         }
                     }
+                }
+            }
+            token = UInt16(tokenIndex)
+        case .cpuFP16Tiled:
+            guard classifierFP16.count > 0 else {
+                throw .runtimeFailure("FP16 tiled classifier backend requested without FP16 weights")
+            }
+            let tokenIndex = classifierFP16.withUnsafePointer { fp16Ptr in
+                stepNorm.withUnsafePointer { normPtr in
+                    FP16TiledClassifier.tiledMatvecArgmax(
+                        weights: fp16Ptr,
+                        input: normPtr,
+                        vocabSize: vocabSize,
+                        dim: ModelConfig.dim
+                    )
                 }
             }
             token = UInt16(tokenIndex)

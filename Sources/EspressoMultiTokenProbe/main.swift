@@ -227,6 +227,12 @@ private func parseOutputHeadBackend(_ raw: String) -> GenerationOutputHeadBacken
         return .aneClassifier
     case "ane-rmsnorm-classifier":
         return .aneRMSNormClassifier
+    case "cpu-then-ane":
+        return .cpuThenANE
+    case "cpu-partitioned-argmax":
+        return .cpuPartitionedArgmax
+    case "cpu-fp16-tiled":
+        return .cpuFP16Tiled
     default:
         fatal("Unknown output-head backend: \(raw)")
     }
@@ -637,6 +643,7 @@ private func describe(_ backend: GenerationOutputHeadBackend) -> String {
     case .aneRMSNormClassifier: return "ane-rmsnorm-classifier"
     case .cpuThenANE: return "cpu-then-ane"
     case .cpuPartitionedArgmax: return "cpu-partitioned-argmax"
+    case .cpuFP16Tiled: return "cpu-fp16-tiled"
     }
 }
 
