@@ -722,6 +722,13 @@ if [[ $failed_runs -gt 0 ]]; then
   gate_warnings="${gate_warnings}FAILED_RUNS: ${failed_runs}/${REPEATS} runs failed\n"
 fi
 
+# Build configuration check: warn if any run was built in debug mode
+debug_runs="$(jq -s 'map(.build_configuration // null) | map(select(. == "debug")) | if length > 0 then length else empty end' "${valid_runs[@]}" 2>/dev/null || echo "")"
+if [[ -n "$debug_runs" ]]; then
+  gate_status="warn"
+  gate_warnings="${gate_warnings}DEBUG_BUILD: ${debug_runs} run(s) used debug build configuration — results are not representative\n"
+fi
+
 # Probe version consistency check
 probe_version_mismatch="$(jq -s 'map(.probe_version // null) | unique | if length > 1 then . else empty end' "${valid_runs[@]}" 2>/dev/null || echo "")"
 if [[ -n "$probe_version_mismatch" ]]; then
