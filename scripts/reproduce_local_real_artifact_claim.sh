@@ -248,6 +248,8 @@ fi
       "harness_per_run_process_ids=\(.per_run_process_ids // [] | tojson)",
       "harness_total_stderr_lines=\(.per_run_stderr_lines // [] | add // 0)",
       "harness_contract_hash=\(.benchmark_contract.contract_hash | na)",
+      "harness_per_run_wall_elapsed_s=\(.per_run_wall_elapsed_s // [] | tojson)",
+      "harness_per_run_outer_elapsed_s=\(.per_run_outer_elapsed_s // [] | tojson)",
       "harness_probe_wall_range_s=\(.probe_wall_range_s | na)",
       "harness_outer_elapsed_range_s=\(.outer_elapsed_range_s | na)",
       "harness_gate_status=\(.reproducibility.gate_status // "unknown")",
