@@ -2936,21 +2936,23 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
         if outputHeadBackend == .cpuThenANE {
             let deferred = DeferredANEHead()
             if sharedClassifier {
-                let head = try ANEGenerationRMSNormClassifierHead(
+                if let head = try? ANEGenerationRMSNormClassifierHead(
                     rmsFinal: rmsFinal,
                     classifierWeights: embedding,
                     vocabSize: vocabSize,
                     laneSpatial: outputHeadLaneSpatial
-                )
-                deferred.store(head)
+                ) {
+                    deferred.store(head)
+                }
             } else {
-                let head = try ANEGenerationRMSNormClassifierHead(
+                if let head = try? ANEGenerationRMSNormClassifierHead(
                     rmsFinal: rmsFinal,
                     classifierWeights: classifier,
                     vocabSize: vocabSize,
                     laneSpatial: outputHeadLaneSpatial
-                )
-                deferred.store(head)
+                ) {
+                    deferred.store(head)
+                }
             }
             deferredANEHead = deferred
         } else {

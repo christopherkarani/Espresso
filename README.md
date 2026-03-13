@@ -96,9 +96,8 @@ This project uses undocumented private Apple APIs (`_ANEClient`, `_ANEInMemoryMo
 
 ## Further reading
 
-- [Release note: exact non-echo decode](docs/releases/2026-03-11-non-echo-exact-decode.md) -- methodology and measured results
-- [Lab notebook](docs/fused-decode-and-next-steps.md) -- full optimization history and dead ends
-- [VirtualClient probe results](docs/vc-probe-results.md) -- private API exploration findings
+- [Local repro harness](scripts/reproduce_local_real_artifact_claim.sh) -- end-to-end exact-claim workflow
+- [Exact benchmark script](scripts/reproduce_exact_4x.sh) -- matched ANE vs CoreML measurement entry point
 - [Benchmark artifacts](artifacts/benchmarks/exact-decode-non-echo/) -- machine-readable evidence
 
 ## License

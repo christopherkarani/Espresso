@@ -10,7 +10,7 @@ public enum GenerationOutputHeadBackend: Sendable {
     case cpuExactClustered
     case aneClassifier
     case aneRMSNormClassifier
-    /// CPU fallback that uses an ANE RMSNorm+classifier head when one is available.
+    /// CPU fallback that opportunistically uses an ANE RMSNorm+classifier head when it compiles.
     case cpuThenANE
     /// Vocabulary-partitioned argmax with Cauchy-Schwarz pruning.
     case cpuPartitionedArgmax
@@ -24,7 +24,8 @@ public enum GenerationOutputHeadBackend: Sendable {
 /// Thread-safe container for an optional `ANEGenerationRMSNormClassifierHead`.
 ///
 /// Readers on the hot token-selection path call `readyHead`, which performs a single
-/// `os_unfair_lock`-protected load.
+/// `os_unfair_lock`-protected load. If the ANE head never compiles, callers continue
+/// using the CPU fallback path.
 public final class DeferredANEHead: @unchecked Sendable {
     private var _lock: os_unfair_lock = os_unfair_lock()
     private var _head: ANEGenerationRMSNormClassifierHead?
