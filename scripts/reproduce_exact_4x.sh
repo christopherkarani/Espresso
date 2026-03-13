@@ -229,6 +229,12 @@ if [[ -n "${GENERATION_MODEL:-}" && -e "$GENERATION_MODEL" ]]; then
   GENERATION_MODEL_SHA256="$(shasum -a 256 "$GENERATION_MODEL" | awk '{print $1}')"
 fi
 
+# Verify CoreML model exists (required for comparison path)
+if [[ ! -e "$COREML_MODEL" ]]; then
+  echo "FATAL: CoreML model not found at $COREML_MODEL" >&2
+  exit 1
+fi
+
 # Verify jq is available (required for aggregation)
 if ! command -v jq &>/dev/null; then
   echo "FATAL: jq is required but not found on PATH" >&2
