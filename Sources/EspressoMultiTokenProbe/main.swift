@@ -452,6 +452,8 @@ private func compileOnlyPayload(options: Options) throws -> [String: Any] {
         "probe_version": probeVersion,
         "probe_timestamp": isoFormatter.string(from: Date()),
         "probe_wall_elapsed_s": probeElapsedS,
+        "hostname": ProcessInfo.processInfo.hostName,
+        "os_version": ProcessInfo.processInfo.operatingSystemVersionString,
         "mode": options.mode.rawValue,
         "control_backend": describe(options.controlBackend),
         "two_step_backend": describe(options.twoStepBackend),
