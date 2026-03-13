@@ -176,6 +176,7 @@ fi
       "harness_speedup_max=\(.two_step_speedup_max)",
       "harness_all_parity=\(.all_parity_match)",
       "harness_parity_total=\(.parity_total | na)",
+      "harness_per_run_parity=\(.per_run_parity // [] | tojson)",
       "harness_parity_match_counts=\(.per_run_parity_match_count // [] | tojson)",
       "harness_two_step_cv=\(.two_step.cv)",
       "harness_control_median_ms=\(.control.median_ms_per_token)",
