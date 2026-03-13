@@ -642,6 +642,8 @@ jq -s \
   per_run_parity: (map(.parity_status)),
   per_run_parity_match_count: (map(.parity_match_count // null)),
   parity_total: (map(.parity_total // null) | .[0]),
+  per_run_control_generated_count: (map(.control.generated_tokens // null | if . != null then length else null end)),
+  per_run_two_step_generated_count: (map(.two_step.generated_tokens // null | if . != null then length else null end)),
   per_run_timestamps: (map(.probe_timestamp // null)),
   per_run_iteration_counts: (map(.measured_iteration_count // null)),
   first_run_timestamp: (map(.probe_timestamp // null) | map(select(. != null)) | sort | first // null),
