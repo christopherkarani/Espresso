@@ -11,6 +11,9 @@ set -euo pipefail
 # The default contract reproduces the release documented in
 # docs/releases/2026-03-11-non-echo-exact-decode.md.
 
+# Bump this when the claim-summary output contract changes.
+CLAIM_VERSION=2
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RESULTS_DIR="${RESULTS_DIR:-$ROOT/results/real-artifact-$(date +%Y%m%d-%H%M%S)}"
 DATASET_PATH="$RESULTS_DIR/local-text.uint16.bin"
@@ -104,6 +107,7 @@ LAYER_COUNT="$LAYER_COUNT" \
 "$ROOT/scripts/reproduce_exact_4x.sh"
 
 {
+  echo "claim_version=$CLAIM_VERSION"
   echo "results_dir=$RESULTS_DIR"
   echo "dataset=$DATASET_PATH"
   echo "artifact_prefix=$ARTIFACT_PREFIX"
