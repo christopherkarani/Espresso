@@ -183,6 +183,13 @@ if [[ ! -e "$COREML_MODEL" ]]; then
   echo "FATAL: CoreML model generation succeeded but $COREML_MODEL is missing" >&2
   exit 1
 fi
+if [[ -d "$COREML_MODEL" ]]; then
+  coreml_files="$(find "$COREML_MODEL" -type f | wc -l | tr -d ' ')"
+  if [[ "$coreml_files" -lt 1 ]]; then
+    echo "FATAL: CoreML model directory $COREML_MODEL contains no files" >&2
+    exit 1
+  fi
+fi
 
 echo "Running public recurrent-checkpoint harness"
 harness_start_epoch=$(date +%s)
