@@ -377,19 +377,21 @@ public enum SurfaceIO {
         channelOffset: Int,
         spatial: Int,
         embeddingTable: UnsafePointer<Float>,
+        vocabSize: Int,
         dim: Int,
         tokenIDs: UnsafePointer<UInt16>,
         streamCount: Int
     ) throws(SurfaceIOError) {
         let chOff32 = try checkedNonNegativeInt32(channelOffset)
         let spatial32 = try checkedNonNegativeInt32(spatial)
+        let vocab32 = try checkedNonNegativeInt32(vocabSize)
         let dim32 = try checkedNonNegativeInt32(dim)
         let count32 = try checkedNonNegativeInt32(streamCount)
-        guard spatial > 0, dim > 0, streamCount > 0, streamCount <= spatial else {
+        guard spatial > 0, vocabSize > 0, dim > 0, streamCount > 0, streamCount <= spatial else {
             throw .argumentOutOfRange
         }
         let ok = ane_interop_io_write_embedding_batch_fp16(
-            surface, chOff32, spatial32, embeddingTable, dim32, tokenIDs, count32
+            surface, chOff32, spatial32, embeddingTable, vocab32, dim32, tokenIDs, count32
         )
         guard ok else { throw .interopCallFailed }
     }
@@ -441,6 +443,9 @@ public enum SurfaceIO {
         let count32 = try checkedNonNegativeInt32(streamCount)
         let blocks32 = try checkedNonNegativeInt32(nBlocks)
         guard spatial > 0, channels > 0, streamCount > 0, streamCount <= spatial else {
+            throw .argumentOutOfRange
+        }
+        guard channels <= Int(UInt16.max) + 1 else {
             throw .argumentOutOfRange
         }
 
@@ -510,7 +515,23 @@ public enum SurfaceIO {
         streamCount: Int,
         nBlocks: Int = 8
     ) throws(SurfaceIOError) -> [FP16ArgmaxResult] {
+        let projChOff32 = try checkedNonNegativeInt32(projChannelOffset)
+        let spatial32 = try checkedNonNegativeInt32(spatial)
+        let bottleneck32 = try checkedNonNegativeInt32(bottleneck)
+        let groups32 = try checkedNonNegativeInt32(groups)
+        let vocab32 = try checkedNonNegativeInt32(vocabSize)
+        let count32 = try checkedNonNegativeInt32(streamCount)
+        let blocks32 = try checkedNonNegativeInt32(nBlocks)
         guard spatial > 0, bottleneck > 0, groups > 0, vocabSize > 0, streamCount > 0 else {
+            throw .argumentOutOfRange
+        }
+        guard streamCount <= spatial else {
+            throw .argumentOutOfRange
+        }
+        guard bottleneck.isMultiple(of: groups), vocabSize.isMultiple(of: groups) else {
+            throw .argumentOutOfRange
+        }
+        guard vocabSize <= Int(UInt16.max) + 1 else {
             throw .argumentOutOfRange
         }
         var indices = [Int32](repeating: 0, count: streamCount)
@@ -519,16 +540,16 @@ public enum SurfaceIO {
             values.withUnsafeMutableBufferPointer { valBuf in
                 ane_interop_fused_expansion_argmax_fp16(
                     projSurface,
-                    Int32(projChannelOffset),
-                    Int32(spatial),
-                    Int32(bottleneck),
-                    Int32(groups),
+                    projChOff32,
+                    spatial32,
+                    bottleneck32,
+                    groups32,
                     expansionWeightsFP16,
-                    Int32(vocabSize),
-                    Int32(streamCount),
+                    vocab32,
+                    count32,
                     idxBuf.baseAddress!,
                     valBuf.baseAddress!,
-                    Int32(nBlocks)
+                    blocks32
                 )
             }
         }

@@ -27,6 +27,9 @@ public struct RWKVStyleFusedThreeLayerFactoredClassifierKernelSet: ~Copyable {
         guard laneSpatial > 0 else {
             throw .invalidArguments("laneSpatial must be > 0")
         }
+        guard groups > 0 else {
+            throw .invalidArguments("groups must be > 0")
+        }
         guard vocabSize > 0 else {
             throw .invalidArguments("vocabSize must be > 0")
         }
@@ -35,6 +38,9 @@ public struct RWKVStyleFusedThreeLayerFactoredClassifierKernelSet: ~Copyable {
         }
 
         let dim = ModelConfig.dim
+        guard dim.isMultiple(of: groups) else {
+            throw .invalidArguments("dim \(dim) must be divisible by groups \(groups)")
+        }
         let colsPerConv = dim / groups
         // Head convs are always dense (groups=1), so cols = full dim / bottleneck
         let projCols = dim
@@ -51,22 +57,22 @@ public struct RWKVStyleFusedThreeLayerFactoredClassifierKernelSet: ~Copyable {
             weights: [
                 // Layer 0
                 (path: "@model_path/weights/rwkv_rms0.bin", data: Self.buildBlob(from: weights0.rms, rows: 1, cols: dim)),
-                (path: "@model_path/weights/wx0.bin", data: Self.buildBlob(from: weights0.Wx, rows: dim, cols: colsPerConv)),
-                (path: "@model_path/weights/ws0.bin", data: Self.buildBlob(from: weights0.Ws, rows: dim, cols: colsPerConv)),
-                (path: "@model_path/weights/wd0.bin", data: Self.buildBlob(from: weights0.Wd, rows: dim, cols: colsPerConv)),
-                (path: "@model_path/weights/wo0.bin", data: Self.buildBlob(from: weights0.Wo, rows: dim, cols: colsPerConv)),
+                (path: "@model_path/weights/wx0.bin", data: GroupedWeightBlob.build(from: weights0.Wx, rows: dim, colsPerGroup: colsPerConv, groups: groups)),
+                (path: "@model_path/weights/ws0.bin", data: GroupedWeightBlob.build(from: weights0.Ws, rows: dim, colsPerGroup: colsPerConv, groups: groups)),
+                (path: "@model_path/weights/wd0.bin", data: GroupedWeightBlob.build(from: weights0.Wd, rows: dim, colsPerGroup: colsPerConv, groups: groups)),
+                (path: "@model_path/weights/wo0.bin", data: GroupedWeightBlob.build(from: weights0.Wo, rows: dim, colsPerGroup: colsPerConv, groups: groups)),
                 // Layer 1
                 (path: "@model_path/weights/rwkv_rms1.bin", data: Self.buildBlob(from: weights1.rms, rows: 1, cols: dim)),
-                (path: "@model_path/weights/wx1.bin", data: Self.buildBlob(from: weights1.Wx, rows: dim, cols: colsPerConv)),
-                (path: "@model_path/weights/ws1.bin", data: Self.buildBlob(from: weights1.Ws, rows: dim, cols: colsPerConv)),
-                (path: "@model_path/weights/wd1.bin", data: Self.buildBlob(from: weights1.Wd, rows: dim, cols: colsPerConv)),
-                (path: "@model_path/weights/wo1.bin", data: Self.buildBlob(from: weights1.Wo, rows: dim, cols: colsPerConv)),
+                (path: "@model_path/weights/wx1.bin", data: GroupedWeightBlob.build(from: weights1.Wx, rows: dim, colsPerGroup: colsPerConv, groups: groups)),
+                (path: "@model_path/weights/ws1.bin", data: GroupedWeightBlob.build(from: weights1.Ws, rows: dim, colsPerGroup: colsPerConv, groups: groups)),
+                (path: "@model_path/weights/wd1.bin", data: GroupedWeightBlob.build(from: weights1.Wd, rows: dim, colsPerGroup: colsPerConv, groups: groups)),
+                (path: "@model_path/weights/wo1.bin", data: GroupedWeightBlob.build(from: weights1.Wo, rows: dim, colsPerGroup: colsPerConv, groups: groups)),
                 // Layer 2
                 (path: "@model_path/weights/rwkv_rms2.bin", data: Self.buildBlob(from: weights2.rms, rows: 1, cols: dim)),
-                (path: "@model_path/weights/wx2.bin", data: Self.buildBlob(from: weights2.Wx, rows: dim, cols: colsPerConv)),
-                (path: "@model_path/weights/ws2.bin", data: Self.buildBlob(from: weights2.Ws, rows: dim, cols: colsPerConv)),
-                (path: "@model_path/weights/wd2.bin", data: Self.buildBlob(from: weights2.Wd, rows: dim, cols: colsPerConv)),
-                (path: "@model_path/weights/wo2.bin", data: Self.buildBlob(from: weights2.Wo, rows: dim, cols: colsPerConv)),
+                (path: "@model_path/weights/wx2.bin", data: GroupedWeightBlob.build(from: weights2.Wx, rows: dim, colsPerGroup: colsPerConv, groups: groups)),
+                (path: "@model_path/weights/ws2.bin", data: GroupedWeightBlob.build(from: weights2.Ws, rows: dim, colsPerGroup: colsPerConv, groups: groups)),
+                (path: "@model_path/weights/wd2.bin", data: GroupedWeightBlob.build(from: weights2.Wd, rows: dim, colsPerGroup: colsPerConv, groups: groups)),
+                (path: "@model_path/weights/wo2.bin", data: GroupedWeightBlob.build(from: weights2.Wo, rows: dim, colsPerGroup: colsPerConv, groups: groups)),
                 // Head: RMS final + factored classifier
                 (path: "@model_path/weights/rms_final.bin", data: Self.buildBlob(from: rmsFinal, rows: 1, cols: dim)),
                 (path: "@model_path/weights/cls_proj.bin", data: Self.buildBlob(from: classifierProjection, rows: bottleneck, cols: projCols)),
@@ -83,12 +89,7 @@ public struct RWKVStyleFusedThreeLayerFactoredClassifierKernelSet: ~Copyable {
     @inline(__always)
     private static func buildBlob(from buffer: borrowing TensorBuffer, rows: Int, cols: Int) -> Data {
         buffer.withUnsafeBufferPointer { ptr in
-            if ptr.count == rows * cols {
-                return WeightBlob.build(from: ptr, rows: rows, cols: cols)
-            }
-            // Slice: take only the first rows*cols elements (for grouped convs)
-            let sliced = UnsafeBufferPointer(start: ptr.baseAddress, count: rows * cols)
-            return WeightBlob.build(from: sliced, rows: rows, cols: cols)
+            WeightBlob.build(from: ptr, rows: rows, cols: cols)
         }
     }
 }

@@ -38,6 +38,12 @@ public struct RWKVStyleFusedThreeLayerKernelSet: ~Copyable {
         guard laneSpatial > 0 else {
             throw .invalidArguments("fused three-layer recurrent laneSpatial must be > 0")
         }
+        guard groups > 0 else {
+            throw .invalidArguments("fused three-layer recurrent groups must be > 0")
+        }
+        guard ModelConfig.dim.isMultiple(of: groups) else {
+            throw .invalidArguments("fused three-layer recurrent dim \(ModelConfig.dim) must be divisible by groups \(groups)")
+        }
         let compiled = try Self.compileStep(
             weights0: weights0,
             weights1: weights1,
@@ -89,6 +95,8 @@ public struct RWKVStyleFusedThreeLayerKernelSet: ~Copyable {
         includeRMSNorm: Bool = true
     ) -> CompileSpec {
         let dim = ModelConfig.dim
+        precondition(groups > 0)
+        precondition(dim.isMultiple(of: groups))
         let colsPerConv = dim / groups
         let generator = RWKVStyleFusedThreeLayerStepGenerator(laneSpatial: laneSpatial, groups: groups, includeRMSNorm: includeRMSNorm)
 
@@ -99,10 +107,10 @@ public struct RWKVStyleFusedThreeLayerKernelSet: ~Copyable {
             if includeRMSNorm {
                 weights.append((path: "@model_path/weights/rwkv_rms\(index).bin", data: buildBlob(from: w.rms, rows: 1, cols: dim)))
             }
-            weights.append((path: "@model_path/weights/wx\(index).bin", data: buildBlob(from: w.Wx, rows: dim, cols: colsPerConv)))
-            weights.append((path: "@model_path/weights/ws\(index).bin", data: buildBlob(from: w.Ws, rows: dim, cols: colsPerConv)))
-            weights.append((path: "@model_path/weights/wd\(index).bin", data: buildBlob(from: w.Wd, rows: dim, cols: colsPerConv)))
-            weights.append((path: "@model_path/weights/wo\(index).bin", data: buildBlob(from: w.Wo, rows: dim, cols: colsPerConv)))
+            weights.append((path: "@model_path/weights/wx\(index).bin", data: GroupedWeightBlob.build(from: w.Wx, rows: dim, colsPerGroup: colsPerConv, groups: groups)))
+            weights.append((path: "@model_path/weights/ws\(index).bin", data: GroupedWeightBlob.build(from: w.Ws, rows: dim, colsPerGroup: colsPerConv, groups: groups)))
+            weights.append((path: "@model_path/weights/wd\(index).bin", data: GroupedWeightBlob.build(from: w.Wd, rows: dim, colsPerGroup: colsPerConv, groups: groups)))
+            weights.append((path: "@model_path/weights/wo\(index).bin", data: GroupedWeightBlob.build(from: w.Wo, rows: dim, colsPerGroup: colsPerConv, groups: groups)))
         }
 
         addLayer(weights0, index: 0)
@@ -117,16 +125,10 @@ public struct RWKVStyleFusedThreeLayerKernelSet: ~Copyable {
             outputSizes: generator.outputByteSizes
         )
     }
-
     @inline(__always)
     private static func buildBlob(from buffer: borrowing TensorBuffer, rows: Int, cols: Int) -> Data {
         buffer.withUnsafeBufferPointer { ptr in
-            if ptr.count == rows * cols {
-                return WeightBlob.build(from: ptr, rows: rows, cols: cols)
-            }
-            // Slice: take only the first rows*cols elements (for grouped convs)
-            let sliced = UnsafeBufferPointer(start: ptr.baseAddress, count: rows * cols)
-            return WeightBlob.build(from: sliced, rows: rows, cols: cols)
+            WeightBlob.build(from: ptr, rows: rows, cols: cols)
         }
     }
 }

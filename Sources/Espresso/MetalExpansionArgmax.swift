@@ -4,6 +4,38 @@ import MetalPerformanceShaders
 import IOSurface
 import ANETypes
 
+@inline(__always)
+private func requireUInt16TokenIDs(vocabSize: Int) throws(MetalExpansionArgmaxError) {
+    guard vocabSize > 0, vocabSize <= Int(UInt16.max) + 1 else {
+        throw .invalidArguments("vocabSize \(vocabSize) exceeds UInt16 token-id capacity")
+    }
+}
+
+@inline(__always)
+private func requiredFP16SurfaceBytes(channels: Int, spatial: Int) throws(MetalExpansionArgmaxError) -> Int {
+    let elementCount = channels.multipliedReportingOverflow(by: spatial)
+    guard !elementCount.overflow else {
+        throw .invalidArguments("surface shape overflow for channels \(channels) and spatial \(spatial)")
+    }
+    let bytes = elementCount.partialValue.multipliedReportingOverflow(by: MemoryLayout<Float16>.stride)
+    guard !bytes.overflow else {
+        throw .invalidArguments("surface byte count overflow for channels \(channels) and spatial \(spatial)")
+    }
+    return bytes.partialValue
+}
+
+@inline(__always)
+private func validatedLockedSurfaceBaseAddress(
+    _ surface: IOSurfaceRef,
+    requiredBytes: Int
+) throws(MetalExpansionArgmaxError) -> UnsafeMutableRawPointer {
+    let baseAddress = IOSurfaceGetBaseAddress(surface)
+    guard requiredBytes <= IOSurfaceGetAllocSize(surface) else {
+        throw .invalidArguments("IOSurface allocation \(IOSurfaceGetAllocSize(surface)) is smaller than required \(requiredBytes) bytes")
+    }
+    return baseAddress
+}
+
 public enum MetalExpansionArgmaxError: Error, Equatable {
     case metalUnavailable
     case commandQueueUnavailable
@@ -50,6 +82,7 @@ public final class MPSExpansionArgmax {
         guard bottleneck > 0, vocabSize > 0, spatial > 0 else {
             throw .invalidArguments("all dimensions must be > 0")
         }
+        try requireUInt16TokenIDs(vocabSize: vocabSize)
         guard wExpand.count >= vocabSize * bottleneck else {
             throw .invalidArguments("wExpand too small")
         }
@@ -121,13 +154,13 @@ public final class MPSExpansionArgmax {
 
     /// Run MPS matmul + GPU argmax on projected ANE output surface.
     public func run(projectedSurface: IOSurfaceRef) throws(MetalExpansionArgmaxError) -> UnsafeBufferPointer<UInt16> {
-        let elementCount = bottleneck * spatial
-        let length = elementCount * MemoryLayout<Float16>.stride
+        let length = try requiredFP16SurfaceBytes(channels: bottleneck, spatial: spatial)
 
         // Copy IOSurface data into Metal buffer
         let status = IOSurfaceLock(projectedSurface, [.readOnly], nil)
         guard status == 0 else { throw .surfaceLockFailed(status) }
-        memcpy(projBuffer.contents(), IOSurfaceGetBaseAddress(projectedSurface), length)
+        let baseAddress = try validatedLockedSurfaceBaseAddress(projectedSurface, requiredBytes: length)
+        memcpy(projBuffer.contents(), baseAddress, length)
         IOSurfaceUnlock(projectedSurface, [.readOnly], nil)
 
         // MPS matrix descriptors
@@ -297,6 +330,7 @@ public final class GPUFullHeadArgmax {
         guard dim > 0, bottleneck > 0, vocabSize > 0, spatial > 0 else {
             throw .invalidArguments("all dimensions must be > 0")
         }
+        try requireUInt16TokenIDs(vocabSize: vocabSize)
         guard rmsGamma.count >= dim else { throw .invalidArguments("rmsGamma too small") }
         guard wProject.count >= dim * bottleneck else { throw .invalidArguments("wProject too small") }
         guard wExpand.count >= vocabSize * bottleneck else { throw .invalidArguments("wExpand too small") }
@@ -385,12 +419,13 @@ public final class GPUFullHeadArgmax {
 
     /// Run full GPU head pipeline on trunk output surface.
     public func run(trunkSurface: IOSurfaceRef) throws(MetalExpansionArgmaxError) -> UnsafeBufferPointer<UInt16> {
-        let trunkBytes = dim * spatial * MemoryLayout<Float16>.stride
+        let trunkBytes = try requiredFP16SurfaceBytes(channels: dim, spatial: spatial)
 
         // 1. Copy trunk output to GPU buffer
         let lockStatus = IOSurfaceLock(trunkSurface, [.readOnly], nil)
         guard lockStatus == 0 else { throw .surfaceLockFailed(lockStatus) }
-        memcpy(trunkBuffer.contents(), IOSurfaceGetBaseAddress(trunkSurface), trunkBytes)
+        let baseAddress = try validatedLockedSurfaceBaseAddress(trunkSurface, requiredBytes: trunkBytes)
+        memcpy(trunkBuffer.contents(), baseAddress, trunkBytes)
         IOSurfaceUnlock(trunkSurface, [.readOnly], nil)
 
         guard let cb = commandQueue.makeCommandBuffer() else { throw .commandBufferUnavailable }
@@ -539,6 +574,7 @@ public final class GPUPipelinedHead {
         guard dim > 0, bottleneck > 0, vocabSize > 0, spatial > 0 else {
             throw .invalidArguments("all dimensions must be > 0")
         }
+        try requireUInt16TokenIDs(vocabSize: vocabSize)
         guard rmsGamma.count >= dim else { throw .invalidArguments("rmsGamma too small") }
         guard wProject.count >= dim * bottleneck else { throw .invalidArguments("wProject too small") }
         guard wExpand.count >= vocabSize * bottleneck else { throw .invalidArguments("wExpand too small") }
@@ -650,19 +686,27 @@ public final class GPUPipelinedHead {
         trunkSurface: IOSurfaceRef,
         embedSurface: IOSurfaceRef
     ) throws(MetalExpansionArgmaxError) -> UnsafeBufferPointer<UInt16> {
-        let trunkBytes = dim * spatial * MemoryLayout<Float16>.stride
+        let trunkBytes = try requiredFP16SurfaceBytes(channels: dim, spatial: spatial)
 
         // Copy trunk output to GPU buffer
         let lockStatus = IOSurfaceLock(trunkSurface, [.readOnly], nil)
         guard lockStatus == 0 else { throw .surfaceLockFailed(lockStatus) }
-        memcpy(trunkBuffer.contents(), IOSurfaceGetBaseAddress(trunkSurface), trunkBytes)
+        let trunkBaseAddress = try validatedLockedSurfaceBaseAddress(trunkSurface, requiredBytes: trunkBytes)
+        memcpy(trunkBuffer.contents(), trunkBaseAddress, trunkBytes)
         IOSurfaceUnlock(trunkSurface, [.readOnly], nil)
 
         // Bind embed surface as Metal buffer
         let embedLock = IOSurfaceLock(embedSurface, [], nil)
         guard embedLock == 0 else { throw .surfaceLockFailed(embedLock) }
+        let embedBaseAddress: UnsafeMutableRawPointer
+        do {
+            embedBaseAddress = try validatedLockedSurfaceBaseAddress(embedSurface, requiredBytes: trunkBytes)
+        } catch {
+            IOSurfaceUnlock(embedSurface, [], nil)
+            throw error
+        }
         guard let embedOutBuffer = device.makeBuffer(
-            bytesNoCopy: IOSurfaceGetBaseAddress(embedSurface),
+            bytesNoCopy: embedBaseAddress,
             length: trunkBytes, options: .storageModeShared, deallocator: nil
         ) else {
             IOSurfaceUnlock(embedSurface, [], nil)
@@ -813,6 +857,7 @@ public final class FusedExpansionArgmax {
         guard bottleneck > 0, vocabSize > 0, spatial > 0 else {
             throw .invalidArguments("all dimensions must be > 0")
         }
+        try requireUInt16TokenIDs(vocabSize: vocabSize)
         guard wExpand.count >= vocabSize * bottleneck else {
             throw .invalidArguments("wExpand too small")
         }
@@ -866,11 +911,12 @@ public final class FusedExpansionArgmax {
 
     /// Run fused matmul+argmax on projected ANE output surface.
     public func run(projectedSurface: IOSurfaceRef) throws(MetalExpansionArgmaxError) -> UnsafeBufferPointer<UInt16> {
-        let length = bottleneck * spatial * MemoryLayout<Float16>.stride
+        let length = try requiredFP16SurfaceBytes(channels: bottleneck, spatial: spatial)
 
         let status = IOSurfaceLock(projectedSurface, [.readOnly], nil)
         guard status == 0 else { throw .surfaceLockFailed(status) }
-        memcpy(projBuffer.contents(), IOSurfaceGetBaseAddress(projectedSurface), length)
+        let baseAddress = try validatedLockedSurfaceBaseAddress(projectedSurface, requiredBytes: length)
+        memcpy(projBuffer.contents(), baseAddress, length)
         IOSurfaceUnlock(projectedSurface, [.readOnly], nil)
 
         guard let commandBuffer = commandQueue.makeCommandBuffer() else {
@@ -1033,6 +1079,7 @@ public final class MetalExpansionArgmax {
         guard bottleneck > 0, vocabSize > 0, spatial > 0 else {
             throw .invalidArguments("all dimensions must be > 0")
         }
+        try requireUInt16TokenIDs(vocabSize: vocabSize)
         guard bottleneck <= 64 else {
             throw .invalidArguments("bottleneck must be <= 64")
         }
@@ -1098,12 +1145,17 @@ public final class MetalExpansionArgmax {
     /// Run expansion+argmax on projected ANE output surface.
     /// Returns pointer to internal output buffer containing uint16 token IDs.
     public func run(projectedSurface: IOSurfaceRef) throws(MetalExpansionArgmaxError) -> UnsafeBufferPointer<UInt16> {
-        let elementCount = bottleneck * spatial
-        let length = elementCount * MemoryLayout<Float16>.stride
+        let length = try requiredFP16SurfaceBytes(channels: bottleneck, spatial: spatial)
 
         let status = IOSurfaceLock(projectedSurface, [.readOnly], nil)
         guard status == 0 else { throw .surfaceLockFailed(status) }
-        let baseAddress = IOSurfaceGetBaseAddress(projectedSurface)
+        let baseAddress: UnsafeMutableRawPointer
+        do {
+            baseAddress = try validatedLockedSurfaceBaseAddress(projectedSurface, requiredBytes: length)
+        } catch {
+            IOSurfaceUnlock(projectedSurface, [.readOnly], nil)
+            throw error
+        }
         guard let inputBuffer = device.makeBuffer(
             bytesNoCopy: baseAddress,
             length: length,
@@ -1257,4 +1309,3 @@ public final class MetalExpansionArgmax {
         """
     }
 }
-

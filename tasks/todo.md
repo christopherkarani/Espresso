@@ -1,5 +1,13 @@
 # TODO
 
+## 2026-03-13 autoresearch-multistream review fixes
+
+- [x] Replace incorrect grouped-weight prefix slicing with a shared row-aware grouped repacker.
+- [x] Remove the stale `RWKVStyleFusedSixLayerKernelSet` compile probe from hardware tests without losing the intended compile-sweep coverage.
+- [x] Harden `SurfaceIO`/ANE interop APIs with vocab, shape, and IOSurface allocation validation.
+- [x] Harden the Metal expansion/argmax fast paths against invalid IOSurface sizes and `UInt16` token-id overflow.
+- [x] Verify with targeted `swift build` and the previously failing filtered hardware test compile path.
+
 - [x] Promote `ebd3c38` from an internal milestone to a public-release surface without changing the measured claim.
 - [x] Rewrite the top-level README so the non-echo exact decode result is the first public benchmark story, with explicit caveats and one-command repro.
 - [x] Add a checked-in benchmark artifact for the non-echo release claim that is stable enough to link publicly.
@@ -8,6 +16,20 @@
 - [x] Update lessons, Wax notes, handoff, and review with the release-packaging outcome.
 
 # Review
+
+## 2026-03-13 autoresearch-multistream review fixes
+
+- Implemented:
+  - grouped dense row-major weights now repack per output-row group instead of truncating a global prefix
+  - stale six-layer compile probe replaced with two existing triplet compile probes
+  - `writeEmbeddingBatchFP16` now carries `vocabSize` explicitly and rejects out-of-range token IDs in C
+  - lockless argmax and fused expansion argmax now validate IOSurface bounds and `UInt16` index width
+  - `ane_interop_rebind_input` now rebuilds requests transactionally and rejects undersized replacement surfaces
+  - Metal fast paths now validate IOSurface allocation sizes before `memcpy` / `bytesNoCopy`
+- Verification:
+  - `swift build` in `/tmp/espresso-fix-autoresearch`: passed
+  - `swift build --target ANERuntimeTests` in `/tmp/espresso-fix-autoresearch`: passed
+  - `swift test --filter GenerationHarnessHardwareTests/test_batched_multistream_scaling_reports_aggregate_throughput_on_hardware` now gets past the missing `RWKVStyleFusedSixLayerKernelSet` symbol, but the `EspressoTests` target still ends in a pre-existing compiler `fatalError` after a large volume of Swift 6 Sendable-capture diagnostics from `GenerationHarnessHardwareTests.swift`
 
 - Current code/control milestone is `ebd3c38`:
   - exact two-step `1.0806302083333332 ms/token`
