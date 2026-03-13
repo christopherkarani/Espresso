@@ -58,6 +58,21 @@ if ! [[ "$PROMPT_TOKEN" =~ ^[0-9]+$ ]]; then
   exit 1
 fi
 
+case "$CONTROL_BACKEND" in
+  single|fused-pair|fused-triplet|identity-zero-trunk) ;;
+  *) echo "Unsupported CONTROL_BACKEND=$CONTROL_BACKEND (expected single|fused-pair|fused-triplet|identity-zero-trunk)" >&2; exit 1 ;;
+esac
+
+case "$TWO_STEP_BACKEND" in
+  single|fused-pair|fused-triplet|identity-zero-trunk) ;;
+  *) echo "Unsupported TWO_STEP_BACKEND=$TWO_STEP_BACKEND (expected single|fused-pair|fused-triplet|identity-zero-trunk)" >&2; exit 1 ;;
+esac
+
+case "$OUTPUT_HEAD_BACKEND" in
+  cpu|ane-classifier|ane-rmsnorm-classifier) ;;
+  *) echo "Unsupported OUTPUT_HEAD_BACKEND=$OUTPUT_HEAD_BACKEND (expected cpu|ane-classifier|ane-rmsnorm-classifier)" >&2; exit 1 ;;
+esac
+
 if [[ ! -e "$COREML_MODEL" ]]; then
   echo "CoreML model not found at $COREML_MODEL" >&2
   exit 1
