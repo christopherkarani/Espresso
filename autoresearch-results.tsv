@@ -296,3 +296,13 @@ cycle	timestamp	hypothesis	result	commit	notes
 296	2026-03-13T04:54:49Z	stale-data-fatal	harness	upgrade stale run data from warning to FATAL error	pass
 297	2026-03-13T04:55:07Z	stale-summary-check	harness	extend stale-data check to include summary.json	pass
 298	2026-03-13T04:55:58Z	test-suite	verify	405 tests pass, 0 failures, 121 skipped	pass
+299	2026-03-13T04:59:43Z	dry-run-claim	claim	add DRY_RUN early-exit to claim script, skip expensive pipeline	pass
+300	2026-03-13T05:00:24Z	contract-xval-full	claim	cross-validate all 9 contract params between claim and harness	pass
+301	2026-03-13T05:00:51Z	mem-pressure-claim	claim	add memory_free_pct start/end tracking to claim script	pass
+302	2026-03-13T05:01:16Z	thermal-load-claim	claim	add thermal+load tracking at claim start/end	pass
+303	2026-03-13T05:01:36Z	power-source-claim	claim	add power_source start/end tracking to claim	pass
+304	2026-03-13T05:02:03Z	env-drift-claim	claim	add LOW_MEMORY and LOW_DISK_SPACE warnings at claim level	pass
+305	2026-03-13T05:02:50Z	test-suite	verify	405 tests pass, 0 failures, 121 skipped	pass
+306	2026-03-13T05:03:16Z	artifact-sizes	claim	add byte sizes for all 5 artifact files in claim-summary	pass
+307	2026-03-13T05:04:42Z	artifact-sha-xval	claim	cross-validate 3 artifact SHA256s between claim and harness	pass
+308	2026-03-13T05:05:09Z	input-mode-xval	claim	cross-validate harness input_mode=recurrent-checkpoint	pass
