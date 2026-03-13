@@ -29,6 +29,7 @@ private struct Options {
     var coreMLModelPath: String? = nil
     var generationModelPath: String? = nil
     var promptToken: UInt16 = 0
+    var shareWeights: Bool = false
 
     static func parse(_ argv: [String]) -> Options {
         var options = Options()
@@ -118,6 +119,8 @@ private struct Options {
                     fatal("Expected --prompt-token UINT16")
                 }
                 options.promptToken = promptToken
+            case "--share-weights":
+                options.shareWeights = true
             case "--help":
                 printUsageAndExit()
             default:
@@ -224,6 +227,12 @@ private func parseOutputHeadBackend(_ raw: String) -> GenerationOutputHeadBacken
         return .aneClassifier
     case "ane-rmsnorm-classifier":
         return .aneRMSNormClassifier
+    case "cpu-then-ane":
+        return .cpuThenANE
+    case "cpu-partitioned-argmax":
+        return .cpuPartitionedArgmax
+    case "cpu-fp16-tiled":
+        return .cpuFP16Tiled
     default:
         fatal("Unknown output-head backend: \(raw)")
     }
@@ -250,6 +259,7 @@ private func printUsageAndExit() -> Never {
       --output-head-backend cpu|ane-classifier|ane-rmsnorm-classifier
       --trunk-lane-spatial N
       --output-head-lane-spatial N
+      --share-weights            Use retained read-only weight buffers for probe initialization
     """
     print(usage)
     exit(0)
@@ -278,10 +288,12 @@ where Model: DirectTokenSelectingLanguageModel & GenerationPerformanceTrackable,
     var throughput: [Double] = []
     var trunkLatencies: [Double] = []
     var logitsLatencies: [Double] = []
+    var prefillLatencies: [Double] = []
     tokenLatencies.reserveCapacity(iterations)
     throughput.reserveCapacity(iterations)
     trunkLatencies.reserveCapacity(iterations)
     logitsLatencies.reserveCapacity(iterations)
+    prefillLatencies.reserveCapacity(iterations)
 
     let compileTimeMs = harness.model.performanceSnapshot.compileTimeMs
 
@@ -293,6 +305,7 @@ where Model: DirectTokenSelectingLanguageModel & GenerationPerformanceTrackable,
             throughput.append(trace.tokensPerSecond)
             trunkLatencies.append(snapshot.trunkLatencyMs / Double(maxNewTokens))
             logitsLatencies.append(snapshot.logitsLatencyMs / Double(maxNewTokens))
+            prefillLatencies.append(trace.prefillLatencyMs)
         }
     }
 
@@ -301,7 +314,8 @@ where Model: DirectTokenSelectingLanguageModel & GenerationPerformanceTrackable,
         medianTokensPerSecond: median(throughput),
         compileTimeMs: compileTimeMs,
         medianTrunkMsPerToken: median(trunkLatencies),
-        medianLogitsMsPerToken: median(logitsLatencies)
+        medianLogitsMsPerToken: median(logitsLatencies),
+        medianPrefillMs: median(prefillLatencies)
     )
 }
 
@@ -321,6 +335,7 @@ where Model: ExactTwoTokenGeneratingLanguageModel & GenerationPerformanceTrackab
     var verifierTrunkMsPerPass: [Double] = []
     var verifierLogitsMsPerPass: [Double] = []
     var stateAdvanceMsPerPass: [Double] = []
+    var prefillLatencies: [Double] = []
 
     tokenLatencies.reserveCapacity(iterations)
     throughput.reserveCapacity(iterations)
@@ -330,6 +345,7 @@ where Model: ExactTwoTokenGeneratingLanguageModel & GenerationPerformanceTrackab
     verifierTrunkMsPerPass.reserveCapacity(iterations)
     verifierLogitsMsPerPass.reserveCapacity(iterations)
     stateAdvanceMsPerPass.reserveCapacity(iterations)
+    prefillLatencies.reserveCapacity(iterations)
 
     let compileTimeMs = harness.model.performanceSnapshot.compileTimeMs
 
@@ -344,6 +360,7 @@ where Model: ExactTwoTokenGeneratingLanguageModel & GenerationPerformanceTrackab
             verifierTrunkMsPerPass.append(trace.verifierTrunkLatencyMsPerPass)
             verifierLogitsMsPerPass.append(trace.verifierLogitsLatencyMsPerPass)
             stateAdvanceMsPerPass.append(trace.stateAdvanceLatencyMsPerPass)
+            prefillLatencies.append(trace.prefillLatencyMs)
         }
     }
 
@@ -356,7 +373,8 @@ where Model: ExactTwoTokenGeneratingLanguageModel & GenerationPerformanceTrackab
         medianProposerMsPerPass: median(proposerMsPerPass),
         medianVerifierTrunkMsPerPass: median(verifierTrunkMsPerPass),
         medianVerifierLogitsMsPerPass: median(verifierLogitsMsPerPass),
-        medianStateAdvanceMsPerPass: median(stateAdvanceMsPerPass)
+        medianStateAdvanceMsPerPass: median(stateAdvanceMsPerPass),
+        medianPrefillMs: median(prefillLatencies)
     )
 }
 
@@ -371,7 +389,8 @@ private func measureRecurrentControlCompileInitOnly(options: Options) throws -> 
         outputHeadBackend: options.outputHeadBackend,
         trunkBackend: options.controlBackend,
         trunkLaneSpatial: options.trunkLaneSpatial,
-        outputHeadLaneSpatial: options.outputHeadLaneSpatial
+        outputHeadLaneSpatial: options.outputHeadLaneSpatial,
+        shareReadOnlyWeights: options.shareWeights
     )
     let wallInitMs = machMilliseconds(mach_absolute_time() - start)
     return CompileInitBenchmarkSample(
@@ -395,7 +414,8 @@ private func measureTwoStepCompileInitOnly(options: Options) throws -> CompileIn
             outputHeadBackend: options.outputHeadBackend,
             trunkBackend: options.twoStepBackend,
             trunkLaneSpatial: options.trunkLaneSpatial,
-            outputHeadLaneSpatial: options.outputHeadLaneSpatial
+            outputHeadLaneSpatial: options.outputHeadLaneSpatial,
+            shareReadOnlyWeights: options.shareWeights
         )
     } else {
         model = try ANEExactTwoTokenBranchStatePromotionModel(
@@ -405,7 +425,8 @@ private func measureTwoStepCompileInitOnly(options: Options) throws -> CompileIn
             outputHeadBackend: options.outputHeadBackend,
             trunkBackend: options.twoStepBackend,
             trunkLaneSpatial: options.trunkLaneSpatial,
-            outputHeadLaneSpatial: options.outputHeadLaneSpatial
+            outputHeadLaneSpatial: options.outputHeadLaneSpatial,
+            shareReadOnlyWeights: options.shareWeights
         )
     }
     let wallInitMs = machMilliseconds(mach_absolute_time() - start)
@@ -455,7 +476,7 @@ private func comparePayload(options: Options) throws -> [String: Any] {
     let prompt: [UInt16] = [options.promptToken]
     let weights = try loadRecurrentGenerationWeights(input: plan.input, layerCount: options.layerCount)
 
-    printStderr("Starting control model init")
+    printStderr("Starting control model init\(options.shareWeights ? " (retained read-only weights)" : "")")
     let controlInitStart = mach_absolute_time()
     let controlModel = try ANERecurrentGenerationModel(
         weights: weights,
@@ -464,13 +485,14 @@ private func comparePayload(options: Options) throws -> [String: Any] {
         outputHeadBackend: options.outputHeadBackend,
         trunkBackend: options.controlBackend,
         trunkLaneSpatial: options.trunkLaneSpatial,
-        outputHeadLaneSpatial: options.outputHeadLaneSpatial
+        outputHeadLaneSpatial: options.outputHeadLaneSpatial,
+        shareReadOnlyWeights: options.shareWeights
     )
     let controlInitMs = machMilliseconds(mach_absolute_time() - controlInitStart)
     printStderr(String(format: "Control model init done in %.3f ms", controlInitMs))
     var controlHarness = DirectTokenSelectionGenerationHarness(model: controlModel, strategy: .argmax)
 
-    printStderr("Starting two-step model init")
+    printStderr("Starting two-step model init\(options.shareWeights ? " (retained read-only weights)" : "")")
     let twoStepInitStart = mach_absolute_time()
     let twoStepModel: ANEExactTwoTokenBranchStatePromotionModel
     if let futureSidecarPath = options.futureSidecarPath {
@@ -483,7 +505,8 @@ private func comparePayload(options: Options) throws -> [String: Any] {
             outputHeadBackend: options.outputHeadBackend,
             trunkBackend: options.twoStepBackend,
             trunkLaneSpatial: options.trunkLaneSpatial,
-            outputHeadLaneSpatial: options.outputHeadLaneSpatial
+            outputHeadLaneSpatial: options.outputHeadLaneSpatial,
+            shareReadOnlyWeights: options.shareWeights
         )
     } else {
         twoStepModel = try ANEExactTwoTokenBranchStatePromotionModel(
@@ -493,7 +516,8 @@ private func comparePayload(options: Options) throws -> [String: Any] {
             outputHeadBackend: options.outputHeadBackend,
             trunkBackend: options.twoStepBackend,
             trunkLaneSpatial: options.trunkLaneSpatial,
-            outputHeadLaneSpatial: options.outputHeadLaneSpatial
+            outputHeadLaneSpatial: options.outputHeadLaneSpatial,
+            shareReadOnlyWeights: options.shareWeights
         )
     }
     let twoStepInitMs = machMilliseconds(mach_absolute_time() - twoStepInitStart)
@@ -562,6 +586,8 @@ private func comparePayload(options: Options) throws -> [String: Any] {
             "median_tokens_per_second": control.medianTokensPerSecond,
             "median_trunk_ms_per_token": control.medianTrunkMsPerToken,
             "median_logits_ms_per_token": control.medianLogitsMsPerToken,
+            "ttft_ms": control.medianPrefillMs,
+            "ttft_cold_ms": controlInitMs + control.medianPrefillMs,
             "generated_tokens": controlParityTrace.generatedTokens.map(Int.init),
         ],
         "two_step": [
@@ -575,6 +601,8 @@ private func comparePayload(options: Options) throws -> [String: Any] {
             "median_verifier_trunk_ms_per_pass": twoStep.medianVerifierTrunkMsPerPass,
             "median_verifier_logits_ms_per_pass": twoStep.medianVerifierLogitsMsPerPass,
             "median_state_advance_ms_per_pass": twoStep.medianStateAdvanceMsPerPass,
+            "ttft_ms": twoStep.medianPrefillMs,
+            "ttft_cold_ms": twoStepInitMs + twoStep.medianPrefillMs,
             "generated_tokens": twoStepParityTrace.generatedTokens.map(Int.init),
         ],
     ]
@@ -588,6 +616,8 @@ private func comparePayload(options: Options) throws -> [String: Any] {
             "reported_compile_ms": coreML.compileTimeMs,
             "median_trunk_ms_per_token": coreML.medianTrunkMsPerToken,
             "median_logits_ms_per_token": coreML.medianLogitsMsPerToken,
+            "ttft_ms": coreML.medianPrefillMs,
+            "ttft_cold_ms": coreML.compileTimeMs + coreML.medianPrefillMs,
         ]
         payload["two_step_speedup_vs_coreml"] = coreML.medianTokenMs / twoStep.medianTokenMs
         payload["control_speedup_vs_coreml"] = coreML.medianTokenMs / control.medianTokenMs
@@ -611,6 +641,9 @@ private func describe(_ backend: GenerationOutputHeadBackend) -> String {
     case .cpuExactClustered: return "cpu-exact-clustered"
     case .aneClassifier: return "ane-classifier"
     case .aneRMSNormClassifier: return "ane-rmsnorm-classifier"
+    case .cpuThenANE: return "cpu-then-ane"
+    case .cpuPartitionedArgmax: return "cpu-partitioned-argmax"
+    case .cpuFP16Tiled: return "cpu-fp16-tiled"
     }
 }
 
@@ -666,6 +699,12 @@ do {
         payload = try comparePayload(options: options)
     }
     try writeJSON(payload)
+    if options.mode == .compare,
+       let parityStatus = payload["parity_status"] as? String,
+       parityStatus != "match" {
+        fputs("espresso-multitoken-probe error: parity mismatch\n", stderr)
+        exit(2)
+    }
 } catch {
     fatal("\(error)")
 }

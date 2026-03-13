@@ -4,6 +4,30 @@ import ANETypes
 @testable import Espresso
 
 final class MultitokenProbeSupportTests: XCTestCase {
+    func test_shared_read_only_output_head_weights_clone_source_buffers() {
+        let weights = makeTestRecurrentWeights(layerCount: 1, sharedClassifier: false)
+        let retained = SharedReadOnlyOutputHeadWeights(cloning: weights)
+
+        let originalRMSAddress = pointerAddress(weights.rmsFinal)
+        let retainedRMSAddress = pointerAddress(retained.rmsFinal)
+        let originalEmbeddingAddress = pointerAddress(weights.embedding)
+        let retainedEmbeddingAddress = pointerAddress(retained.embedding)
+        let originalClassifierAddress = pointerAddress(weights.classifier)
+        let retainedClassifierAddress = pointerAddress(retained.classifier)
+
+        XCTAssertNotEqual(originalRMSAddress, retainedRMSAddress)
+        XCTAssertNotEqual(originalEmbeddingAddress, retainedEmbeddingAddress)
+        XCTAssertNotEqual(originalClassifierAddress, retainedClassifierAddress)
+
+        weights.rmsFinal.withUnsafeMutablePointer { $0[0] = 123.0 }
+        weights.embedding.withUnsafeMutablePointer { $0[0] = 456.0 }
+        weights.classifier.withUnsafeMutablePointer { $0[0] = 789.0 }
+
+        XCTAssertEqual(floats(retained.rmsFinal, prefix: 1)[0], 60.0, accuracy: 1e-5)
+        XCTAssertEqual(floats(retained.embedding, prefix: 1)[0], 70.0, accuracy: 1e-5)
+        XCTAssertEqual(floats(retained.classifier, prefix: 1)[0], 80.0, accuracy: 1e-5)
+    }
+
     func test_recurrent_generation_weight_store_round_trips_weights() throws {
         let weights = makeTestRecurrentWeights(layerCount: 2, sharedClassifier: false)
         let path = temporaryFilePath(named: "recurrent-weights.bin")
@@ -177,5 +201,9 @@ final class MultitokenProbeSupportTests: XCTestCase {
             .appendingPathComponent("espresso-multitoken-tests", isDirectory: true)
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         return directory.appendingPathComponent(UUID().uuidString + "-" + name).path
+    }
+
+    private func pointerAddress(_ buffer: borrowing TensorBuffer) -> UInt {
+        buffer.withUnsafePointer { UInt(bitPattern: $0) }
     }
 }

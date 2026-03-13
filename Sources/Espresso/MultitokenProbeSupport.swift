@@ -10,19 +10,22 @@ public struct GenerationBenchmarkSample: Sendable, Equatable {
     public let compileTimeMs: Double
     public let medianTrunkMsPerToken: Double
     public let medianLogitsMsPerToken: Double
+    public let medianPrefillMs: Double
 
     public init(
         medianTokenMs: Double,
         medianTokensPerSecond: Double,
         compileTimeMs: Double,
         medianTrunkMsPerToken: Double,
-        medianLogitsMsPerToken: Double
+        medianLogitsMsPerToken: Double,
+        medianPrefillMs: Double = 0
     ) {
         self.medianTokenMs = medianTokenMs
         self.medianTokensPerSecond = medianTokensPerSecond
         self.compileTimeMs = compileTimeMs
         self.medianTrunkMsPerToken = medianTrunkMsPerToken
         self.medianLogitsMsPerToken = medianLogitsMsPerToken
+        self.medianPrefillMs = medianPrefillMs
     }
 }
 
@@ -36,6 +39,7 @@ public struct ExactTwoTokenBenchmarkSample: Sendable, Equatable {
     public let medianVerifierTrunkMsPerPass: Double
     public let medianVerifierLogitsMsPerPass: Double
     public let medianStateAdvanceMsPerPass: Double
+    public let medianPrefillMs: Double
 
     public init(
         medianTokenMs: Double,
@@ -46,7 +50,8 @@ public struct ExactTwoTokenBenchmarkSample: Sendable, Equatable {
         medianProposerMsPerPass: Double,
         medianVerifierTrunkMsPerPass: Double,
         medianVerifierLogitsMsPerPass: Double,
-        medianStateAdvanceMsPerPass: Double
+        medianStateAdvanceMsPerPass: Double,
+        medianPrefillMs: Double = 0
     ) {
         self.medianTokenMs = medianTokenMs
         self.medianTokensPerSecond = medianTokensPerSecond
@@ -57,6 +62,7 @@ public struct ExactTwoTokenBenchmarkSample: Sendable, Equatable {
         self.medianVerifierTrunkMsPerPass = medianVerifierTrunkMsPerPass
         self.medianVerifierLogitsMsPerPass = medianVerifierLogitsMsPerPass
         self.medianStateAdvanceMsPerPass = medianStateAdvanceMsPerPass
+        self.medianPrefillMs = medianPrefillMs
     }
 }
 
@@ -302,10 +308,12 @@ where Model: AutoregressiveLanguageModel & GenerationPerformanceTrackable, Model
     var throughput: [Double] = []
     var trunkLatencies: [Double] = []
     var logitsLatencies: [Double] = []
+    var prefillLatencies: [Double] = []
     tokenLatencies.reserveCapacity(iterations)
     throughput.reserveCapacity(iterations)
     trunkLatencies.reserveCapacity(iterations)
     logitsLatencies.reserveCapacity(iterations)
+    prefillLatencies.reserveCapacity(iterations)
 
     let compileTimeMs = harness.model.performanceSnapshot.compileTimeMs
 
@@ -317,6 +325,7 @@ where Model: AutoregressiveLanguageModel & GenerationPerformanceTrackable, Model
             throughput.append(trace.tokensPerSecond)
             trunkLatencies.append(snapshot.trunkLatencyMs / Double(maxNewTokens))
             logitsLatencies.append(snapshot.logitsLatencyMs / Double(maxNewTokens))
+            prefillLatencies.append(trace.prefillLatencyMs)
         }
     }
 
@@ -325,7 +334,8 @@ where Model: AutoregressiveLanguageModel & GenerationPerformanceTrackable, Model
         medianTokensPerSecond: GenerationMetrics.median(throughput),
         compileTimeMs: compileTimeMs,
         medianTrunkMsPerToken: GenerationMetrics.median(trunkLatencies),
-        medianLogitsMsPerToken: GenerationMetrics.median(logitsLatencies)
+        medianLogitsMsPerToken: GenerationMetrics.median(logitsLatencies),
+        medianPrefillMs: GenerationMetrics.median(prefillLatencies)
     )
 }
 

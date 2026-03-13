@@ -23,6 +23,8 @@ xcuserdata/
 
 # Git worktrees
 .worktrees/
+autoresearch-master/
+autoresearch-results.tsv
 
 # Large model weights (>10MB binaries)
 # Golden test fixtures are tracked; add entries here for actual model weights
@@ -48,3 +50,20 @@ scripts/__pycache__/
 Sources/EspressoBenchApp/
 Tests/EspressoBenchAppTests/
 scripts/package_espresso_bench_app.sh
+
+# Development / internal documentation
+docs/
+prompts/
+scripts/
+tasks/
+AGENTS.md
+CLAUDE.md
+
+# Internal development directories
+archive/
+autoresearch-master/
+results/
+training/
+
+# Tooling version pins
+.swift-version

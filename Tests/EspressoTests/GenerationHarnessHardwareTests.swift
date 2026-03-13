@@ -1,6 +1,7 @@
 import Accelerate
 import XCTest
 import ANETypes
+import ANERuntime
 import CoreML
 import CPUOps
 @testable import Espresso
@@ -2483,4 +2484,85 @@ final class GenerationHarnessHardwareTests: XCTestCase {
             medianLogitsMsPerToken: median(logitsLatencies)
         )
     }
+
+    // MARK: - ANE eval-only micro-benchmark
+
+    func testANEEvalOnlyOverhead() throws {
+        try requireGenerationHardware()
+
+        let warmup = 20
+        let iterations = 100
+
+        let weights = makeEchoRecurrentGenerationWeights(layerCount: 6)
+        let triplet0 = try RWKVStyleFusedThreeLayerSession(
+            weights0: weights.layers[0],
+            weights1: weights.layers[1],
+            weights2: weights.layers[2]
+        )
+        let triplet1 = try RWKVStyleFusedThreeLayerSession(
+            weights0: weights.layers[3],
+            weights1: weights.layers[4],
+            weights2: weights.layers[5]
+        )
+
+        let classifierWeights = TensorBuffer(count: ModelConfig.vocab * ModelConfig.dim, zeroed: false)
+        fill(classifierWeights, value: 0.001)
+        let headRmsFinal = TensorBuffer(count: ModelConfig.dim, zeroed: false)
+        fill(headRmsFinal, value: 1.0)
+        let head = try ANEGenerationRMSNormClassifierHead(
+            rmsFinal: headRmsFinal,
+            classifierWeights: classifierWeights,
+            vocabSize: ModelConfig.vocab,
+            laneSpatial: 32
+        )
+
+        for _ in 0..<warmup {
+            try triplet0.kernels.step.eval()
+            try triplet1.kernels.step.eval()
+            try head.kernelSet.rmsNormClassifier.eval()
+        }
+
+        var t0EvalMs: [Double] = []
+        var t1EvalMs: [Double] = []
+        var headEvalMs: [Double] = []
+        var combinedMs: [Double] = []
+
+        for _ in 0..<iterations {
+            let combinedStart = GenerationClock.now()
+
+            let start0 = GenerationClock.now()
+            try triplet0.kernels.step.eval()
+            t0EvalMs.append(GenerationClock.milliseconds(start: start0, end: GenerationClock.now()))
+
+            let start1 = GenerationClock.now()
+            try triplet1.kernels.step.eval()
+            t1EvalMs.append(GenerationClock.milliseconds(start: start1, end: GenerationClock.now()))
+
+            let startH = GenerationClock.now()
+            try head.kernelSet.rmsNormClassifier.eval()
+            headEvalMs.append(GenerationClock.milliseconds(start: startH, end: GenerationClock.now()))
+
+            combinedMs.append(GenerationClock.milliseconds(start: combinedStart, end: GenerationClock.now()))
+        }
+
+        t0EvalMs.sort()
+        t1EvalMs.sort()
+        headEvalMs.sort()
+        combinedMs.sort()
+
+        let t0Med = median(t0EvalMs)
+        let t1Med = median(t1EvalMs)
+        let headMed = median(headEvalMs)
+        let combinedMed = median(combinedMs)
+        let sumMed = t0Med + t1Med + headMed
+
+        print("=== ANE Eval-Only Overhead ===")
+        print("Triplet 0 eval:     \(String(format: "%.3f", t0Med)) ms")
+        print("Triplet 1 eval:     \(String(format: "%.3f", t1Med)) ms")
+        print("Head eval:          \(String(format: "%.3f", headMed)) ms")
+        print("Sum of medians:     \(String(format: "%.3f", sumMed)) ms")
+        print("Combined (3 evals): \(String(format: "%.3f", combinedMed)) ms")
+        print("I/O overhead budget: \(String(format: "%.3f", 1.93 - combinedMed)) ms (from 1.93 ms/token end-to-end)")
+    }
+
 }

@@ -12,7 +12,7 @@ final class GenerationRMSNormClassifierGeneratorTests: XCTestCase {
 
         XCTAssertEqual(generator.inputBytes, ModelConfig.dim * laneSpatial * 2)
         XCTAssertEqual(generator.inputByteSizes, [ModelConfig.dim * laneSpatial * 2])
-        XCTAssertEqual(generator.outputByteSizes, [ModelConfig.vocab * laneSpatial * 2])
+        XCTAssertEqual(generator.outputByteSizes, [ModelConfig.vocab * laneSpatial * 2, 1 * laneSpatial * 2])
     }
 
     func test_generation_rmsnorm_classifier_generator_contains_expected_rmsnorm_and_classifier_ops() {
@@ -31,7 +31,7 @@ final class GenerationRMSNormClassifierGeneratorTests: XCTestCase {
         XCTAssertTrue(mil.contains("pow(x="))
         XCTAssertTrue(mil.contains("tensor<fp16, [1,\(ModelConfig.dim),1,\(laneSpatial)]> xn = mul("))
         XCTAssertTrue(mil.contains("tensor<fp16, [1, \(ModelConfig.vocab), 1, \(laneSpatial)]> logits = conv("))
-        XCTAssertTrue(mil.contains("-> (logits);"))
+        XCTAssertTrue(mil.contains("-> (logits,maxVal);"))
     }
 
     func test_generation_rmsnorm_classifier_generator_stays_inside_proven_op_subset() {

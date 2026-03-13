@@ -136,6 +136,28 @@ int ane_interop_probe_prepare_chaining(ANEHandle *handle);
 void ane_interop_cvt_f32_to_f16(void *dst, const float *src, int count);
 void ane_interop_cvt_f16_to_f32(float *dst, const void *src, int count);
 
+/// NEON-vectorized contiguous FP16 argmax. Returns index and value of the max
+/// element. On ties, the lowest index wins (first-max semantics).
+void ane_interop_neon_argmax_f16(const void *src, int count,
+                                 int *out_index, float *out_value);
+
+/// NEON-vectorized strided FP16 argmax. Scans `count` values starting at `src`
+/// with stride `stride` (in FP16 elements). Used for spatial-slice argmax where
+/// the layout is channel-first [C, S].
+void ane_interop_neon_argmax_f16_strided(const void *src, int count,
+                                          int stride,
+                                          int *out_index, float *out_value);
+
+/// NEON-vectorized strided FP16 -> FP32 gather. Reads `count` FP16 values at
+/// stride `stride` from `src` and writes contiguous FP32 to `dst`.
+void ane_interop_neon_gather_f16_to_f32(float *dst, const void *src,
+                                         int count, int stride);
+
+/// NEON-vectorized strided FP32 -> FP16 scatter. Reads `count` contiguous FP32
+/// values from `src` and writes them as FP16 at stride `stride` into `dst`.
+void ane_interop_neon_scatter_f32_to_f16(void *dst, const float *src,
+                                          int count, int stride);
+
 bool ane_interop_io_copy(IOSurfaceRef dst, int dst_ch_off,
                          IOSurfaceRef src, int src_ch_off,
                          int channels, int spatial);
@@ -171,6 +193,20 @@ bool ane_interop_io_argmax_fp16_spatial_slice(IOSurfaceRef surface,
                                               int channels,
                                               int *out_index,
                                               float *out_value);
+/// Argmax with a known max-value hint from a reduce_max output surface.
+/// Reads the max fp16 value from hint_surface at channel 0, spatial hint_spatial_index,
+/// then scans the logits surface comparing against the hint with early exit on first match.
+bool ane_interop_io_argmax_fp16_spatial_slice_with_hint(
+    IOSurfaceRef surface,
+    int ch_off,
+    int spatial_index,
+    int spatial,
+    int channels,
+    IOSurfaceRef hint_surface,
+    int hint_spatial_index,
+    int hint_spatial,
+    int *out_index,
+    float *out_value);
 bool ane_interop_io_write_fp16(IOSurfaceRef surface,
                                const float *data, int channels, int spatial);
 bool ane_interop_io_read_fp16(IOSurfaceRef surface, int ch_off,
