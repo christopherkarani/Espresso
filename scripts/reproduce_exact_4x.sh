@@ -701,6 +701,15 @@ if [[ -n "$layer_count_mismatch" ]]; then
   gate_warnings="${gate_warnings}LAYER_COUNT_MISMATCH: runs reported layer counts inconsistent with contract ($LAYER_COUNT): ${layer_count_mismatch}\n"
 fi
 
+# Prompt token consistency check
+prompt_token_mismatch="$(jq -s --argjson expected "$PROMPT_TOKEN" \
+  'map(.prompt_token // null) | map(select(. != null and . != $expected)) | if length > 0 then . else empty end' \
+  "${valid_runs[@]}" 2>/dev/null || echo "")"
+if [[ -n "$prompt_token_mismatch" ]]; then
+  gate_status="fail"
+  gate_warnings="${gate_warnings}PROMPT_TOKEN_MISMATCH: runs reported prompt tokens inconsistent with contract ($PROMPT_TOKEN): ${prompt_token_mismatch}\n"
+fi
+
 if [[ "$all_parity_match" != "true" ]]; then
   gate_status="fail"
   parity_detail="$(jq -s '[.[] | {run: input_line_number, status: .parity_status, match_count: (.parity_match_count // "n/a"), total: (.parity_total // "n/a")} | select(.status != "match")] | map("\(.run): \(.match_count)/\(.total)") | join(", ")' "${valid_runs[@]}" 2>/dev/null || echo "detail unavailable")"
