@@ -108,6 +108,11 @@ echo "Generating matching zero-weight CoreML trunk into $COREML_MODEL"
   --weight-mode zero \
   --output "$COREML_MODEL"
 
+if [[ ! -e "$COREML_MODEL" ]]; then
+  echo "FATAL: CoreML model generation succeeded but $COREML_MODEL is missing" >&2
+  exit 1
+fi
+
 echo "Running public recurrent-checkpoint harness"
 harness_exit=0
 RESULTS_DIR="$PUBLIC_RESULTS_DIR" \
