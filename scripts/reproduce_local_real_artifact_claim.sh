@@ -286,6 +286,8 @@ fi
       "harness_contract_warmup=\(.benchmark_contract.warmup | na)",
       "harness_contract_iterations=\(.benchmark_contract.iterations | na)",
       "harness_contract_layer_count=\(.benchmark_contract.layer_count | na)",
+      "harness_per_run_timestamps=\(.per_run_timestamps // [] | tojson)",
+      "harness_per_run_probe_versions=\(.per_run_probe_versions // [] | tojson)",
       "harness_first_run_timestamp=\(.first_run_timestamp | na)",
       "harness_last_run_timestamp=\(.last_run_timestamp | na)",
       "harness_per_run_wall_elapsed_s=\(.per_run_wall_elapsed_s // [] | tojson)",
