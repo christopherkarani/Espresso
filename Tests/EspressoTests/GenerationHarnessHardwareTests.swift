@@ -1552,7 +1552,8 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         let warmup = 3
         let iterations = 20
         let maxNewTokens = 8
-        let streamCounts = [1, 2, 3, 4, 5, 6]
+        let aneStreamCounts = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+        let coremlStreamCounts = [1, 2, 4, 6]
         let modelPath = "benchmarks/models/transformer_6layer.mlpackage"
 
         let ane = try benchmarkBatchedRecurrentGeneration(
@@ -1561,7 +1562,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
             maxNewTokens: maxNewTokens,
             warmup: warmup,
             iterations: iterations,
-            streamCounts: streamCounts,
+            streamCounts: aneStreamCounts,
             groups: 16,
             headGroups: 16
         )
@@ -1571,7 +1572,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
             maxNewTokens: maxNewTokens,
             warmup: warmup,
             iterations: iterations,
-            streamCounts: streamCounts
+            streamCounts: coremlStreamCounts
         )
 
         XCTAssertEqual(ane.promptLength, prompt.count)
@@ -1582,20 +1583,29 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         XCTAssertEqual(coreml.warmupCount, warmup)
         XCTAssertEqual(ane.iterationCount, iterations)
         XCTAssertEqual(coreml.iterationCount, iterations)
-        XCTAssertEqual(ane.samples.map(\.streamCount), streamCounts)
-        XCTAssertEqual(coreml.samples.map(\.streamCount), streamCounts)
+        XCTAssertEqual(ane.samples.map(\.streamCount), aneStreamCounts)
+        XCTAssertEqual(coreml.samples.map(\.streamCount), coremlStreamCounts)
         XCTAssertTrue(ane.samples.allSatisfy { $0.medianMsPerToken > 0 })
         XCTAssertTrue(coreml.samples.allSatisfy { $0.medianMsPerToken > 0 })
 
-        for idx in 0..<streamCounts.count {
-            let aneSample = ane.samples[idx]
-            let coremlSample = coreml.samples[idx]
-            print(
-                """
-                batched ane streams=\(aneSample.streamCount) median_ms_token=\(aneSample.medianMsPerToken) aggregate_tps=\(aneSample.aggregateTokensPerSecond) per_stream_tps=\(aneSample.perStreamTokensPerSecond) compile=\(aneSample.compileTimeMs) round_ms=\(aneSample.medianRoundLatencyMs)
-                concurrent coreml streams=\(coremlSample.streamCount) median_ms_token=\(coremlSample.medianMsPerToken) aggregate_tps=\(coremlSample.aggregateTokensPerSecond) per_stream_tps=\(coremlSample.perStreamTokensPerSecond) compile=\(coremlSample.compileTimeMs) round_ms=\(coremlSample.medianRoundLatencyMs)
-                """
-            )
+        print("=== ANE Batched (g=16, headG=16) ===")
+        for sample in ane.samples {
+            print("  batched ane streams=\(sample.streamCount) median_ms_token=\(String(format: "%.4f", sample.medianMsPerToken)) aggregate_tps=\(String(format: "%.1f", sample.aggregateTokensPerSecond)) per_stream_tps=\(String(format: "%.1f", sample.perStreamTokensPerSecond)) compile=\(String(format: "%.0f", sample.compileTimeMs)) round_ms=\(String(format: "%.3f", sample.medianRoundLatencyMs))")
+        }
+        print("=== CoreML Concurrent ===")
+        for sample in coreml.samples {
+            print("  concurrent coreml streams=\(sample.streamCount) median_ms_token=\(String(format: "%.4f", sample.medianMsPerToken)) aggregate_tps=\(String(format: "%.1f", sample.aggregateTokensPerSecond)) per_stream_tps=\(String(format: "%.1f", sample.perStreamTokensPerSecond)) compile=\(String(format: "%.0f", sample.compileTimeMs)) round_ms=\(String(format: "%.3f", sample.medianRoundLatencyMs))")
+        }
+        // Matched comparison at common stream counts
+        let commonCounts = Set(aneStreamCounts).intersection(coremlStreamCounts).sorted()
+        if !commonCounts.isEmpty {
+            print("=== Matched Comparison ===")
+            for sc in commonCounts {
+                guard let a = ane.samples.first(where: { $0.streamCount == sc }),
+                      let c = coreml.samples.first(where: { $0.streamCount == sc }) else { continue }
+                let speedup = a.aggregateTokensPerSecond / c.aggregateTokensPerSecond
+                print("  streams=\(sc) ane=\(String(format: "%.1f", a.aggregateTokensPerSecond)) coreml=\(String(format: "%.1f", c.aggregateTokensPerSecond)) speedup=\(String(format: "%.1fx", speedup))")
+            }
         }
     }
 
