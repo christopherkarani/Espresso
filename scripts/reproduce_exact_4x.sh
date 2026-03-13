@@ -462,6 +462,8 @@ jq -s \
   --arg control_backend "$CONTROL_BACKEND" \
   --arg two_step_backend "$TWO_STEP_BACKEND" \
   --arg output_head_backend "$OUTPUT_HEAD_BACKEND" \
+  --arg cv_thresh "$CV_THRESHOLD" \
+  --arg duration_budget "$DURATION_BUDGET_S" \
   --argjson requested_repeats "$REPEATS" \
   --argjson failed "$failed_runs" \
   --argjson total_elapsed_s "$total_benchmark_elapsed" \
@@ -518,7 +520,9 @@ jq -s \
     max_new_tokens: $max_new_tokens,
     max_sequence_tokens: $max_seq,
     layer_count: $layers,
-    prompt_token: $prompt_token
+    prompt_token: $prompt_token,
+    cv_threshold: ($cv_thresh | tonumber),
+    duration_budget_s: ($duration_budget | tonumber)
   },
   artifact_hashes: {
     metadata_sha256: $metadata_sha256,
