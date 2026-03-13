@@ -445,6 +445,34 @@ fi
     if [[ -n "$harness_contract_max_new" && "$harness_contract_max_new" != "$MAX_NEW_TOKENS" ]]; then
       echo "WARNING: claim MAX_NEW_TOKENS=$MAX_NEW_TOKENS but harness contract max_new_tokens=$harness_contract_max_new"
     fi
+    harness_contract_max_seq="$(jq -r '.benchmark_contract.max_sequence_tokens // empty' "$PUBLIC_RESULTS_DIR/summary.json" 2>/dev/null || true)"
+    if [[ -n "$harness_contract_max_seq" && "$harness_contract_max_seq" != "$MAX_SEQUENCE_TOKENS" ]]; then
+      echo "WARNING: claim MAX_SEQUENCE_TOKENS=$MAX_SEQUENCE_TOKENS but harness contract max_sequence_tokens=$harness_contract_max_seq"
+    fi
+    harness_contract_warmup="$(jq -r '.benchmark_contract.warmup // empty' "$PUBLIC_RESULTS_DIR/summary.json" 2>/dev/null || true)"
+    if [[ -n "$harness_contract_warmup" && "$harness_contract_warmup" != "$WARMUP" ]]; then
+      echo "WARNING: claim WARMUP=$WARMUP but harness contract warmup=$harness_contract_warmup"
+    fi
+    harness_contract_iters="$(jq -r '.benchmark_contract.iterations // empty' "$PUBLIC_RESULTS_DIR/summary.json" 2>/dev/null || true)"
+    if [[ -n "$harness_contract_iters" && "$harness_contract_iters" != "$ITERATIONS" ]]; then
+      echo "WARNING: claim ITERATIONS=$ITERATIONS but harness contract iterations=$harness_contract_iters"
+    fi
+    harness_contract_ctrl="$(jq -r '.benchmark_contract.control_backend // empty' "$PUBLIC_RESULTS_DIR/summary.json" 2>/dev/null || true)"
+    if [[ -n "$harness_contract_ctrl" && "$harness_contract_ctrl" != "$CONTROL_BACKEND" ]]; then
+      echo "WARNING: claim CONTROL_BACKEND=$CONTROL_BACKEND but harness contract control_backend=$harness_contract_ctrl"
+    fi
+    harness_contract_two="$(jq -r '.benchmark_contract.two_step_backend // empty' "$PUBLIC_RESULTS_DIR/summary.json" 2>/dev/null || true)"
+    if [[ -n "$harness_contract_two" && "$harness_contract_two" != "$TWO_STEP_BACKEND" ]]; then
+      echo "WARNING: claim TWO_STEP_BACKEND=$TWO_STEP_BACKEND but harness contract two_step_backend=$harness_contract_two"
+    fi
+    harness_contract_head="$(jq -r '.benchmark_contract.output_head_backend // empty' "$PUBLIC_RESULTS_DIR/summary.json" 2>/dev/null || true)"
+    if [[ -n "$harness_contract_head" && "$harness_contract_head" != "$OUTPUT_HEAD_BACKEND" ]]; then
+      echo "WARNING: claim OUTPUT_HEAD_BACKEND=$OUTPUT_HEAD_BACKEND but harness contract output_head_backend=$harness_contract_head"
+    fi
+    harness_contract_prompt="$(jq -r '.benchmark_contract.prompt_token // empty' "$PUBLIC_RESULTS_DIR/summary.json" 2>/dev/null || true)"
+    if [[ -n "$harness_contract_prompt" && "$harness_contract_prompt" != "$PROMPT_TOKEN" ]]; then
+      echo "WARNING: claim PROMPT_TOKEN=$PROMPT_TOKEN but harness contract prompt_token=$harness_contract_prompt"
+    fi
   fi
   # Validate that all critical artifact files still exist and are non-empty
   missing_artifacts=""
