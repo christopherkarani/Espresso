@@ -60,6 +60,7 @@ echo "results_dir=$RESULTS_DIR"
 echo "disk_free_mb_start=$(df -m "$RESULTS_DIR" 2>/dev/null | awk 'NR==2{print $4}' || echo unknown)"
 echo ""
 
+dataset_build_start=$(date +%s)
 echo "Building local text dataset into $DATASET_PATH"
 swift run espresso-train \
   --build-local-text-dataset "$DATASET_PATH" \
@@ -68,6 +69,7 @@ swift run espresso-train \
   --text-root "$ROOT/scripts" \
   --text-root "$ROOT/tasks" \
   --max-corpus-bytes "$MAX_CORPUS_BYTES"
+dataset_build_elapsed_s=$(( $(date +%s) - dataset_build_start ))
 
 if [[ ! -s "$DATASET_PATH" ]]; then
   echo "FATAL: dataset build succeeded but $DATASET_PATH is missing or empty" >&2
@@ -169,6 +171,7 @@ fi
   echo "git_dirty=$([ -n "$git_dirty" ] && echo "true" || echo "false")"
   echo "results_dir=$RESULTS_DIR"
   echo "dataset=$DATASET_PATH"
+  echo "dataset_build_elapsed_s=$dataset_build_elapsed_s"
   echo "dataset_sha256=$(shasum -a 256 "$DATASET_PATH" | awk '{print $1}')"
   dataset_bytes="$(wc -c < "$DATASET_PATH" | tr -d ' ')"
   echo "dataset_bytes=$dataset_bytes"
