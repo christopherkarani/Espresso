@@ -42,6 +42,11 @@ int ane_interop_live_handle_count(void);
 uint64_t ane_interop_last_hw_execution_time_ns(ANEHandle *handle);
 bool ane_interop_has_perf_stats(ANEHandle *handle);
 
+/// Replace an input surface and rebuild the ANE request.
+/// Returns true on success (request rebuilt). False if index is out of range
+/// or the request rebuild fails.
+bool ane_interop_rebind_input(ANEHandle *handle, int index, IOSurfaceRef newSurface);
+
 #define ANE_INTEROP_CHAINING_PROBE_UNAVAILABLE 0
 #define ANE_INTEROP_CHAINING_PROBE_REQUEST_BUILD_FAILED 1
 #define ANE_INTEROP_CHAINING_PROBE_PREPARE_FAILED 2
@@ -238,6 +243,72 @@ bool ane_interop_io_copy_multi_src(IOSurfaceRef dst,
                                    const int *channels,
                                    int region_count,
                                    int spatial);
+
+/// Write embeddings for multiple streams to their spatial lanes under one lock.
+/// Fuses embedding lookup + FP32→FP16 conversion + strided write.
+/// embedding_table is FP32 [vocabSize × dim], row-major.
+bool ane_interop_io_write_embedding_batch_fp16(
+    IOSurfaceRef surface,
+    int ch_off,
+    int spatial,
+    const float *embedding_table,
+    int vocab_size,
+    int dim,
+    const uint16_t *token_ids,
+    int stream_count);
+
+/// Argmax over multiple spatial lanes under one lock.
+/// Writes stream_count (index, value) pairs to out_indices and out_values.
+bool ane_interop_io_argmax_batch_fp16_spatial(
+    IOSurfaceRef surface,
+    int ch_off,
+    int spatial,
+    int channels,
+    int stream_count,
+    int *out_indices,
+    float *out_values);
+
+/// Channel-partitioned parallel argmax: splits channels into n_blocks
+/// and uses dispatch_apply to process each block on a separate core.
+/// n_blocks should be 2-4 for best results. Falls back to serial if n_blocks <= 1.
+bool ane_interop_io_argmax_batch_fp16_spatial_parallel(
+    IOSurfaceRef surface,
+    int ch_off,
+    int spatial,
+    int channels,
+    int stream_count,
+    int *out_indices,
+    float *out_values,
+    int n_blocks);
+
+/// Lockless argmax — assumes surface is already coherent (e.g., after sync ANE eval).
+/// WARNING: May produce stale data if called without prior synchronization.
+bool ane_interop_io_argmax_batch_fp16_spatial_nolock(
+    IOSurfaceRef surface,
+    int ch_off,
+    int spatial,
+    int channels,
+    int stream_count,
+    int *out_indices,
+    float *out_values,
+    int n_blocks);
+
+/// Fused expansion + argmax: reads a small projected surface, computes
+/// expansion matmul + argmax on CPU without materializing full vocab logits.
+/// expansion_weights_fp16: fp16 [vocab_size, bottleneck/groups] row-major.
+/// Locks/copies proj surface internally. n_blocks for parallel dispatch.
+bool ane_interop_fused_expansion_argmax_fp16(
+    IOSurfaceRef proj_surface,
+    int proj_ch_off,
+    int spatial,
+    int bottleneck,
+    int groups,
+    const void *expansion_weights_fp16,
+    int vocab_size,
+    int stream_count,
+    int *out_indices,
+    float *out_values,
+    int n_blocks);
 
 /// Lock/unlock surfaces independently for batched I/O sequences.
 /// Use these to amortize lock overhead across write→eval→read cycles.

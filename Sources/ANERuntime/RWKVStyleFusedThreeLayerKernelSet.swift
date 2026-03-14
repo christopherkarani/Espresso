@@ -19,39 +19,53 @@ public struct RWKVStyleFusedThreeLayerKernelSet: ~Copyable {
 
     public let step: ANEKernel
     public let laneSpatial: Int
+    public let includeRMSNorm: Bool
 
-    private init(step: consuming ANEKernel, laneSpatial: Int) {
+    private init(step: consuming ANEKernel, laneSpatial: Int, includeRMSNorm: Bool) {
         self.step = step
         self.laneSpatial = laneSpatial
+        self.includeRMSNorm = includeRMSNorm
     }
 
     public init(
         weights0: borrowing RWKVStyleRecurrentWeights,
         weights1: borrowing RWKVStyleRecurrentWeights,
         weights2: borrowing RWKVStyleRecurrentWeights,
-        laneSpatial: Int = defaultLaneSpatial
+        laneSpatial: Int = defaultLaneSpatial,
+        groups: Int = 1,
+        includeRMSNorm: Bool = true
     ) throws(ANEError) {
         guard laneSpatial > 0 else {
             throw .invalidArguments("fused three-layer recurrent laneSpatial must be > 0")
+        }
+        guard groups > 0 else {
+            throw .invalidArguments("fused three-layer recurrent groups must be > 0")
+        }
+        guard ModelConfig.dim.isMultiple(of: groups) else {
+            throw .invalidArguments("fused three-layer recurrent dim \(ModelConfig.dim) must be divisible by groups \(groups)")
         }
         let compiled = try Self.compileStep(
             weights0: weights0,
             weights1: weights1,
             weights2: weights2,
-            laneSpatial: laneSpatial
+            laneSpatial: laneSpatial,
+            groups: groups,
+            includeRMSNorm: includeRMSNorm
         )
-        self.init(step: compiled, laneSpatial: laneSpatial)
+        self.init(step: compiled, laneSpatial: laneSpatial, includeRMSNorm: includeRMSNorm)
     }
 
     internal static func compileSpecs(
         weights0: borrowing RWKVStyleRecurrentWeights,
         weights1: borrowing RWKVStyleRecurrentWeights,
         weights2: borrowing RWKVStyleRecurrentWeights,
-        laneSpatial: Int
+        laneSpatial: Int,
+        groups: Int = 1,
+        includeRMSNorm: Bool = true
     ) -> [CompileSpec] {
         precondition(laneSpatial > 0)
         return [
-            makeFusedStepSpec(weights0: weights0, weights1: weights1, weights2: weights2, laneSpatial: laneSpatial),
+            makeFusedStepSpec(weights0: weights0, weights1: weights1, weights2: weights2, laneSpatial: laneSpatial, groups: groups, includeRMSNorm: includeRMSNorm),
         ]
     }
 
@@ -59,9 +73,11 @@ public struct RWKVStyleFusedThreeLayerKernelSet: ~Copyable {
         weights0: borrowing RWKVStyleRecurrentWeights,
         weights1: borrowing RWKVStyleRecurrentWeights,
         weights2: borrowing RWKVStyleRecurrentWeights,
-        laneSpatial: Int
+        laneSpatial: Int,
+        groups: Int = 1,
+        includeRMSNorm: Bool = true
     ) throws(ANEError) -> ANEKernel {
-        let spec = makeFusedStepSpec(weights0: weights0, weights1: weights1, weights2: weights2, laneSpatial: laneSpatial)
+        let spec = makeFusedStepSpec(weights0: weights0, weights1: weights1, weights2: weights2, laneSpatial: laneSpatial, groups: groups, includeRMSNorm: includeRMSNorm)
         return try ANEKernel(
             milText: spec.milText,
             weights: spec.weights,
@@ -74,36 +90,41 @@ public struct RWKVStyleFusedThreeLayerKernelSet: ~Copyable {
         weights0: borrowing RWKVStyleRecurrentWeights,
         weights1: borrowing RWKVStyleRecurrentWeights,
         weights2: borrowing RWKVStyleRecurrentWeights,
-        laneSpatial: Int
+        laneSpatial: Int,
+        groups: Int = 1,
+        includeRMSNorm: Bool = true
     ) -> CompileSpec {
         let dim = ModelConfig.dim
-        let generator = RWKVStyleFusedThreeLayerStepGenerator(laneSpatial: laneSpatial)
+        precondition(groups > 0)
+        precondition(dim.isMultiple(of: groups))
+        let colsPerConv = dim / groups
+        let generator = RWKVStyleFusedThreeLayerStepGenerator(laneSpatial: laneSpatial, groups: groups, includeRMSNorm: includeRMSNorm)
+
+        var weights: [(path: String, data: Data)] = []
+        weights.reserveCapacity(includeRMSNorm ? 15 : 12)
+
+        func addLayer(_ w: borrowing RWKVStyleRecurrentWeights, index: Int) {
+            if includeRMSNorm {
+                weights.append((path: "@model_path/weights/rwkv_rms\(index).bin", data: buildBlob(from: w.rms, rows: 1, cols: dim)))
+            }
+            weights.append((path: "@model_path/weights/wx\(index).bin", data: GroupedWeightBlob.build(from: w.Wx, rows: dim, colsPerGroup: colsPerConv, groups: groups)))
+            weights.append((path: "@model_path/weights/ws\(index).bin", data: GroupedWeightBlob.build(from: w.Ws, rows: dim, colsPerGroup: colsPerConv, groups: groups)))
+            weights.append((path: "@model_path/weights/wd\(index).bin", data: GroupedWeightBlob.build(from: w.Wd, rows: dim, colsPerGroup: colsPerConv, groups: groups)))
+            weights.append((path: "@model_path/weights/wo\(index).bin", data: GroupedWeightBlob.build(from: w.Wo, rows: dim, colsPerGroup: colsPerConv, groups: groups)))
+        }
+
+        addLayer(weights0, index: 0)
+        addLayer(weights1, index: 1)
+        addLayer(weights2, index: 2)
 
         return CompileSpec(
             kind: .fusedThreeLayerStep,
             milText: generator.milText,
-            weights: [
-                (path: "@model_path/weights/rwkv_rms0.bin", data: buildBlob(from: weights0.rms, rows: 1, cols: dim)),
-                (path: "@model_path/weights/wx0.bin", data: buildBlob(from: weights0.Wx, rows: dim, cols: dim)),
-                (path: "@model_path/weights/ws0.bin", data: buildBlob(from: weights0.Ws, rows: dim, cols: dim)),
-                (path: "@model_path/weights/wd0.bin", data: buildBlob(from: weights0.Wd, rows: dim, cols: dim)),
-                (path: "@model_path/weights/wo0.bin", data: buildBlob(from: weights0.Wo, rows: dim, cols: dim)),
-                (path: "@model_path/weights/rwkv_rms1.bin", data: buildBlob(from: weights1.rms, rows: 1, cols: dim)),
-                (path: "@model_path/weights/wx1.bin", data: buildBlob(from: weights1.Wx, rows: dim, cols: dim)),
-                (path: "@model_path/weights/ws1.bin", data: buildBlob(from: weights1.Ws, rows: dim, cols: dim)),
-                (path: "@model_path/weights/wd1.bin", data: buildBlob(from: weights1.Wd, rows: dim, cols: dim)),
-                (path: "@model_path/weights/wo1.bin", data: buildBlob(from: weights1.Wo, rows: dim, cols: dim)),
-                (path: "@model_path/weights/rwkv_rms2.bin", data: buildBlob(from: weights2.rms, rows: 1, cols: dim)),
-                (path: "@model_path/weights/wx2.bin", data: buildBlob(from: weights2.Wx, rows: dim, cols: dim)),
-                (path: "@model_path/weights/ws2.bin", data: buildBlob(from: weights2.Ws, rows: dim, cols: dim)),
-                (path: "@model_path/weights/wd2.bin", data: buildBlob(from: weights2.Wd, rows: dim, cols: dim)),
-                (path: "@model_path/weights/wo2.bin", data: buildBlob(from: weights2.Wo, rows: dim, cols: dim)),
-            ],
+            weights: weights,
             inputSizes: generator.inputByteSizes,
             outputSizes: generator.outputByteSizes
         )
     }
-
     @inline(__always)
     private static func buildBlob(from buffer: borrowing TensorBuffer, rows: Int, cols: Int) -> Data {
         buffer.withUnsafeBufferPointer { ptr in

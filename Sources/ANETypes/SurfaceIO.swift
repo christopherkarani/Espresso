@@ -415,6 +415,195 @@ public enum SurfaceIO {
         return FP16ArgmaxResult(index: Int(index32), value: value)
     }
 
+    /// Write embeddings for multiple streams to their spatial lanes under one lock.
+    /// Fuses embedding lookup + FP32→FP16 conversion + strided surface write.
+    public static func writeEmbeddingBatchFP16(
+        to surface: IOSurfaceRef,
+        channelOffset: Int,
+        spatial: Int,
+        embeddingTable: UnsafePointer<Float>,
+        vocabSize: Int,
+        dim: Int,
+        tokenIDs: UnsafePointer<UInt16>,
+        streamCount: Int
+    ) throws(SurfaceIOError) {
+        let chOff32 = try checkedNonNegativeInt32(channelOffset)
+        let spatial32 = try checkedNonNegativeInt32(spatial)
+        let vocab32 = try checkedNonNegativeInt32(vocabSize)
+        let dim32 = try checkedNonNegativeInt32(dim)
+        let count32 = try checkedNonNegativeInt32(streamCount)
+        guard spatial > 0, vocabSize > 0, dim > 0, streamCount > 0, streamCount <= spatial else {
+            throw .argumentOutOfRange
+        }
+        let ok = ane_interop_io_write_embedding_batch_fp16(
+            surface, chOff32, spatial32, embeddingTable, vocab32, dim32, tokenIDs, count32
+        )
+        guard ok else { throw .interopCallFailed }
+    }
+
+    /// Argmax over multiple spatial lanes under one lock.
+    public static func argmaxBatchFP16Spatial(
+        from surface: IOSurfaceRef,
+        channelOffset: Int,
+        spatial: Int,
+        channels: Int,
+        streamCount: Int
+    ) throws(SurfaceIOError) -> [FP16ArgmaxResult] {
+        let chOff32 = try checkedNonNegativeInt32(channelOffset)
+        let spatial32 = try checkedNonNegativeInt32(spatial)
+        let channels32 = try checkedNonNegativeInt32(channels)
+        let count32 = try checkedNonNegativeInt32(streamCount)
+        guard spatial > 0, channels > 0, streamCount > 0, streamCount <= spatial else {
+            throw .argumentOutOfRange
+        }
+
+        var indices = [Int32](repeating: 0, count: streamCount)
+        var values = [Float](repeating: 0, count: streamCount)
+        let ok = indices.withUnsafeMutableBufferPointer { idxBuf in
+            values.withUnsafeMutableBufferPointer { valBuf in
+                ane_interop_io_argmax_batch_fp16_spatial(
+                    surface, chOff32, spatial32, channels32, count32,
+                    idxBuf.baseAddress!, valBuf.baseAddress!
+                )
+            }
+        }
+        guard ok else { throw .interopCallFailed }
+
+        return (0..<streamCount).map { i in
+            FP16ArgmaxResult(index: Int(indices[i]), value: values[i])
+        }
+    }
+
+    public static func argmaxBatchFP16SpatialParallel(
+        from surface: IOSurfaceRef,
+        channelOffset: Int,
+        spatial: Int,
+        channels: Int,
+        streamCount: Int,
+        nBlocks: Int = 4
+    ) throws(SurfaceIOError) -> [FP16ArgmaxResult] {
+        let chOff32 = try checkedNonNegativeInt32(channelOffset)
+        let spatial32 = try checkedNonNegativeInt32(spatial)
+        let channels32 = try checkedNonNegativeInt32(channels)
+        let count32 = try checkedNonNegativeInt32(streamCount)
+        let blocks32 = try checkedNonNegativeInt32(nBlocks)
+        guard spatial > 0, channels > 0, streamCount > 0, streamCount <= spatial else {
+            throw .argumentOutOfRange
+        }
+        guard channels <= Int(UInt16.max) + 1 else {
+            throw .argumentOutOfRange
+        }
+
+        var indices = [Int32](repeating: 0, count: streamCount)
+        var values = [Float](repeating: 0, count: streamCount)
+        let ok = indices.withUnsafeMutableBufferPointer { idxBuf in
+            values.withUnsafeMutableBufferPointer { valBuf in
+                ane_interop_io_argmax_batch_fp16_spatial_parallel(
+                    surface, chOff32, spatial32, channels32, count32,
+                    idxBuf.baseAddress!, valBuf.baseAddress!, blocks32
+                )
+            }
+        }
+        guard ok else { throw .interopCallFailed }
+
+        return (0..<streamCount).map { i in
+            FP16ArgmaxResult(index: Int(indices[i]), value: values[i])
+        }
+    }
+
+    /// Lockless argmax — assumes surface is already coherent (e.g., after sync ANE eval).
+    public static func argmaxBatchFP16SpatialNolock(
+        from surface: IOSurfaceRef,
+        channelOffset: Int,
+        spatial: Int,
+        channels: Int,
+        streamCount: Int,
+        nBlocks: Int = 8
+    ) throws(SurfaceIOError) -> [FP16ArgmaxResult] {
+        let chOff32 = try checkedNonNegativeInt32(channelOffset)
+        let spatial32 = try checkedNonNegativeInt32(spatial)
+        let channels32 = try checkedNonNegativeInt32(channels)
+        let count32 = try checkedNonNegativeInt32(streamCount)
+        let blocks32 = try checkedNonNegativeInt32(nBlocks)
+        guard spatial > 0, channels > 0, streamCount > 0, streamCount <= spatial else {
+            throw .argumentOutOfRange
+        }
+
+        var indices = [Int32](repeating: 0, count: streamCount)
+        var values = [Float](repeating: 0, count: streamCount)
+        let ok = indices.withUnsafeMutableBufferPointer { idxBuf in
+            values.withUnsafeMutableBufferPointer { valBuf in
+                ane_interop_io_argmax_batch_fp16_spatial_nolock(
+                    surface, chOff32, spatial32, channels32, count32,
+                    idxBuf.baseAddress!, valBuf.baseAddress!, blocks32
+                )
+            }
+        }
+        guard ok else { throw .interopCallFailed }
+
+        return (0..<streamCount).map { i in
+            FP16ArgmaxResult(index: Int(indices[i]), value: values[i])
+        }
+    }
+
+    /// Fused expansion + argmax: reads a small projected surface, computes
+    /// matmul + argmax on CPU without materializing full vocab logits.
+    /// `expansionWeightsFP16` must point to contiguous fp16 [vocabSize, bottleneck/groups].
+    public static func fusedExpansionArgmax(
+        projSurface: IOSurfaceRef,
+        projChannelOffset: Int = 0,
+        spatial: Int,
+        bottleneck: Int,
+        groups: Int,
+        expansionWeightsFP16: UnsafeRawPointer,
+        vocabSize: Int,
+        streamCount: Int,
+        nBlocks: Int = 8
+    ) throws(SurfaceIOError) -> [FP16ArgmaxResult] {
+        let projChOff32 = try checkedNonNegativeInt32(projChannelOffset)
+        let spatial32 = try checkedNonNegativeInt32(spatial)
+        let bottleneck32 = try checkedNonNegativeInt32(bottleneck)
+        let groups32 = try checkedNonNegativeInt32(groups)
+        let vocab32 = try checkedNonNegativeInt32(vocabSize)
+        let count32 = try checkedNonNegativeInt32(streamCount)
+        let blocks32 = try checkedNonNegativeInt32(nBlocks)
+        guard spatial > 0, bottleneck > 0, groups > 0, vocabSize > 0, streamCount > 0 else {
+            throw .argumentOutOfRange
+        }
+        guard streamCount <= spatial else {
+            throw .argumentOutOfRange
+        }
+        guard bottleneck.isMultiple(of: groups), vocabSize.isMultiple(of: groups) else {
+            throw .argumentOutOfRange
+        }
+        guard vocabSize <= Int(UInt16.max) + 1 else {
+            throw .argumentOutOfRange
+        }
+        var indices = [Int32](repeating: 0, count: streamCount)
+        var values = [Float](repeating: 0, count: streamCount)
+        let ok = indices.withUnsafeMutableBufferPointer { idxBuf in
+            values.withUnsafeMutableBufferPointer { valBuf in
+                ane_interop_fused_expansion_argmax_fp16(
+                    projSurface,
+                    projChOff32,
+                    spatial32,
+                    bottleneck32,
+                    groups32,
+                    expansionWeightsFP16,
+                    vocab32,
+                    count32,
+                    idxBuf.baseAddress!,
+                    valBuf.baseAddress!,
+                    blocks32
+                )
+            }
+        }
+        guard ok else { throw .interopCallFailed }
+        return (0..<streamCount).map { i in
+            FP16ArgmaxResult(index: Int(indices[i]), value: values[i])
+        }
+    }
+
     public static func copyFP16Batched(dst: IOSurfaceRef,
                                        src: IOSurfaceRef,
                                        spatial: Int,

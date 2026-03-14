@@ -439,6 +439,15 @@ public struct ANEKernel: ~Copyable {
         return surface
     }
 
+    /// Replace an input surface and rebuild the ANE request.
+    /// Used for surface sharing between kernels (zero-copy I/O chaining).
+    public func rebindInput(at index: Int, to surface: IOSurfaceRef) throws(ANEError) {
+        let checkedIndex = try Self.checkedSurfaceIndex(index)
+        guard ane_interop_rebind_input(handle, checkedIndex, surface) else {
+            throw .invalidArguments("rebindInput failed at index \(index)")
+        }
+    }
+
     public struct CodeSigningProbe: Sendable {
         public let hasGetCodeSigningIdentity: Bool
         public let hasSetCodeSigningIdentity: Bool

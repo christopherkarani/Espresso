@@ -16,7 +16,7 @@ let package = Package(
             path: "Sources/ANEInterop",
             publicHeadersPath: "include",
             cSettings: [
-                .unsafeFlags(["-fobjc-arc"]),
+                .unsafeFlags(["-fobjc-arc", "-O2"]),
                 .headerSearchPath("include"),
             ],
             linkerSettings: [

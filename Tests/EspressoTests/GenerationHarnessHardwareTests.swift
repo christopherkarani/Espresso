@@ -2,8 +2,13 @@ import Accelerate
 import XCTest
 import ANETypes
 import ANERuntime
+import ANEInterop
 import CoreML
 import CPUOps
+import IOSurface
+import Metal
+import MetalPerformanceShaders
+@testable import MILGenerator
 @testable import Espresso
 
 private func requireGenerationHardware(file: StaticString = #filePath, line: UInt = #line) throws {
@@ -97,7 +102,7 @@ private func makeEchoGenerationWeights(layerCount: Int) -> GenerationWeights {
     )
 }
 
-private func makeEchoRecurrentGenerationWeights(layerCount: Int) -> RecurrentGenerationWeights {
+private func makeEchoRecurrentGenerationWeights(layerCount: Int, vocabSize: Int = ModelConfig.vocab) -> RecurrentGenerationWeights {
     let layers = LayerStorage<RWKVStyleRecurrentWeights>(count: layerCount) { _ in
         let weights = RWKVStyleRecurrentWeights()
         fill(weights.rms, value: 1)
@@ -111,7 +116,7 @@ private func makeEchoRecurrentGenerationWeights(layerCount: Int) -> RecurrentGen
     let rmsFinal = TensorBuffer(count: ModelConfig.dim, zeroed: false)
     fill(rmsFinal, value: 1)
 
-    let embedding = TensorBuffer(count: ModelConfig.vocab * ModelConfig.dim, zeroed: true)
+    let embedding = TensorBuffer(count: vocabSize * ModelConfig.dim, zeroed: true)
     embedding.withUnsafeMutablePointer { ptr in
         for dimIdx in 0..<ModelConfig.dim {
             ptr[dimIdx] = 1
@@ -123,7 +128,8 @@ private func makeEchoRecurrentGenerationWeights(layerCount: Int) -> RecurrentGen
         rmsFinal: rmsFinal,
         embedding: embedding,
         classifier: TensorBuffer(count: 0, zeroed: true),
-        sharedClassifier: true
+        sharedClassifier: true,
+        vocabSize: vocabSize
     )
 }
 
@@ -1547,19 +1553,19 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         let warmup = 3
         let iterations = 20
         let maxNewTokens = 8
-        let streamCounts = [1, 2, 3, 4, 5, 6]
+        let aneStreamCounts = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+        let coremlStreamCounts = [1, 2, 4, 6]
         let modelPath = "benchmarks/models/transformer_6layer.mlpackage"
 
-        let ane = try benchmarkConcurrentRecurrentEchoGeneration(
+        let ane = try benchmarkBatchedRecurrentGeneration(
             layerCount: 6,
             promptTokens: prompt,
             maxNewTokens: maxNewTokens,
             warmup: warmup,
             iterations: iterations,
-            streamCounts: streamCounts,
-            outputHeadBackend: .aneRMSNormClassifier,
-            trunkBackend: .fusedThreeLayerTriplets,
-            useDirectTokenSelection: true
+            streamCounts: aneStreamCounts,
+            groups: 16,
+            headGroups: 16
         )
         let coreml = try benchmarkConcurrentCoreMLGeneration(
             modelPath: modelPath,
@@ -1567,7 +1573,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
             maxNewTokens: maxNewTokens,
             warmup: warmup,
             iterations: iterations,
-            streamCounts: streamCounts
+            streamCounts: coremlStreamCounts
         )
 
         XCTAssertEqual(ane.promptLength, prompt.count)
@@ -1578,21 +1584,3861 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         XCTAssertEqual(coreml.warmupCount, warmup)
         XCTAssertEqual(ane.iterationCount, iterations)
         XCTAssertEqual(coreml.iterationCount, iterations)
-        XCTAssertEqual(ane.samples.map(\.streamCount), streamCounts)
-        XCTAssertEqual(coreml.samples.map(\.streamCount), streamCounts)
+        XCTAssertEqual(ane.samples.map(\.streamCount), aneStreamCounts)
+        XCTAssertEqual(coreml.samples.map(\.streamCount), coremlStreamCounts)
         XCTAssertTrue(ane.samples.allSatisfy { $0.medianMsPerToken > 0 })
         XCTAssertTrue(coreml.samples.allSatisfy { $0.medianMsPerToken > 0 })
 
+        // Pipelined double-buffer at 1024 streams (2×1024 = 2048 total)
+        let pipelined = try benchmarkPipelinedGeneration(
+            layerCount: 6,
+            maxNewTokens: maxNewTokens,
+            warmup: warmup,
+            iterations: iterations,
+            streamCount: 1024,
+            groups: 8,
+            headGroups: 1
+        )
+
+        print("=== ANE Batched (g=16, headG=16) ===")
+        for sample in ane.samples {
+            print("  batched ane streams=\(sample.streamCount) median_ms_token=\(String(format: "%.4f", sample.medianMsPerToken)) aggregate_tps=\(String(format: "%.1f", sample.aggregateTokensPerSecond)) per_stream_tps=\(String(format: "%.1f", sample.perStreamTokensPerSecond)) compile=\(String(format: "%.0f", sample.compileTimeMs)) round_ms=\(String(format: "%.3f", sample.medianRoundLatencyMs))")
+        }
+        print("=== ANE Pipelined (2x1024, g=8, headG=1) ===")
+        print("  pipelined ane streams=\(pipelined.streamCount) median_ms_token=\(String(format: "%.4f", pipelined.medianMsPerToken)) aggregate_tps=\(String(format: "%.1f", pipelined.aggregateTokensPerSecond)) per_stream_tps=\(String(format: "%.1f", pipelined.perStreamTokensPerSecond)) compile=\(String(format: "%.0f", pipelined.compileTimeMs)) round_ms=\(String(format: "%.3f", pipelined.medianRoundLatencyMs))")
+        print("=== CoreML Concurrent ===")
+        for sample in coreml.samples {
+            print("  concurrent coreml streams=\(sample.streamCount) median_ms_token=\(String(format: "%.4f", sample.medianMsPerToken)) aggregate_tps=\(String(format: "%.1f", sample.aggregateTokensPerSecond)) per_stream_tps=\(String(format: "%.1f", sample.perStreamTokensPerSecond)) compile=\(String(format: "%.0f", sample.compileTimeMs)) round_ms=\(String(format: "%.3f", sample.medianRoundLatencyMs))")
+        }
+        // Matched comparison at common stream counts
+        let commonCounts = Set(aneStreamCounts).intersection(coremlStreamCounts).sorted()
+        if !commonCounts.isEmpty {
+            print("=== Matched Comparison ===")
+            for sc in commonCounts {
+                guard let a = ane.samples.first(where: { $0.streamCount == sc }),
+                      let c = coreml.samples.first(where: { $0.streamCount == sc }) else { continue }
+                let speedup = a.aggregateTokensPerSecond / c.aggregateTokensPerSecond
+                print("  streams=\(sc) ane=\(String(format: "%.1f", a.aggregateTokensPerSecond)) coreml=\(String(format: "%.1f", c.aggregateTokensPerSecond)) speedup=\(String(format: "%.1fx", speedup))")
+            }
+        }
+        // Peak comparison
+        let peakANE = max(
+            ane.samples.map(\.aggregateTokensPerSecond).max() ?? 0,
+            pipelined.aggregateTokensPerSecond
+        )
+        let peakCoreML = coreml.samples.map(\.aggregateTokensPerSecond).max() ?? 1
+        print("=== Peak ===")
+        print("  ANE peak: \(String(format: "%.1f", peakANE)) TPS")
+        print("  CoreML peak: \(String(format: "%.1f", peakCoreML)) TPS")
+        print("  Peak speedup: \(String(format: "%.1fx", peakANE / peakCoreML))")
+    }
+
+    func test_batched_multistream_scaling_reports_aggregate_throughput_on_hardware() throws {
+        try requireGenerationHardware()
+
+        let prompt: [UInt16] = [0]
+        let warmup = 3
+        let iterations = 20
+        let maxNewTokens = 8
+        let streamCounts = [1, 2, 3, 4, 5, 6]
+        let modelPath = "benchmarks/models/transformer_6layer.mlpackage"
+
+        let batched = try benchmarkBatchedRecurrentGeneration(
+            layerCount: 6,
+            promptTokens: prompt,
+            maxNewTokens: maxNewTokens,
+            warmup: warmup,
+            iterations: iterations,
+            streamCounts: streamCounts
+        )
+
+        let concurrent = try benchmarkConcurrentRecurrentEchoGeneration(
+            layerCount: 6,
+            promptTokens: prompt,
+            maxNewTokens: maxNewTokens,
+            warmup: warmup,
+            iterations: iterations,
+            streamCounts: streamCounts,
+            outputHeadBackend: .aneRMSNormClassifier,
+            trunkBackend: .fusedThreeLayerTriplets,
+            useDirectTokenSelection: true
+        )
+
+        let coreml = try benchmarkConcurrentCoreMLGeneration(
+            modelPath: modelPath,
+            promptTokens: prompt,
+            maxNewTokens: maxNewTokens,
+            warmup: warmup,
+            iterations: iterations,
+            streamCounts: streamCounts
+        )
+
+        XCTAssertEqual(batched.samples.map(\.streamCount), streamCounts)
+        XCTAssertTrue(batched.samples.allSatisfy { $0.medianMsPerToken > 0 })
+
         for idx in 0..<streamCounts.count {
-            let aneSample = ane.samples[idx]
-            let coremlSample = coreml.samples[idx]
+            let bSample = batched.samples[idx]
+            let aSample = concurrent.samples[idx]
+            let cSample = coreml.samples[idx]
             print(
                 """
-                concurrent ane streams=\(aneSample.streamCount) median_ms_token=\(aneSample.medianMsPerToken) aggregate_tps=\(aneSample.aggregateTokensPerSecond) per_stream_tps=\(aneSample.perStreamTokensPerSecond) compile=\(aneSample.compileTimeMs) round_ms=\(aneSample.medianRoundLatencyMs)
-                concurrent coreml streams=\(coremlSample.streamCount) median_ms_token=\(coremlSample.medianMsPerToken) aggregate_tps=\(coremlSample.aggregateTokensPerSecond) per_stream_tps=\(coremlSample.perStreamTokensPerSecond) compile=\(coremlSample.compileTimeMs) round_ms=\(coremlSample.medianRoundLatencyMs)
+                batched ane streams=\(bSample.streamCount) median_ms_token=\(bSample.medianMsPerToken) aggregate_tps=\(bSample.aggregateTokensPerSecond) per_stream_tps=\(bSample.perStreamTokensPerSecond) compile=\(bSample.compileTimeMs) round_ms=\(bSample.medianRoundLatencyMs)
+                concurrent ane streams=\(aSample.streamCount) median_ms_token=\(aSample.medianMsPerToken) aggregate_tps=\(aSample.aggregateTokensPerSecond) per_stream_tps=\(aSample.perStreamTokensPerSecond) compile=\(aSample.compileTimeMs) round_ms=\(aSample.medianRoundLatencyMs)
+                concurrent coreml streams=\(cSample.streamCount) median_ms_token=\(cSample.medianMsPerToken) aggregate_tps=\(cSample.aggregateTokensPerSecond) per_stream_tps=\(cSample.perStreamTokensPerSecond) compile=\(cSample.compileTimeMs) round_ms=\(cSample.medianRoundLatencyMs)
                 """
             )
         }
+    }
+
+    private func benchmarkBatchedRecurrentGeneration(
+        layerCount: Int,
+        promptTokens: [UInt16],
+        maxNewTokens: Int,
+        warmup: Int,
+        iterations: Int,
+        streamCounts: [Int],
+        groups: Int = 1,
+        headGroups: Int = 1,
+        vocabSize: Int = ModelConfig.vocab
+    ) throws -> ConcurrentGenerationScalingReport {
+        let dim = ModelConfig.dim
+        var samples: [ConcurrentGenerationScalingSample] = []
+        samples.reserveCapacity(streamCounts.count)
+
+        for streamCount in streamCounts {
+            // laneSpatial must be a power of 2 >= 32 (ANE constraint)
+            let laneSpatial: Int
+            if streamCount <= 32 { laneSpatial = 32 }
+            else if streamCount <= 64 { laneSpatial = 64 }
+            else if streamCount <= 128 { laneSpatial = 128 }
+            else if streamCount <= 256 { laneSpatial = 256 }
+            else { laneSpatial = 512 }
+
+            let compileStart = GenerationClock.now()
+
+            let weights = makeEchoRecurrentGenerationWeights(layerCount: layerCount, vocabSize: vocabSize)
+            let tripletCount = layerCount / 3
+
+            var tripletSessions = try LayerStorage<RWKVStyleFusedThreeLayerSession>(
+                count: tripletCount,
+                throwingInitializer: { tripletIdx in
+                    let base = tripletIdx * 3
+                    return try RWKVStyleFusedThreeLayerSession(
+                        weights0: weights.layers[base],
+                        weights1: weights.layers[base + 1],
+                        weights2: weights.layers[base + 2],
+                        laneSpatial: laneSpatial,
+                        groups: groups
+                    )
+                }
+            )
+
+            // Head kernel — use factored classifier for lower weight-loading latency
+            let factoredHead = try FactoredGenerationRMSNormClassifierKernelSet(
+                rmsFinal: weights.rmsFinal,
+                classifierProjection: TensorBuffer(count: 128 * ModelConfig.dim, zeroed: true),
+                classifierExpansion: TensorBuffer(count: weights.vocabSize * 128, zeroed: true),
+                vocabSize: weights.vocabSize,
+                bottleneck: 128,
+                laneSpatial: laneSpatial,
+                groups: headGroups
+            )
+            let headOutputSurface = try factoredHead.rmsNormClassifier.outputSurface(at: 0)
+
+            let vocabSize = weights.vocabSize
+
+            // === ZERO-COPY REBINDING ===
+            // Rebind T0 state inputs → T0 state outputs (in-place state)
+            let t0sOut0 = tripletSessions[0].handles.stateOut0
+            let t0sOut1 = tripletSessions[0].handles.stateOut1
+            let t0sOut2 = tripletSessions[0].handles.stateOut2
+            try tripletSessions[0].kernels.step.rebindInput(at: 1, to: t0sOut0)
+            try tripletSessions[0].kernels.step.rebindInput(at: 2, to: t0sOut1)
+            try tripletSessions[0].kernels.step.rebindInput(at: 3, to: t0sOut2)
+
+            if tripletCount > 1 {
+                // Rebind T1 xIn → T0 xOut (zero-copy transfer)
+                let t0xOut = tripletSessions[0].handles.xOut
+                try tripletSessions[1].kernels.step.rebindInput(at: 0, to: t0xOut)
+
+                // Rebind T1 state inputs → T1 state outputs (in-place state)
+                let t1sOut0 = tripletSessions[1].handles.stateOut0
+                let t1sOut1 = tripletSessions[1].handles.stateOut1
+                let t1sOut2 = tripletSessions[1].handles.stateOut2
+                try tripletSessions[1].kernels.step.rebindInput(at: 1, to: t1sOut0)
+                try tripletSessions[1].kernels.step.rebindInput(at: 2, to: t1sOut1)
+                try tripletSessions[1].kernels.step.rebindInput(at: 3, to: t1sOut2)
+
+                // Rebind head input → T1 xOut (zero-copy transfer)
+                let t1xOut = tripletSessions[1].handles.xOut
+                try factoredHead.rmsNormClassifier.rebindInput(at: 0, to: t1xOut)
+            } else {
+                let t0xOut = tripletSessions[0].handles.xOut
+                try factoredHead.rmsNormClassifier.rebindInput(at: 0, to: t0xOut)
+            }
+
+            let t0xIn = tripletSessions[0].handles.xIn
+            let headOut = headOutputSurface
+            let compileTimeMs = machMilliseconds(GenerationClock.now() - compileStart)
+
+            // Zero-copy reset: zero the shared state surfaces directly
+            func resetZeroCopy() throws {
+                let zeroLane = tripletSessions[0].handles.zeroLane
+                try SurfaceIO.copyFP16(dst: t0sOut0, dstChannelOffset: 0, src: zeroLane, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+                try SurfaceIO.copyFP16(dst: t0sOut1, dstChannelOffset: 0, src: zeroLane, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+                try SurfaceIO.copyFP16(dst: t0sOut2, dstChannelOffset: 0, src: zeroLane, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+                if tripletCount > 1 {
+                    let zl1 = tripletSessions[1].handles.zeroLane
+                    let s10 = tripletSessions[1].handles.stateOut0
+                    let s11 = tripletSessions[1].handles.stateOut1
+                    let s12 = tripletSessions[1].handles.stateOut2
+                    try SurfaceIO.copyFP16(dst: s10, dstChannelOffset: 0, src: zl1, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+                    try SurfaceIO.copyFP16(dst: s11, dstChannelOffset: 0, src: zl1, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+                    try SurfaceIO.copyFP16(dst: s12, dstChannelOffset: 0, src: zl1, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+                }
+            }
+
+            // Warmup
+            for _ in 0..<warmup {
+                try resetZeroCopy()
+                var tokens = Array(repeating: promptTokens[0], count: streamCount)
+                for _ in 0..<maxNewTokens {
+                    try batchedTokenStepZeroCopy(
+                        tokens: &tokens,
+                        streamCount: streamCount,
+                        embedding: weights.embedding,
+                        dim: dim,
+                        laneSpatial: laneSpatial,
+                        tripletCount: tripletCount,
+                        tripletSessions: &tripletSessions,
+                        t0xIn: t0xIn,
+                        headOut: headOut,
+                        headEval: { try factoredHead.rmsNormClassifier.eval() },
+                        vocabSize: vocabSize
+                    )
+                }
+            }
+
+            // Timed iterations
+            var roundLatenciesMs: [Double] = []
+            roundLatenciesMs.reserveCapacity(iterations)
+            for _ in 0..<iterations {
+                try resetZeroCopy()
+                var tokens = Array(repeating: promptTokens[0], count: streamCount)
+
+                let start = GenerationClock.now()
+                for _ in 0..<maxNewTokens {
+                    try batchedTokenStepZeroCopy(
+                        tokens: &tokens,
+                        streamCount: streamCount,
+                        embedding: weights.embedding,
+                        dim: dim,
+                        laneSpatial: laneSpatial,
+                        tripletCount: tripletCount,
+                        tripletSessions: &tripletSessions,
+                        t0xIn: t0xIn,
+                        headOut: headOut,
+                        headEval: { try factoredHead.rmsNormClassifier.eval() },
+                        vocabSize: vocabSize
+                    )
+                }
+                roundLatenciesMs.append(machMilliseconds(GenerationClock.now() - start))
+            }
+
+            samples.append(
+                ConcurrentGenerationScalingSample(
+                    streamCount: streamCount,
+                    tokensPerStream: maxNewTokens,
+                    compileTimeMs: compileTimeMs,
+                    roundLatenciesMs: roundLatenciesMs
+                )
+            )
+        }
+
+        return ConcurrentGenerationScalingReport(
+            label: "ANE Batched Recurrent",
+            promptLength: promptTokens.count,
+            maxNewTokens: maxNewTokens,
+            warmupCount: warmup,
+            iterationCount: iterations,
+            samples: samples
+        )
+    }
+
+    private func batchedTokenStep(
+        tokens: inout [UInt16],
+        streamCount: Int,
+        embedding: borrowing TensorBuffer,
+        dim: Int,
+        laneSpatial: Int,
+        tripletCount: Int,
+        tripletSessions: inout LayerStorage<RWKVStyleFusedThreeLayerSession>,
+        t0xIn: IOSurfaceRef, t0xOut: IOSurfaceRef,
+        t0sIn0: IOSurfaceRef, t0sIn1: IOSurfaceRef, t0sIn2: IOSurfaceRef,
+        t0sOut0: IOSurfaceRef, t0sOut1: IOSurfaceRef, t0sOut2: IOSurfaceRef,
+        t1xIn: IOSurfaceRef, t1xOut: IOSurfaceRef,
+        t1sIn0: IOSurfaceRef, t1sIn1: IOSurfaceRef, t1sIn2: IOSurfaceRef,
+        t1sOut0: IOSurfaceRef, t1sOut1: IOSurfaceRef, t1sOut2: IOSurfaceRef,
+        headIn: IOSurfaceRef, headOut: IOSurfaceRef,
+        head: ANEGenerationRMSNormClassifierHead,
+        vocabSize: Int
+    ) throws {
+        try batchedTokenStepWithEval(
+            tokens: &tokens, streamCount: streamCount,
+            embedding: embedding, dim: dim, laneSpatial: laneSpatial,
+            tripletCount: tripletCount, tripletSessions: &tripletSessions,
+            t0xIn: t0xIn, t0xOut: t0xOut,
+            t0sIn0: t0sIn0, t0sIn1: t0sIn1, t0sIn2: t0sIn2,
+            t0sOut0: t0sOut0, t0sOut1: t0sOut1, t0sOut2: t0sOut2,
+            t1xIn: t1xIn, t1xOut: t1xOut,
+            t1sIn0: t1sIn0, t1sIn1: t1sIn1, t1sIn2: t1sIn2,
+            t1sOut0: t1sOut0, t1sOut1: t1sOut1, t1sOut2: t1sOut2,
+            headIn: headIn, headOut: headOut,
+            headEval: { try head.kernelSet.rmsNormClassifier.eval() },
+            vocabSize: vocabSize
+        )
+    }
+
+    private func batchedTokenStepWithEval(
+        tokens: inout [UInt16],
+        streamCount: Int,
+        embedding: borrowing TensorBuffer,
+        dim: Int,
+        laneSpatial: Int,
+        tripletCount: Int,
+        tripletSessions: inout LayerStorage<RWKVStyleFusedThreeLayerSession>,
+        t0xIn: IOSurfaceRef, t0xOut: IOSurfaceRef,
+        t0sIn0: IOSurfaceRef, t0sIn1: IOSurfaceRef, t0sIn2: IOSurfaceRef,
+        t0sOut0: IOSurfaceRef, t0sOut1: IOSurfaceRef, t0sOut2: IOSurfaceRef,
+        t1xIn: IOSurfaceRef, t1xOut: IOSurfaceRef,
+        t1sIn0: IOSurfaceRef, t1sIn1: IOSurfaceRef, t1sIn2: IOSurfaceRef,
+        t1sOut0: IOSurfaceRef, t1sOut1: IOSurfaceRef, t1sOut2: IOSurfaceRef,
+        headIn: IOSurfaceRef, headOut: IOSurfaceRef,
+        headEval: () throws -> Void,
+        vocabSize: Int
+    ) throws {
+        try embedding.withUnsafePointer { embPtr in
+            try tokens.withUnsafeBufferPointer { tokenBuf in
+                try SurfaceIO.writeEmbeddingBatchFP16(
+                    to: t0xIn, channelOffset: 0, spatial: laneSpatial,
+                    embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
+                    tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount
+                )
+            }
+        }
+
+        try tripletSessions[0].kernels.step.eval()
+
+        try SurfaceIO.copyFP16(dst: t0sIn0, dstChannelOffset: 0, src: t0sOut0, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+        try SurfaceIO.copyFP16(dst: t0sIn1, dstChannelOffset: 0, src: t0sOut1, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+        try SurfaceIO.copyFP16(dst: t0sIn2, dstChannelOffset: 0, src: t0sOut2, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+
+        if tripletCount > 1 {
+            try SurfaceIO.copyFP16(dst: t1xIn, dstChannelOffset: 0, src: t0xOut, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+            try tripletSessions[1].kernels.step.eval()
+            try SurfaceIO.copyFP16(dst: t1sIn0, dstChannelOffset: 0, src: t1sOut0, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+            try SurfaceIO.copyFP16(dst: t1sIn1, dstChannelOffset: 0, src: t1sOut1, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+            try SurfaceIO.copyFP16(dst: t1sIn2, dstChannelOffset: 0, src: t1sOut2, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+        }
+
+        let lastXOut = tripletCount > 1 ? t1xOut : t0xOut
+        try SurfaceIO.copyFP16(dst: headIn, dstChannelOffset: 0, src: lastXOut, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+
+        try headEval()
+
+        let argmaxResults = try SurfaceIO.argmaxBatchFP16SpatialParallel(
+            from: headOut, channelOffset: 0, spatial: laneSpatial,
+            channels: vocabSize, streamCount: streamCount, nBlocks: 32
+        )
+        for streamIdx in 0..<streamCount {
+            tokens[streamIdx] = UInt16(argmaxResults[streamIdx].index)
+        }
+    }
+
+    func test_fused_trunk_head_compile_probe_on_hardware() throws {
+        try requireGenerationHardware()
+
+        let laneSpatial = 256
+        let dim = ModelConfig.dim
+        let weights = makeEchoRecurrentGenerationWeights(layerCount: 6)
+        let k = 128
+        let vocabSize = weights.vocabSize
+
+        // Build MIL for N-layer trunk + factored head, and try compile+eval
+        func probeNLayerFusedHead(layerCount: Int) {
+            let invd: Float = 1.0 / Float(dim)
+            var b = MILBuilder(reserveCapacity: 32_768)
+            b.append(MILText.header)
+
+            var inputs = "tensor<fp16, [1, \(dim), 1, \(laneSpatial)]> x"
+            for i in 0..<layerCount {
+                inputs += ", tensor<fp16, [1, \(dim), 1, \(laneSpatial)]> stateIn\(i)"
+            }
+            b.appendLine("    func main<ios18>(\(inputs)) {")
+
+            // Shared constants
+            b.appendLine("        tensor<int32, [1]> raxCh = const()[name=string(\"rax_ch\"), val=tensor<int32, [1]>([1])];")
+            b.appendLine("        bool kd = const()[name=string(\"kd\"), val=bool(true)];")
+            b.append("        fp16 invd = const()[name=string(\"invd\"), val=fp16(")
+            b.appendFP16(invd)
+            b.appendLine(")];")
+            b.appendLine("        fp16 eps = const()[name=string(\"eps\"), val=fp16(0.00001)];")
+            b.appendLine("        fp16 nhalf = const()[name=string(\"nhalf\"), val=fp16(-0.5)];")
+            b.append(MILText.convConst)
+
+            // Recurrent layers
+            for i in 0..<layerCount {
+                let p = "l\(i)_"
+                let xIn = i == 0 ? "x" : "l\(i-1)_xNext"
+                let xOut = i == layerCount - 1 ? "xNext" : "l\(i)_xNext"
+                let sIn = "stateIn\(i)"
+                let sOut = "stateOut\(i)"
+
+                b.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> \(p)sq = mul(x=\(xIn),y=\(xIn))[name=string(\"\(p)sq\")];")
+                b.appendLine("        tensor<fp16, [1,1,1,\(laneSpatial)]> \(p)ss = reduce_sum(x=\(p)sq,axes=raxCh,keep_dims=kd)[name=string(\"\(p)ss\")];")
+                b.appendLine("        tensor<fp16, [1,1,1,\(laneSpatial)]> \(p)ss2 = mul(x=\(p)ss,y=invd)[name=string(\"\(p)ss2\")];")
+                b.appendLine("        tensor<fp16, [1,1,1,\(laneSpatial)]> \(p)ss3 = add(x=\(p)ss2,y=eps)[name=string(\"\(p)ss3\")];")
+                b.appendLine("        tensor<fp16, [1,1,1,\(laneSpatial)]> \(p)rrms = pow(x=\(p)ss3,y=nhalf)[name=string(\"\(p)rrms\")];")
+                b.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> \(p)xr = mul(x=\(xIn),y=\(p)rrms)[name=string(\"\(p)xr\")];")
+                b.appendLine("        tensor<fp16, [1,\(dim),1,1]> \(p)rw = const()[name=string(\"\(p)rw\"), val=tensor<fp16, [1,\(dim),1,1]>(BLOBFILE(path=string(\"@model_path/weights/rwkv_rms\(i).bin\"), offset=uint64(64)))];")
+                b.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> \(p)xn = mul(x=\(p)xr,y=\(p)rw)[name=string(\"\(p)xn\")];")
+                b.appendLine("        tensor<fp16, [\(dim),\(dim),1,1]> \(p)Wx = const()[name=string(\"\(p)Wx\"), val=tensor<fp16, [\(dim),\(dim),1,1]>(BLOBFILE(path=string(\"@model_path/weights/wx\(i).bin\"), offset=uint64(64)))];")
+                b.appendLine("        tensor<fp16, [\(dim),\(dim),1,1]> \(p)Ws = const()[name=string(\"\(p)Ws\"), val=tensor<fp16, [\(dim),\(dim),1,1]>(BLOBFILE(path=string(\"@model_path/weights/ws\(i).bin\"), offset=uint64(64)))];")
+                b.appendLine("        tensor<fp16, [\(dim),\(dim),1,1]> \(p)Wd = const()[name=string(\"\(p)Wd\"), val=tensor<fp16, [\(dim),\(dim),1,1]>(BLOBFILE(path=string(\"@model_path/weights/wd\(i).bin\"), offset=uint64(64)))];")
+                b.appendLine("        tensor<fp16, [\(dim),\(dim),1,1]> \(p)Wo = const()[name=string(\"\(p)Wo\"), val=tensor<fp16, [\(dim),\(dim),1,1]>(BLOBFILE(path=string(\"@model_path/weights/wo\(i).bin\"), offset=uint64(64)))];")
+                b.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> \(p)xMix = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=\(p)Wx,x=\(p)xn)[name=string(\"\(p)x_mix\")];")
+                b.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> \(p)sMix = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=\(p)Ws,x=\(sIn))[name=string(\"\(p)s_mix\")];")
+                b.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> \(p)carry = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=\(p)Wd,x=\(sIn))[name=string(\"\(p)carry\")];")
+                b.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> \(p)mixPre = add(x=\(p)xMix,y=\(p)sMix)[name=string(\"\(p)mix_pre\")];")
+                b.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> \(p)gate = sigmoid(x=\(p)mixPre)[name=string(\"\(p)gate\")];")
+                b.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> \(p)gatedCarry = mul(x=\(p)carry,y=\(p)gate)[name=string(\"\(p)gated_carry\")];")
+                b.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> \(sOut) = add(x=\(p)xMix,y=\(p)gatedCarry)[name=string(\"\(p)state_out\")];")
+                b.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> \(p)proj = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=\(p)Wo,x=\(sOut))[name=string(\"\(p)proj\")];")
+                b.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> \(xOut) = add(x=\(xIn),y=\(p)proj)[name=string(\"\(p)x_next\")];")
+            }
+
+            // Factored head on xNext
+            b.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> h_sq = mul(x=xNext,y=xNext)[name=string(\"h_sq\")];")
+            b.appendLine("        tensor<fp16, [1,1,1,\(laneSpatial)]> h_ss = reduce_sum(x=h_sq,axes=raxCh,keep_dims=kd)[name=string(\"h_ss\")];")
+            b.appendLine("        tensor<fp16, [1,1,1,\(laneSpatial)]> h_ss2 = mul(x=h_ss,y=invd)[name=string(\"h_ss2\")];")
+            b.appendLine("        tensor<fp16, [1,1,1,\(laneSpatial)]> h_ss3 = add(x=h_ss2,y=eps)[name=string(\"h_ss3\")];")
+            b.appendLine("        tensor<fp16, [1,1,1,\(laneSpatial)]> h_rrms = pow(x=h_ss3,y=nhalf)[name=string(\"h_rrms\")];")
+            b.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> h_xr = mul(x=xNext,y=h_rrms)[name=string(\"h_xr\")];")
+            b.appendLine("        tensor<fp16, [1,\(dim),1,1]> h_rw = const()[name=string(\"h_rw\"), val=tensor<fp16, [1,\(dim),1,1]>(BLOBFILE(path=string(\"@model_path/weights/rms_final.bin\"), offset=uint64(64)))];")
+            b.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> h_xn = mul(x=h_xr,y=h_rw)[name=string(\"h_xn\")];")
+            b.appendLine("        tensor<fp16, [\(k), \(dim), 1, 1]> Wproj = const()[name=string(\"Wproj\"), val=tensor<fp16, [\(k), \(dim), 1, 1]>(BLOBFILE(path=string(\"@model_path/weights/cls_proj.bin\"), offset=uint64(64)))];")
+            b.appendLine("        tensor<fp16, [1, \(k), 1, \(laneSpatial)]> h_proj = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Wproj,x=h_xn)[name=string(\"h_proj\")];")
+            b.appendLine("        tensor<fp16, [\(vocabSize), \(k), 1, 1]> Wexp = const()[name=string(\"Wexp\"), val=tensor<fp16, [\(vocabSize), \(k), 1, 1]>(BLOBFILE(path=string(\"@model_path/weights/cls_expand.bin\"), offset=uint64(64)))];")
+            b.appendLine("        tensor<fp16, [1, \(vocabSize), 1, \(laneSpatial)]> logits = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Wexp,x=h_proj)[name=string(\"h_expand\")];")
+
+            var outputs = "xNext"
+            for i in 0..<layerCount {
+                outputs += ",stateOut\(i)"
+            }
+            outputs += ",logits"
+            b.appendLine("    } -> (\(outputs));")
+            b.appendLine("}")
+
+            // Build weight blobs
+            var weightBlobs: [(path: String, data: Data)] = []
+            for i in 0..<layerCount {
+                let idx = i >= weights.layers.count ? 0 : i
+                weightBlobs.append(("@model_path/weights/rwkv_rms\(i).bin", weights.layers[idx].rms.withUnsafeBufferPointer { WeightBlob.build(from: $0, rows: 1, cols: dim) }))
+                weightBlobs.append(("@model_path/weights/wx\(i).bin", weights.layers[idx].Wx.withUnsafeBufferPointer { WeightBlob.build(from: $0, rows: dim, cols: dim) }))
+                weightBlobs.append(("@model_path/weights/ws\(i).bin", weights.layers[idx].Ws.withUnsafeBufferPointer { WeightBlob.build(from: $0, rows: dim, cols: dim) }))
+                weightBlobs.append(("@model_path/weights/wd\(i).bin", weights.layers[idx].Wd.withUnsafeBufferPointer { WeightBlob.build(from: $0, rows: dim, cols: dim) }))
+                weightBlobs.append(("@model_path/weights/wo\(i).bin", weights.layers[idx].Wo.withUnsafeBufferPointer { WeightBlob.build(from: $0, rows: dim, cols: dim) }))
+            }
+            // Head weights
+            weightBlobs.append(("@model_path/weights/rms_final.bin", weights.rmsFinal.withUnsafeBufferPointer { WeightBlob.build(from: $0, rows: 1, cols: dim) }))
+            let projBuf = TensorBuffer(count: k * dim, zeroed: true)
+            weightBlobs.append(("@model_path/weights/cls_proj.bin", projBuf.withUnsafeBufferPointer { WeightBlob.build(from: $0, rows: k, cols: dim) }))
+            let expBuf = TensorBuffer(count: vocabSize * k, zeroed: true)
+            weightBlobs.append(("@model_path/weights/cls_expand.bin", expBuf.withUnsafeBufferPointer { WeightBlob.build(from: $0, rows: vocabSize, cols: k) }))
+
+            let stateBytes = dim * laneSpatial * 2
+            let inputSizes = [stateBytes] + Array(repeating: stateBytes, count: layerCount)
+            let outputSizes = [stateBytes] + Array(repeating: stateBytes, count: layerCount) + [vocabSize * laneSpatial * 2]
+
+            let compileStart = GenerationClock.now()
+            do {
+                let kernel = try ANEKernel(
+                    milText: b.text,
+                    weights: weightBlobs,
+                    inputSizes: inputSizes,
+                    outputSizes: outputSizes
+                )
+                let compileMs = machMilliseconds(GenerationClock.now() - compileStart)
+
+                // Try eval
+                try kernel.eval()
+
+                // Benchmark 20 evals
+                var times: [Double] = []
+                for _ in 0..<20 {
+                    let t = GenerationClock.now()
+                    try kernel.eval()
+                    times.append(machMilliseconds(GenerationClock.now() - t))
+                }
+                times.sort()
+                let median = times[times.count / 2]
+                print("\(layerCount)L+head: COMPILE OK (\(String(format: "%.0f", compileMs))ms), EVAL OK, median=\(String(format: "%.3f", median))ms")
+            } catch {
+                let compileMs = machMilliseconds(GenerationClock.now() - compileStart)
+                print("\(layerCount)L+head: FAILED after \(String(format: "%.0f", compileMs))ms — \(error)")
+            }
+        }
+
+        // Also probe standalone N-layer trunks (no head)
+        func probeNLayerTrunk(layerCount: Int) {
+            let invd: Float = 1.0 / Float(dim)
+            var b = MILBuilder(reserveCapacity: 32_768)
+            b.append(MILText.header)
+
+            var inputs = "tensor<fp16, [1, \(dim), 1, \(laneSpatial)]> x"
+            for i in 0..<layerCount {
+                inputs += ", tensor<fp16, [1, \(dim), 1, \(laneSpatial)]> stateIn\(i)"
+            }
+            b.appendLine("    func main<ios18>(\(inputs)) {")
+            b.appendLine("        tensor<int32, [1]> raxCh = const()[name=string(\"rax_ch\"), val=tensor<int32, [1]>([1])];")
+            b.appendLine("        bool kd = const()[name=string(\"kd\"), val=bool(true)];")
+            b.append("        fp16 invd = const()[name=string(\"invd\"), val=fp16(")
+            b.appendFP16(invd)
+            b.appendLine(")];")
+            b.appendLine("        fp16 eps = const()[name=string(\"eps\"), val=fp16(0.00001)];")
+            b.appendLine("        fp16 nhalf = const()[name=string(\"nhalf\"), val=fp16(-0.5)];")
+            b.append(MILText.convConst)
+
+            for i in 0..<layerCount {
+                let p = "l\(i)_"
+                let xIn = i == 0 ? "x" : "l\(i-1)_xNext"
+                let xOut = i == layerCount - 1 ? "xNext" : "l\(i)_xNext"
+                let sIn = "stateIn\(i)"
+                let sOut = "stateOut\(i)"
+
+                b.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> \(p)sq = mul(x=\(xIn),y=\(xIn))[name=string(\"\(p)sq\")];")
+                b.appendLine("        tensor<fp16, [1,1,1,\(laneSpatial)]> \(p)ss = reduce_sum(x=\(p)sq,axes=raxCh,keep_dims=kd)[name=string(\"\(p)ss\")];")
+                b.appendLine("        tensor<fp16, [1,1,1,\(laneSpatial)]> \(p)ss2 = mul(x=\(p)ss,y=invd)[name=string(\"\(p)ss2\")];")
+                b.appendLine("        tensor<fp16, [1,1,1,\(laneSpatial)]> \(p)ss3 = add(x=\(p)ss2,y=eps)[name=string(\"\(p)ss3\")];")
+                b.appendLine("        tensor<fp16, [1,1,1,\(laneSpatial)]> \(p)rrms = pow(x=\(p)ss3,y=nhalf)[name=string(\"\(p)rrms\")];")
+                b.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> \(p)xr = mul(x=\(xIn),y=\(p)rrms)[name=string(\"\(p)xr\")];")
+                b.appendLine("        tensor<fp16, [1,\(dim),1,1]> \(p)rw = const()[name=string(\"\(p)rw\"), val=tensor<fp16, [1,\(dim),1,1]>(BLOBFILE(path=string(\"@model_path/weights/rwkv_rms\(i).bin\"), offset=uint64(64)))];")
+                b.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> \(p)xn = mul(x=\(p)xr,y=\(p)rw)[name=string(\"\(p)xn\")];")
+                b.appendLine("        tensor<fp16, [\(dim),\(dim),1,1]> \(p)Wx = const()[name=string(\"\(p)Wx\"), val=tensor<fp16, [\(dim),\(dim),1,1]>(BLOBFILE(path=string(\"@model_path/weights/wx\(i).bin\"), offset=uint64(64)))];")
+                b.appendLine("        tensor<fp16, [\(dim),\(dim),1,1]> \(p)Ws = const()[name=string(\"\(p)Ws\"), val=tensor<fp16, [\(dim),\(dim),1,1]>(BLOBFILE(path=string(\"@model_path/weights/ws\(i).bin\"), offset=uint64(64)))];")
+                b.appendLine("        tensor<fp16, [\(dim),\(dim),1,1]> \(p)Wd = const()[name=string(\"\(p)Wd\"), val=tensor<fp16, [\(dim),\(dim),1,1]>(BLOBFILE(path=string(\"@model_path/weights/wd\(i).bin\"), offset=uint64(64)))];")
+                b.appendLine("        tensor<fp16, [\(dim),\(dim),1,1]> \(p)Wo = const()[name=string(\"\(p)Wo\"), val=tensor<fp16, [\(dim),\(dim),1,1]>(BLOBFILE(path=string(\"@model_path/weights/wo\(i).bin\"), offset=uint64(64)))];")
+                b.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> \(p)xMix = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=\(p)Wx,x=\(p)xn)[name=string(\"\(p)x_mix\")];")
+                b.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> \(p)sMix = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=\(p)Ws,x=\(sIn))[name=string(\"\(p)s_mix\")];")
+                b.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> \(p)carry = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=\(p)Wd,x=\(sIn))[name=string(\"\(p)carry\")];")
+                b.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> \(p)mixPre = add(x=\(p)xMix,y=\(p)sMix)[name=string(\"\(p)mix_pre\")];")
+                b.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> \(p)gate = sigmoid(x=\(p)mixPre)[name=string(\"\(p)gate\")];")
+                b.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> \(p)gatedCarry = mul(x=\(p)carry,y=\(p)gate)[name=string(\"\(p)gated_carry\")];")
+                b.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> \(sOut) = add(x=\(p)xMix,y=\(p)gatedCarry)[name=string(\"\(p)state_out\")];")
+                b.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> \(p)proj = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=\(p)Wo,x=\(sOut))[name=string(\"\(p)proj\")];")
+                b.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> \(xOut) = add(x=\(xIn),y=\(p)proj)[name=string(\"\(p)x_next\")];")
+            }
+
+            var outputs = "xNext"
+            for i in 0..<layerCount { outputs += ",stateOut\(i)" }
+            b.appendLine("    } -> (\(outputs));")
+            b.appendLine("}")
+
+            var weightBlobs: [(path: String, data: Data)] = []
+            for i in 0..<layerCount {
+                let idx = i >= weights.layers.count ? 0 : i
+                weightBlobs.append(("@model_path/weights/rwkv_rms\(i).bin", weights.layers[idx].rms.withUnsafeBufferPointer { WeightBlob.build(from: $0, rows: 1, cols: dim) }))
+                weightBlobs.append(("@model_path/weights/wx\(i).bin", weights.layers[idx].Wx.withUnsafeBufferPointer { WeightBlob.build(from: $0, rows: dim, cols: dim) }))
+                weightBlobs.append(("@model_path/weights/ws\(i).bin", weights.layers[idx].Ws.withUnsafeBufferPointer { WeightBlob.build(from: $0, rows: dim, cols: dim) }))
+                weightBlobs.append(("@model_path/weights/wd\(i).bin", weights.layers[idx].Wd.withUnsafeBufferPointer { WeightBlob.build(from: $0, rows: dim, cols: dim) }))
+                weightBlobs.append(("@model_path/weights/wo\(i).bin", weights.layers[idx].Wo.withUnsafeBufferPointer { WeightBlob.build(from: $0, rows: dim, cols: dim) }))
+            }
+
+            let stateBytes = dim * laneSpatial * 2
+            let inputSizes = [stateBytes] + Array(repeating: stateBytes, count: layerCount)
+            let outputSizes = [stateBytes] + Array(repeating: stateBytes, count: layerCount)
+
+            let compileStart = GenerationClock.now()
+            do {
+                let kernel = try ANEKernel(
+                    milText: b.text,
+                    weights: weightBlobs,
+                    inputSizes: inputSizes,
+                    outputSizes: outputSizes
+                )
+                let compileMs = machMilliseconds(GenerationClock.now() - compileStart)
+
+                try kernel.eval()
+
+                var times: [Double] = []
+                for _ in 0..<20 {
+                    let t = GenerationClock.now()
+                    try kernel.eval()
+                    times.append(machMilliseconds(GenerationClock.now() - t))
+                }
+                times.sort()
+                let median = times[times.count / 2]
+                print("\(layerCount)L trunk: COMPILE OK (\(String(format: "%.0f", compileMs))ms), EVAL OK, median=\(String(format: "%.3f", median))ms")
+            } catch {
+                let compileMs = machMilliseconds(GenerationClock.now() - compileStart)
+                print("\(layerCount)L trunk: FAILED after \(String(format: "%.0f", compileMs))ms — \(error)")
+            }
+        }
+
+        // Probe matrix: trunk-only and fused trunk+head at different layer counts
+        print("=== Trunk-only probes ===")
+        probeNLayerTrunk(layerCount: 4)
+        probeNLayerTrunk(layerCount: 5)
+
+        print("=== Fused trunk+head probes ===")
+        probeNLayerFusedHead(layerCount: 1)
+        probeNLayerFusedHead(layerCount: 2)
+        probeNLayerFusedHead(layerCount: 3)
+
+        // Probe: factored head variants
+        print("=== Factored head output variants ===")
+        let blockSize = 125 // 32000 / 256 = 125
+        let numBlocks = 256
+
+        // Helper to build factored head MIL with configurable outputs
+        func buildFactoredHeadMILProbe(outputLogits: Bool, outputBmax: Bool, outputProj: Bool) -> String {
+            let invdVal: Float = 1.0 / Float(dim)
+            var hb = MILBuilder(reserveCapacity: 4_096)
+            hb.append(MILText.header)
+            hb.appendLine("    func main<ios18>(tensor<fp16, [1, \(dim), 1, \(laneSpatial)]> x) {")
+            hb.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> sq = mul(x=x,y=x)[name=string(\"sq\")];")
+            hb.appendLine("        tensor<int32, [1]> raxCh = const()[name=string(\"rax_ch\"), val=tensor<int32, [1]>([1])];")
+            hb.appendLine("        bool kd = const()[name=string(\"kd\"), val=bool(true)];")
+            hb.append("        fp16 invd = const()[name=string(\"invd\"), val=fp16(")
+            hb.appendFP16(invdVal)
+            hb.appendLine(")];")
+            hb.appendLine("        tensor<fp16, [1,1,1,\(laneSpatial)]> ss = reduce_sum(x=sq,axes=raxCh,keep_dims=kd)[name=string(\"ss\")];")
+            hb.appendLine("        tensor<fp16, [1,1,1,\(laneSpatial)]> ss2 = mul(x=ss,y=invd)[name=string(\"ss2\")];")
+            hb.appendLine("        fp16 eps = const()[name=string(\"eps\"), val=fp16(0.00001)];")
+            hb.appendLine("        tensor<fp16, [1,1,1,\(laneSpatial)]> ss3 = add(x=ss2,y=eps)[name=string(\"ss3\")];")
+            hb.appendLine("        fp16 nhalf = const()[name=string(\"nhalf\"), val=fp16(-0.5)];")
+            hb.appendLine("        tensor<fp16, [1,1,1,\(laneSpatial)]> rrms = pow(x=ss3,y=nhalf)[name=string(\"rrms\")];")
+            hb.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> xr = mul(x=x,y=rrms)[name=string(\"xr\")];")
+            hb.appendLine("        tensor<fp16, [1,\(dim),1,1]> rw = const()[name=string(\"rw\"), val=tensor<fp16, [1,\(dim),1,1]>(BLOBFILE(path=string(\"@model_path/weights/rms_final.bin\"), offset=uint64(64)))];")
+            hb.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> xn = mul(x=xr,y=rw)[name=string(\"xn\")];")
+            hb.append(MILText.convConst)
+            hb.appendLine("        tensor<fp16, [\(k), \(dim), 1, 1]> Wproj = const()[name=string(\"Wproj\"), val=tensor<fp16, [\(k), \(dim), 1, 1]>(BLOBFILE(path=string(\"@model_path/weights/cls_proj.bin\"), offset=uint64(64)))];")
+            hb.appendLine("        tensor<fp16, [1, \(k), 1, \(laneSpatial)]> proj = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Wproj,x=xn)[name=string(\"proj\")];")
+            hb.appendLine("        tensor<fp16, [\(vocabSize), \(k), 1, 1]> Wexp = const()[name=string(\"Wexp\"), val=tensor<fp16, [\(vocabSize), \(k), 1, 1]>(BLOBFILE(path=string(\"@model_path/weights/cls_expand.bin\"), offset=uint64(64)))];")
+            hb.appendLine("        tensor<fp16, [1, \(vocabSize), 1, \(laneSpatial)]> logits = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Wexp,x=proj)[name=string(\"expand\")];")
+            if outputBmax {
+                hb.appendLine("        tensor<int32, [4]> rs = const()[name=string(\"rs\"), val=tensor<int32, [4]>([1, \(numBlocks), \(blockSize), \(laneSpatial)])];")
+                hb.appendLine("        tensor<fp16, [1, \(numBlocks), \(blockSize), \(laneSpatial)]> lr = reshape(x=logits, shape=rs)[name=string(\"lr\")];")
+                hb.appendLine("        tensor<int32, [1]> raxH = const()[name=string(\"rax_h\"), val=tensor<int32, [1]>([2])];")
+                hb.appendLine("        tensor<fp16, [1, \(numBlocks), 1, \(laneSpatial)]> bmax = reduce_max(x=lr,axes=raxH,keep_dims=kd)[name=string(\"bmax\")];")
+            }
+            var outs: [String] = []
+            if outputLogits { outs.append("logits") }
+            if outputBmax { outs.append("bmax") }
+            if outputProj { outs.append("proj") }
+            hb.appendLine("    } -> (\(outs.joined(separator: ",")));")
+            hb.appendLine("}")
+            return hb.text
+        }
+
+        func probeHeadVariant(label: String, milText: String, outputSizes: [Int]) {
+            let rmsBlob = weights.rmsFinal.withUnsafeBufferPointer { WeightBlob.build(from: $0, rows: 1, cols: dim) }
+            let projBuf2 = TensorBuffer(count: k * dim, zeroed: true)
+            let projBlob2 = projBuf2.withUnsafeBufferPointer { WeightBlob.build(from: $0, rows: k, cols: dim) }
+            let expBuf2 = TensorBuffer(count: vocabSize * k, zeroed: true)
+            let expBlob2 = expBuf2.withUnsafeBufferPointer { WeightBlob.build(from: $0, rows: vocabSize, cols: k) }
+
+            let t = GenerationClock.now()
+            do {
+                let kernel = try ANEKernel(
+                    milText: milText,
+                    weights: [
+                        (path: "@model_path/weights/rms_final.bin", data: rmsBlob),
+                        (path: "@model_path/weights/cls_proj.bin", data: projBlob2),
+                        (path: "@model_path/weights/cls_expand.bin", data: expBlob2),
+                    ],
+                    inputSizes: [dim * laneSpatial * 2],
+                    outputSizes: outputSizes
+                )
+                let cMs = machMilliseconds(GenerationClock.now() - t)
+                try kernel.eval()
+                var times: [Double] = []
+                for _ in 0..<20 {
+                    let t0 = GenerationClock.now()
+                    try kernel.eval()
+                    times.append(machMilliseconds(GenerationClock.now() - t0))
+                }
+                times.sort()
+                print("\(label): OK compile=\(String(format: "%.0f", cMs))ms eval_median=\(String(format: "%.3f", times[10]))ms")
+            } catch {
+                let cMs = machMilliseconds(GenerationClock.now() - t)
+                print("\(label): FAILED after \(String(format: "%.0f", cMs))ms")
+            }
+        }
+
+        // Variant A: logits only (baseline — should work)
+        probeHeadVariant(
+            label: "logits_only",
+            milText: buildFactoredHeadMILProbe(outputLogits: true, outputBmax: false, outputProj: false),
+            outputSizes: [vocabSize * laneSpatial * 2]
+        )
+        // Variant B: logits + bmax (two outputs)
+        probeHeadVariant(
+            label: "logits+bmax",
+            milText: buildFactoredHeadMILProbe(outputLogits: true, outputBmax: true, outputProj: false),
+            outputSizes: [vocabSize * laneSpatial * 2, numBlocks * laneSpatial * 2]
+        )
+        // Variant C: bmax only (no full logits)
+        probeHeadVariant(
+            label: "bmax_only",
+            milText: buildFactoredHeadMILProbe(outputLogits: false, outputBmax: true, outputProj: false),
+            outputSizes: [numBlocks * laneSpatial * 2]
+        )
+        // Variant D: proj + bmax (bottleneck + blocked max, no full logits)
+        probeHeadVariant(
+            label: "proj+bmax",
+            milText: buildFactoredHeadMILProbe(outputLogits: false, outputBmax: true, outputProj: true),
+            outputSizes: [numBlocks * laneSpatial * 2, k * laneSpatial * 2]
+        )
+        // Variant E: proj only (bottleneck only)
+        probeHeadVariant(
+            label: "proj_only",
+            milText: buildFactoredHeadMILProbe(outputLogits: false, outputBmax: false, outputProj: true),
+            outputSizes: [k * laneSpatial * 2]
+        )
+
+        // K-sweep at 256 lanes: measure head eval with different bottleneck sizes
+        print("=== K-sweep at lane=\(laneSpatial) ===")
+        for kVal in [64, 80, 96, 112, 128, 160, 192] {
+            let kInvd: Float = 1.0 / Float(dim)
+            var kb = MILBuilder(reserveCapacity: 4_096)
+            kb.append(MILText.header)
+            kb.appendLine("    func main<ios18>(tensor<fp16, [1, \(dim), 1, \(laneSpatial)]> x) {")
+            kb.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> sq = mul(x=x,y=x)[name=string(\"sq\")];")
+            kb.appendLine("        tensor<int32, [1]> raxCh = const()[name=string(\"rax_ch\"), val=tensor<int32, [1]>([1])];")
+            kb.appendLine("        bool kd = const()[name=string(\"kd\"), val=bool(true)];")
+            kb.append("        fp16 invd = const()[name=string(\"invd\"), val=fp16(")
+            kb.appendFP16(kInvd)
+            kb.appendLine(")];")
+            kb.appendLine("        tensor<fp16, [1,1,1,\(laneSpatial)]> ss = reduce_sum(x=sq,axes=raxCh,keep_dims=kd)[name=string(\"ss\")];")
+            kb.appendLine("        tensor<fp16, [1,1,1,\(laneSpatial)]> ss2 = mul(x=ss,y=invd)[name=string(\"ss2\")];")
+            kb.appendLine("        fp16 eps = const()[name=string(\"eps\"), val=fp16(0.00001)];")
+            kb.appendLine("        tensor<fp16, [1,1,1,\(laneSpatial)]> ss3 = add(x=ss2,y=eps)[name=string(\"ss3\")];")
+            kb.appendLine("        fp16 nhalf = const()[name=string(\"nhalf\"), val=fp16(-0.5)];")
+            kb.appendLine("        tensor<fp16, [1,1,1,\(laneSpatial)]> rrms = pow(x=ss3,y=nhalf)[name=string(\"rrms\")];")
+            kb.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> xr = mul(x=x,y=rrms)[name=string(\"xr\")];")
+            kb.appendLine("        tensor<fp16, [1,\(dim),1,1]> rw = const()[name=string(\"rw\"), val=tensor<fp16, [1,\(dim),1,1]>(BLOBFILE(path=string(\"@model_path/weights/rms_final.bin\"), offset=uint64(64)))];")
+            kb.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> xn = mul(x=xr,y=rw)[name=string(\"xn\")];")
+            kb.append(MILText.convConst)
+            kb.appendLine("        tensor<fp16, [\(kVal), \(dim), 1, 1]> Wproj = const()[name=string(\"Wproj\"), val=tensor<fp16, [\(kVal), \(dim), 1, 1]>(BLOBFILE(path=string(\"@model_path/weights/cls_proj.bin\"), offset=uint64(64)))];")
+            kb.appendLine("        tensor<fp16, [1, \(kVal), 1, \(laneSpatial)]> proj = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Wproj,x=xn)[name=string(\"proj\")];")
+            kb.appendLine("        tensor<fp16, [\(vocabSize), \(kVal), 1, 1]> Wexp = const()[name=string(\"Wexp\"), val=tensor<fp16, [\(vocabSize), \(kVal), 1, 1]>(BLOBFILE(path=string(\"@model_path/weights/cls_expand.bin\"), offset=uint64(64)))];")
+            kb.appendLine("        tensor<fp16, [1, \(vocabSize), 1, \(laneSpatial)]> logits = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Wexp,x=proj)[name=string(\"expand\")];")
+            kb.appendLine("    } -> (logits);")
+            kb.appendLine("}")
+
+            let rmsBlob2 = weights.rmsFinal.withUnsafeBufferPointer { WeightBlob.build(from: $0, rows: 1, cols: dim) }
+            let projBuf3 = TensorBuffer(count: kVal * dim, zeroed: true)
+            let projBlob3 = projBuf3.withUnsafeBufferPointer { WeightBlob.build(from: $0, rows: kVal, cols: dim) }
+            let expBuf3 = TensorBuffer(count: vocabSize * kVal, zeroed: true)
+            let expBlob3 = expBuf3.withUnsafeBufferPointer { WeightBlob.build(from: $0, rows: vocabSize, cols: kVal) }
+
+            let ct = GenerationClock.now()
+            do {
+                let kernel = try ANEKernel(
+                    milText: kb.text,
+                    weights: [
+                        (path: "@model_path/weights/rms_final.bin", data: rmsBlob2),
+                        (path: "@model_path/weights/cls_proj.bin", data: projBlob3),
+                        (path: "@model_path/weights/cls_expand.bin", data: expBlob3),
+                    ],
+                    inputSizes: [dim * laneSpatial * 2],
+                    outputSizes: [vocabSize * laneSpatial * 2]
+                )
+                let cMs = machMilliseconds(GenerationClock.now() - ct)
+                try kernel.eval()
+                var times: [Double] = []
+                for _ in 0..<20 {
+                    let t0 = GenerationClock.now()
+                    try kernel.eval()
+                    times.append(machMilliseconds(GenerationClock.now() - t0))
+                }
+                times.sort()
+                let wtMB = Double(kVal * dim + vocabSize * kVal) * 2.0 / 1_000_000.0
+                print("k=\(kVal): eval_median=\(String(format: "%.3f", times[10]))ms compile=\(String(format: "%.0f", cMs))ms weights=\(String(format: "%.1f", wtMB))MB")
+            } catch {
+                print("k=\(kVal): FAILED — \(error)")
+            }
+        }
+    }
+
+    func test_batched_multistream_high_lane_sweep_on_hardware() throws {
+        try requireGenerationHardware()
+
+        let prompt: [UInt16] = [0]
+        let warmup = 10
+        let iterations = 50
+        let maxNewTokens = 8
+
+        // Groups sweep at 512 streams (bottleneck=128, dim=768 — both must be divisible by g)
+        for g in [8, 16, 32, 64, 128] {
+            let result = try benchmarkBatchedRecurrentGeneration(
+                layerCount: 6,
+                promptTokens: prompt,
+                maxNewTokens: maxNewTokens,
+                warmup: warmup,
+                iterations: iterations,
+                streamCounts: [512],
+                groups: g,
+                headGroups: g
+            )
+            for s in result.samples {
+                print("g=\(g) streams=\(s.streamCount) aggregate_tps=\(s.aggregateTokensPerSecond) round_ms=\(s.medianRoundLatencyMs) compile=\(s.compileTimeMs)")
+            }
+        }
+    }
+
+    /// Zero-copy step: no state copies, no xfer copy, no head copy.
+    /// Requires surfaces to be pre-rebound so inputs alias outputs.
+    private func batchedTokenStepZeroCopy(
+        tokens: inout [UInt16],
+        streamCount: Int,
+        embedding: borrowing TensorBuffer,
+        dim: Int,
+        laneSpatial: Int,
+        tripletCount: Int,
+        tripletSessions: inout LayerStorage<RWKVStyleFusedThreeLayerSession>,
+        t0xIn: IOSurfaceRef,
+        headOut: IOSurfaceRef,
+        headEval: () throws -> Void,
+        vocabSize: Int
+    ) throws {
+        try embedding.withUnsafePointer { embPtr in
+            try tokens.withUnsafeBufferPointer { tokenBuf in
+                try SurfaceIO.writeEmbeddingBatchFP16(
+                    to: t0xIn, channelOffset: 0, spatial: laneSpatial,
+                    embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
+                    tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount
+                )
+            }
+        }
+
+        try tripletSessions[0].kernels.step.eval()
+
+        if tripletCount > 1 {
+            // T1.xIn is already rebound to T0.xOut — no copy needed
+            try tripletSessions[1].kernels.step.eval()
+        }
+
+        // headIn is already rebound to lastXOut — no copy needed
+        try headEval()
+
+        let argmaxResults = try SurfaceIO.argmaxBatchFP16SpatialParallel(
+            from: headOut, channelOffset: 0, spatial: laneSpatial,
+            channels: vocabSize, streamCount: streamCount, nBlocks: 32
+        )
+        for streamIdx in 0..<streamCount {
+            tokens[streamIdx] = UInt16(argmaxResults[streamIdx].index)
+        }
+    }
+
+    /// Pipelined double-buffer generation: 2 independent pipeline halves, CPU argmax+embed overlaps ANE eval.
+    /// Returns results as a ConcurrentGenerationScalingReport for comparison with batched/concurrent.
+    private func benchmarkPipelinedGeneration(
+        layerCount: Int,
+        maxNewTokens: Int,
+        warmup: Int,
+        iterations: Int,
+        streamCount: Int,
+        groups: Int = 8,
+        headGroups: Int = 1,
+        bottleneck: Int = 64
+    ) throws -> ConcurrentGenerationScalingSample {
+        let dim = ModelConfig.dim
+        let weights = makeEchoRecurrentGenerationWeights(layerCount: layerCount)
+        let vocabSize = weights.vocabSize
+        let tripletCount = layerCount / 3
+
+        let compileStart = GenerationClock.now()
+
+        // Pipeline A
+        var trA = try LayerStorage<RWKVStyleFusedThreeLayerSession>(
+            count: tripletCount,
+            throwingInitializer: { tripletIdx in
+                let base = tripletIdx * 3
+                return try RWKVStyleFusedThreeLayerSession(
+                    weights0: weights.layers[base], weights1: weights.layers[base + 1],
+                    weights2: weights.layers[base + 2], laneSpatial: streamCount, groups: groups)
+            })
+        let headA = try FactoredGenerationRMSNormClassifierKernelSet(
+            rmsFinal: weights.rmsFinal,
+            classifierProjection: TensorBuffer(count: bottleneck * dim, zeroed: true),
+            classifierExpansion: TensorBuffer(count: vocabSize * bottleneck, zeroed: true),
+            vocabSize: vocabSize, bottleneck: bottleneck, laneSpatial: streamCount, groups: headGroups)
+        // Zero-copy rebinding for A
+        for i in 0..<3 { try trA[0].kernels.step.rebindInput(at: 1+i, to: trA[0].kernels.step.outputSurface(at: 1+i)) }
+        if tripletCount > 1 {
+            try trA[1].kernels.step.rebindInput(at: 0, to: trA[0].handles.xOut)
+            for i in 0..<3 { try trA[1].kernels.step.rebindInput(at: 1+i, to: trA[1].kernels.step.outputSurface(at: 1+i)) }
+            try headA.rmsNormClassifier.rebindInput(at: 0, to: trA[tripletCount - 1].handles.xOut)
+        } else {
+            try headA.rmsNormClassifier.rebindInput(at: 0, to: trA[0].handles.xOut)
+        }
+        let headOutA = try headA.rmsNormClassifier.outputSurface(at: 0)
+        let t0xInA = trA[0].handles.xIn
+
+        // Pipeline B
+        var trB = try LayerStorage<RWKVStyleFusedThreeLayerSession>(
+            count: tripletCount,
+            throwingInitializer: { tripletIdx in
+                let base = tripletIdx * 3
+                return try RWKVStyleFusedThreeLayerSession(
+                    weights0: weights.layers[base], weights1: weights.layers[base + 1],
+                    weights2: weights.layers[base + 2], laneSpatial: streamCount, groups: groups)
+            })
+        let headB = try FactoredGenerationRMSNormClassifierKernelSet(
+            rmsFinal: weights.rmsFinal,
+            classifierProjection: TensorBuffer(count: bottleneck * dim, zeroed: true),
+            classifierExpansion: TensorBuffer(count: vocabSize * bottleneck, zeroed: true),
+            vocabSize: vocabSize, bottleneck: bottleneck, laneSpatial: streamCount, groups: headGroups)
+        for i in 0..<3 { try trB[0].kernels.step.rebindInput(at: 1+i, to: trB[0].kernels.step.outputSurface(at: 1+i)) }
+        if tripletCount > 1 {
+            try trB[1].kernels.step.rebindInput(at: 0, to: trB[0].handles.xOut)
+            for i in 0..<3 { try trB[1].kernels.step.rebindInput(at: 1+i, to: trB[1].kernels.step.outputSurface(at: 1+i)) }
+            try headB.rmsNormClassifier.rebindInput(at: 0, to: trB[tripletCount - 1].handles.xOut)
+        } else {
+            try headB.rmsNormClassifier.rebindInput(at: 0, to: trB[0].handles.xOut)
+        }
+        let headOutB = try headB.rmsNormClassifier.outputSurface(at: 0)
+        let t0xInB = trB[0].handles.xIn
+
+        let compileTimeMs = machMilliseconds(GenerationClock.now() - compileStart)
+
+        var tokensA = Array(repeating: UInt16(0), count: streamCount)
+        var tokensB = Array(repeating: UInt16(0), count: streamCount)
+
+        func embWrite(_ tokens: [UInt16], to surface: IOSurfaceRef) throws {
+            try weights.embedding.withUnsafePointer { embPtr in
+                try tokens.withUnsafeBufferPointer { tokenBuf in
+                    try SurfaceIO.writeEmbeddingBatchFP16(
+                        to: surface, channelOffset: 0, spatial: streamCount,
+                        embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
+                        tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount)
+                }
+            }
+        }
+
+        func argmax(from surface: IOSurfaceRef, into tokens: inout [UInt16]) throws {
+            let r = try SurfaceIO.argmaxBatchFP16SpatialParallel(
+                from: surface, channelOffset: 0, spatial: streamCount,
+                channels: vocabSize, streamCount: streamCount, nBlocks: 32)
+            for i in 0..<streamCount { tokens[i] = UInt16(r[i].index) }
+        }
+
+        func evalAll(_ tr: inout LayerStorage<RWKVStyleFusedThreeLayerSession>, head: borrowing FactoredGenerationRMSNormClassifierKernelSet) throws {
+            for t in 0..<tripletCount { try tr[t].kernels.step.eval() }
+            try head.rmsNormClassifier.eval()
+        }
+
+        // Prime pipeline A
+        try embWrite(tokensA, to: t0xInA)
+        try evalAll(&trA, head: headA)
+        try embWrite(tokensB, to: t0xInB)
+
+        // Pipelined loop: each iteration does 2 half-cycles (A+B), generating maxNewTokens per pipeline
+        var roundLatenciesMs: [Double] = []
+        roundLatenciesMs.reserveCapacity(iterations)
+        for iter in 0..<(warmup + iterations) {
+            let s = GenerationClock.now()
+
+            for _ in 0..<maxNewTokens {
+                // Half 1: eval B on background, CPU processes A
+                var aneError: (any Error)?
+                let sem1 = DispatchSemaphore(value: 0)
+                DispatchQueue.global(qos: .userInteractive).async { [self] in
+                    do { try evalAll(&trB, head: headB) } catch { aneError = error }
+                    sem1.signal()
+                }
+                try argmax(from: headOutA, into: &tokensA)
+                try embWrite(tokensA, to: t0xInA)
+                sem1.wait()
+                if let e = aneError { throw e }
+
+                // Half 2: eval A on background, CPU processes B
+                let sem2 = DispatchSemaphore(value: 0)
+                DispatchQueue.global(qos: .userInteractive).async { [self] in
+                    do { try evalAll(&trA, head: headA) } catch { aneError = error }
+                    sem2.signal()
+                }
+                try argmax(from: headOutB, into: &tokensB)
+                try embWrite(tokensB, to: t0xInB)
+                sem2.wait()
+                if let e = aneError { throw e }
+            }
+
+            if iter >= warmup {
+                roundLatenciesMs.append(machMilliseconds(GenerationClock.now() - s))
+            }
+        }
+
+        return ConcurrentGenerationScalingSample(
+            streamCount: streamCount * 2,  // 2 pipeline halves
+            tokensPerStream: maxNewTokens,
+            compileTimeMs: compileTimeMs,
+            roundLatenciesMs: roundLatenciesMs
+        )
+    }
+
+    // MARK: - Component timing probe
+
+    func test_component_timing_probe_on_hardware() throws {
+        try requireGenerationHardware()
+
+        let dim = ModelConfig.dim
+        let laneSpatial = 512
+        let streamCount = 512
+        let layerCount = 6
+        let groups = 16
+        let headGroups = 16
+        let iters = 50
+
+        let weights = makeEchoRecurrentGenerationWeights(layerCount: layerCount)
+        let tripletCount = layerCount / 3
+
+        var tripletSessions = try LayerStorage<RWKVStyleFusedThreeLayerSession>(
+            count: tripletCount,
+            throwingInitializer: { tripletIdx in
+                let base = tripletIdx * 3
+                return try RWKVStyleFusedThreeLayerSession(
+                    weights0: weights.layers[base],
+                    weights1: weights.layers[base + 1],
+                    weights2: weights.layers[base + 2],
+                    laneSpatial: laneSpatial,
+                    groups: groups
+                )
+            }
+        )
+        let factoredHead = try FactoredGenerationRMSNormClassifierKernelSet(
+            rmsFinal: weights.rmsFinal,
+            classifierProjection: TensorBuffer(count: 128 * dim, zeroed: true),
+            classifierExpansion: TensorBuffer(count: weights.vocabSize * 128, zeroed: true),
+            vocabSize: weights.vocabSize,
+            bottleneck: 128,
+            laneSpatial: laneSpatial,
+            groups: headGroups
+        )
+        let headOut = try factoredHead.rmsNormClassifier.outputSurface(at: 0)
+
+        // Zero-copy rebinding
+        let t0sOut0 = tripletSessions[0].handles.stateOut0
+        let t0sOut1 = tripletSessions[0].handles.stateOut1
+        let t0sOut2 = tripletSessions[0].handles.stateOut2
+        try tripletSessions[0].kernels.step.rebindInput(at: 1, to: t0sOut0)
+        try tripletSessions[0].kernels.step.rebindInput(at: 2, to: t0sOut1)
+        try tripletSessions[0].kernels.step.rebindInput(at: 3, to: t0sOut2)
+
+        let t0xOut = tripletSessions[0].handles.xOut
+        try tripletSessions[1].kernels.step.rebindInput(at: 0, to: t0xOut)
+        let t1sOut0 = tripletSessions[1].handles.stateOut0
+        let t1sOut1 = tripletSessions[1].handles.stateOut1
+        let t1sOut2 = tripletSessions[1].handles.stateOut2
+        try tripletSessions[1].kernels.step.rebindInput(at: 1, to: t1sOut0)
+        try tripletSessions[1].kernels.step.rebindInput(at: 2, to: t1sOut1)
+        try tripletSessions[1].kernels.step.rebindInput(at: 3, to: t1sOut2)
+        let t1xOut = tripletSessions[1].handles.xOut
+        try factoredHead.rmsNormClassifier.rebindInput(at: 0, to: t1xOut)
+
+        let t0xIn = tripletSessions[0].handles.xIn
+        let vocabSize = weights.vocabSize
+        var tokens = Array(repeating: UInt16(0), count: streamCount)
+
+        // Warmup
+        for _ in 0..<5 {
+            try batchedTokenStepZeroCopy(
+                tokens: &tokens, streamCount: streamCount,
+                embedding: weights.embedding, dim: dim, laneSpatial: laneSpatial,
+                tripletCount: tripletCount, tripletSessions: &tripletSessions,
+                t0xIn: t0xIn, headOut: headOut,
+                headEval: { try factoredHead.rmsNormClassifier.eval() },
+                vocabSize: vocabSize
+            )
+        }
+
+        // Timed components
+        var embedUs: [Double] = []
+        var t0EvalUs: [Double] = []
+        var t1EvalUs: [Double] = []
+        var headEvalUs: [Double] = []
+        var argmaxUs: [Double] = []
+
+        for _ in 0..<iters {
+            var s = GenerationClock.now()
+            try weights.embedding.withUnsafePointer { embPtr in
+                try tokens.withUnsafeBufferPointer { tokenBuf in
+                    try SurfaceIO.writeEmbeddingBatchFP16(
+                        to: t0xIn, channelOffset: 0, spatial: laneSpatial,
+                        embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
+                        tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount
+                    )
+                }
+            }
+            embedUs.append(machMilliseconds(GenerationClock.now() - s) * 1000)
+
+            s = GenerationClock.now()
+            try tripletSessions[0].kernels.step.eval()
+            t0EvalUs.append(machMilliseconds(GenerationClock.now() - s) * 1000)
+
+            s = GenerationClock.now()
+            try tripletSessions[1].kernels.step.eval()
+            t1EvalUs.append(machMilliseconds(GenerationClock.now() - s) * 1000)
+
+            s = GenerationClock.now()
+            try factoredHead.rmsNormClassifier.eval()
+            headEvalUs.append(machMilliseconds(GenerationClock.now() - s) * 1000)
+
+            s = GenerationClock.now()
+            let argmaxResults = try SurfaceIO.argmaxBatchFP16SpatialParallel(
+                from: headOut, channelOffset: 0, spatial: laneSpatial,
+                channels: vocabSize, streamCount: streamCount, nBlocks: 8
+            )
+            argmaxUs.append(machMilliseconds(GenerationClock.now() - s) * 1000)
+            for i in 0..<streamCount { tokens[i] = UInt16(argmaxResults[i].index) }
+        }
+
+        func median(_ arr: [Double]) -> Double {
+            let s = arr.sorted()
+            return s[s.count / 2]
+        }
+        let totalUs = median(embedUs) + median(t0EvalUs) + median(t1EvalUs) + median(headEvalUs) + median(argmaxUs)
+        print("Component timing @\(streamCount) streams, g=\(groups), head_g=\(headGroups) (median µs, \(iters) iters):")
+        print("  embed_write: \(String(format: "%.0f", median(embedUs)))µs (\(String(format: "%.1f", median(embedUs)/totalUs*100))%)")
+        print("  t0_eval:     \(String(format: "%.0f", median(t0EvalUs)))µs (\(String(format: "%.1f", median(t0EvalUs)/totalUs*100))%)")
+        print("  t1_eval:     \(String(format: "%.0f", median(t1EvalUs)))µs (\(String(format: "%.1f", median(t1EvalUs)/totalUs*100))%)")
+        print("  head_eval:   \(String(format: "%.0f", median(headEvalUs)))µs (\(String(format: "%.1f", median(headEvalUs)/totalUs*100))%)")
+        print("  argmax:      \(String(format: "%.0f", median(argmaxUs)))µs (\(String(format: "%.1f", median(argmaxUs)/totalUs*100))%)")
+
+        // === Position asymmetry probe: run isolated evals to test if position matters ===
+        print("\n--- Position asymmetry probe (isolated evals, \(iters) iters) ---")
+        var isolT0: [Double] = []
+        var isolT1: [Double] = []
+        var isolHead: [Double] = []
+        // Isolated T0
+        for _ in 0..<iters {
+            let s = GenerationClock.now()
+            try tripletSessions[0].kernels.step.eval()
+            isolT0.append(machMilliseconds(GenerationClock.now() - s) * 1000)
+        }
+        // Isolated T1
+        for _ in 0..<iters {
+            let s = GenerationClock.now()
+            try tripletSessions[1].kernels.step.eval()
+            isolT1.append(machMilliseconds(GenerationClock.now() - s) * 1000)
+        }
+        // Isolated head
+        for _ in 0..<iters {
+            let s = GenerationClock.now()
+            try factoredHead.rmsNormClassifier.eval()
+            isolHead.append(machMilliseconds(GenerationClock.now() - s) * 1000)
+        }
+        print("  T0 isolated: \(String(format: "%.0f", median(isolT0)))µs")
+        print("  T1 isolated: \(String(format: "%.0f", median(isolT1)))µs")
+        print("  Head isolated: \(String(format: "%.0f", median(isolHead)))µs")
+
+        // Second-position probe: run T1 first, then T0
+        var secondPosA: [Double] = []  // T1 runs first
+        var secondPosB: [Double] = []  // T0 runs second
+        for _ in 0..<iters {
+            var s = GenerationClock.now()
+            try tripletSessions[1].kernels.step.eval()
+            secondPosA.append(machMilliseconds(GenerationClock.now() - s) * 1000)
+            s = GenerationClock.now()
+            try tripletSessions[0].kernels.step.eval()
+            secondPosB.append(machMilliseconds(GenerationClock.now() - s) * 1000)
+        }
+        print("  T1-first: \(String(format: "%.0f", median(secondPosA)))µs, T0-second: \(String(format: "%.0f", median(secondPosB)))µs")
+        print("  total:       \(String(format: "%.0f", totalUs))µs")
+        print("  implied_tps: \(String(format: "%.0f", Double(streamCount) / totalUs * 1_000_000))")
+    }
+
+    // MARK: - Spatial scaling probe (512 vs 1024 streams)
+
+    func test_spatial_scaling_probe_on_hardware() throws {
+        try requireGenerationHardware()
+
+        let dim = ModelConfig.dim
+        let layerCount = 6
+        let iters = 50
+
+        // Canonical benchmark: 512 and 1024 with best groups
+        print("=== Canonical sweep (nBlocks=32 default) ===")
+        for spatial in [512, 1024] {
+            for testGroups in [8, 16] {
+                do {
+                    try runSpatialScalingPoint(
+                        streamCount: spatial, laneSpatial: spatial, dim: dim,
+                        layerCount: layerCount, groups: testGroups, headGroups: testGroups, iters: iters
+                    )
+                } catch {
+                    print("g=\(testGroups) spatial=\(spatial) streams=\(spatial): FAILED (\(error))")
+                }
+            }
+        }
+
+        // 1024 streams: component isolation (eval-only, skip argmax)
+        print("\n=== 1024 stream component isolation ===")
+        do {
+            let weights = makeEchoRecurrentGenerationWeights(layerCount: layerCount)
+            var tripletSessions = try LayerStorage<RWKVStyleFusedThreeLayerSession>(
+                count: layerCount / 3,
+                throwingInitializer: { tripletIdx in
+                    let base = tripletIdx * 3
+                    return try RWKVStyleFusedThreeLayerSession(
+                        weights0: weights.layers[base],
+                        weights1: weights.layers[base + 1],
+                        weights2: weights.layers[base + 2],
+                        laneSpatial: 1024,
+                        groups: 16
+                    )
+                }
+            )
+            let factoredHead = try FactoredGenerationRMSNormClassifierKernelSet(
+                rmsFinal: weights.rmsFinal,
+                classifierProjection: TensorBuffer(count: 128 * dim, zeroed: true),
+                classifierExpansion: TensorBuffer(count: weights.vocabSize * 128, zeroed: true),
+                vocabSize: weights.vocabSize,
+                bottleneck: 128,
+                laneSpatial: 1024,
+                groups: 16
+            )
+
+            // Rebind
+            for i in 0..<3 {
+                let sOut = try tripletSessions[0].kernels.step.outputSurface(at: 1 + i)
+                try tripletSessions[0].kernels.step.rebindInput(at: 1 + i, to: sOut)
+            }
+            let t0xOut = tripletSessions[0].handles.xOut
+            try tripletSessions[1].kernels.step.rebindInput(at: 0, to: t0xOut)
+            for i in 0..<3 {
+                let sOut = try tripletSessions[1].kernels.step.outputSurface(at: 1 + i)
+                try tripletSessions[1].kernels.step.rebindInput(at: 1 + i, to: sOut)
+            }
+            let t1xOut = tripletSessions[1].handles.xOut
+            try factoredHead.rmsNormClassifier.rebindInput(at: 0, to: t1xOut)
+
+            // Warmup evals only
+            for _ in 0..<3 {
+                try tripletSessions[0].kernels.step.eval()
+                try tripletSessions[1].kernels.step.eval()
+                try factoredHead.rmsNormClassifier.eval()
+            }
+
+            // Timed: T0 eval only
+            var t0Us: [Double] = []
+            for _ in 0..<20 {
+                let s = GenerationClock.now()
+                try tripletSessions[0].kernels.step.eval()
+                t0Us.append(machMilliseconds(GenerationClock.now() - s) * 1000)
+            }
+            // Timed: head eval only
+            var headUs: [Double] = []
+            for _ in 0..<20 {
+                let s = GenerationClock.now()
+                try factoredHead.rmsNormClassifier.eval()
+                headUs.append(machMilliseconds(GenerationClock.now() - s) * 1000)
+            }
+            // Timed: full 3-dispatch
+            var fullUs: [Double] = []
+            for _ in 0..<20 {
+                let s = GenerationClock.now()
+                try tripletSessions[0].kernels.step.eval()
+                try tripletSessions[1].kernels.step.eval()
+                try factoredHead.rmsNormClassifier.eval()
+                fullUs.append(machMilliseconds(GenerationClock.now() - s) * 1000)
+            }
+            func median(_ a: [Double]) -> Double { let s = a.sorted(); return s[s.count / 2] }
+            print("  1024 T0 eval: \(String(format: "%.0f", median(t0Us)))µs")
+            print("  1024 head eval: \(String(format: "%.0f", median(headUs)))µs")
+            print("  1024 3-dispatch eval-only: \(String(format: "%.0f", median(fullUs)))µs  implied_tps=\(String(format: "%.0f", 1024.0/median(fullUs)*1e6))")
+        } catch {
+            print("  1024 compile: FAILED (\(error))")
+        }
+    }
+
+    private func runSpatialScalingPoint(
+        streamCount: Int, laneSpatial: Int, dim: Int,
+        layerCount: Int, groups: Int, headGroups: Int, iters: Int
+    ) throws {
+        let weights = makeEchoRecurrentGenerationWeights(layerCount: layerCount)
+        let tripletCount = layerCount / 3
+
+        var tripletSessions = try LayerStorage<RWKVStyleFusedThreeLayerSession>(
+            count: tripletCount,
+            throwingInitializer: { tripletIdx in
+                let base = tripletIdx * 3
+                return try RWKVStyleFusedThreeLayerSession(
+                    weights0: weights.layers[base],
+                    weights1: weights.layers[base + 1],
+                    weights2: weights.layers[base + 2],
+                    laneSpatial: laneSpatial,
+                    groups: groups
+                )
+            }
+        )
+        let factoredHead = try FactoredGenerationRMSNormClassifierKernelSet(
+            rmsFinal: weights.rmsFinal,
+            classifierProjection: TensorBuffer(count: 128 * dim, zeroed: true),
+            classifierExpansion: TensorBuffer(count: weights.vocabSize * 128, zeroed: true),
+            vocabSize: weights.vocabSize,
+            bottleneck: 128,
+            laneSpatial: laneSpatial,
+            groups: headGroups
+        )
+
+        // Zero-copy rebinding
+        for i in 0..<3 {
+            let sOut = try tripletSessions[0].kernels.step.outputSurface(at: 1 + i)
+            try tripletSessions[0].kernels.step.rebindInput(at: 1 + i, to: sOut)
+        }
+        let t0xOut = tripletSessions[0].handles.xOut
+        try tripletSessions[1].kernels.step.rebindInput(at: 0, to: t0xOut)
+        for i in 0..<3 {
+            let sOut = try tripletSessions[1].kernels.step.outputSurface(at: 1 + i)
+            try tripletSessions[1].kernels.step.rebindInput(at: 1 + i, to: sOut)
+        }
+        let t1xOut = tripletSessions[1].handles.xOut
+        try factoredHead.rmsNormClassifier.rebindInput(at: 0, to: t1xOut)
+        let headOut = try factoredHead.rmsNormClassifier.outputSurface(at: 0)
+        let t0xIn = tripletSessions[0].handles.xIn
+        let vocabSize = weights.vocabSize
+
+        var tokens = Array(repeating: UInt16(0), count: streamCount)
+
+        // Warmup
+        for _ in 0..<5 {
+            try batchedTokenStepZeroCopy(
+                tokens: &tokens, streamCount: streamCount,
+                embedding: weights.embedding, dim: dim, laneSpatial: laneSpatial,
+                tripletCount: tripletCount, tripletSessions: &tripletSessions,
+                t0xIn: t0xIn, headOut: headOut,
+                headEval: { try factoredHead.rmsNormClassifier.eval() },
+                vocabSize: vocabSize
+            )
+        }
+
+        // Timed
+        var stepUs: [Double] = []
+        for _ in 0..<iters {
+            let s = GenerationClock.now()
+            try batchedTokenStepZeroCopy(
+                tokens: &tokens, streamCount: streamCount,
+                embedding: weights.embedding, dim: dim, laneSpatial: laneSpatial,
+                tripletCount: tripletCount, tripletSessions: &tripletSessions,
+                t0xIn: t0xIn, headOut: headOut,
+                headEval: { try factoredHead.rmsNormClassifier.eval() },
+                vocabSize: vocabSize
+            )
+            stepUs.append(machMilliseconds(GenerationClock.now() - s) * 1000)
+        }
+
+        let sorted = stepUs.sorted()
+        let med = sorted[sorted.count / 2]
+        let tps = Double(streamCount) / med * 1_000_000
+        print("g=\(groups) spatial=\(laneSpatial) streams=\(streamCount): median=\(String(format: "%.0f", med))µs tps=\(String(format: "%.0f", tps)) us_per_stream=\(String(format: "%.2f", med / Double(streamCount)))")
+    }
+
+    // MARK: - Projection head + CPU expansion probe
+
+    func test_projection_head_cpu_expansion_probe_on_hardware() throws {
+        try requireGenerationHardware()
+
+        let dim = ModelConfig.dim
+        let layerCount = 6
+        let groups = 8  // best from sweep
+        let bneck = 128
+        let iters = 50
+
+        for streamCount in [1024] {
+            let laneSpatial = streamCount
+            let weights = makeEchoRecurrentGenerationWeights(layerCount: layerCount)
+            let tripletCount = layerCount / 3
+
+            var tripletSessions = try LayerStorage<RWKVStyleFusedThreeLayerSession>(
+                count: tripletCount,
+                throwingInitializer: { tripletIdx in
+                    let base = tripletIdx * 3
+                    return try RWKVStyleFusedThreeLayerSession(
+                        weights0: weights.layers[base],
+                        weights1: weights.layers[base + 1],
+                        weights2: weights.layers[base + 2],
+                        laneSpatial: laneSpatial,
+                        groups: groups
+                    )
+                }
+            )
+
+            // Projection-only head (RMSNorm + [dim→bottleneck])
+            let projHead = try GenerationRMSNormProjectionKernelSet(
+                rmsFinal: weights.rmsFinal,
+                classifierProjection: TensorBuffer(count: bneck * dim, zeroed: true),
+                bottleneck: bneck,
+                laneSpatial: laneSpatial,
+                groups: groups
+            )
+
+            // Also compile the full factored head for comparison
+            let factoredHead = try FactoredGenerationRMSNormClassifierKernelSet(
+                rmsFinal: weights.rmsFinal,
+                classifierProjection: TensorBuffer(count: bneck * dim, zeroed: true),
+                classifierExpansion: TensorBuffer(count: weights.vocabSize * bneck, zeroed: true),
+                vocabSize: weights.vocabSize,
+                bottleneck: bneck,
+                laneSpatial: laneSpatial,
+                groups: groups
+            )
+
+            // Zero-copy rebinding for trunk
+            for i in 0..<3 {
+                let sOut = try tripletSessions[0].kernels.step.outputSurface(at: 1 + i)
+                try tripletSessions[0].kernels.step.rebindInput(at: 1 + i, to: sOut)
+            }
+            let t0xOut = tripletSessions[0].handles.xOut
+            try tripletSessions[1].kernels.step.rebindInput(at: 0, to: t0xOut)
+            for i in 0..<3 {
+                let sOut = try tripletSessions[1].kernels.step.outputSurface(at: 1 + i)
+                try tripletSessions[1].kernels.step.rebindInput(at: 1 + i, to: sOut)
+            }
+            let t1xOut = tripletSessions[1].handles.xOut
+
+            // Rebind proj head input → T1 xOut
+            try projHead.rmsNormProjection.rebindInput(at: 0, to: t1xOut)
+            let projOut = try projHead.rmsNormProjection.outputSurface(at: 0)
+
+            // Rebind factored head input → T1 xOut
+            try factoredHead.rmsNormClassifier.rebindInput(at: 0, to: t1xOut)
+            let factoredOut = try factoredHead.rmsNormClassifier.outputSurface(at: 0)
+
+            let t0xIn = tripletSessions[0].handles.xIn
+            let vocabSize = weights.vocabSize
+
+            // Expansion weights for CPU-side argmax (zeroed = synthetic)
+            let expWeights = TensorBuffer(count: vocabSize * (bneck / groups), zeroed: true)
+
+            var tokens = Array(repeating: UInt16(0), count: streamCount)
+
+            // === BASELINE: ANE factored head + surface argmax ===
+            // Warmup
+            for _ in 0..<5 {
+                try weights.embedding.withUnsafePointer { embPtr in
+                    try tokens.withUnsafeBufferPointer { tokenBuf in
+                        try SurfaceIO.writeEmbeddingBatchFP16(
+                            to: t0xIn, channelOffset: 0, spatial: laneSpatial,
+                            embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
+                            tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount
+                        )
+                    }
+                }
+                try tripletSessions[0].kernels.step.eval()
+                try tripletSessions[1].kernels.step.eval()
+                try factoredHead.rmsNormClassifier.eval()
+                let r = try SurfaceIO.argmaxBatchFP16SpatialParallel(
+                    from: factoredOut, channelOffset: 0, spatial: laneSpatial,
+                    channels: vocabSize, streamCount: streamCount, nBlocks: 8
+                )
+                for i in 0..<streamCount { tokens[i] = UInt16(r[i].index) }
+            }
+
+            var baselineUs: [Double] = []
+            for _ in 0..<iters {
+                let s = GenerationClock.now()
+                try weights.embedding.withUnsafePointer { embPtr in
+                    try tokens.withUnsafeBufferPointer { tokenBuf in
+                        try SurfaceIO.writeEmbeddingBatchFP16(
+                            to: t0xIn, channelOffset: 0, spatial: laneSpatial,
+                            embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
+                            tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount
+                        )
+                    }
+                }
+                try tripletSessions[0].kernels.step.eval()
+                try tripletSessions[1].kernels.step.eval()
+                try factoredHead.rmsNormClassifier.eval()
+                let r = try SurfaceIO.argmaxBatchFP16SpatialParallel(
+                    from: factoredOut, channelOffset: 0, spatial: laneSpatial,
+                    channels: vocabSize, streamCount: streamCount, nBlocks: 8
+                )
+                baselineUs.append(machMilliseconds(GenerationClock.now() - s) * 1000)
+                for i in 0..<streamCount { tokens[i] = UInt16(r[i].index) }
+            }
+
+            // === PROJECTION: ANE proj head + CPU fused expansion argmax ===
+            tokens = Array(repeating: UInt16(0), count: streamCount)
+            // Warmup
+            for _ in 0..<5 {
+                try weights.embedding.withUnsafePointer { embPtr in
+                    try tokens.withUnsafeBufferPointer { tokenBuf in
+                        try SurfaceIO.writeEmbeddingBatchFP16(
+                            to: t0xIn, channelOffset: 0, spatial: laneSpatial,
+                            embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
+                            tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount
+                        )
+                    }
+                }
+                try tripletSessions[0].kernels.step.eval()
+                try tripletSessions[1].kernels.step.eval()
+                try projHead.rmsNormProjection.eval()
+                let r = try expWeights.withUnsafePointer { expPtr in
+                    try SurfaceIO.fusedExpansionArgmax(
+                        projSurface: projOut, projChannelOffset: 0, spatial: laneSpatial,
+                        bottleneck: bneck, groups: groups,
+                        expansionWeightsFP16: UnsafeRawPointer(expPtr),
+                        vocabSize: vocabSize, streamCount: streamCount, nBlocks: 8
+                    )
+                }
+                for i in 0..<streamCount { tokens[i] = UInt16(r[i].index) }
+            }
+
+            var projUs: [Double] = []
+            for _ in 0..<iters {
+                let s = GenerationClock.now()
+                try weights.embedding.withUnsafePointer { embPtr in
+                    try tokens.withUnsafeBufferPointer { tokenBuf in
+                        try SurfaceIO.writeEmbeddingBatchFP16(
+                            to: t0xIn, channelOffset: 0, spatial: laneSpatial,
+                            embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
+                            tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount
+                        )
+                    }
+                }
+                try tripletSessions[0].kernels.step.eval()
+                try tripletSessions[1].kernels.step.eval()
+                try projHead.rmsNormProjection.eval()
+                let r = try expWeights.withUnsafePointer { expPtr in
+                    try SurfaceIO.fusedExpansionArgmax(
+                        projSurface: projOut, projChannelOffset: 0, spatial: laneSpatial,
+                        bottleneck: bneck, groups: groups,
+                        expansionWeightsFP16: UnsafeRawPointer(expPtr),
+                        vocabSize: vocabSize, streamCount: streamCount, nBlocks: 8
+                    )
+                }
+                projUs.append(machMilliseconds(GenerationClock.now() - s) * 1000)
+                for i in 0..<streamCount { tokens[i] = UInt16(r[i].index) }
+            }
+
+            func median(_ a: [Double]) -> Double { let s = a.sorted(); return s[s.count / 2] }
+            let baseMed = median(baselineUs)
+            let projMed = median(projUs)
+            let baseTPS = Double(streamCount) / baseMed * 1_000_000
+            let projTPS = Double(streamCount) / projMed * 1_000_000
+            let delta = (projMed - baseMed) / baseMed * 100
+
+            print("streams=\(streamCount) g=\(groups):")
+            print("  BASELINE (ANE factored head): \(String(format: "%.0f", baseMed))µs  tps=\(String(format: "%.0f", baseTPS))")
+            print("  PROJ+CPU (ANE proj + CPU exp): \(String(format: "%.0f", projMed))µs  tps=\(String(format: "%.0f", projTPS))  delta=\(String(format: "%+.1f", delta))%")
+        }
+    }
+
+    // MARK: - Fused six-layer trunk probe
+
+    func test_fused_triplet_plus_head_probe_on_hardware() throws {
+        try requireGenerationHardware()
+
+        let dim = ModelConfig.dim
+        let laneSpatial = 512
+        let streamCount = 512
+        let layerCount = 6
+        let groups = 16
+        let iters = 50
+
+        let weights = makeEchoRecurrentGenerationWeights(layerCount: layerCount)
+
+        // --- BASELINE: T0 triplet + T1 triplet + head = 3 dispatches ---
+        let tripletCount = layerCount / 3
+        var tripletSessions = try LayerStorage<RWKVStyleFusedThreeLayerSession>(
+            count: tripletCount,
+            throwingInitializer: { tripletIdx in
+                let base = tripletIdx * 3
+                return try RWKVStyleFusedThreeLayerSession(
+                    weights0: weights.layers[base],
+                    weights1: weights.layers[base + 1],
+                    weights2: weights.layers[base + 2],
+                    laneSpatial: laneSpatial,
+                    groups: groups
+                )
+            }
+        )
+        let separateHead = try FactoredGenerationRMSNormClassifierKernelSet(
+            rmsFinal: weights.rmsFinal,
+            classifierProjection: TensorBuffer(count: 128 * dim, zeroed: true),
+            classifierExpansion: TensorBuffer(count: weights.vocabSize * 128, zeroed: true),
+            vocabSize: weights.vocabSize,
+            bottleneck: 128,
+            laneSpatial: laneSpatial,
+            groups: groups
+        )
+
+        // Zero-copy rebind for baseline
+        for i in 0..<3 {
+            let sOut = try tripletSessions[0].kernels.step.outputSurface(at: 1 + i)
+            try tripletSessions[0].kernels.step.rebindInput(at: 1 + i, to: sOut)
+        }
+        let t0xOut = tripletSessions[0].handles.xOut
+        try tripletSessions[1].kernels.step.rebindInput(at: 0, to: t0xOut)
+        for i in 0..<3 {
+            let sOut = try tripletSessions[1].kernels.step.outputSurface(at: 1 + i)
+            try tripletSessions[1].kernels.step.rebindInput(at: 1 + i, to: sOut)
+        }
+        let t1xOut = tripletSessions[1].handles.xOut
+        try separateHead.rmsNormClassifier.rebindInput(at: 0, to: t1xOut)
+        let baselineHeadOut = try separateHead.rmsNormClassifier.outputSurface(at: 0)
+        let baselineXIn = tripletSessions[0].handles.xIn
+
+        // --- FUSED: T0 triplet + T1+head fused = 2 dispatches ---
+        // Dump MIL for inspection
+        let debugGen = RWKVStyleFusedThreeLayerFactoredClassifierGenerator(
+            vocabSize: 256, bottleneck: 128, laneSpatial: 32, groups: 16
+        )
+        // Print just the tail (head section)
+        let milLines = debugGen.milText.split(separator: "\n", omittingEmptySubsequences: false)
+        print("=== MIL TAIL (\(milLines.count) total lines, last 30) ===")
+        for line in milLines.suffix(30) { print(line) }
+        print("=== END ===")
+
+        // Also test the NON-factored version for comparison
+        let nonFactoredGen = RWKVStyleFusedThreeLayerRMSNormClassifierGenerator(
+            vocabSize: 256, laneSpatial: 32
+        )
+        let nfLines = nonFactoredGen.milText.split(separator: "\n", omittingEmptySubsequences: false)
+        print("=== NON-FACTORED MIL TAIL (last 20) ===")
+        for line in nfLines.suffix(20) { print(line) }
+        print("=== END ===")
+
+        // === TWO-TRIPLET TRUNK COMPILE PROBE (6 layers total via existing triplet kernels) ===
+        print("two-triplet trunk compile sweep (groups=16, smaller weights):")
+        for testSpatial in [32, 128, 512] {
+            let t = GenerationClock.now()
+            do {
+                let _ = try RWKVStyleFusedThreeLayerKernelSet(
+                    weights0: weights.layers[0],
+                    weights1: weights.layers[1],
+                    weights2: weights.layers[2],
+                    laneSpatial: testSpatial,
+                    groups: 16
+                )
+                let _ = try RWKVStyleFusedThreeLayerKernelSet(
+                    weights0: weights.layers[3],
+                    weights1: weights.layers[4],
+                    weights2: weights.layers[5],
+                    laneSpatial: testSpatial,
+                    groups: 16
+                )
+                print("  spatial=\(testSpatial) g=16: OK (\(String(format: "%.0f", machMilliseconds(GenerationClock.now() - t)))ms)")
+            } catch {
+                print("  spatial=\(testSpatial) g=16: FAILED (\(String(format: "%.0f", machMilliseconds(GenerationClock.now() - t)))ms)")
+            }
+        }
+        // Also test groups=1 as control (should fail, confirming previous result)
+        do {
+            let t = GenerationClock.now()
+            let _ = try RWKVStyleFusedThreeLayerKernelSet(
+                weights0: weights.layers[0],
+                weights1: weights.layers[1],
+                weights2: weights.layers[2],
+                laneSpatial: 32,
+                groups: 1
+            )
+            let _ = try RWKVStyleFusedThreeLayerKernelSet(
+                weights0: weights.layers[3],
+                weights1: weights.layers[4],
+                weights2: weights.layers[5],
+                laneSpatial: 32,
+                groups: 1
+            )
+            print("  spatial=32 g=1: OK (\(String(format: "%.0f", machMilliseconds(GenerationClock.now() - t)))ms)")
+        } catch {
+            print("  spatial=32 g=1: FAILED (control, expected)")
+        }
+
+        print("\nCompiling fused triplet+head (spatial=\(laneSpatial), groups=\(groups))...")
+        let fusedCompileStart = GenerationClock.now()
+        let fusedTripletHead: RWKVStyleFusedThreeLayerFactoredClassifierKernelSet
+        do {
+            fusedTripletHead = try RWKVStyleFusedThreeLayerFactoredClassifierKernelSet(
+                weights0: weights.layers[3],
+                weights1: weights.layers[4],
+                weights2: weights.layers[5],
+                rmsFinal: weights.rmsFinal,
+                classifierProjection: TensorBuffer(count: 128 * dim, zeroed: true),
+                classifierExpansion: TensorBuffer(count: weights.vocabSize * 128, zeroed: true),
+                vocabSize: weights.vocabSize,
+                bottleneck: 128,
+                laneSpatial: laneSpatial,
+                groups: groups
+            )
+        } catch {
+            print("  COMPILE FAILED: \(error)")
+            return
+        }
+        let fusedCompileMs = machMilliseconds(GenerationClock.now() - fusedCompileStart)
+        print("  compile: \(String(format: "%.0f", fusedCompileMs))ms")
+
+        // Rebind fused T1+head: x_in → T0 xOut, state in → state out
+        try fusedTripletHead.fusedStep.rebindInput(at: 0, to: t0xOut)
+        for i in 0..<3 {
+            let sOut = try fusedTripletHead.fusedStep.outputSurface(at: 1 + i)
+            try fusedTripletHead.fusedStep.rebindInput(at: 1 + i, to: sOut)
+        }
+        // logits output is at index 4
+        let fusedLogitsOut = try fusedTripletHead.fusedStep.outputSurface(at: 4)
+
+        // Eval test
+        do {
+            try tripletSessions[0].kernels.step.eval()
+            try fusedTripletHead.fusedStep.eval()
+            print("  eval: OK")
+        } catch {
+            print("  EVAL FAILED: \(error)")
+            return
+        }
+
+        // === BASELINE warmup + timing ===
+        var tokens = Array(repeating: UInt16(0), count: streamCount)
+        let vocabSize = weights.vocabSize
+
+        for _ in 0..<10 {
+            try batchedTokenStepZeroCopy(
+                tokens: &tokens, streamCount: streamCount,
+                embedding: weights.embedding, dim: dim, laneSpatial: laneSpatial,
+                tripletCount: tripletCount, tripletSessions: &tripletSessions,
+                t0xIn: baselineXIn, headOut: baselineHeadOut,
+                headEval: { try separateHead.rmsNormClassifier.eval() },
+                vocabSize: vocabSize
+            )
+        }
+
+        var baselineStepUs: [Double] = []
+        for _ in 0..<iters {
+            let s = GenerationClock.now()
+            try batchedTokenStepZeroCopy(
+                tokens: &tokens, streamCount: streamCount,
+                embedding: weights.embedding, dim: dim, laneSpatial: laneSpatial,
+                tripletCount: tripletCount, tripletSessions: &tripletSessions,
+                t0xIn: baselineXIn, headOut: baselineHeadOut,
+                headEval: { try separateHead.rmsNormClassifier.eval() },
+                vocabSize: vocabSize
+            )
+            baselineStepUs.append(machMilliseconds(GenerationClock.now() - s) * 1000)
+        }
+
+        // === FUSED warmup + timing ===
+        tokens = Array(repeating: UInt16(0), count: streamCount)
+        for _ in 0..<10 {
+            try weights.embedding.withUnsafePointer { embPtr in
+                try tokens.withUnsafeBufferPointer { tokenBuf in
+                    try SurfaceIO.writeEmbeddingBatchFP16(
+                        to: baselineXIn, channelOffset: 0, spatial: laneSpatial,
+                        embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
+                        tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount
+                    )
+                }
+            }
+            try tripletSessions[0].kernels.step.eval()
+            try fusedTripletHead.fusedStep.eval()
+            let results = try SurfaceIO.argmaxBatchFP16SpatialParallel(
+                from: fusedLogitsOut, channelOffset: 0, spatial: laneSpatial,
+                channels: vocabSize, streamCount: streamCount, nBlocks: 8
+            )
+            for i in 0..<streamCount { tokens[i] = UInt16(results[i].index) }
+        }
+
+        var fusedStepUs: [Double] = []
+        for _ in 0..<iters {
+            let s = GenerationClock.now()
+            try weights.embedding.withUnsafePointer { embPtr in
+                try tokens.withUnsafeBufferPointer { tokenBuf in
+                    try SurfaceIO.writeEmbeddingBatchFP16(
+                        to: baselineXIn, channelOffset: 0, spatial: laneSpatial,
+                        embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
+                        tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount
+                    )
+                }
+            }
+            try tripletSessions[0].kernels.step.eval()
+            try fusedTripletHead.fusedStep.eval()
+            let results = try SurfaceIO.argmaxBatchFP16SpatialParallel(
+                from: fusedLogitsOut, channelOffset: 0, spatial: laneSpatial,
+                channels: vocabSize, streamCount: streamCount, nBlocks: 8
+            )
+            fusedStepUs.append(machMilliseconds(GenerationClock.now() - s) * 1000)
+            for i in 0..<streamCount { tokens[i] = UInt16(results[i].index) }
+        }
+
+        func median(_ arr: [Double]) -> Double {
+            let s = arr.sorted(); return s[s.count / 2]
+        }
+
+        let baselineMedian = median(baselineStepUs)
+        let fusedMedian = median(fusedStepUs)
+        let delta = (fusedMedian - baselineMedian) / baselineMedian * 100
+
+        print("\nFused triplet+head probe @\(streamCount) streams, g=\(groups) (\(iters) iters):")
+        print("  BASELINE (3 dispatch): \(String(format: "%.0f", baselineMedian))µs  implied_tps=\(String(format: "%.0f", Double(streamCount)/baselineMedian*1e6))")
+        print("  FUSED    (2 dispatch): \(String(format: "%.0f", fusedMedian))µs  implied_tps=\(String(format: "%.0f", Double(streamCount)/fusedMedian*1e6))")
+        print("  delta: \(String(format: "%+.1f", delta))%")
+        print("  fused compile: \(String(format: "%.0f", fusedCompileMs))ms")
+    }
+
+    // MARK: - Zero-copy correctness check
+
+    func test_zerocopy_correctness_on_hardware() throws {
+        try requireGenerationHardware()
+
+        let laneSpatial = 512
+        let dim = ModelConfig.dim
+        let layerCount = 6
+        let streamCount = 512
+        let maxNewTokens = 8
+
+        let weights = makeEchoRecurrentGenerationWeights(layerCount: layerCount)
+        let tripletCount = layerCount / 3
+
+        // === BASELINE: normal copies ===
+        var baselineSessions = try LayerStorage<RWKVStyleFusedThreeLayerSession>(
+            count: tripletCount,
+            throwingInitializer: { tripletIdx in
+                let base = tripletIdx * 3
+                return try RWKVStyleFusedThreeLayerSession(
+                    weights0: weights.layers[base],
+                    weights1: weights.layers[base + 1],
+                    weights2: weights.layers[base + 2],
+                    laneSpatial: laneSpatial
+                )
+            }
+        )
+        let baselineHead = try FactoredGenerationRMSNormClassifierKernelSet(
+            rmsFinal: weights.rmsFinal,
+            classifierProjection: TensorBuffer(count: 128 * dim, zeroed: true),
+            classifierExpansion: TensorBuffer(count: weights.vocabSize * 128, zeroed: true),
+            vocabSize: weights.vocabSize, bottleneck: 128, laneSpatial: laneSpatial
+        )
+        var baselineTokens = Array(repeating: UInt16(0), count: streamCount)
+        for tIdx in 0..<tripletCount { try baselineSessions[tIdx].reset() }
+        for _ in 0..<maxNewTokens {
+            try batchedTokenStepWithEval(
+                tokens: &baselineTokens, streamCount: streamCount,
+                embedding: weights.embedding, dim: dim, laneSpatial: laneSpatial,
+                tripletCount: tripletCount, tripletSessions: &baselineSessions,
+                t0xIn: baselineSessions[0].handles.xIn, t0xOut: baselineSessions[0].handles.xOut,
+                t0sIn0: baselineSessions[0].handles.stateIn0, t0sIn1: baselineSessions[0].handles.stateIn1, t0sIn2: baselineSessions[0].handles.stateIn2,
+                t0sOut0: baselineSessions[0].handles.stateOut0, t0sOut1: baselineSessions[0].handles.stateOut1, t0sOut2: baselineSessions[0].handles.stateOut2,
+                t1xIn: baselineSessions[1].handles.xIn, t1xOut: baselineSessions[1].handles.xOut,
+                t1sIn0: baselineSessions[1].handles.stateIn0, t1sIn1: baselineSessions[1].handles.stateIn1, t1sIn2: baselineSessions[1].handles.stateIn2,
+                t1sOut0: baselineSessions[1].handles.stateOut0, t1sOut1: baselineSessions[1].handles.stateOut1, t1sOut2: baselineSessions[1].handles.stateOut2,
+                headIn: try baselineHead.rmsNormClassifier.inputSurface(at: 0),
+                headOut: try baselineHead.rmsNormClassifier.outputSurface(at: 0),
+                headEval: { try baselineHead.rmsNormClassifier.eval() },
+                vocabSize: weights.vocabSize
+            )
+        }
+
+        // === ZERO-COPY: in-place rebind ===
+        var zcSessions = try LayerStorage<RWKVStyleFusedThreeLayerSession>(
+            count: tripletCount,
+            throwingInitializer: { tripletIdx in
+                let base = tripletIdx * 3
+                return try RWKVStyleFusedThreeLayerSession(
+                    weights0: weights.layers[base],
+                    weights1: weights.layers[base + 1],
+                    weights2: weights.layers[base + 2],
+                    laneSpatial: laneSpatial
+                )
+            }
+        )
+        let zcHead = try FactoredGenerationRMSNormClassifierKernelSet(
+            rmsFinal: weights.rmsFinal,
+            classifierProjection: TensorBuffer(count: 128 * dim, zeroed: true),
+            classifierExpansion: TensorBuffer(count: weights.vocabSize * 128, zeroed: true),
+            vocabSize: weights.vocabSize, bottleneck: 128, laneSpatial: laneSpatial
+        )
+
+        // Rebind for zero-copy
+        let t0sOut0 = zcSessions[0].handles.stateOut0
+        let t0sOut1 = zcSessions[0].handles.stateOut1
+        let t0sOut2 = zcSessions[0].handles.stateOut2
+        try zcSessions[0].kernels.step.rebindInput(at: 1, to: t0sOut0)
+        try zcSessions[0].kernels.step.rebindInput(at: 2, to: t0sOut1)
+        try zcSessions[0].kernels.step.rebindInput(at: 3, to: t0sOut2)
+        let t0xOut = zcSessions[0].handles.xOut
+        try zcSessions[1].kernels.step.rebindInput(at: 0, to: t0xOut)
+        let t1sOut0 = zcSessions[1].handles.stateOut0
+        let t1sOut1 = zcSessions[1].handles.stateOut1
+        let t1sOut2 = zcSessions[1].handles.stateOut2
+        try zcSessions[1].kernels.step.rebindInput(at: 1, to: t1sOut0)
+        try zcSessions[1].kernels.step.rebindInput(at: 2, to: t1sOut1)
+        try zcSessions[1].kernels.step.rebindInput(at: 3, to: t1sOut2)
+        let t1xOut = zcSessions[1].handles.xOut
+        try zcHead.rmsNormClassifier.rebindInput(at: 0, to: t1xOut)
+
+        // Zero the shared state surfaces
+        let zl = zcSessions[0].handles.zeroLane
+        try SurfaceIO.copyFP16(dst: t0sOut0, dstChannelOffset: 0, src: zl, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+        try SurfaceIO.copyFP16(dst: t0sOut1, dstChannelOffset: 0, src: zl, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+        try SurfaceIO.copyFP16(dst: t0sOut2, dstChannelOffset: 0, src: zl, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+        let zl1 = zcSessions[1].handles.zeroLane
+        try SurfaceIO.copyFP16(dst: t1sOut0, dstChannelOffset: 0, src: zl1, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+        try SurfaceIO.copyFP16(dst: t1sOut1, dstChannelOffset: 0, src: zl1, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+        try SurfaceIO.copyFP16(dst: t1sOut2, dstChannelOffset: 0, src: zl1, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+
+        var zcTokens = Array(repeating: UInt16(0), count: streamCount)
+        let zcXIn = zcSessions[0].handles.xIn
+        let zcHeadOut = try zcHead.rmsNormClassifier.outputSurface(at: 0)
+        for _ in 0..<maxNewTokens {
+            try batchedTokenStepZeroCopy(
+                tokens: &zcTokens, streamCount: streamCount,
+                embedding: weights.embedding, dim: dim, laneSpatial: laneSpatial,
+                tripletCount: tripletCount, tripletSessions: &zcSessions,
+                t0xIn: zcXIn, headOut: zcHeadOut,
+                headEval: { try zcHead.rmsNormClassifier.eval() },
+                vocabSize: weights.vocabSize
+            )
+        }
+
+        // Compare tokens
+        var mismatches = 0
+        for i in 0..<streamCount {
+            if baselineTokens[i] != zcTokens[i] { mismatches += 1 }
+        }
+        print("zerocopy_correctness: \(mismatches)/\(streamCount) mismatches")
+        XCTAssertEqual(mismatches, 0, "Zero-copy tokens must match baseline tokens")
+    }
+
+    // MARK: - Zero-copy surface rebind benchmark
+
+    func test_zerocopy_rebind_benchmark_on_hardware() throws {
+        try requireGenerationHardware()
+
+        let dim = ModelConfig.dim
+        let layerCount = 6
+        let warmup = 3
+        let iterations = 20
+        let maxNewTokens = 8
+        let streamCounts = [32, 64, 128, 256, 512]
+        let prompt: [UInt16] = [0]
+
+        for streamCount in streamCounts {
+            let laneSpatial: Int
+            if streamCount <= 32 { laneSpatial = 32 }
+            else if streamCount <= 64 { laneSpatial = 64 }
+            else if streamCount <= 128 { laneSpatial = 128 }
+            else if streamCount <= 256 { laneSpatial = 256 }
+            else { laneSpatial = 512 }
+
+            let compileStart = GenerationClock.now()
+            let weights = makeEchoRecurrentGenerationWeights(layerCount: layerCount)
+            let tripletCount = layerCount / 3
+
+            var tripletSessions = try LayerStorage<RWKVStyleFusedThreeLayerSession>(
+                count: tripletCount,
+                throwingInitializer: { tripletIdx in
+                    let base = tripletIdx * 3
+                    return try RWKVStyleFusedThreeLayerSession(
+                        weights0: weights.layers[base],
+                        weights1: weights.layers[base + 1],
+                        weights2: weights.layers[base + 2],
+                        laneSpatial: laneSpatial
+                    )
+                }
+            )
+
+            let factoredHead = try FactoredGenerationRMSNormClassifierKernelSet(
+                rmsFinal: weights.rmsFinal,
+                classifierProjection: TensorBuffer(count: 128 * ModelConfig.dim, zeroed: true),
+                classifierExpansion: TensorBuffer(count: weights.vocabSize * 128, zeroed: true),
+                vocabSize: weights.vocabSize,
+                bottleneck: 128,
+                laneSpatial: laneSpatial
+            )
+            let headOut = try factoredHead.rmsNormClassifier.outputSurface(at: 0)
+            let vocabSize = weights.vocabSize
+
+            // === ZERO-COPY REBINDING ===
+            // 1. Rebind T0 state inputs → T0 state outputs (in-place state)
+            let t0sOut0 = tripletSessions[0].handles.stateOut0
+            let t0sOut1 = tripletSessions[0].handles.stateOut1
+            let t0sOut2 = tripletSessions[0].handles.stateOut2
+            try tripletSessions[0].kernels.step.rebindInput(at: 1, to: t0sOut0)
+            try tripletSessions[0].kernels.step.rebindInput(at: 2, to: t0sOut1)
+            try tripletSessions[0].kernels.step.rebindInput(at: 3, to: t0sOut2)
+
+            if tripletCount > 1 {
+                // 2. Rebind T1 xIn → T0 xOut (zero-copy transfer)
+                let t0xOut = tripletSessions[0].handles.xOut
+                try tripletSessions[1].kernels.step.rebindInput(at: 0, to: t0xOut)
+
+                // 3. Rebind T1 state inputs → T1 state outputs (in-place state)
+                let t1sOut0 = tripletSessions[1].handles.stateOut0
+                let t1sOut1 = tripletSessions[1].handles.stateOut1
+                let t1sOut2 = tripletSessions[1].handles.stateOut2
+                try tripletSessions[1].kernels.step.rebindInput(at: 1, to: t1sOut0)
+                try tripletSessions[1].kernels.step.rebindInput(at: 2, to: t1sOut1)
+                try tripletSessions[1].kernels.step.rebindInput(at: 3, to: t1sOut2)
+
+                // 4. Rebind head input → T1 xOut (zero-copy transfer)
+                let t1xOut = tripletSessions[1].handles.xOut
+                try factoredHead.rmsNormClassifier.rebindInput(at: 0, to: t1xOut)
+            } else {
+                let t0xOut = tripletSessions[0].handles.xOut
+                try factoredHead.rmsNormClassifier.rebindInput(at: 0, to: t0xOut)
+            }
+
+            let t0xIn = tripletSessions[0].handles.xIn
+            let compileTimeMs = machMilliseconds(GenerationClock.now() - compileStart)
+
+            // Zero surfaces for reset (state surfaces are now the output surfaces)
+            func resetZeroCopy() throws {
+                let zeroLane = tripletSessions[0].handles.zeroLane
+                try SurfaceIO.copyFP16(dst: t0sOut0, dstChannelOffset: 0, src: zeroLane, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+                try SurfaceIO.copyFP16(dst: t0sOut1, dstChannelOffset: 0, src: zeroLane, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+                try SurfaceIO.copyFP16(dst: t0sOut2, dstChannelOffset: 0, src: zeroLane, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+                if tripletCount > 1 {
+                    let zl1 = tripletSessions[1].handles.zeroLane
+                    let s10 = tripletSessions[1].handles.stateOut0
+                    let s11 = tripletSessions[1].handles.stateOut1
+                    let s12 = tripletSessions[1].handles.stateOut2
+                    try SurfaceIO.copyFP16(dst: s10, dstChannelOffset: 0, src: zl1, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+                    try SurfaceIO.copyFP16(dst: s11, dstChannelOffset: 0, src: zl1, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+                    try SurfaceIO.copyFP16(dst: s12, dstChannelOffset: 0, src: zl1, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+                }
+            }
+
+            // Warmup
+            for _ in 0..<warmup {
+                try resetZeroCopy()
+                var tokens = Array(repeating: prompt[0], count: streamCount)
+                for _ in 0..<maxNewTokens {
+                    try batchedTokenStepZeroCopy(
+                        tokens: &tokens, streamCount: streamCount,
+                        embedding: weights.embedding, dim: dim, laneSpatial: laneSpatial,
+                        tripletCount: tripletCount, tripletSessions: &tripletSessions,
+                        t0xIn: t0xIn, headOut: headOut,
+                        headEval: { try factoredHead.rmsNormClassifier.eval() },
+                        vocabSize: vocabSize
+                    )
+                }
+            }
+
+            // Timed iterations
+            var roundLatenciesMs: [Double] = []
+            roundLatenciesMs.reserveCapacity(iterations)
+            for _ in 0..<iterations {
+                try resetZeroCopy()
+                var tokens = Array(repeating: prompt[0], count: streamCount)
+                let start = GenerationClock.now()
+                for _ in 0..<maxNewTokens {
+                    try batchedTokenStepZeroCopy(
+                        tokens: &tokens, streamCount: streamCount,
+                        embedding: weights.embedding, dim: dim, laneSpatial: laneSpatial,
+                        tripletCount: tripletCount, tripletSessions: &tripletSessions,
+                        t0xIn: t0xIn, headOut: headOut,
+                        headEval: { try factoredHead.rmsNormClassifier.eval() },
+                        vocabSize: vocabSize
+                    )
+                }
+                let elapsed = machMilliseconds(GenerationClock.now() - start)
+                roundLatenciesMs.append(elapsed / Double(maxNewTokens))
+            }
+            roundLatenciesMs.sort()
+            let medianRound = roundLatenciesMs[roundLatenciesMs.count / 2]
+            let medianPerToken = medianRound / Double(streamCount)
+            let aggTps = Double(streamCount) / (medianRound / 1000.0)
+            print("zerocopy ane streams=\(streamCount) median_ms_token=\(medianPerToken) aggregate_tps=\(aggTps) compile=\(compileTimeMs) round_ms=\(medianRound)")
+        }
+    }
+
+    // MARK: - Parallel argmax probe
+
+    func test_parallel_argmax_vs_serial_on_hardware() throws {
+        try requireGenerationHardware()
+
+        let laneSpatial = 256
+        let streamCount = 256
+        let vocabSize = ModelConfig.vocab  // 32000
+        let iterations = 50
+        let warmup = 10
+
+        // Build a factored head to get a realistic logits surface
+        let weights = makeEchoRecurrentGenerationWeights(layerCount: 6)
+        let factoredHead = try FactoredGenerationRMSNormClassifierKernelSet(
+            rmsFinal: weights.rmsFinal,
+            classifierProjection: TensorBuffer(count: 128 * ModelConfig.dim, zeroed: true),
+            classifierExpansion: TensorBuffer(count: vocabSize * 128, zeroed: true),
+            vocabSize: vocabSize,
+            bottleneck: 128,
+            laneSpatial: laneSpatial
+        )
+        let headOut = try factoredHead.rmsNormClassifier.outputSurface(at: 0)
+        // Eval head once to populate the surface
+        try factoredHead.rmsNormClassifier.eval()
+
+        // Warmup both paths
+        for _ in 0..<warmup {
+            let _ = try SurfaceIO.argmaxBatchFP16Spatial(
+                from: headOut, channelOffset: 0, spatial: laneSpatial,
+                channels: vocabSize, streamCount: streamCount
+            )
+            let _ = try SurfaceIO.argmaxBatchFP16SpatialParallel(
+                from: headOut, channelOffset: 0, spatial: laneSpatial,
+                channels: vocabSize, streamCount: streamCount, nBlocks: 2
+            )
+            let _ = try SurfaceIO.argmaxBatchFP16SpatialParallel(
+                from: headOut, channelOffset: 0, spatial: laneSpatial,
+                channels: vocabSize, streamCount: streamCount, nBlocks: 8
+            )
+        }
+
+        // Serial argmax
+        var serialUs: [Double] = []
+        for _ in 0..<iterations {
+            let t = GenerationClock.now()
+            let _ = try SurfaceIO.argmaxBatchFP16Spatial(
+                from: headOut, channelOffset: 0, spatial: laneSpatial,
+                channels: vocabSize, streamCount: streamCount
+            )
+            serialUs.append(machMicroseconds(GenerationClock.now() - t))
+        }
+
+        // Parallel argmax n=2
+        var par2Us: [Double] = []
+        for _ in 0..<iterations {
+            let t = GenerationClock.now()
+            let _ = try SurfaceIO.argmaxBatchFP16SpatialParallel(
+                from: headOut, channelOffset: 0, spatial: laneSpatial,
+                channels: vocabSize, streamCount: streamCount, nBlocks: 2
+            )
+            par2Us.append(machMicroseconds(GenerationClock.now() - t))
+        }
+
+        // Parallel argmax n=4
+        var par4Us: [Double] = []
+        for _ in 0..<iterations {
+            let t = GenerationClock.now()
+            let _ = try SurfaceIO.argmaxBatchFP16SpatialParallel(
+                from: headOut, channelOffset: 0, spatial: laneSpatial,
+                channels: vocabSize, streamCount: streamCount, nBlocks: 8
+            )
+            par4Us.append(machMicroseconds(GenerationClock.now() - t))
+        }
+
+        // Parallel argmax n=8
+        var par8Us: [Double] = []
+        for _ in 0..<iterations {
+            let t = GenerationClock.now()
+            let _ = try SurfaceIO.argmaxBatchFP16SpatialParallel(
+                from: headOut, channelOffset: 0, spatial: laneSpatial,
+                channels: vocabSize, streamCount: streamCount, nBlocks: 8
+            )
+            par8Us.append(machMicroseconds(GenerationClock.now() - t))
+        }
+
+        // Parallel argmax n=16
+        var par16Us: [Double] = []
+        for _ in 0..<iterations {
+            let t = GenerationClock.now()
+            let _ = try SurfaceIO.argmaxBatchFP16SpatialParallel(
+                from: headOut, channelOffset: 0, spatial: laneSpatial,
+                channels: vocabSize, streamCount: streamCount, nBlocks: 16
+            )
+            par16Us.append(machMicroseconds(GenerationClock.now() - t))
+        }
+
+        // Correctness check
+        let serialResult = try SurfaceIO.argmaxBatchFP16Spatial(
+            from: headOut, channelOffset: 0, spatial: laneSpatial,
+            channels: vocabSize, streamCount: streamCount
+        )
+        let par8Result = try SurfaceIO.argmaxBatchFP16SpatialParallel(
+            from: headOut, channelOffset: 0, spatial: laneSpatial,
+            channels: vocabSize, streamCount: streamCount, nBlocks: 8
+        )
+        let par16Result = try SurfaceIO.argmaxBatchFP16SpatialParallel(
+            from: headOut, channelOffset: 0, spatial: laneSpatial,
+            channels: vocabSize, streamCount: streamCount, nBlocks: 16
+        )
+        for i in 0..<streamCount {
+            XCTAssertEqual(serialResult[i].index, par8Result[i].index,
+                           "Parallel_8 argmax mismatch at lane \(i)")
+            XCTAssertEqual(serialResult[i].index, par16Result[i].index,
+                           "Parallel_16 argmax mismatch at lane \(i)")
+        }
+
+        func median(_ arr: [Double]) -> Double {
+            let sorted = arr.sorted()
+            return sorted[sorted.count / 2]
+        }
+
+        let sMedian = median(serialUs)
+        let p2Median = median(par2Us)
+        let p4Median = median(par4Us)
+        let p8Median = median(par8Us)
+        let p16Median = median(par16Us)
+        print("argmax @\(streamCount) streams, \(vocabSize) vocab, \(iterations) iterations:")
+        print("  serial:      \(String(format: "%.1f", sMedian)) µs")
+        print("  parallel_2:  \(String(format: "%.1f", p2Median)) µs (\(String(format: "%+.1f", p2Median - sMedian)) µs, \(String(format: "%.1f", (sMedian - p2Median) / sMedian * 100))% faster)")
+        print("  parallel_4:  \(String(format: "%.1f", p4Median)) µs (\(String(format: "%+.1f", p4Median - sMedian)) µs, \(String(format: "%.1f", (sMedian - p4Median) / sMedian * 100))% faster)")
+        print("  parallel_8:  \(String(format: "%.1f", p8Median)) µs (\(String(format: "%+.1f", p8Median - sMedian)) µs, \(String(format: "%.1f", (sMedian - p8Median) / sMedian * 100))% faster)")
+        print("  parallel_16: \(String(format: "%.1f", p16Median)) µs (\(String(format: "%+.1f", p16Median - sMedian)) µs, \(String(format: "%.1f", (sMedian - p16Median) / sMedian * 100))% faster)")
+    }
+
+    // MARK: - MIL op ANE compile probes (argmax alternatives)
+
+    func test_ane_argmax_alternatives_compile_probe_on_hardware() throws {
+        try requireGenerationHardware()
+
+        let inCh = 256
+        let spatial = 32
+
+        // --- Probe 1: reduce_argmax (scalar axis variant) ---
+        let milArgmax = """
+        program(1.3)
+        [buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, {"coremlc-version", "3505.4.1"}, {"coremltools-component-milinternal", ""}, {"coremltools-version", "9.0"}})]
+        {
+            func main<ios18>(tensor<fp16, [1, \(inCh), 1, \(spatial)]> x) {
+                int32 ax = const()[name=string("ax"), val=int32(1)];
+                bool kd = const()[name=string("kd"), val=bool(true)];
+                tensor<int32, [1, 1, 1, \(spatial)]> idx = reduce_argmax(x=x, axis=ax, keep_dims=kd)[name=string("argmax")];
+                string to_fp32 = const()[name=string("to_fp32"), val=string("fp32")];
+                tensor<fp32, [1, 1, 1, \(spatial)]> idx_f = cast(dtype=to_fp32, x=idx)[name=string("cast_out")];
+            } -> (idx_f);
+        }
+        """
+        let argmaxResult = tryCompileAndEval(
+            label: "reduce_argmax_scalar_axis",
+            milText: milArgmax,
+            inputBytes: inCh * spatial * 2,
+            outputBytes: 1 * spatial * 4
+        )
+        print("probe reduce_argmax_scalar_axis: \(argmaxResult)")
+
+        // --- Probe 2: topk(k=1) returning values only ---
+        let milTopk = """
+        program(1.3)
+        [buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, {"coremlc-version", "3505.4.1"}, {"coremltools-component-milinternal", ""}, {"coremltools-version", "9.0"}})]
+        {
+            func main<ios18>(tensor<fp16, [1, \(inCh), 1, \(spatial)]> x) {
+                int32 k = const()[name=string("k"), val=int32(1)];
+                int32 ax = const()[name=string("ax"), val=int32(1)];
+                bool asc = const()[name=string("asc"), val=bool(false)];
+                tensor<fp16, [1, 1, 1, \(spatial)]> vals, tensor<int32, [1, 1, 1, \(spatial)]> indices = topk(x=x, k=k, axis=ax, ascending=asc)[name=string("topk")];
+                string to_fp32 = const()[name=string("to_fp32"), val=string("fp32")];
+                tensor<fp32, [1, 1, 1, \(spatial)]> idx_f = cast(dtype=to_fp32, x=indices)[name=string("cast_idx")];
+            } -> (idx_f);
+        }
+        """
+        let topkResult = tryCompileAndEval(
+            label: "topk_k1",
+            milText: milTopk,
+            inputBytes: inCh * spatial * 2,
+            outputBytes: 1 * spatial * 4
+        )
+        print("probe topk_k1: \(topkResult)")
+
+        // --- Probe 3: reduce_max (confirmed in memory, verify with vocab-scale) ---
+        let milReduceMax = """
+        program(1.3)
+        [buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, {"coremlc-version", "3505.4.1"}, {"coremltools-component-milinternal", ""}, {"coremltools-version", "9.0"}})]
+        {
+            func main<ios18>(tensor<fp16, [1, \(inCh), 1, \(spatial)]> x) {
+                tensor<int32, [1]> ax = const()[name=string("ax"), val=tensor<int32, [1]>([1])];
+                bool kd = const()[name=string("kd"), val=bool(true)];
+                tensor<fp16, [1, 1, 1, \(spatial)]> mx = reduce_max(x=x, axes=ax, keep_dims=kd)[name=string("rmax")];
+            } -> (mx);
+        }
+        """
+        let reduceMaxResult = tryCompileAndEval(
+            label: "reduce_max",
+            milText: milReduceMax,
+            inputBytes: inCh * spatial * 2,
+            outputBytes: 1 * spatial * 2
+        )
+        print("probe reduce_max: \(reduceMaxResult)")
+
+        // --- Probe 4: reduce_argmin (test if any reduce_arg* works) ---
+        let milArgmin = """
+        program(1.3)
+        [buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, {"coremlc-version", "3505.4.1"}, {"coremltools-component-milinternal", ""}, {"coremltools-version", "9.0"}})]
+        {
+            func main<ios18>(tensor<fp16, [1, \(inCh), 1, \(spatial)]> x) {
+                tensor<fp16, [1, \(inCh), 1, \(spatial)]> neg = mul(x=x, y=fp16(-1.0))[name=string("neg")];
+                tensor<int32, [1]> ax = const()[name=string("ax"), val=tensor<int32, [1]>([1])];
+                bool kd = const()[name=string("kd"), val=bool(true)];
+                tensor<int32, [1, 1, 1, \(spatial)]> idx = reduce_argmin(x=neg, axis=ax, keep_dims=kd)[name=string("argmin")];
+                string to_fp32 = const()[name=string("to_fp32"), val=string("fp32")];
+                tensor<fp32, [1, 1, 1, \(spatial)]> idx_f = cast(dtype=to_fp32, x=idx)[name=string("cast_out")];
+            } -> (idx_f);
+        }
+        """
+        let argminResult = tryCompileAndEval(
+            label: "reduce_argmin_via_neg",
+            milText: milArgmin,
+            inputBytes: inCh * spatial * 2,
+            outputBytes: 1 * spatial * 4
+        )
+        print("probe reduce_argmin_via_neg: \(argminResult)")
+
+        // --- Probe 5: Constructed argmax via reduce_max + equal + mul + reduce_sum ---
+        let milConstructed = """
+        program(1.3)
+        [buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, {"coremlc-version", "3505.4.1"}, {"coremltools-component-milinternal", ""}, {"coremltools-version", "9.0"}})]
+        {
+            func main<ios18>(tensor<fp16, [1, \(inCh), 1, \(spatial)]> x) {
+                tensor<int32, [1]> ax = const()[name=string("ax"), val=tensor<int32, [1]>([1])];
+                bool kd = const()[name=string("kd"), val=bool(true)];
+                tensor<fp16, [1, 1, 1, \(spatial)]> mx = reduce_max(x=x, axes=ax, keep_dims=kd)[name=string("rmax")];
+                tensor<bool, [1, \(inCh), 1, \(spatial)]> eq = equal(x=x, y=mx)[name=string("eq")];
+                string to_fp16 = const()[name=string("to_fp16"), val=string("fp16")];
+                tensor<fp16, [1, \(inCh), 1, \(spatial)]> mask = cast(dtype=to_fp16, x=eq)[name=string("mask")];
+                tensor<fp16, [1, \(inCh), 1, 1]> indices = const()[name=string("indices"), val=tensor<fp16, [1, \(inCh), 1, 1]>(BLOBFILE(path=string("@model_path/weights/indices.bin"), offset=uint64(64)))];
+                tensor<fp16, [1, \(inCh), 1, \(spatial)]> masked = mul(x=mask, y=indices)[name=string("masked")];
+                tensor<fp16, [1, 1, 1, \(spatial)]> result = reduce_max(x=masked, axes=ax, keep_dims=kd)[name=string("result")];
+            } -> (result);
+        }
+        """
+        // Build indices weight blob: [0, 1, 2, ..., inCh-1] as fp16
+        var indexData = Data(count: 128 + inCh * 2)  // 128-byte header + fp16 values
+        for i in 0..<inCh {
+            let val = Float16(Float(i))
+            var bits = val.bitPattern
+            indexData.replaceSubrange((128 + i * 2)..<(128 + i * 2 + 2), with: Data(bytes: &bits, count: 2))
+        }
+        let constructedResult = tryCompileAndEvalWithWeights(
+            label: "constructed_argmax",
+            milText: milConstructed,
+            weights: [("@model_path/weights/indices.bin", indexData)],
+            inputBytes: inCh * spatial * 2,
+            outputBytes: 1 * spatial * 2
+        )
+        print("probe constructed_argmax: \(constructedResult)")
+
+        // --- Probe 6: Blocked reduce_max (reshape + reduce_max along H axis) ---
+        // Reshape [1, 256, 1, 32] → [1, 4, 64, 32] → reduce_max(axis=2) → [1, 4, 1, 32]
+        let blocks = 4
+        let blockSize = inCh / blocks  // 64
+        let milBlocked = """
+        program(1.3)
+        [buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, {"coremlc-version", "3505.4.1"}, {"coremltools-component-milinternal", ""}, {"coremltools-version", "9.0"}})]
+        {
+            func main<ios18>(tensor<fp16, [1, \(inCh), 1, \(spatial)]> x) {
+                tensor<int32, [4]> shape = const()[name=string("shape"), val=tensor<int32, [4]>([1, \(blocks), \(blockSize), \(spatial)])];
+                tensor<fp16, [1, \(blocks), \(blockSize), \(spatial)]> xr = reshape(x=x, shape=shape)[name=string("reshape")];
+                tensor<int32, [1]> ax = const()[name=string("ax"), val=tensor<int32, [1]>([2])];
+                bool kd = const()[name=string("kd"), val=bool(true)];
+                tensor<fp16, [1, \(blocks), 1, \(spatial)]> bmax = reduce_max(x=xr, axes=ax, keep_dims=kd)[name=string("bmax")];
+            } -> (bmax);
+        }
+        """
+        let blockedResult = tryCompileAndEval(
+            label: "blocked_reduce_max",
+            milText: milBlocked,
+            inputBytes: inCh * spatial * 2,
+            outputBytes: blocks * spatial * 2
+        )
+        print("probe blocked_reduce_max: \(blockedResult)")
+
+        // --- Probe 7: Full-vocab blocked reduce_max at realistic scale ---
+        // Reshape [1, 32000, 1, 32] → [1, 250, 128, 32] → reduce_max(axis=2) → [1, 250, 1, 32]
+        let vocabBlocks = 250
+        let vocabBlockSize = 128
+        let fullVocab = vocabBlocks * vocabBlockSize  // 32000
+        let milFullBlocked = """
+        program(1.3)
+        [buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, {"coremlc-version", "3505.4.1"}, {"coremltools-component-milinternal", ""}, {"coremltools-version", "9.0"}})]
+        {
+            func main<ios18>(tensor<fp16, [1, \(fullVocab), 1, \(spatial)]> x) {
+                tensor<int32, [4]> shape = const()[name=string("shape"), val=tensor<int32, [4]>([1, \(vocabBlocks), \(vocabBlockSize), \(spatial)])];
+                tensor<fp16, [1, \(vocabBlocks), \(vocabBlockSize), \(spatial)]> xr = reshape(x=x, shape=shape)[name=string("reshape")];
+                tensor<int32, [1]> ax = const()[name=string("ax"), val=tensor<int32, [1]>([2])];
+                bool kd = const()[name=string("kd"), val=bool(true)];
+                tensor<fp16, [1, \(vocabBlocks), 1, \(spatial)]> bmax = reduce_max(x=xr, axes=ax, keep_dims=kd)[name=string("bmax")];
+            } -> (bmax);
+        }
+        """
+        let fullBlockedResult = tryCompileAndEval(
+            label: "full_vocab_blocked_reduce_max",
+            milText: milFullBlocked,
+            inputBytes: fullVocab * spatial * 2,
+            outputBytes: vocabBlocks * spatial * 2
+        )
+        print("probe full_vocab_blocked_reduce_max: \(fullBlockedResult)")
+
+        // --- Probe 8: Fused head (RMSNorm + classifier + reduce_max) with two outputs ---
+        // This combines the head kernel with reduce_max to output both logits and max value
+        let dim = ModelConfig.dim
+        let vocab = 32000
+        let invd: Float = 1.0 / Float(dim)
+        let milFusedHead = """
+        program(1.3)
+        [buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, {"coremlc-version", "3505.4.1"}, {"coremltools-component-milinternal", ""}, {"coremltools-version", "9.0"}})]
+        {
+            func main<ios18>(tensor<fp16, [1, \(dim), 1, \(spatial)]> x) {
+                tensor<fp16, [1,\(dim),1,\(spatial)]> sq = mul(x=x,y=x)[name=string("sq")];
+                tensor<int32, [1]> raxCh = const()[name=string("rax_ch"), val=tensor<int32, [1]>([1])];
+                bool kd = const()[name=string("kd"), val=bool(true)];
+                tensor<fp16, [1,1,1,\(spatial)]> ss = reduce_sum(x=sq,axes=raxCh,keep_dims=kd)[name=string("ss")];
+                fp16 invd = const()[name=string("invd"), val=fp16(\(String(format: "%.6f", invd)))];
+                tensor<fp16, [1,1,1,\(spatial)]> ss2 = mul(x=ss,y=invd)[name=string("ss2")];
+                fp16 eps = const()[name=string("eps"), val=fp16(0.00001)];
+                tensor<fp16, [1,1,1,\(spatial)]> ss3 = add(x=ss2,y=eps)[name=string("ss3")];
+                fp16 nhalf = const()[name=string("nhalf"), val=fp16(-0.5)];
+                tensor<fp16, [1,1,1,\(spatial)]> rrms = pow(x=ss3,y=nhalf)[name=string("rrms")];
+                tensor<fp16, [1,\(dim),1,\(spatial)]> xr = mul(x=x,y=rrms)[name=string("xr")];
+                tensor<fp16, [1,\(dim),1,1]> rw = const()[name=string("rw"), val=tensor<fp16, [1,\(dim),1,1]>(BLOBFILE(path=string("@model_path/weights/rms_final.bin"), offset=uint64(64)))];
+                tensor<fp16, [1,\(dim),1,\(spatial)]> xn = mul(x=xr,y=rw)[name=string("xn")];
+                string pt = const()[name=string("pt"), val=string("valid")];
+                tensor<int32, [2]> st = const()[name=string("st"), val=tensor<int32, [2]>([1,1])];
+                tensor<int32, [4]> pd = const()[name=string("pd"), val=tensor<int32, [4]>([0,0,0,0])];
+                tensor<int32, [2]> dl = const()[name=string("dl"), val=tensor<int32, [2]>([1,1])];
+                int32 gr = const()[name=string("gr"), val=int32(1)];
+                tensor<fp16, [\(vocab), \(dim), 1, 1]> Wcls = const()[name=string("Wcls"), val=tensor<fp16, [\(vocab), \(dim), 1, 1]>(BLOBFILE(path=string("@model_path/weights/classifier.bin"), offset=uint64(64)))];
+                tensor<fp16, [1, \(vocab), 1, \(spatial)]> logits = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Wcls,x=xn)[name=string("cls")];
+                tensor<fp16, [1, 1, 1, \(spatial)]> maxval = reduce_max(x=logits,axes=raxCh,keep_dims=kd)[name=string("maxval")];
+            } -> (logits, maxval);
+        }
+        """
+        let rmsWeightSize = dim * 2 + 128  // fp16 + header
+        let clsWeightSize = vocab * dim * 2 + 128
+        var rmsData = Data(repeating: 0, count: rmsWeightSize)
+        // Fill RMS weights with 1.0
+        for i in 0..<dim {
+            let val = Float16(1.0)
+            var bits = val.bitPattern
+            rmsData.replaceSubrange((128 + i * 2)..<(128 + i * 2 + 2), with: Data(bytes: &bits, count: 2))
+        }
+        var clsData = Data(repeating: 0, count: clsWeightSize)
+        // Fill classifier with small random-ish values (just zeros is fine for compile test)
+        let logitsOutBytes = vocab * spatial * 2
+        let maxvalOutBytes = 1 * spatial * 2
+        let fusedHeadResult = tryCompileAndEvalWithWeights(
+            label: "fused_head_with_reduce_max",
+            milText: milFusedHead,
+            weights: [
+                ("@model_path/weights/rms_final.bin", rmsData),
+                ("@model_path/weights/classifier.bin", clsData)
+            ],
+            inputBytes: dim * spatial * 2,
+            outputSizes: [logitsOutBytes, maxvalOutBytes]
+        )
+        print("probe fused_head_with_reduce_max: \(fusedHeadResult)")
+    }
+
+    // MARK: - Int8 weight quantization ANE compile probe
+
+    func test_int8_quantized_weight_compile_probe_on_hardware() throws {
+        try requireGenerationHardware()
+
+        let inCh = 64
+        let outCh = 64
+        let spatial = 32
+
+        // Helper: build an int8 weight blob (same header, 1 byte per element)
+        func buildInt8Blob(count: Int) -> Data {
+            let payloadBytes = count
+            let total = 128 + payloadBytes
+            var data = Data(count: total)
+            data.withUnsafeMutableBytes { raw in
+                let base = raw.baseAddress!.assumingMemoryBound(to: UInt8.self)
+                base[0] = 1
+                base[4] = 2
+                base[64] = 0xEF
+                base[65] = 0xBE
+                base[66] = 0xAD
+                base[67] = 0xDE
+                base[68] = 1
+                raw.storeBytes(of: UInt32(payloadBytes).littleEndian, toByteOffset: 72, as: UInt32.self)
+                raw.storeBytes(of: UInt32(128).littleEndian, toByteOffset: 80, as: UInt32.self)
+                // Fill with small int8 values
+                for i in 0..<payloadBytes {
+                    base[128 + i] = UInt8(bitPattern: Int8(i % 127))
+                }
+            }
+            return data
+        }
+
+        // Helper: build fp16 scalar blob
+        func buildFP16ScalarBlob(value: Float) -> Data {
+            var data = Data(count: 128 + 2)
+            data.withUnsafeMutableBytes { raw in
+                let base = raw.baseAddress!.assumingMemoryBound(to: UInt8.self)
+                base[0] = 1; base[4] = 2
+                base[64] = 0xEF; base[65] = 0xBE; base[66] = 0xAD; base[67] = 0xDE; base[68] = 1
+                raw.storeBytes(of: UInt32(2).littleEndian, toByteOffset: 72, as: UInt32.self)
+                raw.storeBytes(of: UInt32(128).littleEndian, toByteOffset: 80, as: UInt32.self)
+                let payload = raw.baseAddress!.advanced(by: 128).assumingMemoryBound(to: UInt16.self)
+                payload[0] = Float16(value).bitPattern
+            }
+            return data
+        }
+
+        // Helper: build per-channel fp16 blob
+        func buildFP16PerChannelBlob(count: Int, value: Float) -> Data {
+            let payloadBytes = count * 2
+            var data = Data(count: 128 + payloadBytes)
+            data.withUnsafeMutableBytes { raw in
+                let base = raw.baseAddress!.assumingMemoryBound(to: UInt8.self)
+                base[0] = 1; base[4] = 2
+                base[64] = 0xEF; base[65] = 0xBE; base[66] = 0xAD; base[67] = 0xDE; base[68] = 1
+                raw.storeBytes(of: UInt32(payloadBytes).littleEndian, toByteOffset: 72, as: UInt32.self)
+                raw.storeBytes(of: UInt32(128).littleEndian, toByteOffset: 80, as: UInt32.self)
+                let payload = raw.baseAddress!.advanced(by: 128).assumingMemoryBound(to: UInt16.self)
+                for i in 0..<count { payload[i] = Float16(value).bitPattern }
+            }
+            return data
+        }
+
+        // Helper: build per-channel int8 blob (zero points)
+        func buildInt8PerChannelBlob(count: Int, value: Int8) -> Data {
+            let payloadBytes = count
+            var data = Data(count: 128 + payloadBytes)
+            data.withUnsafeMutableBytes { raw in
+                let base = raw.baseAddress!.assumingMemoryBound(to: UInt8.self)
+                base[0] = 1; base[4] = 2
+                base[64] = 0xEF; base[65] = 0xBE; base[66] = 0xAD; base[67] = 0xDE; base[68] = 1
+                raw.storeBytes(of: UInt32(payloadBytes).littleEndian, toByteOffset: 72, as: UInt32.self)
+                raw.storeBytes(of: UInt32(128).littleEndian, toByteOffset: 80, as: UInt32.self)
+                for i in 0..<payloadBytes { base[128 + i] = UInt8(bitPattern: value) }
+            }
+            return data
+        }
+
+        let int8WeightBlob = buildInt8Blob(count: outCh * inCh)
+        let scaleBlob = buildFP16PerChannelBlob(count: outCh, value: 0.01)
+        let zpBlob = buildInt8PerChannelBlob(count: outCh, value: 0)
+
+        // --- Probe A: constexpr_affine_dequantize with per-channel scale ---
+        let milQuantA = """
+        program(1.3)
+        [buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, {"coremlc-version", "3505.4.1"}, {"coremltools-component-milinternal", ""}, {"coremltools-version", "9.0"}})]
+        {
+            func main<ios18>(tensor<fp16, [1, \(inCh), 1, \(spatial)]> x) {
+                tensor<int8, [\(outCh), \(inCh), 1, 1]> Wq = const()[name=string("Wq"), val=tensor<int8, [\(outCh), \(inCh), 1, 1]>(BLOBFILE(path=string("@model_path/weights/wq.bin"), offset=uint64(128)))];
+                tensor<fp16, [\(outCh), 1, 1, 1]> scale = const()[name=string("scale"), val=tensor<fp16, [\(outCh), 1, 1, 1]>(BLOBFILE(path=string("@model_path/weights/scale.bin"), offset=uint64(128)))];
+                tensor<int8, [\(outCh), 1, 1, 1]> zp = const()[name=string("zp"), val=tensor<int8, [\(outCh), 1, 1, 1]>(BLOBFILE(path=string("@model_path/weights/zp.bin"), offset=uint64(128)))];
+                tensor<fp16, [\(outCh), \(inCh), 1, 1]> W = constexpr_affine_dequantize(quantized_data=Wq, zero_point=zp, scale=scale, axis=int32(0))[name=string("W")];
+                string pt = const()[name=string("pt"), val=string("valid")];
+                tensor<int32, [2]> st = const()[name=string("st"), val=tensor<int32, [2]>([1,1])];
+                tensor<int32, [4]> pd = const()[name=string("pd"), val=tensor<int32, [4]>([0,0,0,0])];
+                tensor<int32, [2]> dl = const()[name=string("dl"), val=tensor<int32, [2]>([1,1])];
+                int32 gr = const()[name=string("gr"), val=int32(1)];
+                tensor<fp16, [1, \(outCh), 1, \(spatial)]> out = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=W,x=x)[name=string("out")];
+            } -> (out);
+        }
+        """
+        let resultA = tryCompileAndEvalWithWeights(
+            label: "constexpr_affine_dequantize_per_channel",
+            milText: milQuantA,
+            weights: [
+                ("@model_path/weights/wq.bin", int8WeightBlob),
+                ("@model_path/weights/scale.bin", scaleBlob),
+                ("@model_path/weights/zp.bin", zpBlob)
+            ],
+            inputBytes: inCh * spatial * 2,
+            outputBytes: outCh * spatial * 2
+        )
+        print("probe constexpr_affine_dequantize (per-channel): \(resultA)")
+
+        // --- Probe B: constexpr_affine_dequantize with scalar scale ---
+        let scalarScaleBlob = buildFP16ScalarBlob(value: 0.01)
+        let scalarZpData = Data([0])  // single int8 zero
+        var scalarZpBlob = Data(count: 128 + 1)
+        scalarZpBlob.withUnsafeMutableBytes { raw in
+            let base = raw.baseAddress!.assumingMemoryBound(to: UInt8.self)
+            base[0] = 1; base[4] = 2
+            base[64] = 0xEF; base[65] = 0xBE; base[66] = 0xAD; base[67] = 0xDE; base[68] = 1
+            raw.storeBytes(of: UInt32(1).littleEndian, toByteOffset: 72, as: UInt32.self)
+            raw.storeBytes(of: UInt32(128).littleEndian, toByteOffset: 80, as: UInt32.self)
+            base[128] = 0
+        }
+        let milQuantB = """
+        program(1.3)
+        [buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, {"coremlc-version", "3505.4.1"}, {"coremltools-component-milinternal", ""}, {"coremltools-version", "9.0"}})]
+        {
+            func main<ios18>(tensor<fp16, [1, \(inCh), 1, \(spatial)]> x) {
+                tensor<int8, [\(outCh), \(inCh), 1, 1]> Wq = const()[name=string("Wq"), val=tensor<int8, [\(outCh), \(inCh), 1, 1]>(BLOBFILE(path=string("@model_path/weights/wq.bin"), offset=uint64(128)))];
+                fp16 scale = const()[name=string("scale"), val=fp16(0.01)];
+                int8 zp = const()[name=string("zp"), val=int8(0)];
+                tensor<fp16, [\(outCh), \(inCh), 1, 1]> W = constexpr_affine_dequantize(quantized_data=Wq, zero_point=zp, scale=scale, axis=int32(0))[name=string("W")];
+                string pt = const()[name=string("pt"), val=string("valid")];
+                tensor<int32, [2]> st = const()[name=string("st"), val=tensor<int32, [2]>([1,1])];
+                tensor<int32, [4]> pd = const()[name=string("pd"), val=tensor<int32, [4]>([0,0,0,0])];
+                tensor<int32, [2]> dl = const()[name=string("dl"), val=tensor<int32, [2]>([1,1])];
+                int32 gr = const()[name=string("gr"), val=int32(1)];
+                tensor<fp16, [1, \(outCh), 1, \(spatial)]> out = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=W,x=x)[name=string("out")];
+            } -> (out);
+        }
+        """
+        let resultB = tryCompileAndEvalWithWeights(
+            label: "constexpr_affine_dequantize_scalar",
+            milText: milQuantB,
+            weights: [
+                ("@model_path/weights/wq.bin", int8WeightBlob)
+            ],
+            inputBytes: inCh * spatial * 2,
+            outputBytes: outCh * spatial * 2
+        )
+        print("probe constexpr_affine_dequantize (scalar): \(resultB)")
+
+        // --- Probe C: direct cast int8→fp16 then conv ---
+        let milQuantC = """
+        program(1.3)
+        [buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, {"coremlc-version", "3505.4.1"}, {"coremltools-component-milinternal", ""}, {"coremltools-version", "9.0"}})]
+        {
+            func main<ios18>(tensor<fp16, [1, \(inCh), 1, \(spatial)]> x) {
+                tensor<int8, [\(outCh), \(inCh), 1, 1]> Wq = const()[name=string("Wq"), val=tensor<int8, [\(outCh), \(inCh), 1, 1]>(BLOBFILE(path=string("@model_path/weights/wq.bin"), offset=uint64(128)))];
+                string to_fp16 = const()[name=string("to_fp16"), val=string("fp16")];
+                tensor<fp16, [\(outCh), \(inCh), 1, 1]> W = cast(dtype=to_fp16, x=Wq)[name=string("W")];
+                string pt = const()[name=string("pt"), val=string("valid")];
+                tensor<int32, [2]> st = const()[name=string("st"), val=tensor<int32, [2]>([1,1])];
+                tensor<int32, [4]> pd = const()[name=string("pd"), val=tensor<int32, [4]>([0,0,0,0])];
+                tensor<int32, [2]> dl = const()[name=string("dl"), val=tensor<int32, [2]>([1,1])];
+                int32 gr = const()[name=string("gr"), val=int32(1)];
+                tensor<fp16, [1, \(outCh), 1, \(spatial)]> out = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=W,x=x)[name=string("out")];
+            } -> (out);
+        }
+        """
+        let resultC = tryCompileAndEvalWithWeights(
+            label: "int8_cast_to_fp16_conv",
+            milText: milQuantC,
+            weights: [
+                ("@model_path/weights/wq.bin", int8WeightBlob)
+            ],
+            inputBytes: inCh * spatial * 2,
+            outputBytes: outCh * spatial * 2
+        )
+        print("probe int8_cast_to_fp16_conv: \(resultC)")
+
+        // --- Probe D: constexpr_lut_to_dense (palette quantization) ---
+        // This is another quantization approach used in CoreML
+        // Skip for now if constexpr_affine_dequantize works
+
+        // --- Probe E: uint8 instead of int8 ---
+        let milQuantE = """
+        program(1.3)
+        [buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, {"coremlc-version", "3505.4.1"}, {"coremltools-component-milinternal", ""}, {"coremltools-version", "9.0"}})]
+        {
+            func main<ios18>(tensor<fp16, [1, \(inCh), 1, \(spatial)]> x) {
+                tensor<uint8, [\(outCh), \(inCh), 1, 1]> Wq = const()[name=string("Wq"), val=tensor<uint8, [\(outCh), \(inCh), 1, 1]>(BLOBFILE(path=string("@model_path/weights/wq.bin"), offset=uint64(128)))];
+                fp16 scale = const()[name=string("scale"), val=fp16(0.01)];
+                uint8 zp = const()[name=string("zp"), val=uint8(128)];
+                tensor<fp16, [\(outCh), \(inCh), 1, 1]> W = constexpr_affine_dequantize(quantized_data=Wq, zero_point=zp, scale=scale, axis=int32(0))[name=string("W")];
+                string pt = const()[name=string("pt"), val=string("valid")];
+                tensor<int32, [2]> st = const()[name=string("st"), val=tensor<int32, [2]>([1,1])];
+                tensor<int32, [4]> pd = const()[name=string("pd"), val=tensor<int32, [4]>([0,0,0,0])];
+                tensor<int32, [2]> dl = const()[name=string("dl"), val=tensor<int32, [2]>([1,1])];
+                int32 gr = const()[name=string("gr"), val=int32(1)];
+                tensor<fp16, [1, \(outCh), 1, \(spatial)]> out = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=W,x=x)[name=string("out")];
+            } -> (out);
+        }
+        """
+        let resultE = tryCompileAndEvalWithWeights(
+            label: "constexpr_affine_dequantize_uint8",
+            milText: milQuantE,
+            weights: [
+                ("@model_path/weights/wq.bin", int8WeightBlob)
+            ],
+            inputBytes: inCh * spatial * 2,
+            outputBytes: outCh * spatial * 2
+        )
+        print("probe constexpr_affine_dequantize (uint8): \(resultE)")
+    }
+
+    private enum ProbeResult: CustomStringConvertible {
+        case compileFailed(String)
+        case evalFailed(String)
+        case evalSuccess
+        var description: String {
+            switch self {
+            case .compileFailed(let e): return "COMPILE_FAILED: \(e)"
+            case .evalFailed(let e): return "EVAL_FAILED: \(e)"
+            case .evalSuccess: return "SUCCESS"
+            }
+        }
+    }
+
+    private func tryCompileAndEval(label: String, milText: String, inputBytes: Int, outputBytes: Int) -> ProbeResult {
+        tryCompileAndEvalWithWeights(label: label, milText: milText, weights: [], inputBytes: inputBytes, outputBytes: outputBytes)
+    }
+
+    private func tryCompileAndEvalWithWeights(label: String, milText: String, weights: [(path: String, data: Data)], inputBytes: Int, outputBytes: Int) -> ProbeResult {
+        tryCompileAndEvalWithWeights(label: label, milText: milText, weights: weights, inputBytes: inputBytes, outputSizes: [outputBytes])
+    }
+
+    private func tryCompileAndEvalWithWeights(label: String, milText: String, weights: [(path: String, data: Data)], inputBytes: Int, outputSizes: [Int]) -> ProbeResult {
+        do {
+            let kernel = try ANEKernel(
+                milText: milText,
+                weights: weights.map { (path: $0.0, data: $0.1) },
+                inputSizes: [inputBytes],
+                outputSizes: outputSizes,
+                checkBudget: false
+            )
+            do {
+                try kernel.eval()
+                return .evalSuccess
+            } catch {
+                return .evalFailed("\(error)")
+            }
+        } catch {
+            return .compileFailed("\(error)")
+        }
+    }
+
+    func test_batched_step_component_timing_on_hardware() throws {
+        try requireGenerationHardware()
+
+        let layerCount = 6
+        let streamCount = 32
+        let dim = ModelConfig.dim
+        let laneSpatial = 32
+        let iterations = 100
+
+        let weights = makeEchoRecurrentGenerationWeights(layerCount: layerCount)
+        let tripletCount = layerCount / 3
+
+        var tripletSessions = try LayerStorage<RWKVStyleFusedThreeLayerSession>(
+            count: tripletCount,
+            throwingInitializer: { tripletIdx in
+                let base = tripletIdx * 3
+                return try RWKVStyleFusedThreeLayerSession(
+                    weights0: weights.layers[base],
+                    weights1: weights.layers[base + 1],
+                    weights2: weights.layers[base + 2],
+                    laneSpatial: laneSpatial
+                )
+            }
+        )
+
+        let head = try ANEGenerationRMSNormClassifierHead(
+            rmsFinal: weights.rmsFinal,
+            classifierWeights: weights.embedding,
+            vocabSize: weights.vocabSize,
+            laneSpatial: laneSpatial
+        )
+
+        let t0xIn = tripletSessions[0].handles.xIn
+        let t0xOut = tripletSessions[0].handles.xOut
+        let t0sIn0 = tripletSessions[0].handles.stateIn0
+        let t0sIn1 = tripletSessions[0].handles.stateIn1
+        let t0sIn2 = tripletSessions[0].handles.stateIn2
+        let t0sOut0 = tripletSessions[0].handles.stateOut0
+        let t0sOut1 = tripletSessions[0].handles.stateOut1
+        let t0sOut2 = tripletSessions[0].handles.stateOut2
+        let t1xIn = tripletSessions[1].handles.xIn
+        let t1xOut = tripletSessions[1].handles.xOut
+        let t1sIn0 = tripletSessions[1].handles.stateIn0
+        let t1sIn1 = tripletSessions[1].handles.stateIn1
+        let t1sIn2 = tripletSessions[1].handles.stateIn2
+        let t1sOut0 = tripletSessions[1].handles.stateOut0
+        let t1sOut1 = tripletSessions[1].handles.stateOut1
+        let t1sOut2 = tripletSessions[1].handles.stateOut2
+        let headIn = head.inputSurface
+        let headOut = head.outputSurface
+        let vocabSize = weights.vocabSize
+
+        var tokens = Array(repeating: UInt16(0), count: streamCount)
+
+        // Warmup
+        for _ in 0..<5 {
+            try batchedTokenStep(
+                tokens: &tokens, streamCount: streamCount,
+                embedding: weights.embedding, dim: dim, laneSpatial: laneSpatial,
+                tripletCount: tripletCount, tripletSessions: &tripletSessions,
+                t0xIn: t0xIn, t0xOut: t0xOut,
+                t0sIn0: t0sIn0, t0sIn1: t0sIn1, t0sIn2: t0sIn2,
+                t0sOut0: t0sOut0, t0sOut1: t0sOut1, t0sOut2: t0sOut2,
+                t1xIn: t1xIn, t1xOut: t1xOut,
+                t1sIn0: t1sIn0, t1sIn1: t1sIn1, t1sIn2: t1sIn2,
+                t1sOut0: t1sOut0, t1sOut1: t1sOut1, t1sOut2: t1sOut2,
+                headIn: headIn, headOut: headOut,
+                head: head, vocabSize: vocabSize
+            )
+        }
+
+        // Per-component timing
+        var embedUs: [Double] = []
+        var evalT0Us: [Double] = []
+        var stateT0Us: [Double] = []
+        var xferUs: [Double] = []
+        var evalT1Us: [Double] = []
+        var stateT1Us: [Double] = []
+        var headCopyUs: [Double] = []
+        var evalHeadUs: [Double] = []
+        var argmaxUs: [Double] = []
+
+        for _ in 0..<iterations {
+            var t = GenerationClock.now()
+
+            // Embed write
+            try weights.embedding.withUnsafePointer { embPtr in
+                try tokens.withUnsafeBufferPointer { tokenBuf in
+                    try SurfaceIO.writeEmbeddingBatchFP16(
+                        to: t0xIn, channelOffset: 0, spatial: laneSpatial,
+                        embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
+                        tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount
+                    )
+                }
+            }
+            var t2 = GenerationClock.now(); embedUs.append(machMicroseconds(t2 - t)); t = t2
+
+            // Eval T0
+            try tripletSessions[0].kernels.step.eval()
+            t2 = GenerationClock.now(); evalT0Us.append(machMicroseconds(t2 - t)); t = t2
+
+            // State T0 copies
+            try SurfaceIO.copyFP16(dst: t0sIn0, dstChannelOffset: 0, src: t0sOut0, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+            try SurfaceIO.copyFP16(dst: t0sIn1, dstChannelOffset: 0, src: t0sOut1, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+            try SurfaceIO.copyFP16(dst: t0sIn2, dstChannelOffset: 0, src: t0sOut2, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+            t2 = GenerationClock.now(); stateT0Us.append(machMicroseconds(t2 - t)); t = t2
+
+            // Inter-triplet transfer
+            try SurfaceIO.copyFP16(dst: t1xIn, dstChannelOffset: 0, src: t0xOut, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+            t2 = GenerationClock.now(); xferUs.append(machMicroseconds(t2 - t)); t = t2
+
+            // Eval T1
+            try tripletSessions[1].kernels.step.eval()
+            t2 = GenerationClock.now(); evalT1Us.append(machMicroseconds(t2 - t)); t = t2
+
+            // State T1 copies
+            try SurfaceIO.copyFP16(dst: t1sIn0, dstChannelOffset: 0, src: t1sOut0, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+            try SurfaceIO.copyFP16(dst: t1sIn1, dstChannelOffset: 0, src: t1sOut1, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+            try SurfaceIO.copyFP16(dst: t1sIn2, dstChannelOffset: 0, src: t1sOut2, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+            t2 = GenerationClock.now(); stateT1Us.append(machMicroseconds(t2 - t)); t = t2
+
+            // Head copy
+            try SurfaceIO.copyFP16(dst: headIn, dstChannelOffset: 0, src: t1xOut, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+            t2 = GenerationClock.now(); headCopyUs.append(machMicroseconds(t2 - t)); t = t2
+
+            // Eval head
+            try head.kernelSet.rmsNormClassifier.eval()
+            t2 = GenerationClock.now(); evalHeadUs.append(machMicroseconds(t2 - t)); t = t2
+
+            // Argmax
+            let argmaxResults = try SurfaceIO.argmaxBatchFP16Spatial(
+                from: headOut, channelOffset: 0, spatial: laneSpatial,
+                channels: vocabSize, streamCount: streamCount
+            )
+            for i in 0..<streamCount { tokens[i] = UInt16(argmaxResults[i].index) }
+            t2 = GenerationClock.now(); argmaxUs.append(machMicroseconds(t2 - t))
+        }
+
+        func median(_ arr: [Double]) -> Double {
+            let sorted = arr.sorted()
+            let n = sorted.count
+            return n % 2 == 0 ? (sorted[n/2 - 1] + sorted[n/2]) / 2.0 : sorted[n/2]
+        }
+
+        let totalUs = median(embedUs) + median(evalT0Us) + median(stateT0Us) + median(xferUs) +
+            median(evalT1Us) + median(stateT1Us) + median(headCopyUs) + median(evalHeadUs) + median(argmaxUs)
+
+        print("Component timing (median µs, \(streamCount) streams, \(iterations) iterations):")
+        print("  embed_write: \(String(format: "%.1f", median(embedUs))) µs (\(String(format: "%.1f", median(embedUs) / totalUs * 100))%)")
+        print("  eval_T0:     \(String(format: "%.1f", median(evalT0Us))) µs (\(String(format: "%.1f", median(evalT0Us) / totalUs * 100))%)")
+        print("  state_T0:    \(String(format: "%.1f", median(stateT0Us))) µs (\(String(format: "%.1f", median(stateT0Us) / totalUs * 100))%)")
+        print("  xfer_T0T1:   \(String(format: "%.1f", median(xferUs))) µs (\(String(format: "%.1f", median(xferUs) / totalUs * 100))%)")
+        print("  eval_T1:     \(String(format: "%.1f", median(evalT1Us))) µs (\(String(format: "%.1f", median(evalT1Us) / totalUs * 100))%)")
+        print("  state_T1:    \(String(format: "%.1f", median(stateT1Us))) µs (\(String(format: "%.1f", median(stateT1Us) / totalUs * 100))%)")
+        print("  head_copy:   \(String(format: "%.1f", median(headCopyUs))) µs (\(String(format: "%.1f", median(headCopyUs) / totalUs * 100))%)")
+        print("  eval_head:   \(String(format: "%.1f", median(evalHeadUs))) µs (\(String(format: "%.1f", median(evalHeadUs) / totalUs * 100))%)")
+        print("  argmax:      \(String(format: "%.1f", median(argmaxUs))) µs (\(String(format: "%.1f", median(argmaxUs) / totalUs * 100))%)")
+        print("  TOTAL:       \(String(format: "%.1f", totalUs)) µs")
+    }
+
+    func test_factored_head_eval_benchmark_on_hardware() throws {
+        try requireGenerationHardware()
+
+        let dim = ModelConfig.dim  // 768
+        let vocab = 32000
+        let laneSpatial = 256
+        let warmup = 5
+        let iterations = 30
+
+        // Build proper weight blobs using WeightBlob
+        let rmsWeights = [Float](repeating: 1.0, count: dim)
+        let rmsBlob = WeightBlob.build(from: rmsWeights, rows: 1, cols: dim)
+
+        let clsWeights = [Float](repeating: 0.0, count: vocab * dim)
+        let clsBlob = WeightBlob.build(from: clsWeights, rows: vocab, cols: dim)
+
+        // --- Build direct head kernel (existing) ---
+        let directGen = GenerationRMSNormClassifierGenerator(vocabSize: vocab, laneSpatial: laneSpatial)
+        let directKernel = try ANEKernel(
+            milText: directGen.milText,
+            weights: [
+                (path: "@model_path/weights/rms_final.bin", data: rmsBlob),
+                (path: "@model_path/weights/classifier.bin", data: clsBlob)
+            ],
+            inputBytes: directGen.inputBytes,
+            outputBytes: vocab * laneSpatial * 2,
+            checkBudget: false
+        )
+
+        // --- Build factored head kernel: [768→k→32000] ---
+        let k = 128
+        let factoredMIL = buildFactoredHeadMIL(dim: dim, vocab: vocab, lane: laneSpatial, bottleneck: k)
+
+        let w1Weights = [Float](repeating: 0.0, count: k * dim)
+        let w1Blob = WeightBlob.build(from: w1Weights, rows: k, cols: dim)
+
+        let w2Weights = [Float](repeating: 0.0, count: vocab * k)
+        let w2Blob = WeightBlob.build(from: w2Weights, rows: vocab, cols: k)
+
+        let factoredKernel = try ANEKernel(
+            milText: factoredMIL,
+            weights: [
+                (path: "@model_path/weights/rms_final.bin", data: rmsBlob),
+                (path: "@model_path/weights/cls_proj.bin", data: w1Blob),
+                (path: "@model_path/weights/cls_expand.bin", data: w2Blob)
+            ],
+            inputBytes: dim * laneSpatial * 2,
+            outputBytes: vocab * laneSpatial * 2,
+            checkBudget: false
+        )
+
+        // --- Benchmark direct ---
+        for _ in 0..<warmup { try directKernel.eval() }
+        var directUs: [Double] = []
+        for _ in 0..<iterations {
+            let t = GenerationClock.now()
+            try directKernel.eval()
+            let t2 = GenerationClock.now()
+            directUs.append(machMicroseconds(t2 - t))
+        }
+
+        // --- Benchmark factored k=128 ---
+        for _ in 0..<warmup { try factoredKernel.eval() }
+        var factoredUs: [Double] = []
+        for _ in 0..<iterations {
+            let t = GenerationClock.now()
+            try factoredKernel.eval()
+            let t2 = GenerationClock.now()
+            factoredUs.append(machMicroseconds(t2 - t))
+        }
+
+        // --- Sweep additional k values ---
+        let kValues = [32, 64, 256]
+        var kResults: [(k: Int, median: Double)] = []
+
+        for kv in kValues {
+            let mil = buildFactoredHeadMIL(dim: dim, vocab: vocab, lane: laneSpatial, bottleneck: kv)
+            let w1 = WeightBlob.build(from: [Float](repeating: 0.0, count: kv * dim), rows: kv, cols: dim)
+            let w2 = WeightBlob.build(from: [Float](repeating: 0.0, count: vocab * kv), rows: vocab, cols: kv)
+            do {
+                let kernel = try ANEKernel(
+                    milText: mil,
+                    weights: [
+                        (path: "@model_path/weights/rms_final.bin", data: rmsBlob),
+                        (path: "@model_path/weights/cls_proj.bin", data: w1),
+                        (path: "@model_path/weights/cls_expand.bin", data: w2)
+                    ],
+                    inputBytes: dim * laneSpatial * 2,
+                    outputBytes: vocab * laneSpatial * 2,
+                    checkBudget: false
+                )
+                for _ in 0..<warmup { try kernel.eval() }
+                var us: [Double] = []
+                for _ in 0..<iterations {
+                    let t = GenerationClock.now()
+                    try kernel.eval()
+                    let t2 = GenerationClock.now()
+                    us.append(machMicroseconds(t2 - t))
+                }
+                kResults.append((k: kv, median: median(us)))
+            } catch {
+                print("  k=\(kv): COMPILE FAILED")
+            }
+        }
+
+        func median(_ arr: [Double]) -> Double {
+            let sorted = arr.sorted()
+            let n = sorted.count
+            return n % 2 == 0 ? (sorted[n/2 - 1] + sorted[n/2]) / 2.0 : sorted[n/2]
+        }
+
+        let directMedian = median(directUs)
+        let factoredMedian = median(factoredUs)
+
+        print("Head eval sweep (laneSpatial=\(laneSpatial), dim=\(dim), vocab=\(vocab)):")
+        print("  direct [768→32000]:  \(String(format: "%.1f", directMedian)) µs (weights \(String(format: "%.1f", Double(vocab * dim * 2) / 1_048_576.0)) MB)")
+        print("  k=\(k): \(String(format: "%.1f", factoredMedian)) µs (\(String(format: "%.2f", directMedian / factoredMedian))x, weights \(String(format: "%.1f", Double(k * dim * 2 + vocab * k * 2) / 1_048_576.0)) MB)")
+        for r in kResults {
+            let kWt = Double(r.k * dim * 2 + vocab * r.k * 2) / 1_048_576.0
+            print("  k=\(r.k): \(String(format: "%.1f", r.median)) µs (\(String(format: "%.2f", directMedian / r.median))x, weights \(String(format: "%.1f", kWt)) MB)")
+        }
+    }
+
+    private func buildFactoredHeadMIL(dim: Int, vocab: Int, lane: Int, bottleneck k: Int) -> String {
+        let invd: Float = 1.0 / Float(dim)
+        var b = MILBuilder(reserveCapacity: 4_096)
+        b.append(MILText.header)
+        b.appendLine("    func main<ios18>(tensor<fp16, [1, \(dim), 1, \(lane)]> x) {")
+        // RMSNorm
+        b.appendLine("        tensor<fp16, [1,\(dim),1,\(lane)]> sq = mul(x=x,y=x)[name=string(\"sq\")];")
+        b.appendLine("        tensor<int32, [1]> raxCh = const()[name=string(\"rax_ch\"), val=tensor<int32, [1]>([1])];")
+        b.appendLine("        bool kd = const()[name=string(\"kd\"), val=bool(true)];")
+        b.appendLine("        tensor<fp16, [1,1,1,\(lane)]> ss = reduce_sum(x=sq,axes=raxCh,keep_dims=kd)[name=string(\"ss\")];")
+        b.append("        fp16 invd = const()[name=string(\"invd\"), val=fp16(")
+        b.appendFP16(invd)
+        b.appendLine(")];")
+        b.appendLine("        tensor<fp16, [1,1,1,\(lane)]> ss2 = mul(x=ss,y=invd)[name=string(\"ss2\")];")
+        b.appendLine("        fp16 eps = const()[name=string(\"eps\"), val=fp16(0.00001)];")
+        b.appendLine("        tensor<fp16, [1,1,1,\(lane)]> ss3 = add(x=ss2,y=eps)[name=string(\"ss3\")];")
+        b.appendLine("        fp16 nhalf = const()[name=string(\"nhalf\"), val=fp16(-0.5)];")
+        b.appendLine("        tensor<fp16, [1,1,1,\(lane)]> rrms = pow(x=ss3,y=nhalf)[name=string(\"rrms\")];")
+        b.appendLine("        tensor<fp16, [1,\(dim),1,\(lane)]> xr = mul(x=x,y=rrms)[name=string(\"xr\")];")
+        b.appendLine(
+            "        tensor<fp16, [1,\(dim),1,1]> rw = const()[name=string(\"rw\"), val=tensor<fp16, [1,\(dim),1,1]>(BLOBFILE(path=string(\"@model_path/weights/rms_final.bin\"), offset=uint64(64)))];"
+        )
+        b.appendLine("        tensor<fp16, [1,\(dim),1,\(lane)]> xn = mul(x=xr,y=rw)[name=string(\"xn\")];")
+        b.append(MILText.convConst)
+        // Factored conv: [dim→k]
+        b.appendLine(
+            "        tensor<fp16, [\(k), \(dim), 1, 1]> Wproj = const()[name=string(\"Wproj\"), val=tensor<fp16, [\(k), \(dim), 1, 1]>(BLOBFILE(path=string(\"@model_path/weights/cls_proj.bin\"), offset=uint64(64)))];"
+        )
+        b.appendLine(
+            "        tensor<fp16, [1, \(k), 1, \(lane)]> proj = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Wproj,x=xn)[name=string(\"proj\")];"
+        )
+        // Factored conv: [k→vocab]
+        b.appendLine(
+            "        tensor<fp16, [\(vocab), \(k), 1, 1]> Wexp = const()[name=string(\"Wexp\"), val=tensor<fp16, [\(vocab), \(k), 1, 1]>(BLOBFILE(path=string(\"@model_path/weights/cls_expand.bin\"), offset=uint64(64)))];"
+        )
+        b.appendLine(
+            "        tensor<fp16, [1, \(vocab), 1, \(lane)]> logits = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Wexp,x=proj)[name=string(\"expand\")];"
+        )
+        b.appendLine("    } -> (logits);")
+        b.appendLine("}")
+        return b.text
+    }
+
+    // MARK: - Grouped conv ANE probe
+
+    func test_grouped_conv_probe_on_hardware() throws {
+        try requireGenerationHardware()
+
+        let dim = ModelConfig.dim  // 768
+        let lane = 512
+        let warmup = 5
+        let iterations = 30
+
+        // Build a fp16 blob with 128-byte header (matches WeightBlob format)
+        func buildFP16Blob(elementCount: Int) -> Data {
+            let payloadBytes = elementCount * 2
+            var data = Data(count: 128 + payloadBytes)
+            data.withUnsafeMutableBytes { raw in
+                let base = raw.baseAddress!.assumingMemoryBound(to: UInt8.self)
+                base[0] = 1
+                base[4] = 2
+                base[64] = 0xEF
+                base[65] = 0xBE
+                base[66] = 0xAD
+                base[67] = 0xDE
+                base[68] = 1
+                raw.storeBytes(of: UInt32(payloadBytes).littleEndian, toByteOffset: 72, as: UInt32.self)
+                raw.storeBytes(of: UInt32(128).littleEndian, toByteOffset: 80, as: UInt32.self)
+                // Fill payload with small fp16 values
+                let payload = raw.baseAddress!.advanced(by: 128).assumingMemoryBound(to: UInt16.self)
+                for i in 0..<elementCount {
+                    payload[i] = Float16(Float(i % 256) * 0.001).bitPattern
+                }
+            }
+            return data
+        }
+
+        // First: minimal compile check — single conv with weight blob
+        let minimalMil = """
+        program(1.3)
+        [buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, {"coremlc-version", "3505.4.1"}, {"coremltools-component-milinternal", ""}, {"coremltools-version", "9.0"}})]
+        {
+            func main<ios18>(tensor<fp16, [1, \(dim), 1, \(lane)]> x) {
+                string pt = const()[name=string("pt"), val=string("valid")];
+                tensor<int32, [2]> st = const()[name=string("st"), val=tensor<int32, [2]>([1,1])];
+                tensor<int32, [4]> pd = const()[name=string("pd"), val=tensor<int32, [4]>([0,0,0,0])];
+                tensor<int32, [2]> dl = const()[name=string("dl"), val=tensor<int32, [2]>([1,1])];
+                int32 gr = const()[name=string("gr"), val=int32(1)];
+                tensor<fp16, [\(dim),\(dim),1,1]> W = const()[name=string("W"), val=tensor<fp16, [\(dim),\(dim),1,1]>(BLOBFILE(path=string("@model_path/weights/w.bin"), offset=uint64(64)))];
+                tensor<fp16, [1,\(dim),1,\(lane)]> out = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=W,x=x)[name=string("out")];
+            } -> (out);
+        }
+        """
+        let wBlob = buildFP16Blob(elementCount: dim * dim)
+        do {
+            let kernel = try ANEKernel(
+                milText: minimalMil,
+                weights: [(path: "@model_path/weights/w.bin", data: wBlob)],
+                inputSizes: [dim * lane * 2],
+                outputSizes: [dim * lane * 2],
+                checkBudget: false
+            )
+            try kernel.eval()
+            print("minimal_conv_probe: SUCCESS")
+        } catch {
+            print("minimal_conv_probe: FAILED \(error)")
+        }
+
+        // Test each group count
+        let groupCounts = [1, 4, 8, 16, 64, 768]
+
+        for groups in groupCounts {
+            guard dim % groups == 0 else { continue }
+            let chPerGroup = dim / groups
+
+            // Build single-layer RWKV MIL with grouped convs
+            let mil = """
+            program(1.3)
+            [buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, {"coremlc-version", "3505.4.1"}, {"coremltools-component-milinternal", ""}, {"coremltools-version", "9.0"}})]
+            {
+                func main<ios18>(tensor<fp16, [1, \(dim), 1, \(lane)]> x, tensor<fp16, [1, \(dim), 1, \(lane)]> stateIn) {
+                    tensor<int32, [1]> raxCh = const()[name=string("rax_ch"), val=tensor<int32, [1]>([1])];
+                    bool kd = const()[name=string("kd"), val=bool(true)];
+                    fp16 invd = const()[name=string("invd"), val=fp16(0.0013)];
+                    fp16 eps = const()[name=string("eps"), val=fp16(0.00001)];
+                    fp16 nhalf = const()[name=string("nhalf"), val=fp16(-0.5)];
+                    string pt = const()[name=string("pt"), val=string("valid")];
+                    tensor<int32, [2]> st = const()[name=string("st"), val=tensor<int32, [2]>([1,1])];
+                    tensor<int32, [4]> pd = const()[name=string("pd"), val=tensor<int32, [4]>([0,0,0,0])];
+                    tensor<int32, [2]> dl = const()[name=string("dl"), val=tensor<int32, [2]>([1,1])];
+                    int32 gr = const()[name=string("gr"), val=int32(\(groups))];
+
+                    tensor<fp16, [1,\(dim),1,\(lane)]> sq = mul(x=x,y=x)[name=string("sq")];
+                    tensor<fp16, [1,1,1,\(lane)]> ss = reduce_sum(x=sq,axes=raxCh,keep_dims=kd)[name=string("ss")];
+                    tensor<fp16, [1,1,1,\(lane)]> ss2 = mul(x=ss,y=invd)[name=string("ss2")];
+                    tensor<fp16, [1,1,1,\(lane)]> ss3 = add(x=ss2,y=eps)[name=string("ss3")];
+                    tensor<fp16, [1,1,1,\(lane)]> rrms = pow(x=ss3,y=nhalf)[name=string("rrms")];
+                    tensor<fp16, [1,\(dim),1,\(lane)]> xr = mul(x=x,y=rrms)[name=string("xr")];
+                    tensor<fp16, [1,\(dim),1,1]> rw = const()[name=string("rw"), val=tensor<fp16, [1,\(dim),1,1]>(BLOBFILE(path=string("@model_path/weights/rms.bin"), offset=uint64(64)))];
+                    tensor<fp16, [1,\(dim),1,\(lane)]> xn = mul(x=xr,y=rw)[name=string("xn")];
+
+                    tensor<fp16, [\(dim),\(chPerGroup),1,1]> Wx = const()[name=string("Wx"), val=tensor<fp16, [\(dim),\(chPerGroup),1,1]>(BLOBFILE(path=string("@model_path/weights/wx.bin"), offset=uint64(64)))];
+                    tensor<fp16, [\(dim),\(chPerGroup),1,1]> Ws = const()[name=string("Ws"), val=tensor<fp16, [\(dim),\(chPerGroup),1,1]>(BLOBFILE(path=string("@model_path/weights/ws.bin"), offset=uint64(64)))];
+                    tensor<fp16, [\(dim),\(chPerGroup),1,1]> Wd = const()[name=string("Wd"), val=tensor<fp16, [\(dim),\(chPerGroup),1,1]>(BLOBFILE(path=string("@model_path/weights/wd.bin"), offset=uint64(64)))];
+                    tensor<fp16, [\(dim),\(chPerGroup),1,1]> Wo = const()[name=string("Wo"), val=tensor<fp16, [\(dim),\(chPerGroup),1,1]>(BLOBFILE(path=string("@model_path/weights/wo.bin"), offset=uint64(64)))];
+
+                    tensor<fp16, [1,\(dim),1,\(lane)]> xMix = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Wx,x=xn)[name=string("x_mix")];
+                    tensor<fp16, [1,\(dim),1,\(lane)]> sMix = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Ws,x=stateIn)[name=string("s_mix")];
+                    tensor<fp16, [1,\(dim),1,\(lane)]> carry = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Wd,x=stateIn)[name=string("carry")];
+                    tensor<fp16, [1,\(dim),1,\(lane)]> mixPre = add(x=xMix,y=sMix)[name=string("mix_pre")];
+                    tensor<fp16, [1,\(dim),1,\(lane)]> gate = sigmoid(x=mixPre)[name=string("gate")];
+                    tensor<fp16, [1,\(dim),1,\(lane)]> gatedCarry = mul(x=carry,y=gate)[name=string("gated_carry")];
+                    tensor<fp16, [1,\(dim),1,\(lane)]> stateOut = add(x=xMix,y=gatedCarry)[name=string("state_out")];
+                    tensor<fp16, [1,\(dim),1,\(lane)]> proj = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Wo,x=stateOut)[name=string("proj")];
+                    tensor<fp16, [1,\(dim),1,\(lane)]> xNext = add(x=x,y=proj)[name=string("x_next")];
+                } -> (xNext, stateOut);
+            }
+            """
+
+            let convWeightSize = dim * chPerGroup
+            let rmsBlob = buildFP16Blob(elementCount: dim)
+            let convBlob = buildFP16Blob(elementCount: convWeightSize)
+            let inputBytes = dim * lane * 2
+
+            do {
+                let kernel = try ANEKernel(
+                    milText: mil,
+                    weights: [
+                        (path: "@model_path/weights/rms.bin", data: rmsBlob),
+                        (path: "@model_path/weights/wx.bin", data: convBlob),
+                        (path: "@model_path/weights/ws.bin", data: convBlob),
+                        (path: "@model_path/weights/wd.bin", data: convBlob),
+                        (path: "@model_path/weights/wo.bin", data: convBlob)
+                    ],
+                    inputSizes: [inputBytes, inputBytes],
+                    outputSizes: [inputBytes, inputBytes],
+                    checkBudget: false
+                )
+
+                // Warmup
+                for _ in 0..<warmup { try kernel.eval() }
+
+                // Timed
+                var evalUs: [Double] = []
+                evalUs.reserveCapacity(iterations)
+                for _ in 0..<iterations {
+                    let start = GenerationClock.now()
+                    try kernel.eval()
+                    let elapsed = machMicroseconds(GenerationClock.now() - start)
+                    evalUs.append(elapsed)
+                }
+                evalUs.sort()
+                let median = evalUs[evalUs.count / 2]
+                let weightMB = Double(dim * chPerGroup * 4 * 2 + dim * 2) / (1024.0 * 1024.0)
+                print("grouped_conv_probe groups=\(groups) chPerGroup=\(chPerGroup) eval_median_us=\(median) weight_MB=\(String(format: "%.2f", weightMB))")
+            } catch {
+                print("grouped_conv_probe groups=\(groups) chPerGroup=\(chPerGroup) FAILED: \(error)")
+            }
+        }
+    }
+
+    // MARK: - 3-layer fused grouped conv probe
+
+    func test_grouped_conv_3layer_fused_probe_on_hardware() throws {
+        try requireGenerationHardware()
+
+        let dim = ModelConfig.dim  // 768
+        let lane = 512
+        let warmup = 5
+        let iterations = 30
+
+        func buildFP16Blob3L(elementCount: Int) -> Data {
+            let payloadBytes = elementCount * 2
+            var data = Data(count: 128 + payloadBytes)
+            data.withUnsafeMutableBytes { raw in
+                let base = raw.baseAddress!.assumingMemoryBound(to: UInt8.self)
+                base[0] = 1; base[4] = 2
+                base[64] = 0xEF; base[65] = 0xBE; base[66] = 0xAD; base[67] = 0xDE; base[68] = 1
+                raw.storeBytes(of: UInt32(payloadBytes).littleEndian, toByteOffset: 72, as: UInt32.self)
+                raw.storeBytes(of: UInt32(128).littleEndian, toByteOffset: 80, as: UInt32.self)
+                let payload = raw.baseAddress!.advanced(by: 128).assumingMemoryBound(to: UInt16.self)
+                for i in 0..<elementCount { payload[i] = Float16(Float(i % 256) * 0.001).bitPattern }
+            }
+            return data
+        }
+
+        func buildFused3LayerMIL(groups: Int) -> String {
+            let chPerGroup = dim / groups
+            var mil = """
+            program(1.3)
+            [buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, {"coremlc-version", "3505.4.1"}, {"coremltools-component-milinternal", ""}, {"coremltools-version", "9.0"}})]
+            {
+                func main<ios18>(tensor<fp16, [1, \(dim), 1, \(lane)]> x, tensor<fp16, [1, \(dim), 1, \(lane)]> stateIn0, tensor<fp16, [1, \(dim), 1, \(lane)]> stateIn1, tensor<fp16, [1, \(dim), 1, \(lane)]> stateIn2) {
+                    tensor<int32, [1]> raxCh = const()[name=string("rax_ch"), val=tensor<int32, [1]>([1])];
+                    bool kd = const()[name=string("kd"), val=bool(true)];
+                    fp16 invd = const()[name=string("invd"), val=fp16(0.0013)];
+                    fp16 eps = const()[name=string("eps"), val=fp16(0.00001)];
+                    fp16 nhalf = const()[name=string("nhalf"), val=fp16(-0.5)];
+                    string pt = const()[name=string("pt"), val=string("valid")];
+                    tensor<int32, [2]> st = const()[name=string("st"), val=tensor<int32, [2]>([1,1])];
+                    tensor<int32, [4]> pd = const()[name=string("pd"), val=tensor<int32, [4]>([0,0,0,0])];
+                    tensor<int32, [2]> dl = const()[name=string("dl"), val=tensor<int32, [2]>([1,1])];
+                    int32 gr = const()[name=string("gr"), val=int32(\(groups))];
+
+            """
+            for i in 0..<3 {
+                let p = "l\(i)_"
+                let xIn = i == 0 ? "x" : "l\(i-1)_xNext"
+                let xOut = i == 2 ? "xNext" : "l\(i)_xNext"
+                let sIn = "stateIn\(i)"
+                let sOut = "stateOut\(i)"
+                mil += """
+                        tensor<fp16, [1,\(dim),1,\(lane)]> \(p)sq = mul(x=\(xIn),y=\(xIn))[name=string("\(p)sq")];
+                        tensor<fp16, [1,1,1,\(lane)]> \(p)ss = reduce_sum(x=\(p)sq,axes=raxCh,keep_dims=kd)[name=string("\(p)ss")];
+                        tensor<fp16, [1,1,1,\(lane)]> \(p)ss2 = mul(x=\(p)ss,y=invd)[name=string("\(p)ss2")];
+                        tensor<fp16, [1,1,1,\(lane)]> \(p)ss3 = add(x=\(p)ss2,y=eps)[name=string("\(p)ss3")];
+                        tensor<fp16, [1,1,1,\(lane)]> \(p)rrms = pow(x=\(p)ss3,y=nhalf)[name=string("\(p)rrms")];
+                        tensor<fp16, [1,\(dim),1,\(lane)]> \(p)xr = mul(x=\(xIn),y=\(p)rrms)[name=string("\(p)xr")];
+                        tensor<fp16, [1,\(dim),1,1]> \(p)rw = const()[name=string("\(p)rw"), val=tensor<fp16, [1,\(dim),1,1]>(BLOBFILE(path=string("@model_path/weights/rms\(i).bin"), offset=uint64(64)))];
+                        tensor<fp16, [1,\(dim),1,\(lane)]> \(p)xn = mul(x=\(p)xr,y=\(p)rw)[name=string("\(p)xn")];
+                        tensor<fp16, [\(dim),\(chPerGroup),1,1]> \(p)Wx = const()[name=string("\(p)Wx"), val=tensor<fp16, [\(dim),\(chPerGroup),1,1]>(BLOBFILE(path=string("@model_path/weights/wx\(i).bin"), offset=uint64(64)))];
+                        tensor<fp16, [\(dim),\(chPerGroup),1,1]> \(p)Ws = const()[name=string("\(p)Ws"), val=tensor<fp16, [\(dim),\(chPerGroup),1,1]>(BLOBFILE(path=string("@model_path/weights/ws\(i).bin"), offset=uint64(64)))];
+                        tensor<fp16, [\(dim),\(chPerGroup),1,1]> \(p)Wd = const()[name=string("\(p)Wd"), val=tensor<fp16, [\(dim),\(chPerGroup),1,1]>(BLOBFILE(path=string("@model_path/weights/wd\(i).bin"), offset=uint64(64)))];
+                        tensor<fp16, [\(dim),\(chPerGroup),1,1]> \(p)Wo = const()[name=string("\(p)Wo"), val=tensor<fp16, [\(dim),\(chPerGroup),1,1]>(BLOBFILE(path=string("@model_path/weights/wo\(i).bin"), offset=uint64(64)))];
+                        tensor<fp16, [1,\(dim),1,\(lane)]> \(p)xMix = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=\(p)Wx,x=\(p)xn)[name=string("\(p)x_mix")];
+                        tensor<fp16, [1,\(dim),1,\(lane)]> \(p)sMix = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=\(p)Ws,x=\(sIn))[name=string("\(p)s_mix")];
+                        tensor<fp16, [1,\(dim),1,\(lane)]> \(p)carry = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=\(p)Wd,x=\(sIn))[name=string("\(p)carry")];
+                        tensor<fp16, [1,\(dim),1,\(lane)]> \(p)mixPre = add(x=\(p)xMix,y=\(p)sMix)[name=string("\(p)mix_pre")];
+                        tensor<fp16, [1,\(dim),1,\(lane)]> \(p)gate = sigmoid(x=\(p)mixPre)[name=string("\(p)gate")];
+                        tensor<fp16, [1,\(dim),1,\(lane)]> \(p)gatedCarry = mul(x=\(p)carry,y=\(p)gate)[name=string("\(p)gated_carry")];
+                        tensor<fp16, [1,\(dim),1,\(lane)]> \(sOut) = add(x=\(p)xMix,y=\(p)gatedCarry)[name=string("\(p)state_out")];
+                        tensor<fp16, [1,\(dim),1,\(lane)]> \(p)proj = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=\(p)Wo,x=\(sOut))[name=string("\(p)proj")];
+                        tensor<fp16, [1,\(dim),1,\(lane)]> \(xOut) = add(x=\(xIn),y=\(p)proj)[name=string("\(p)x_next")];
+
+                """
+            }
+            mil += """
+                } -> (xNext,stateOut0,stateOut1,stateOut2);
+            }
+            """
+            return mil
+        }
+
+        let groupCounts = [1, 16, 64]
+        let inputBytes = dim * lane * 2
+
+        for groups in groupCounts {
+            let chPerGroup = dim / groups
+            let convWeightSize = dim * chPerGroup
+            let rmsBlob = buildFP16Blob3L(elementCount: dim)
+            let convBlob = buildFP16Blob3L(elementCount: convWeightSize)
+
+            var weightPairs: [(path: String, data: Data)] = []
+            for i in 0..<3 {
+                weightPairs.append(("@model_path/weights/rms\(i).bin", rmsBlob))
+                weightPairs.append(("@model_path/weights/wx\(i).bin", convBlob))
+                weightPairs.append(("@model_path/weights/ws\(i).bin", convBlob))
+                weightPairs.append(("@model_path/weights/wd\(i).bin", convBlob))
+                weightPairs.append(("@model_path/weights/wo\(i).bin", convBlob))
+            }
+
+            let mil = buildFused3LayerMIL(groups: groups)
+
+            do {
+                let kernel = try ANEKernel(
+                    milText: mil,
+                    weights: weightPairs,
+                    inputSizes: [inputBytes, inputBytes, inputBytes, inputBytes],
+                    outputSizes: [inputBytes, inputBytes, inputBytes, inputBytes],
+                    checkBudget: false
+                )
+
+                for _ in 0..<warmup { try kernel.eval() }
+
+                var evalUs: [Double] = []
+                evalUs.reserveCapacity(iterations)
+                for _ in 0..<iterations {
+                    let start = GenerationClock.now()
+                    try kernel.eval()
+                    let elapsed = machMicroseconds(GenerationClock.now() - start)
+                    evalUs.append(elapsed)
+                }
+                evalUs.sort()
+                let median = evalUs[evalUs.count / 2]
+                let weightMB = Double(3 * (dim * chPerGroup * 4 * 2 + dim * 2)) / (1024.0 * 1024.0)
+                print("fused_3l_grouped groups=\(groups) chPerGroup=\(chPerGroup) eval_median_us=\(median) weight_MB=\(String(format: "%.2f", weightMB))")
+            } catch {
+                print("fused_3l_grouped groups=\(groups) chPerGroup=\(chPerGroup) FAILED: \(error)")
+            }
+        }
+    }
+
+    func test_metal_argmax_probe_on_hardware() throws {
+        try requireGenerationHardware()
+
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            print("METAL: No GPU device available")
+            return
+        }
+        guard let queue = device.makeCommandQueue() else {
+            print("METAL: No command queue")
+            return
+        }
+
+        // Metal compute shader for per-lane argmax over channels
+        // Each thread handles one spatial lane. Iterates over all channels.
+        let shaderSource = """
+        #include <metal_stdlib>
+        using namespace metal;
+
+        kernel void argmax_channels(
+            device const half *data [[buffer(0)]],
+            device int *outIndices [[buffer(1)]],
+            device half *outValues [[buffer(2)]],
+            constant uint &channels [[buffer(3)]],
+            constant uint &spatial [[buffer(4)]],
+            uint lane [[thread_position_in_grid]]
+        ) {
+            if (lane >= spatial) return;
+            half bestVal = data[lane]; // channel 0
+            int bestIdx = 0;
+            for (uint c = 1; c < channels; c++) {
+                half val = data[c * spatial + lane];
+                if (val > bestVal) {
+                    bestVal = val;
+                    bestIdx = int(c);
+                }
+            }
+            outIndices[lane] = bestIdx;
+            outValues[lane] = bestVal;
+        }
+        """
+
+        let library: MTLLibrary
+        do {
+            library = try device.makeLibrary(source: shaderSource, options: nil)
+        } catch {
+            print("METAL: Shader compile failed: \(error)")
+            return
+        }
+        guard let function = library.makeFunction(name: "argmax_channels"),
+              let pso = try? device.makeComputePipelineState(function: function) else {
+            print("METAL: Pipeline state failed")
+            return
+        }
+
+        let laneSpatial = 256
+        let channels = 32000  // ModelConfig.vocab
+        let dim = ModelConfig.dim
+
+        // Create a factored head kernel to get a real output surface
+        let weights = makeEchoRecurrentGenerationWeights(layerCount: 6)
+        let factoredHead = try FactoredGenerationRMSNormClassifierKernelSet(
+            rmsFinal: weights.rmsFinal,
+            classifierProjection: TensorBuffer(count: 128 * dim, zeroed: true),
+            classifierExpansion: TensorBuffer(count: channels * 128, zeroed: true),
+            vocabSize: channels,
+            bottleneck: 128,
+            laneSpatial: laneSpatial
+        )
+        let headOut = try factoredHead.rmsNormClassifier.outputSurface(at: 0)
+
+        // Eval once to populate the output surface
+        try factoredHead.rmsNormClassifier.eval()
+
+        // Create Metal buffer from IOSurface base address (unified memory, zero-copy)
+        let surfaceSize = IOSurfaceGetAllocSize(headOut)
+        IOSurfaceLock(headOut, .readOnly, nil)
+        let baseAddr = IOSurfaceGetBaseAddress(headOut)
+        let metalBuf = device.makeBuffer(bytesNoCopy: baseAddr, length: surfaceSize, options: .storageModeShared, deallocator: nil)!
+        IOSurfaceUnlock(headOut, .readOnly, nil)
+
+        // Output buffers
+        let indexBuf = device.makeBuffer(length: laneSpatial * MemoryLayout<Int32>.size, options: .storageModeShared)!
+        let valueBuf = device.makeBuffer(length: laneSpatial * MemoryLayout<UInt16>.size, options: .storageModeShared)!
+        var channelsVal = UInt32(channels)
+        var spatialVal = UInt32(laneSpatial)
+
+        // Warmup
+        for _ in 0..<5 {
+            let cb = queue.makeCommandBuffer()!
+            let enc = cb.makeComputeCommandEncoder()!
+            enc.setComputePipelineState(pso)
+            enc.setBuffer(metalBuf, offset: 0, index: 0)
+            enc.setBuffer(indexBuf, offset: 0, index: 1)
+            enc.setBuffer(valueBuf, offset: 0, index: 2)
+            enc.setBytes(&channelsVal, length: 4, index: 3)
+            enc.setBytes(&spatialVal, length: 4, index: 4)
+            enc.dispatchThreads(MTLSize(width: laneSpatial, height: 1, depth: 1),
+                               threadsPerThreadgroup: MTLSize(width: min(laneSpatial, pso.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+            enc.endEncoding()
+            cb.commit()
+            cb.waitUntilCompleted()
+        }
+
+        // Benchmark Metal argmax
+        var metalTimesUs: [Double] = []
+        for _ in 0..<50 {
+            IOSurfaceLock(headOut, .readOnly, nil)
+            let t = GenerationClock.now()
+
+            let cb = queue.makeCommandBuffer()!
+            let enc = cb.makeComputeCommandEncoder()!
+            enc.setComputePipelineState(pso)
+            enc.setBuffer(metalBuf, offset: 0, index: 0)
+            enc.setBuffer(indexBuf, offset: 0, index: 1)
+            enc.setBuffer(valueBuf, offset: 0, index: 2)
+            enc.setBytes(&channelsVal, length: 4, index: 3)
+            enc.setBytes(&spatialVal, length: 4, index: 4)
+            enc.dispatchThreads(MTLSize(width: laneSpatial, height: 1, depth: 1),
+                               threadsPerThreadgroup: MTLSize(width: min(laneSpatial, pso.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+            enc.endEncoding()
+            cb.commit()
+            cb.waitUntilCompleted()
+
+            metalTimesUs.append(machMicroseconds(GenerationClock.now() - t))
+            IOSurfaceUnlock(headOut, .readOnly, nil)
+        }
+
+        // Benchmark NEON argmax for comparison
+        var neonTimesUs: [Double] = []
+        for _ in 0..<50 {
+            let t = GenerationClock.now()
+            let _ = try SurfaceIO.argmaxBatchFP16Spatial(
+                from: headOut, channelOffset: 0, spatial: laneSpatial,
+                channels: channels, streamCount: laneSpatial
+            )
+            neonTimesUs.append(machMicroseconds(GenerationClock.now() - t))
+        }
+
+        metalTimesUs.sort()
+        neonTimesUs.sort()
+        let metalMedian = metalTimesUs[25]
+        let neonMedian = neonTimesUs[25]
+
+        print("Metal argmax: median=\(String(format: "%.1f", metalMedian))µs (32K ch × 256 lanes)")
+        print("NEON argmax:  median=\(String(format: "%.1f", neonMedian))µs")
+        print("Speedup: \(String(format: "%.2f", neonMedian / metalMedian))x")
+
+        // Verify correctness
+        let metalIndices = indexBuf.contents().bindMemory(to: Int32.self, capacity: laneSpatial)
+        let neonResults = try SurfaceIO.argmaxBatchFP16Spatial(
+            from: headOut, channelOffset: 0, spatial: laneSpatial,
+            channels: channels, streamCount: laneSpatial
+        )
+        var correct = true
+        for i in 0..<laneSpatial {
+            if metalIndices[i] != Int32(neonResults[i].index) {
+                print("MISMATCH at lane \(i): metal=\(metalIndices[i]) neon=\(neonResults[i].index)")
+                correct = false
+                break
+            }
+        }
+        print("Correctness: \(correct ? "MATCH" : "MISMATCH")")
+    }
+
+    func test_batched_step_component_timing_256_on_hardware() throws {
+        try requireGenerationHardware()
+
+        let layerCount = 6
+        let streamCount = 256
+        let dim = ModelConfig.dim
+        let laneSpatial = 256
+        let iterations = 50
+
+        let weights = makeEchoRecurrentGenerationWeights(layerCount: layerCount)
+        let tripletCount = layerCount / 3
+
+        var tripletSessions = try LayerStorage<RWKVStyleFusedThreeLayerSession>(
+            count: tripletCount,
+            throwingInitializer: { tripletIdx in
+                let base = tripletIdx * 3
+                return try RWKVStyleFusedThreeLayerSession(
+                    weights0: weights.layers[base],
+                    weights1: weights.layers[base + 1],
+                    weights2: weights.layers[base + 2],
+                    laneSpatial: laneSpatial
+                )
+            }
+        )
+
+        let factoredHead = try FactoredGenerationRMSNormClassifierKernelSet(
+            rmsFinal: weights.rmsFinal,
+            classifierProjection: TensorBuffer(count: 128 * ModelConfig.dim, zeroed: true),
+            classifierExpansion: TensorBuffer(count: weights.vocabSize * 128, zeroed: true),
+            vocabSize: weights.vocabSize,
+            bottleneck: 128,
+            laneSpatial: laneSpatial
+        )
+
+        let t0xIn = tripletSessions[0].handles.xIn
+        let t0xOut = tripletSessions[0].handles.xOut
+        let t0sIn0 = tripletSessions[0].handles.stateIn0
+        let t0sIn1 = tripletSessions[0].handles.stateIn1
+        let t0sIn2 = tripletSessions[0].handles.stateIn2
+        let t0sOut0 = tripletSessions[0].handles.stateOut0
+        let t0sOut1 = tripletSessions[0].handles.stateOut1
+        let t0sOut2 = tripletSessions[0].handles.stateOut2
+        let t1xIn = tripletSessions[1].handles.xIn
+        let t1xOut = tripletSessions[1].handles.xOut
+        let t1sIn0 = tripletSessions[1].handles.stateIn0
+        let t1sIn1 = tripletSessions[1].handles.stateIn1
+        let t1sIn2 = tripletSessions[1].handles.stateIn2
+        let t1sOut0 = tripletSessions[1].handles.stateOut0
+        let t1sOut1 = tripletSessions[1].handles.stateOut1
+        let t1sOut2 = tripletSessions[1].handles.stateOut2
+        let headIn = try factoredHead.rmsNormClassifier.inputSurface(at: 0)
+        let headOut = try factoredHead.rmsNormClassifier.outputSurface(at: 0)
+        let vocabSize = weights.vocabSize
+
+        var tokens = Array(repeating: UInt16(0), count: streamCount)
+
+        // Warmup
+        for _ in 0..<3 {
+            try batchedTokenStepWithEval(
+                tokens: &tokens, streamCount: streamCount,
+                embedding: weights.embedding, dim: dim, laneSpatial: laneSpatial,
+                tripletCount: tripletCount, tripletSessions: &tripletSessions,
+                t0xIn: t0xIn, t0xOut: t0xOut,
+                t0sIn0: t0sIn0, t0sIn1: t0sIn1, t0sIn2: t0sIn2,
+                t0sOut0: t0sOut0, t0sOut1: t0sOut1, t0sOut2: t0sOut2,
+                t1xIn: t1xIn, t1xOut: t1xOut,
+                t1sIn0: t1sIn0, t1sIn1: t1sIn1, t1sIn2: t1sIn2,
+                t1sOut0: t1sOut0, t1sOut1: t1sOut1, t1sOut2: t1sOut2,
+                headIn: headIn, headOut: headOut,
+                headEval: { try factoredHead.rmsNormClassifier.eval() },
+                vocabSize: vocabSize
+            )
+        }
+
+        var embedUs: [Double] = []
+        var evalT0Us: [Double] = []
+        var stateT0Us: [Double] = []
+        var xferUs: [Double] = []
+        var evalT1Us: [Double] = []
+        var stateT1Us: [Double] = []
+        var headCopyUs: [Double] = []
+        var evalHeadUs: [Double] = []
+        var argmaxUs: [Double] = []
+
+        for _ in 0..<iterations {
+            var t = GenerationClock.now()
+
+            try weights.embedding.withUnsafePointer { embPtr in
+                try tokens.withUnsafeBufferPointer { tokenBuf in
+                    try SurfaceIO.writeEmbeddingBatchFP16(
+                        to: t0xIn, channelOffset: 0, spatial: laneSpatial,
+                        embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
+                        tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount
+                    )
+                }
+            }
+            var t2 = GenerationClock.now(); embedUs.append(machMicroseconds(t2 - t)); t = t2
+
+            try tripletSessions[0].kernels.step.eval()
+            t2 = GenerationClock.now(); evalT0Us.append(machMicroseconds(t2 - t)); t = t2
+
+            try SurfaceIO.copyFP16(dst: t0sIn0, dstChannelOffset: 0, src: t0sOut0, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+            try SurfaceIO.copyFP16(dst: t0sIn1, dstChannelOffset: 0, src: t0sOut1, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+            try SurfaceIO.copyFP16(dst: t0sIn2, dstChannelOffset: 0, src: t0sOut2, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+            t2 = GenerationClock.now(); stateT0Us.append(machMicroseconds(t2 - t)); t = t2
+
+            try SurfaceIO.copyFP16(dst: t1xIn, dstChannelOffset: 0, src: t0xOut, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+            t2 = GenerationClock.now(); xferUs.append(machMicroseconds(t2 - t)); t = t2
+
+            try tripletSessions[1].kernels.step.eval()
+            t2 = GenerationClock.now(); evalT1Us.append(machMicroseconds(t2 - t)); t = t2
+
+            try SurfaceIO.copyFP16(dst: t1sIn0, dstChannelOffset: 0, src: t1sOut0, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+            try SurfaceIO.copyFP16(dst: t1sIn1, dstChannelOffset: 0, src: t1sOut1, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+            try SurfaceIO.copyFP16(dst: t1sIn2, dstChannelOffset: 0, src: t1sOut2, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+            t2 = GenerationClock.now(); stateT1Us.append(machMicroseconds(t2 - t)); t = t2
+
+            try SurfaceIO.copyFP16(dst: headIn, dstChannelOffset: 0, src: t1xOut, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+            t2 = GenerationClock.now(); headCopyUs.append(machMicroseconds(t2 - t)); t = t2
+
+            try factoredHead.rmsNormClassifier.eval()
+            t2 = GenerationClock.now(); evalHeadUs.append(machMicroseconds(t2 - t)); t = t2
+
+            let argmaxResults = try SurfaceIO.argmaxBatchFP16SpatialParallel(
+                from: headOut, channelOffset: 0, spatial: laneSpatial,
+                channels: vocabSize, streamCount: streamCount, nBlocks: 8
+            )
+            for i in 0..<streamCount { tokens[i] = UInt16(argmaxResults[i].index) }
+            t2 = GenerationClock.now(); argmaxUs.append(machMicroseconds(t2 - t))
+        }
+
+        func median(_ arr: [Double]) -> Double {
+            let sorted = arr.sorted()
+            let n = sorted.count
+            return n % 2 == 0 ? (sorted[n/2 - 1] + sorted[n/2]) / 2.0 : sorted[n/2]
+        }
+
+        let totalUs = median(embedUs) + median(evalT0Us) + median(stateT0Us) + median(xferUs) +
+            median(evalT1Us) + median(stateT1Us) + median(headCopyUs) + median(evalHeadUs) + median(argmaxUs)
+
+        print("Component timing (median µs, \(streamCount) streams @ lane=\(laneSpatial), \(iterations) iterations):")
+        print("  embed_write: \(String(format: "%.1f", median(embedUs))) µs (\(String(format: "%.1f", median(embedUs) / totalUs * 100))%)")
+        print("  eval_T0:     \(String(format: "%.1f", median(evalT0Us))) µs (\(String(format: "%.1f", median(evalT0Us) / totalUs * 100))%)")
+        print("  state_T0:    \(String(format: "%.1f", median(stateT0Us))) µs (\(String(format: "%.1f", median(stateT0Us) / totalUs * 100))%)")
+        print("  xfer_T0T1:   \(String(format: "%.1f", median(xferUs))) µs (\(String(format: "%.1f", median(xferUs) / totalUs * 100))%)")
+        print("  eval_T1:     \(String(format: "%.1f", median(evalT1Us))) µs (\(String(format: "%.1f", median(evalT1Us) / totalUs * 100))%)")
+        print("  state_T1:    \(String(format: "%.1f", median(stateT1Us))) µs (\(String(format: "%.1f", median(stateT1Us) / totalUs * 100))%)")
+        print("  head_copy:   \(String(format: "%.1f", median(headCopyUs))) µs (\(String(format: "%.1f", median(headCopyUs) / totalUs * 100))%)")
+        print("  eval_head:   \(String(format: "%.1f", median(evalHeadUs))) µs (\(String(format: "%.1f", median(evalHeadUs) / totalUs * 100))%)")
+        print("  argmax:      \(String(format: "%.1f", median(argmaxUs))) µs (\(String(format: "%.1f", median(argmaxUs) / totalUs * 100))%)")
+        print("  TOTAL:       \(String(format: "%.1f", totalUs)) µs")
+        print("  implied_tps: \(String(format: "%.1f", Double(streamCount) / (totalUs / 1_000_000.0)))")
+    }
+
+    func test_batched_step_component_timing_512_on_hardware() throws {
+        try requireGenerationHardware()
+
+        let layerCount = 6
+        let streamCount = 512
+        let dim = ModelConfig.dim
+        let laneSpatial = 512
+        let iterations = 50
+
+        let weights = makeEchoRecurrentGenerationWeights(layerCount: layerCount)
+        let tripletCount = layerCount / 3
+
+        var tripletSessions = try LayerStorage<RWKVStyleFusedThreeLayerSession>(
+            count: tripletCount,
+            throwingInitializer: { tripletIdx in
+                let base = tripletIdx * 3
+                return try RWKVStyleFusedThreeLayerSession(
+                    weights0: weights.layers[base],
+                    weights1: weights.layers[base + 1],
+                    weights2: weights.layers[base + 2],
+                    laneSpatial: laneSpatial
+                )
+            }
+        )
+
+        let factoredHead = try FactoredGenerationRMSNormClassifierKernelSet(
+            rmsFinal: weights.rmsFinal,
+            classifierProjection: TensorBuffer(count: 128 * ModelConfig.dim, zeroed: true),
+            classifierExpansion: TensorBuffer(count: weights.vocabSize * 128, zeroed: true),
+            vocabSize: weights.vocabSize,
+            bottleneck: 128,
+            laneSpatial: laneSpatial
+        )
+
+        let t0xIn = tripletSessions[0].handles.xIn
+        let t0xOut = tripletSessions[0].handles.xOut
+        let t0sIn0 = tripletSessions[0].handles.stateIn0
+        let t0sIn1 = tripletSessions[0].handles.stateIn1
+        let t0sIn2 = tripletSessions[0].handles.stateIn2
+        let t0sOut0 = tripletSessions[0].handles.stateOut0
+        let t0sOut1 = tripletSessions[0].handles.stateOut1
+        let t0sOut2 = tripletSessions[0].handles.stateOut2
+        let t1xIn = tripletSessions[1].handles.xIn
+        let t1xOut = tripletSessions[1].handles.xOut
+        let t1sIn0 = tripletSessions[1].handles.stateIn0
+        let t1sIn1 = tripletSessions[1].handles.stateIn1
+        let t1sIn2 = tripletSessions[1].handles.stateIn2
+        let t1sOut0 = tripletSessions[1].handles.stateOut0
+        let t1sOut1 = tripletSessions[1].handles.stateOut1
+        let t1sOut2 = tripletSessions[1].handles.stateOut2
+        let headIn = try factoredHead.rmsNormClassifier.inputSurface(at: 0)
+        let headOut = try factoredHead.rmsNormClassifier.outputSurface(at: 0)
+        let vocabSize = weights.vocabSize
+
+        var tokens = Array(repeating: UInt16(0), count: streamCount)
+
+        // Warmup
+        for _ in 0..<3 {
+            try batchedTokenStepWithEval(
+                tokens: &tokens, streamCount: streamCount,
+                embedding: weights.embedding, dim: dim, laneSpatial: laneSpatial,
+                tripletCount: tripletCount, tripletSessions: &tripletSessions,
+                t0xIn: t0xIn, t0xOut: t0xOut,
+                t0sIn0: t0sIn0, t0sIn1: t0sIn1, t0sIn2: t0sIn2,
+                t0sOut0: t0sOut0, t0sOut1: t0sOut1, t0sOut2: t0sOut2,
+                t1xIn: t1xIn, t1xOut: t1xOut,
+                t1sIn0: t1sIn0, t1sIn1: t1sIn1, t1sIn2: t1sIn2,
+                t1sOut0: t1sOut0, t1sOut1: t1sOut1, t1sOut2: t1sOut2,
+                headIn: headIn, headOut: headOut,
+                headEval: { try factoredHead.rmsNormClassifier.eval() },
+                vocabSize: vocabSize
+            )
+        }
+
+        var embedUs: [Double] = []
+        var evalT0Us: [Double] = []
+        var stateT0Us: [Double] = []
+        var xferUs: [Double] = []
+        var evalT1Us: [Double] = []
+        var stateT1Us: [Double] = []
+        var headCopyUs: [Double] = []
+        var evalHeadUs: [Double] = []
+        var argmaxUs: [Double] = []
+
+        for _ in 0..<iterations {
+            var t = GenerationClock.now()
+
+            try weights.embedding.withUnsafePointer { embPtr in
+                try tokens.withUnsafeBufferPointer { tokenBuf in
+                    try SurfaceIO.writeEmbeddingBatchFP16(
+                        to: t0xIn, channelOffset: 0, spatial: laneSpatial,
+                        embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
+                        tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount
+                    )
+                }
+            }
+            var t2 = GenerationClock.now(); embedUs.append(machMicroseconds(t2 - t)); t = t2
+
+            try tripletSessions[0].kernels.step.eval()
+            t2 = GenerationClock.now(); evalT0Us.append(machMicroseconds(t2 - t)); t = t2
+
+            try SurfaceIO.copyFP16(dst: t0sIn0, dstChannelOffset: 0, src: t0sOut0, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+            try SurfaceIO.copyFP16(dst: t0sIn1, dstChannelOffset: 0, src: t0sOut1, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+            try SurfaceIO.copyFP16(dst: t0sIn2, dstChannelOffset: 0, src: t0sOut2, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+            t2 = GenerationClock.now(); stateT0Us.append(machMicroseconds(t2 - t)); t = t2
+
+            try SurfaceIO.copyFP16(dst: t1xIn, dstChannelOffset: 0, src: t0xOut, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+            t2 = GenerationClock.now(); xferUs.append(machMicroseconds(t2 - t)); t = t2
+
+            try tripletSessions[1].kernels.step.eval()
+            t2 = GenerationClock.now(); evalT1Us.append(machMicroseconds(t2 - t)); t = t2
+
+            try SurfaceIO.copyFP16(dst: t1sIn0, dstChannelOffset: 0, src: t1sOut0, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+            try SurfaceIO.copyFP16(dst: t1sIn1, dstChannelOffset: 0, src: t1sOut1, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+            try SurfaceIO.copyFP16(dst: t1sIn2, dstChannelOffset: 0, src: t1sOut2, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+            t2 = GenerationClock.now(); stateT1Us.append(machMicroseconds(t2 - t)); t = t2
+
+            try SurfaceIO.copyFP16(dst: headIn, dstChannelOffset: 0, src: t1xOut, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+            t2 = GenerationClock.now(); headCopyUs.append(machMicroseconds(t2 - t)); t = t2
+
+            try factoredHead.rmsNormClassifier.eval()
+            t2 = GenerationClock.now(); evalHeadUs.append(machMicroseconds(t2 - t)); t = t2
+
+            let argmaxResults = try SurfaceIO.argmaxBatchFP16SpatialParallel(
+                from: headOut, channelOffset: 0, spatial: laneSpatial,
+                channels: vocabSize, streamCount: streamCount, nBlocks: 8
+            )
+            for i in 0..<streamCount { tokens[i] = UInt16(argmaxResults[i].index) }
+            t2 = GenerationClock.now(); argmaxUs.append(machMicroseconds(t2 - t))
+        }
+
+        func median(_ arr: [Double]) -> Double {
+            let sorted = arr.sorted()
+            let n = sorted.count
+            return n % 2 == 0 ? (sorted[n/2 - 1] + sorted[n/2]) / 2.0 : sorted[n/2]
+        }
+
+        let totalUs = median(embedUs) + median(evalT0Us) + median(stateT0Us) + median(xferUs) +
+            median(evalT1Us) + median(stateT1Us) + median(headCopyUs) + median(evalHeadUs) + median(argmaxUs)
+
+        print("Component timing (median µs, \(streamCount) streams @ lane=\(laneSpatial), \(iterations) iterations):")
+        print("  embed_write: \(String(format: "%.1f", median(embedUs))) µs (\(String(format: "%.1f", median(embedUs) / totalUs * 100))%)")
+        print("  eval_T0:     \(String(format: "%.1f", median(evalT0Us))) µs (\(String(format: "%.1f", median(evalT0Us) / totalUs * 100))%)")
+        print("  state_T0:    \(String(format: "%.1f", median(stateT0Us))) µs (\(String(format: "%.1f", median(stateT0Us) / totalUs * 100))%)")
+        print("  xfer_T0T1:   \(String(format: "%.1f", median(xferUs))) µs (\(String(format: "%.1f", median(xferUs) / totalUs * 100))%)")
+        print("  eval_T1:     \(String(format: "%.1f", median(evalT1Us))) µs (\(String(format: "%.1f", median(evalT1Us) / totalUs * 100))%)")
+        print("  state_T1:    \(String(format: "%.1f", median(stateT1Us))) µs (\(String(format: "%.1f", median(stateT1Us) / totalUs * 100))%)")
+        print("  head_copy:   \(String(format: "%.1f", median(headCopyUs))) µs (\(String(format: "%.1f", median(headCopyUs) / totalUs * 100))%)")
+        print("  eval_head:   \(String(format: "%.1f", median(evalHeadUs))) µs (\(String(format: "%.1f", median(evalHeadUs) / totalUs * 100))%)")
+        print("  argmax:      \(String(format: "%.1f", median(argmaxUs))) µs (\(String(format: "%.1f", median(argmaxUs) / totalUs * 100))%)")
+        print("  TOTAL:       \(String(format: "%.1f", totalUs)) µs")
+        print("  implied_tps: \(String(format: "%.1f", Double(streamCount) / (totalUs / 1_000_000.0)))")
+    }
+
+    func test_head_k_sweep_512_on_hardware() throws {
+        try requireGenerationHardware()
+
+        let layerCount = 6
+        let streamCount = 512
+        let dim = ModelConfig.dim
+        let laneSpatial = 512
+        let iterations = 30
+
+        let weights = makeEchoRecurrentGenerationWeights(layerCount: layerCount)
+        let vocabSize = weights.vocabSize
+
+        for k in [32, 64, 96, 128, 192, 256] {
+            let factoredHead = try FactoredGenerationRMSNormClassifierKernelSet(
+                rmsFinal: weights.rmsFinal,
+                classifierProjection: TensorBuffer(count: k * dim, zeroed: true),
+                classifierExpansion: TensorBuffer(count: vocabSize * k, zeroed: true),
+                vocabSize: vocabSize,
+                bottleneck: k,
+                laneSpatial: laneSpatial
+            )
+            let headOut = try factoredHead.rmsNormClassifier.outputSurface(at: 0)
+
+            // Warmup
+            for _ in 0..<5 { try factoredHead.rmsNormClassifier.eval() }
+
+            var evalUs: [Double] = []
+            var argmaxUs: [Double] = []
+            for _ in 0..<iterations {
+                var t = GenerationClock.now()
+                try factoredHead.rmsNormClassifier.eval()
+                var t2 = GenerationClock.now()
+                evalUs.append(machMicroseconds(t2 - t))
+
+                t = t2
+                let _ = try SurfaceIO.argmaxBatchFP16SpatialParallel(
+                    from: headOut, channelOffset: 0, spatial: laneSpatial,
+                    channels: vocabSize, streamCount: streamCount, nBlocks: 8
+                )
+                t2 = GenerationClock.now()
+                argmaxUs.append(machMicroseconds(t2 - t))
+            }
+
+            func median(_ arr: [Double]) -> Double {
+                let sorted = arr.sorted()
+                let n = sorted.count
+                return n % 2 == 0 ? (sorted[n/2-1] + sorted[n/2]) / 2.0 : sorted[n/2]
+            }
+
+            let headMs = median(evalUs) / 1000.0
+            let argMs = median(argmaxUs) / 1000.0
+            let projWeightKB = k * dim * 2 / 1024
+            let expandWeightKB = vocabSize * k * 2 / 1024
+            print("k=\(k): head_eval=\(String(format: "%.3f", headMs))ms argmax=\(String(format: "%.3f", argMs))ms total=\(String(format: "%.3f", headMs + argMs))ms proj_w=\(projWeightKB)KB expand_w=\(expandWeightKB)KB")
+        }
+    }
+
+    private func machMicroseconds(_ deltaTicks: UInt64) -> Double {
+        var info = mach_timebase_info_data_t()
+        mach_timebase_info(&info)
+        let nanos = Double(deltaTicks) * Double(info.numer) / Double(info.denom)
+        return nanos / 1_000.0
     }
 
     private func machMilliseconds(_ deltaTicks: UInt64) -> Double {
@@ -2483,6 +6329,3554 @@ final class GenerationHarnessHardwareTests: XCTestCase {
             medianTrunkMsPerToken: median(trunkLatencies),
             medianLogitsMsPerToken: median(logitsLatencies)
         )
+    }
+
+    // MARK: - Double-buffered pipeline probe
+
+    func test_double_buffered_pipeline_on_hardware() throws {
+        try requireGenerationHardware()
+
+        let dim = ModelConfig.dim
+        let layerCount = 6
+        let streamCount = 1024
+        let groups = 8
+        let headGroups = 1
+        let bneck = 64
+        let iters = 60
+        let warmup = 10
+
+        let weights = makeEchoRecurrentGenerationWeights(layerCount: layerCount)
+        let vocabSize = weights.vocabSize
+
+        // Build pipeline A
+        var tripletsA = try LayerStorage<RWKVStyleFusedThreeLayerSession>(
+            count: layerCount / 3,
+            throwingInitializer: { tripletIdx in
+                let base = tripletIdx * 3
+                return try RWKVStyleFusedThreeLayerSession(
+                    weights0: weights.layers[base],
+                    weights1: weights.layers[base + 1],
+                    weights2: weights.layers[base + 2],
+                    laneSpatial: streamCount,
+                    groups: groups
+                )
+            }
+        )
+        let headA = try FactoredGenerationRMSNormClassifierKernelSet(
+            rmsFinal: weights.rmsFinal,
+            classifierProjection: TensorBuffer(count: bneck * dim, zeroed: true),
+            classifierExpansion: TensorBuffer(count: vocabSize * bneck, zeroed: true),
+            vocabSize: vocabSize,
+            bottleneck: bneck,
+            laneSpatial: streamCount,
+            groups: headGroups
+        )
+
+        // Build pipeline B
+        var tripletsB = try LayerStorage<RWKVStyleFusedThreeLayerSession>(
+            count: layerCount / 3,
+            throwingInitializer: { tripletIdx in
+                let base = tripletIdx * 3
+                return try RWKVStyleFusedThreeLayerSession(
+                    weights0: weights.layers[base],
+                    weights1: weights.layers[base + 1],
+                    weights2: weights.layers[base + 2],
+                    laneSpatial: streamCount,
+                    groups: groups
+                )
+            }
+        )
+        let headB = try FactoredGenerationRMSNormClassifierKernelSet(
+            rmsFinal: weights.rmsFinal,
+            classifierProjection: TensorBuffer(count: bneck * dim, zeroed: true),
+            classifierExpansion: TensorBuffer(count: vocabSize * bneck, zeroed: true),
+            vocabSize: vocabSize,
+            bottleneck: bneck,
+            laneSpatial: streamCount,
+            groups: headGroups
+        )
+
+        // Rebind pipeline A
+        for i in 0..<3 {
+            let sOut = try tripletsA[0].kernels.step.outputSurface(at: 1 + i)
+            try tripletsA[0].kernels.step.rebindInput(at: 1 + i, to: sOut)
+        }
+        try tripletsA[1].kernels.step.rebindInput(at: 0, to: tripletsA[0].handles.xOut)
+        for i in 0..<3 {
+            let sOut = try tripletsA[1].kernels.step.outputSurface(at: 1 + i)
+            try tripletsA[1].kernels.step.rebindInput(at: 1 + i, to: sOut)
+        }
+        try headA.rmsNormClassifier.rebindInput(at: 0, to: tripletsA[1].handles.xOut)
+        let headOutA = try headA.rmsNormClassifier.outputSurface(at: 0)
+        let t0xInA = tripletsA[0].handles.xIn
+
+        // Rebind pipeline B
+        for i in 0..<3 {
+            let sOut = try tripletsB[0].kernels.step.outputSurface(at: 1 + i)
+            try tripletsB[0].kernels.step.rebindInput(at: 1 + i, to: sOut)
+        }
+        try tripletsB[1].kernels.step.rebindInput(at: 0, to: tripletsB[0].handles.xOut)
+        for i in 0..<3 {
+            let sOut = try tripletsB[1].kernels.step.outputSurface(at: 1 + i)
+            try tripletsB[1].kernels.step.rebindInput(at: 1 + i, to: sOut)
+        }
+        try headB.rmsNormClassifier.rebindInput(at: 0, to: tripletsB[1].handles.xOut)
+        let headOutB = try headB.rmsNormClassifier.outputSurface(at: 0)
+        let t0xInB = tripletsB[0].handles.xIn
+
+        var tokensA = Array(repeating: UInt16(0), count: streamCount)
+        var tokensB = Array(repeating: UInt16(0), count: streamCount)
+
+        // Helper closures
+        func embWrite(_ tokens: [UInt16], to surface: IOSurfaceRef) throws {
+            try weights.embedding.withUnsafePointer { embPtr in
+                try tokens.withUnsafeBufferPointer { tokenBuf in
+                    try SurfaceIO.writeEmbeddingBatchFP16(
+                        to: surface, channelOffset: 0, spatial: streamCount,
+                        embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
+                        tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount
+                    )
+                }
+            }
+        }
+
+        func aneEval(_ triplets: inout LayerStorage<RWKVStyleFusedThreeLayerSession>,
+                     head: borrowing FactoredGenerationRMSNormClassifierKernelSet) throws {
+            try triplets[0].kernels.step.eval()
+            try triplets[1].kernels.step.eval()
+            try head.rmsNormClassifier.eval()
+        }
+
+        func argmax(from surface: IOSurfaceRef, into tokens: inout [UInt16]) throws {
+            let r = try SurfaceIO.argmaxBatchFP16SpatialParallel(
+                from: surface, channelOffset: 0, spatial: streamCount,
+                channels: vocabSize, streamCount: streamCount, nBlocks: 32
+            )
+            for i in 0..<streamCount { tokens[i] = UInt16(r[i].index) }
+        }
+
+        // === BASELINE: sequential single-pipeline ===
+        print("=== Single pipeline baseline (1024 streams, g=8, head_g=1, bneck=64) ===")
+        // Warmup
+        for _ in 0..<warmup {
+            try embWrite(tokensA, to: t0xInA)
+            try aneEval(&tripletsA, head: headA)
+            try argmax(from: headOutA, into: &tokensA)
+        }
+        var singleUs: [Double] = []
+        for _ in 0..<iters {
+            let s = GenerationClock.now()
+            try embWrite(tokensA, to: t0xInA)
+            try aneEval(&tripletsA, head: headA)
+            try argmax(from: headOutA, into: &tokensA)
+            singleUs.append(machMilliseconds(GenerationClock.now() - s) * 1000)
+        }
+        func median(_ a: [Double]) -> Double { let s = a.sorted(); return s[s.count / 2] }
+        let singleMed = median(singleUs)
+        let singleTPS = Double(streamCount) / singleMed * 1_000_000
+        print("  single: median=\(String(format: "%.0f", singleMed))µs tps=\(String(format: "%.0f", singleTPS))")
+
+        // === DOUBLE-BUFFERED: overlap CPU work with ANE eval ===
+        print("\n=== Double-buffered pipeline (2x1024 streams) ===")
+        tokensA = Array(repeating: UInt16(0), count: streamCount)
+        tokensB = Array(repeating: UInt16(0), count: streamCount)
+
+        // Prime both pipelines
+        try embWrite(tokensA, to: t0xInA)
+        try aneEval(&tripletsA, head: headA)
+        try argmax(from: headOutA, into: &tokensA)
+        try embWrite(tokensB, to: t0xInB)
+        try aneEval(&tripletsB, head: headB)
+        try argmax(from: headOutB, into: &tokensB)
+
+        // Warmup double-buffered
+        let aneQueue = DispatchQueue(label: "ane.eval", qos: .userInteractive)
+        for _ in 0..<warmup {
+            // Step A: eval A on ANE while CPU does argmax+embWrite for B
+            try embWrite(tokensA, to: t0xInA)
+            var aneError: (any Error)?
+            let group = DispatchGroup()
+            group.enter()
+            aneQueue.async { [self] in
+                defer { group.leave() }
+                do {
+                    try tripletsA[0].kernels.step.eval()
+                    try tripletsA[1].kernels.step.eval()
+                    try headA.rmsNormClassifier.eval()
+                } catch { aneError = error }
+            }
+            // CPU side: nothing to overlap yet in warmup
+            group.wait()
+            if let e = aneError { throw e }
+            try argmax(from: headOutA, into: &tokensA)
+
+            // Step B
+            try embWrite(tokensB, to: t0xInB)
+            group.enter()
+            aneQueue.async { [self] in
+                defer { group.leave() }
+                do {
+                    try tripletsB[0].kernels.step.eval()
+                    try tripletsB[1].kernels.step.eval()
+                    try headB.rmsNormClassifier.eval()
+                } catch { aneError = error }
+            }
+            group.wait()
+            if let e = aneError { throw e }
+            try argmax(from: headOutB, into: &tokensB)
+        }
+
+        // Timed double-buffered loop
+        // Each cycle: eval A (ANE) || argmax B + emb A (CPU), then eval B (ANE) || argmax A + emb B (CPU)
+        // Each cycle produces 2 × streamCount tokens
+        var dbUs: [Double] = []
+        for _ in 0..<iters {
+            let s = GenerationClock.now()
+            var aneError: (any Error)?
+
+            // Half 1: eval A on ANE, CPU does argmax(B) + embWrite(A)
+            // But wait — embWrite(A) must happen BEFORE evalA starts!
+            // So sequence: embWrite(A), then launch eval(A) || argmax(B)
+            try embWrite(tokensA, to: t0xInA)
+            let g1 = DispatchGroup()
+            g1.enter()
+            aneQueue.async { [self] in
+                defer { g1.leave() }
+                do {
+                    try tripletsA[0].kernels.step.eval()
+                    try tripletsA[1].kernels.step.eval()
+                    try headA.rmsNormClassifier.eval()
+                } catch { aneError = error }
+            }
+            // Overlap: argmax on B (from previous cycle's result)
+            // Note: argmax B was already done at end of previous cycle, tokens are ready
+            // Actually in steady state, we can overlap embWrite(B) here instead
+            g1.wait()
+            if let e = aneError { throw e }
+            try argmax(from: headOutA, into: &tokensA)
+
+            // Half 2: eval B on ANE, CPU overlaps
+            try embWrite(tokensB, to: t0xInB)
+            let g2 = DispatchGroup()
+            g2.enter()
+            aneQueue.async { [self] in
+                defer { g2.leave() }
+                do {
+                    try tripletsB[0].kernels.step.eval()
+                    try tripletsB[1].kernels.step.eval()
+                    try headB.rmsNormClassifier.eval()
+                } catch { aneError = error }
+            }
+            g2.wait()
+            if let e = aneError { throw e }
+            try argmax(from: headOutB, into: &tokensB)
+
+            dbUs.append(machMilliseconds(GenerationClock.now() - s) * 1000)
+        }
+        let dbMed = median(dbUs)
+        let totalStreamsPerCycle = streamCount * 2
+        let dbTPS = Double(totalStreamsPerCycle) / dbMed * 1_000_000
+        let dbPerHalfUs = dbMed / 2.0
+        let dbPerHalfTPS = Double(streamCount) / dbPerHalfUs * 1_000_000
+        print("  double-buf: median=\(String(format: "%.0f", dbMed))µs (\(String(format: "%.0f", dbPerHalfUs))µs/half)")
+        print("  aggregate TPS: \(String(format: "%.0f", dbTPS)) (\(String(format: "%.0f", dbPerHalfTPS)) per-half effective)")
+        print("  speedup vs single: \(String(format: "%.2f", singleTPS > 0 ? dbTPS / singleTPS : 0))x (aggregate) \(String(format: "%.2f", singleTPS > 0 ? dbPerHalfTPS / singleTPS : 0))x (per-half)")
+
+        // === TRUE OVERLAP: pipeline the CPU work during ANE eval ===
+        print("\n=== Pipelined double-buffer (CPU argmax overlaps ANE eval) ===")
+        tokensA = Array(repeating: UInt16(0), count: streamCount)
+        tokensB = Array(repeating: UInt16(0), count: streamCount)
+
+        // Prime
+        try embWrite(tokensA, to: t0xInA)
+        try aneEval(&tripletsA, head: headA)
+        try embWrite(tokensB, to: t0xInB)
+
+        var pipeUs: [Double] = []
+        for _ in 0..<(warmup + iters) {
+            let s = GenerationClock.now()
+            var aneError: (any Error)?
+
+            // Launch eval B on ANE thread
+            let g = DispatchGroup()
+            g.enter()
+            aneQueue.async { [self] in
+                defer { g.leave() }
+                do {
+                    try tripletsB[0].kernels.step.eval()
+                    try tripletsB[1].kernels.step.eval()
+                    try headB.rmsNormClassifier.eval()
+                } catch { aneError = error }
+            }
+
+            // CPU: argmax A + embWrite A (for next cycle)
+            try argmax(from: headOutA, into: &tokensA)
+            try embWrite(tokensA, to: t0xInA)
+
+            g.wait()
+            if let e = aneError { throw e }
+
+            // Now swap A and B references for next cycle
+            // Since we can't actually swap the kernel sets, we alternate
+            // Launch eval A on ANE thread
+            let g2 = DispatchGroup()
+            g2.enter()
+            aneQueue.async { [self] in
+                defer { g2.leave() }
+                do {
+                    try tripletsA[0].kernels.step.eval()
+                    try tripletsA[1].kernels.step.eval()
+                    try headA.rmsNormClassifier.eval()
+                } catch { aneError = error }
+            }
+
+            // CPU: argmax B + embWrite B
+            try argmax(from: headOutB, into: &tokensB)
+            try embWrite(tokensB, to: t0xInB)
+
+            g2.wait()
+            if let e = aneError { throw e }
+
+            let elapsed = machMilliseconds(GenerationClock.now() - s) * 1000
+            if pipeUs.count >= warmup {
+                // Only count after warmup
+            }
+            pipeUs.append(elapsed)
+        }
+        let pipeTimed = Array(pipeUs.dropFirst(warmup))
+        let pipeMed = median(pipeTimed)
+        let pipeTPS = Double(totalStreamsPerCycle) / pipeMed * 1_000_000
+        let pipePerHalfTPS = Double(streamCount) / (pipeMed / 2.0) * 1_000_000
+        print("  pipelined: median=\(String(format: "%.0f", pipeMed))µs (\(String(format: "%.0f", pipeMed / 2))µs/half)")
+        print("  aggregate TPS: \(String(format: "%.0f", pipeTPS)) (\(String(format: "%.0f", pipePerHalfTPS)) per-half effective)")
+        print("  speedup vs single: \(String(format: "%.2f", singleTPS > 0 ? pipeTPS / singleTPS : 0))x (aggregate) \(String(format: "%.2f", singleTPS > 0 ? pipePerHalfTPS / singleTPS : 0))x (per-half)")
+    }
+
+    // MARK: - Tight-loop pipelined benchmark (pthread vs GCD)
+
+    func test_tight_pipelined_on_hardware() throws {
+        try requireGenerationHardware()
+
+        let dim = ModelConfig.dim
+        let layerCount = 6
+        let streamCount = 1024
+        let groups = 8
+        let headGroups = 1
+        let bneck = 64
+        let iters = 80
+        let warmup = 20
+
+        let weights = makeEchoRecurrentGenerationWeights(layerCount: layerCount)
+        let vocabSize = weights.vocabSize
+
+        // Pipeline A
+        var trA = try LayerStorage<RWKVStyleFusedThreeLayerSession>(
+            count: 2,
+            throwingInitializer: { tripletIdx in
+                let base = tripletIdx * 3
+                return try RWKVStyleFusedThreeLayerSession(
+                    weights0: weights.layers[base], weights1: weights.layers[base + 1],
+                    weights2: weights.layers[base + 2], laneSpatial: streamCount, groups: groups)
+            })
+        let headA = try FactoredGenerationRMSNormClassifierKernelSet(
+            rmsFinal: weights.rmsFinal,
+            classifierProjection: TensorBuffer(count: bneck * dim, zeroed: true),
+            classifierExpansion: TensorBuffer(count: vocabSize * bneck, zeroed: true),
+            vocabSize: vocabSize, bottleneck: bneck, laneSpatial: streamCount, groups: headGroups)
+        for i in 0..<3 { try trA[0].kernels.step.rebindInput(at: 1+i, to: trA[0].kernels.step.outputSurface(at: 1+i)) }
+        try trA[1].kernels.step.rebindInput(at: 0, to: trA[0].handles.xOut)
+        for i in 0..<3 { try trA[1].kernels.step.rebindInput(at: 1+i, to: trA[1].kernels.step.outputSurface(at: 1+i)) }
+        try headA.rmsNormClassifier.rebindInput(at: 0, to: trA[1].handles.xOut)
+        let headOutA = try headA.rmsNormClassifier.outputSurface(at: 0)
+        let t0xInA = trA[0].handles.xIn
+
+        // Pipeline B
+        var trB = try LayerStorage<RWKVStyleFusedThreeLayerSession>(
+            count: 2,
+            throwingInitializer: { tripletIdx in
+                let base = tripletIdx * 3
+                return try RWKVStyleFusedThreeLayerSession(
+                    weights0: weights.layers[base], weights1: weights.layers[base + 1],
+                    weights2: weights.layers[base + 2], laneSpatial: streamCount, groups: groups)
+            })
+        let headB = try FactoredGenerationRMSNormClassifierKernelSet(
+            rmsFinal: weights.rmsFinal,
+            classifierProjection: TensorBuffer(count: bneck * dim, zeroed: true),
+            classifierExpansion: TensorBuffer(count: vocabSize * bneck, zeroed: true),
+            vocabSize: vocabSize, bottleneck: bneck, laneSpatial: streamCount, groups: headGroups)
+        for i in 0..<3 { try trB[0].kernels.step.rebindInput(at: 1+i, to: trB[0].kernels.step.outputSurface(at: 1+i)) }
+        try trB[1].kernels.step.rebindInput(at: 0, to: trB[0].handles.xOut)
+        for i in 0..<3 { try trB[1].kernels.step.rebindInput(at: 1+i, to: trB[1].kernels.step.outputSurface(at: 1+i)) }
+        try headB.rmsNormClassifier.rebindInput(at: 0, to: trB[1].handles.xOut)
+        let headOutB = try headB.rmsNormClassifier.outputSurface(at: 0)
+        let t0xInB = trB[0].handles.xIn
+
+        var tokensA = Array(repeating: UInt16(0), count: streamCount)
+        var tokensB = Array(repeating: UInt16(0), count: streamCount)
+
+        func embWrite(_ tokens: [UInt16], to surface: IOSurfaceRef) throws {
+            try weights.embedding.withUnsafePointer { embPtr in
+                try tokens.withUnsafeBufferPointer { tokenBuf in
+                    try SurfaceIO.writeEmbeddingBatchFP16(
+                        to: surface, channelOffset: 0, spatial: streamCount,
+                        embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
+                        tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount)
+                }
+            }
+        }
+
+        func argmax(from surface: IOSurfaceRef, into tokens: inout [UInt16]) throws {
+            let r = try SurfaceIO.argmaxBatchFP16SpatialParallel(
+                from: surface, channelOffset: 0, spatial: streamCount,
+                channels: vocabSize, streamCount: streamCount, nBlocks: 32)
+            for i in 0..<streamCount { tokens[i] = UInt16(r[i].index) }
+        }
+
+        // Prime
+        try embWrite(tokensA, to: t0xInA)
+        try trA[0].kernels.step.eval(); try trA[1].kernels.step.eval(); try headA.rmsNormClassifier.eval()
+        try embWrite(tokensB, to: t0xInB)
+
+        // Use pthread for minimal overhead
+        var pipeUs: [Double] = []
+        for iter in 0..<(warmup + iters) {
+            let s = GenerationClock.now()
+
+            // Half 1: eval B on pthread, CPU does argmax A + emb A
+            var aneError: (any Error)?
+            let sem1 = DispatchSemaphore(value: 0)
+            DispatchQueue.global(qos: .userInteractive).async { [self] in
+                do {
+                    try trB[0].kernels.step.eval(); try trB[1].kernels.step.eval()
+                    try headB.rmsNormClassifier.eval()
+                } catch { aneError = error }
+                sem1.signal()
+            }
+            try argmax(from: headOutA, into: &tokensA)
+            try embWrite(tokensA, to: t0xInA)
+            sem1.wait()
+            if let e = aneError { throw e }
+
+            // Half 2: eval A on pthread, CPU does argmax B + emb B
+            let sem2 = DispatchSemaphore(value: 0)
+            DispatchQueue.global(qos: .userInteractive).async { [self] in
+                do {
+                    try trA[0].kernels.step.eval(); try trA[1].kernels.step.eval()
+                    try headA.rmsNormClassifier.eval()
+                } catch { aneError = error }
+                sem2.signal()
+            }
+            try argmax(from: headOutB, into: &tokensB)
+            try embWrite(tokensB, to: t0xInB)
+            sem2.wait()
+            if let e = aneError { throw e }
+
+            if iter >= warmup {
+                pipeUs.append(machMilliseconds(GenerationClock.now() - s) * 1000)
+            }
+        }
+        func median(_ a: [Double]) -> Double { let s = a.sorted(); return s[s.count / 2] }
+        let med = median(pipeUs)
+        let tps = Double(streamCount * 2) / med * 1_000_000
+        print("=== Tight pipelined (semaphore, 80 iters) ===")
+        print("  median=\(String(format: "%.0f", med))µs (\(String(format: "%.0f", med/2))µs/half)")
+        print("  aggregate TPS: \(String(format: "%.0f", tps))")
+        print("  p10=\(String(format: "%.0f", pipeUs.sorted()[pipeUs.count / 10]))µs p90=\(String(format: "%.0f", pipeUs.sorted()[pipeUs.count * 9 / 10]))µs")
+    }
+
+    // MARK: - Metal projection pipelined (ANE proj + GPU expansion argmax)
+
+    func test_metal_projection_pipelined_on_hardware() throws {
+        try requireGenerationHardware()
+
+        let dim = ModelConfig.dim
+        let layerCount = 6
+        let streamCount = 1024
+        let groups = 8
+        let headGroups = 1
+        let bneck = 64
+        let iters = 80
+        let warmup = 20
+
+        // Test vocab sizes to find the contention crossover point
+        let vocabSizes = [64, 256, 1024, 4096, 32000]
+        print("=== Vocab-size sweep: pipelined vs serial at each vocab ===")
+
+        for testVocab in vocabSizes {
+            let weights = makeEchoRecurrentGenerationWeights(layerCount: layerCount, vocabSize: testVocab)
+            let tripletCount = layerCount / 3
+
+            // Pipeline A
+            var trA = try LayerStorage<RWKVStyleFusedThreeLayerSession>(
+                count: tripletCount,
+                throwingInitializer: { tripletIdx in
+                    let base = tripletIdx * 3
+                    return try RWKVStyleFusedThreeLayerSession(
+                        weights0: weights.layers[base], weights1: weights.layers[base + 1],
+                        weights2: weights.layers[base + 2], laneSpatial: streamCount, groups: groups)
+                })
+            let headA = try FactoredGenerationRMSNormClassifierKernelSet(
+                rmsFinal: weights.rmsFinal,
+                classifierProjection: TensorBuffer(count: bneck * dim, zeroed: true),
+                classifierExpansion: TensorBuffer(count: testVocab * bneck, zeroed: true),
+                vocabSize: testVocab, bottleneck: bneck, laneSpatial: streamCount, groups: headGroups)
+            for i in 0..<3 { try trA[0].kernels.step.rebindInput(at: 1+i, to: trA[0].kernels.step.outputSurface(at: 1+i)) }
+            if tripletCount > 1 {
+                try trA[1].kernels.step.rebindInput(at: 0, to: trA[0].handles.xOut)
+                for i in 0..<3 { try trA[1].kernels.step.rebindInput(at: 1+i, to: trA[1].kernels.step.outputSurface(at: 1+i)) }
+                try headA.rmsNormClassifier.rebindInput(at: 0, to: trA[tripletCount - 1].handles.xOut)
+            } else {
+                try headA.rmsNormClassifier.rebindInput(at: 0, to: trA[0].handles.xOut)
+            }
+            let headOutA = try headA.rmsNormClassifier.outputSurface(at: 0)
+            let t0xInA = trA[0].handles.xIn
+
+            // Pipeline B
+            var trB = try LayerStorage<RWKVStyleFusedThreeLayerSession>(
+                count: tripletCount,
+                throwingInitializer: { tripletIdx in
+                    let base = tripletIdx * 3
+                    return try RWKVStyleFusedThreeLayerSession(
+                        weights0: weights.layers[base], weights1: weights.layers[base + 1],
+                        weights2: weights.layers[base + 2], laneSpatial: streamCount, groups: groups)
+                })
+            let headB = try FactoredGenerationRMSNormClassifierKernelSet(
+                rmsFinal: weights.rmsFinal,
+                classifierProjection: TensorBuffer(count: bneck * dim, zeroed: true),
+                classifierExpansion: TensorBuffer(count: testVocab * bneck, zeroed: true),
+                vocabSize: testVocab, bottleneck: bneck, laneSpatial: streamCount, groups: headGroups)
+            for i in 0..<3 { try trB[0].kernels.step.rebindInput(at: 1+i, to: trB[0].kernels.step.outputSurface(at: 1+i)) }
+            if tripletCount > 1 {
+                try trB[1].kernels.step.rebindInput(at: 0, to: trB[0].handles.xOut)
+                for i in 0..<3 { try trB[1].kernels.step.rebindInput(at: 1+i, to: trB[1].kernels.step.outputSurface(at: 1+i)) }
+                try headB.rmsNormClassifier.rebindInput(at: 0, to: trB[tripletCount - 1].handles.xOut)
+            } else {
+                try headB.rmsNormClassifier.rebindInput(at: 0, to: trB[0].handles.xOut)
+            }
+            let headOutB = try headB.rmsNormClassifier.outputSurface(at: 0)
+            let t0xInB = trB[0].handles.xIn
+
+            var tokensA = Array(repeating: UInt16(0), count: streamCount)
+            var tokensB = Array(repeating: UInt16(0), count: streamCount)
+
+            func embWrite(_ tokens: [UInt16], to surface: IOSurfaceRef) throws {
+                try weights.embedding.withUnsafePointer { embPtr in
+                    try tokens.withUnsafeBufferPointer { tokenBuf in
+                        try SurfaceIO.writeEmbeddingBatchFP16(
+                            to: surface, channelOffset: 0, spatial: streamCount,
+                            embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
+                            tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount)
+                    }
+                }
+            }
+
+            func argmax(from surface: IOSurfaceRef, into tokens: inout [UInt16]) throws {
+                let r = try SurfaceIO.argmaxBatchFP16SpatialParallel(
+                    from: surface, channelOffset: 0, spatial: streamCount,
+                    channels: testVocab, streamCount: streamCount, nBlocks: 32)
+                for i in 0..<streamCount { tokens[i] = UInt16(r[i].index) }
+            }
+
+            func evalAll(_ tr: inout LayerStorage<RWKVStyleFusedThreeLayerSession>, head: borrowing FactoredGenerationRMSNormClassifierKernelSet) throws {
+                for t in 0..<tripletCount { try tr[t].kernels.step.eval() }
+                try head.rmsNormClassifier.eval()
+            }
+
+            // Prime
+            try embWrite(tokensA, to: t0xInA)
+            try evalAll(&trA, head: headA)
+            try embWrite(tokensB, to: t0xInB)
+
+            // Pipelined
+            var pipeUs: [Double] = []
+            for iter in 0..<(warmup + iters) {
+                let s = GenerationClock.now()
+                var aneError: (any Error)?
+                let sem1 = DispatchSemaphore(value: 0)
+                DispatchQueue.global(qos: .userInteractive).async { [self] in
+                    do { try evalAll(&trB, head: headB) } catch { aneError = error }
+                    sem1.signal()
+                }
+                try argmax(from: headOutA, into: &tokensA)
+                try embWrite(tokensA, to: t0xInA)
+                sem1.wait()
+                if let e = aneError { throw e }
+
+                let sem2 = DispatchSemaphore(value: 0)
+                DispatchQueue.global(qos: .userInteractive).async { [self] in
+                    do { try evalAll(&trA, head: headA) } catch { aneError = error }
+                    sem2.signal()
+                }
+                try argmax(from: headOutB, into: &tokensB)
+                try embWrite(tokensB, to: t0xInB)
+                sem2.wait()
+                if let e = aneError { throw e }
+
+                if iter >= warmup {
+                    pipeUs.append(machMilliseconds(GenerationClock.now() - s) * 1000)
+                }
+            }
+
+            // Serial
+            var serialUs: [Double] = []
+            for iter in 0..<(warmup + iters) {
+                let s = GenerationClock.now()
+                try evalAll(&trA, head: headA)
+                try argmax(from: headOutA, into: &tokensA)
+                try embWrite(tokensA, to: t0xInA)
+                try evalAll(&trB, head: headB)
+                try argmax(from: headOutB, into: &tokensB)
+                try embWrite(tokensB, to: t0xInB)
+                if iter >= warmup {
+                    serialUs.append(machMilliseconds(GenerationClock.now() - s) * 1000)
+                }
+            }
+
+            func median(_ a: [Double]) -> Double { let s = a.sorted(); return s[s.count / 2] }
+            let pipeMed = median(pipeUs)
+            let serialMed = median(serialUs)
+            let pipeTPS = Double(streamCount * 2) / pipeMed * 1_000_000
+            let serialTPS = Double(streamCount * 2) / serialMed * 1_000_000
+            let surfaceMB = Double(testVocab * streamCount * 2) / 1_048_576
+            print("  vocab=\(testVocab) (\(String(format: "%.1f", surfaceMB))MB): pipe=\(String(format: "%.0f", pipeTPS)) serial=\(String(format: "%.0f", serialTPS)) ratio=\(String(format: "%.2f", serialTPS > 0 ? pipeTPS / serialTPS : 0))x")
+        }
+    }
+
+    // MARK: - CPU expansion pipelined benchmark
+
+    /// ANE head outputs [1, bneck, 1, spatial] (128KB) instead of [1, vocab, 1, spatial] (62.5MB).
+    /// CPU does [bneck→vocab] matmul via Accelerate BLAS + argmax.
+    /// The CPU expansion (~1ms) should fully hide behind ANE trunk eval (~4.5ms) in pipelined mode.
+    func test_cpu_expansion_pipelined_on_hardware() throws {
+        try requireGenerationHardware()
+
+        let dim = ModelConfig.dim
+        let layerCount = 6
+        let streamCount = 1024
+        let groups = 8
+        let headGroups = 1
+        let bneck = 64
+        let fullVocab = 32000
+        let iters = 80
+        let warmup = 20
+
+        let weights = makeEchoRecurrentGenerationWeights(layerCount: layerCount, vocabSize: fullVocab)
+        let tripletCount = layerCount / 3
+
+        // Expansion weights [fullVocab, bneck] in fp32 for CPU GEMM
+        let wExpandF32 = UnsafeMutablePointer<Float>.allocate(capacity: fullVocab * bneck)
+        defer { wExpandF32.deallocate() }
+        for i in 0..<(fullVocab * bneck) { wExpandF32[i] = Float.random(in: -0.01...0.01) }
+
+        // Scratch: projected repr [spatial, bneck] in fp32
+        let projF32 = UnsafeMutablePointer<Float>.allocate(capacity: streamCount * bneck)
+        defer { projF32.deallocate() }
+
+        // Sharded expansion: split vocab across cores so each output fits in L2
+        let nShards = 14
+        let shardVocab = (fullVocab + nShards - 1) / nShards
+        let shardBufs = (0..<nShards).map { _ in
+            UnsafeMutablePointer<Float>.allocate(capacity: streamCount * shardVocab)
+        }
+        defer { for b in shardBufs { b.deallocate() } }
+        let shardBestVals = UnsafeMutablePointer<Float>.allocate(capacity: nShards * streamCount)
+        let shardBestIdxs = UnsafeMutablePointer<Int32>.allocate(capacity: nShards * streamCount)
+        defer { shardBestVals.deallocate(); shardBestIdxs.deallocate() }
+
+        // Pipeline A
+        var trA = try LayerStorage<RWKVStyleFusedThreeLayerSession>(
+            count: tripletCount,
+            throwingInitializer: { tripletIdx in
+                let base = tripletIdx * 3
+                return try RWKVStyleFusedThreeLayerSession(
+                    weights0: weights.layers[base], weights1: weights.layers[base + 1],
+                    weights2: weights.layers[base + 2], laneSpatial: streamCount, groups: groups)
+            })
+        let headA = try FactoredGenerationRMSNormClassifierKernelSet(
+            rmsFinal: weights.rmsFinal,
+            classifierProjection: TensorBuffer(count: bneck * dim, zeroed: true),
+            classifierExpansion: TensorBuffer(count: bneck * bneck, zeroed: true),
+            vocabSize: bneck, bottleneck: bneck, laneSpatial: streamCount, groups: headGroups)
+        for i in 0..<3 { try trA[0].kernels.step.rebindInput(at: 1+i, to: trA[0].kernels.step.outputSurface(at: 1+i)) }
+        if tripletCount > 1 {
+            try trA[1].kernels.step.rebindInput(at: 0, to: trA[0].handles.xOut)
+            for i in 0..<3 { try trA[1].kernels.step.rebindInput(at: 1+i, to: trA[1].kernels.step.outputSurface(at: 1+i)) }
+            try headA.rmsNormClassifier.rebindInput(at: 0, to: trA[tripletCount - 1].handles.xOut)
+        } else {
+            try headA.rmsNormClassifier.rebindInput(at: 0, to: trA[0].handles.xOut)
+        }
+        let headOutA = try headA.rmsNormClassifier.outputSurface(at: 0)
+        let t0xInA = trA[0].handles.xIn
+
+        // Pipeline B
+        var trB = try LayerStorage<RWKVStyleFusedThreeLayerSession>(
+            count: tripletCount,
+            throwingInitializer: { tripletIdx in
+                let base = tripletIdx * 3
+                return try RWKVStyleFusedThreeLayerSession(
+                    weights0: weights.layers[base], weights1: weights.layers[base + 1],
+                    weights2: weights.layers[base + 2], laneSpatial: streamCount, groups: groups)
+            })
+        let headB = try FactoredGenerationRMSNormClassifierKernelSet(
+            rmsFinal: weights.rmsFinal,
+            classifierProjection: TensorBuffer(count: bneck * dim, zeroed: true),
+            classifierExpansion: TensorBuffer(count: bneck * bneck, zeroed: true),
+            vocabSize: bneck, bottleneck: bneck, laneSpatial: streamCount, groups: headGroups)
+        for i in 0..<3 { try trB[0].kernels.step.rebindInput(at: 1+i, to: trB[0].kernels.step.outputSurface(at: 1+i)) }
+        if tripletCount > 1 {
+            try trB[1].kernels.step.rebindInput(at: 0, to: trB[0].handles.xOut)
+            for i in 0..<3 { try trB[1].kernels.step.rebindInput(at: 1+i, to: trB[1].kernels.step.outputSurface(at: 1+i)) }
+            try headB.rmsNormClassifier.rebindInput(at: 0, to: trB[tripletCount - 1].handles.xOut)
+        } else {
+            try headB.rmsNormClassifier.rebindInput(at: 0, to: trB[0].handles.xOut)
+        }
+        let headOutB = try headB.rmsNormClassifier.outputSurface(at: 0)
+        let t0xInB = trB[0].handles.xIn
+
+        var tokensA = Array(repeating: UInt16(0), count: streamCount)
+        var tokensB = Array(repeating: UInt16(0), count: streamCount)
+
+        func embWrite(_ tokens: [UInt16], to surface: IOSurfaceRef) throws {
+            try weights.embedding.withUnsafePointer { embPtr in
+                try tokens.withUnsafeBufferPointer { tokenBuf in
+                    try SurfaceIO.writeEmbeddingBatchFP16(
+                        to: surface, channelOffset: 0, spatial: streamCount,
+                        embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
+                        tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount)
+                }
+            }
+        }
+
+        // CPU sharded expansion [bneck→fullVocab] + fused argmax
+        func cpuExpandArgmax(from surface: IOSurfaceRef, into tokens: inout [UInt16]) {
+            // Read [bneck, spatial] fp16 surface → transpose to [spatial, bneck] fp32
+            IOSurfaceLock(surface, [.readOnly], nil)
+            let base = IOSurfaceGetBaseAddress(surface).assumingMemoryBound(to: Float16.self)
+            for k in 0..<bneck {
+                for sp in 0..<streamCount {
+                    projF32[sp * bneck + k] = Float(base[k * streamCount + sp])
+                }
+            }
+            IOSurfaceUnlock(surface, [.readOnly], nil)
+
+            // Parallel sharded GEMM: each core handles vocab/14 entries → output fits in L2
+            DispatchQueue.concurrentPerform(iterations: nShards) { shard in
+                let vStart = shard * shardVocab
+                let vCount = min(shardVocab, fullVocab - vStart)
+                guard vCount > 0 else { return }
+
+                BLAS.sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    m: Int32(streamCount), n: Int32(vCount), k: Int32(bneck),
+                    alpha: 1.0, a: projF32, lda: Int32(bneck),
+                    b: wExpandF32 + vStart * bneck, ldb: Int32(bneck), beta: 0.0,
+                    c: shardBufs[shard], ldc: Int32(vCount))
+
+                for sp in 0..<streamCount {
+                    var maxVal: Float = 0; var maxIdx: vDSP_Length = 0
+                    vDSP_maxvi(shardBufs[shard] + sp * vCount, 1, &maxVal, &maxIdx, vDSP_Length(vCount))
+                    shardBestVals[shard * streamCount + sp] = maxVal
+                    shardBestIdxs[shard * streamCount + sp] = Int32(vStart + Int(maxIdx))
+                }
+            }
+
+            // Merge across shards
+            for sp in 0..<streamCount {
+                var gBest: Float = -.infinity
+                var gIdx: UInt16 = 0
+                for shard in 0..<nShards {
+                    let v = shardBestVals[shard * streamCount + sp]
+                    if v > gBest { gBest = v; gIdx = UInt16(shardBestIdxs[shard * streamCount + sp]) }
+                }
+                tokens[sp] = gIdx
+            }
+        }
+
+        func evalAll(_ tr: inout LayerStorage<RWKVStyleFusedThreeLayerSession>, head: borrowing FactoredGenerationRMSNormClassifierKernelSet) throws {
+            for t in 0..<tripletCount { try tr[t].kernels.step.eval() }
+            try head.rmsNormClassifier.eval()
+        }
+
+        // Prime
+        try embWrite(tokensA, to: t0xInA)
+        try evalAll(&trA, head: headA)
+        try embWrite(tokensB, to: t0xInB)
+
+        // === Time CPU expansion alone ===
+        var cpuExpUs: [Double] = []
+        for _ in 0..<40 {
+            let s = GenerationClock.now()
+            cpuExpandArgmax(from: headOutA, into: &tokensA)
+            cpuExpUs.append(machMilliseconds(GenerationClock.now() - s) * 1000)
+        }
+        let cpuExpMed = cpuExpUs.sorted()[cpuExpUs.count / 2]
+        print("CPU expansion+argmax [\(bneck)→\(fullVocab)] × \(streamCount) streams: \(String(format: "%.1f", cpuExpMed)) µs")
+
+        // === Pipelined: overlap CPU expansion with ANE eval ===
+        var pipeUs: [Double] = []
+        for iter in 0..<(warmup + iters) {
+            let s = GenerationClock.now()
+            var aneError: (any Error)?
+
+            let sem1 = DispatchSemaphore(value: 0)
+            DispatchQueue.global(qos: .userInteractive).async {
+                do { try evalAll(&trB, head: headB) } catch { aneError = error }
+                sem1.signal()
+            }
+            cpuExpandArgmax(from: headOutA, into: &tokensA)
+            try embWrite(tokensA, to: t0xInA)
+            sem1.wait()
+            if let e = aneError { throw e }
+
+            let sem2 = DispatchSemaphore(value: 0)
+            DispatchQueue.global(qos: .userInteractive).async {
+                do { try evalAll(&trA, head: headA) } catch { aneError = error }
+                sem2.signal()
+            }
+            cpuExpandArgmax(from: headOutB, into: &tokensB)
+            try embWrite(tokensB, to: t0xInB)
+            sem2.wait()
+            if let e = aneError { throw e }
+
+            if iter >= warmup {
+                pipeUs.append(machMilliseconds(GenerationClock.now() - s) * 1000)
+            }
+        }
+
+        // === Serial: ANE then CPU, no overlap ===
+        var serialUs: [Double] = []
+        for iter in 0..<(warmup + iters) {
+            let s = GenerationClock.now()
+            try evalAll(&trA, head: headA)
+            cpuExpandArgmax(from: headOutA, into: &tokensA)
+            try embWrite(tokensA, to: t0xInA)
+            try evalAll(&trB, head: headB)
+            cpuExpandArgmax(from: headOutB, into: &tokensB)
+            try embWrite(tokensB, to: t0xInB)
+            if iter >= warmup {
+                serialUs.append(machMilliseconds(GenerationClock.now() - s) * 1000)
+            }
+        }
+
+        func median(_ a: [Double]) -> Double { let s = a.sorted(); return s[s.count / 2] }
+        let pipeMed = median(pipeUs)
+        let serialMed = median(serialUs)
+        let pipeTPS = Double(streamCount * 2) / pipeMed * 1_000_000
+        let serialTPS = Double(streamCount * 2) / serialMed * 1_000_000
+        print("=== CPU expansion pipelined benchmark ===")
+        print("  ANE head: vocab=\(bneck) (proj only), CPU expansion [\(bneck)→\(fullVocab)]")
+        print("  Pipelined: \(String(format: "%.0f", pipeTPS)) TPS (\(String(format: "%.1f", pipeMed)) µs/step)")
+        print("  Serial:    \(String(format: "%.0f", serialTPS)) TPS (\(String(format: "%.1f", serialMed)) µs/step)")
+        print("  Ratio:     \(String(format: "%.2f", serialTPS > 0 ? pipeTPS / serialTPS : 0))x")
+        print("  CPU exp:   \(String(format: "%.1f", cpuExpMed)) µs")
+        print("  Ref: vocab=32K ANE head = 159K pipe / 138K serial")
+    }
+
+    // MARK: - Spatial width sweep
+
+    /// Sweep spatial width (number of concurrent streams) to find the throughput-optimal
+    /// lane count. More streams = more tokens per eval, but larger surfaces.
+    func test_spatial_width_sweep() throws {
+        try requireGenerationHardware()
+
+        let dim = ModelConfig.dim
+        let layerCount = 6
+        let groups = 8
+        let headGroups = 1
+        let bneck = 64
+        let fullVocab = 32000
+        let iters = 60
+        let warmup = 15
+
+        print("=== Spatial width sweep: pipelined TPS at different stream counts ===")
+
+        for streamCount in [256, 512, 1024, 2048] {
+            let weights = makeEchoRecurrentGenerationWeights(layerCount: layerCount, vocabSize: fullVocab)
+            let tripletCount = layerCount / 3
+
+            // Pipeline A
+            var trA = try LayerStorage<RWKVStyleFusedThreeLayerSession>(
+                count: tripletCount,
+                throwingInitializer: { tripletIdx in
+                    let base = tripletIdx * 3
+                    return try RWKVStyleFusedThreeLayerSession(
+                        weights0: weights.layers[base], weights1: weights.layers[base + 1],
+                        weights2: weights.layers[base + 2], laneSpatial: streamCount, groups: groups)
+                })
+            let headA = try FactoredGenerationRMSNormClassifierKernelSet(
+                rmsFinal: weights.rmsFinal,
+                classifierProjection: TensorBuffer(count: bneck * dim, zeroed: true),
+                classifierExpansion: TensorBuffer(count: fullVocab * bneck, zeroed: true),
+                vocabSize: fullVocab, bottleneck: bneck, laneSpatial: streamCount, groups: headGroups)
+            for i in 0..<3 { try trA[0].kernels.step.rebindInput(at: 1+i, to: trA[0].kernels.step.outputSurface(at: 1+i)) }
+            if tripletCount > 1 {
+                try trA[1].kernels.step.rebindInput(at: 0, to: trA[0].handles.xOut)
+                for i in 0..<3 { try trA[1].kernels.step.rebindInput(at: 1+i, to: trA[1].kernels.step.outputSurface(at: 1+i)) }
+                try headA.rmsNormClassifier.rebindInput(at: 0, to: trA[tripletCount - 1].handles.xOut)
+            } else {
+                try headA.rmsNormClassifier.rebindInput(at: 0, to: trA[0].handles.xOut)
+            }
+            let headOutA = try headA.rmsNormClassifier.outputSurface(at: 0)
+            let t0xInA = trA[0].handles.xIn
+
+            // Pipeline B
+            var trB = try LayerStorage<RWKVStyleFusedThreeLayerSession>(
+                count: tripletCount,
+                throwingInitializer: { tripletIdx in
+                    let base = tripletIdx * 3
+                    return try RWKVStyleFusedThreeLayerSession(
+                        weights0: weights.layers[base], weights1: weights.layers[base + 1],
+                        weights2: weights.layers[base + 2], laneSpatial: streamCount, groups: groups)
+                })
+            let headB = try FactoredGenerationRMSNormClassifierKernelSet(
+                rmsFinal: weights.rmsFinal,
+                classifierProjection: TensorBuffer(count: bneck * dim, zeroed: true),
+                classifierExpansion: TensorBuffer(count: fullVocab * bneck, zeroed: true),
+                vocabSize: fullVocab, bottleneck: bneck, laneSpatial: streamCount, groups: headGroups)
+            for i in 0..<3 { try trB[0].kernels.step.rebindInput(at: 1+i, to: trB[0].kernels.step.outputSurface(at: 1+i)) }
+            if tripletCount > 1 {
+                try trB[1].kernels.step.rebindInput(at: 0, to: trB[0].handles.xOut)
+                for i in 0..<3 { try trB[1].kernels.step.rebindInput(at: 1+i, to: trB[1].kernels.step.outputSurface(at: 1+i)) }
+                try headB.rmsNormClassifier.rebindInput(at: 0, to: trB[tripletCount - 1].handles.xOut)
+            } else {
+                try headB.rmsNormClassifier.rebindInput(at: 0, to: trB[0].handles.xOut)
+            }
+            let headOutB = try headB.rmsNormClassifier.outputSurface(at: 0)
+            let t0xInB = trB[0].handles.xIn
+
+            var tokensA = Array(repeating: UInt16(0), count: streamCount)
+            var tokensB = Array(repeating: UInt16(0), count: streamCount)
+
+            func embWrite(_ tokens: [UInt16], to surface: IOSurfaceRef) throws {
+                try weights.embedding.withUnsafePointer { embPtr in
+                    try tokens.withUnsafeBufferPointer { tokenBuf in
+                        try SurfaceIO.writeEmbeddingBatchFP16(
+                            to: surface, channelOffset: 0, spatial: streamCount,
+                            embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
+                            tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount)
+                    }
+                }
+            }
+
+            func argmax(from surface: IOSurfaceRef, into tokens: inout [UInt16]) throws {
+                let nBlocks = min(32, streamCount / 8)
+                let r = try SurfaceIO.argmaxBatchFP16SpatialParallel(
+                    from: surface, channelOffset: 0, spatial: streamCount,
+                    channels: fullVocab, streamCount: streamCount, nBlocks: max(1, nBlocks))
+                for i in 0..<streamCount { tokens[i] = UInt16(r[i].index) }
+            }
+
+            func evalAll(_ tr: inout LayerStorage<RWKVStyleFusedThreeLayerSession>, head: borrowing FactoredGenerationRMSNormClassifierKernelSet) throws {
+                for t in 0..<tripletCount { try tr[t].kernels.step.eval() }
+                try head.rmsNormClassifier.eval()
+            }
+
+            // Prime
+            try embWrite(tokensA, to: t0xInA)
+            try evalAll(&trA, head: headA)
+            try embWrite(tokensB, to: t0xInB)
+
+            // Pipelined
+            var pipeUs: [Double] = []
+            for iter in 0..<(warmup + iters) {
+                let s = GenerationClock.now()
+                var aneError: (any Error)?
+                let sem1 = DispatchSemaphore(value: 0)
+                DispatchQueue.global(qos: .userInteractive).async {
+                    do { try evalAll(&trB, head: headB) } catch { aneError = error }
+                    sem1.signal()
+                }
+                try argmax(from: headOutA, into: &tokensA)
+                try embWrite(tokensA, to: t0xInA)
+                sem1.wait()
+                if let e = aneError { throw e }
+
+                let sem2 = DispatchSemaphore(value: 0)
+                DispatchQueue.global(qos: .userInteractive).async {
+                    do { try evalAll(&trA, head: headA) } catch { aneError = error }
+                    sem2.signal()
+                }
+                try argmax(from: headOutB, into: &tokensB)
+                try embWrite(tokensB, to: t0xInB)
+                sem2.wait()
+                if let e = aneError { throw e }
+
+                if iter >= warmup {
+                    pipeUs.append(machMilliseconds(GenerationClock.now() - s) * 1000)
+                }
+            }
+
+            // Serial
+            var serialUs: [Double] = []
+            for iter in 0..<(warmup + iters) {
+                let s = GenerationClock.now()
+                try evalAll(&trA, head: headA)
+                try argmax(from: headOutA, into: &tokensA)
+                try embWrite(tokensA, to: t0xInA)
+                try evalAll(&trB, head: headB)
+                try argmax(from: headOutB, into: &tokensB)
+                try embWrite(tokensB, to: t0xInB)
+                if iter >= warmup {
+                    serialUs.append(machMilliseconds(GenerationClock.now() - s) * 1000)
+                }
+            }
+
+            func median(_ a: [Double]) -> Double { let s = a.sorted(); return s[s.count / 2] }
+            let pipeMed = median(pipeUs)
+            let serialMed = median(serialUs)
+            let pipeTPS = Double(streamCount * 2) / pipeMed * 1_000_000
+            let serialTPS = Double(streamCount * 2) / serialMed * 1_000_000
+            let headSurfMB = Double(fullVocab * streamCount * 2) / 1_048_576
+            let aneTimePerHalf = pipeMed / 2
+            print("  spatial=\(streamCount): pipe=\(String(format: "%.0f", pipeTPS)) serial=\(String(format: "%.0f", serialTPS)) TPS, \(String(format: "%.1f", aneTimePerHalf)) µs/half, head=\(String(format: "%.1f", headSurfMB))MB")
+        }
+    }
+
+    // MARK: - Expansion method microbenchmark
+
+    /// Compare expansion [bneck→vocab] + argmax methods.
+    /// Key insight: chunking along VOCAB dimension keeps output in L2 (~4MB chunks).
+    func test_expansion_method_microbenchmark() throws {
+        try requireGenerationHardware()
+
+        let bneck = 64
+        let vocab = 32000
+        let spatial = 1024
+        let reps = 40
+
+        // Create a dummy projected surface [1, bneck, 1, spatial] fp16
+        let surfProps: [CFString: Any] = [
+            kIOSurfaceWidth: spatial,
+            kIOSurfaceHeight: bneck,
+            kIOSurfaceBytesPerElement: 2,
+            kIOSurfaceBytesPerRow: spatial * 2,
+            kIOSurfaceAllocSize: bneck * spatial * 2,
+        ]
+        let projSurf = IOSurfaceCreate(surfProps as CFDictionary)!
+        // Fill with random fp16 data
+        IOSurfaceLock(projSurf, [], nil)
+        let surfPtr = IOSurfaceGetBaseAddress(projSurf).assumingMemoryBound(to: Float16.self)
+        for i in 0..<(bneck * spatial) { surfPtr[i] = Float16.random(in: -1...1) }
+        IOSurfaceUnlock(projSurf, [], nil)
+
+        // Expansion weights [vocab, bneck] in fp32
+        let wF32 = UnsafeMutablePointer<Float>.allocate(capacity: vocab * bneck)
+        defer { wF32.deallocate() }
+        for i in 0..<(vocab * bneck) { wF32[i] = Float.random(in: -0.01...0.01) }
+
+        // Expansion weights in fp16 (for Metal)
+        let wF16 = UnsafeMutablePointer<Float16>.allocate(capacity: vocab * bneck)
+        defer { wF16.deallocate() }
+        for i in 0..<(vocab * bneck) { wF16[i] = Float16(wF32[i]) }
+
+        var tokens = Array(repeating: UInt16(0), count: spatial)
+
+        // --- Method 1: CPU BLAS chunked (128) ---
+        let projBuf = UnsafeMutablePointer<Float>.allocate(capacity: spatial * bneck)
+        defer { projBuf.deallocate() }
+        let chunkSp = 128
+        let logitsChunk = UnsafeMutablePointer<Float>.allocate(capacity: chunkSp * vocab)
+        defer { logitsChunk.deallocate() }
+
+        func cpuChunked() {
+            IOSurfaceLock(projSurf, [.readOnly], nil)
+            let base = IOSurfaceGetBaseAddress(projSurf).assumingMemoryBound(to: Float16.self)
+            for k in 0..<bneck {
+                for sp in 0..<spatial {
+                    projBuf[sp * bneck + k] = Float(base[k * spatial + sp])
+                }
+            }
+            IOSurfaceUnlock(projSurf, [.readOnly], nil)
+            let nChunks = (spatial + chunkSp - 1) / chunkSp
+            for c in 0..<nChunks {
+                let start = c * chunkSp
+                let count = min(chunkSp, spatial - start)
+                BLAS.sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    m: Int32(count), n: Int32(vocab), k: Int32(bneck),
+                    alpha: 1.0, a: projBuf + start * bneck, lda: Int32(bneck),
+                    b: wF32, ldb: Int32(bneck), beta: 0.0,
+                    c: logitsChunk, ldc: Int32(vocab))
+                for i in 0..<count {
+                    var maxVal: Float = 0; var maxIdx: vDSP_Length = 0
+                    vDSP_maxvi(logitsChunk + i * vocab, 1, &maxVal, &maxIdx, vDSP_Length(vocab))
+                    tokens[start + i] = UInt16(maxIdx)
+                }
+            }
+        }
+
+        var t1: [Double] = []
+        for _ in 0..<reps {
+            let s = GenerationClock.now()
+            cpuChunked()
+            t1.append(machMilliseconds(GenerationClock.now() - s) * 1000)
+        }
+
+        // --- Method 2: CPU BLAS single call ---
+        let logitsFull = UnsafeMutablePointer<Float>.allocate(capacity: spatial * vocab)
+        defer { logitsFull.deallocate() }
+
+        func cpuFull() {
+            IOSurfaceLock(projSurf, [.readOnly], nil)
+            let base = IOSurfaceGetBaseAddress(projSurf).assumingMemoryBound(to: Float16.self)
+            for k in 0..<bneck {
+                for sp in 0..<spatial {
+                    projBuf[sp * bneck + k] = Float(base[k * spatial + sp])
+                }
+            }
+            IOSurfaceUnlock(projSurf, [.readOnly], nil)
+            BLAS.sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                m: Int32(spatial), n: Int32(vocab), k: Int32(bneck),
+                alpha: 1.0, a: projBuf, lda: Int32(bneck),
+                b: wF32, ldb: Int32(bneck), beta: 0.0,
+                c: logitsFull, ldc: Int32(vocab))
+            for sp in 0..<spatial {
+                var maxVal: Float = 0; var maxIdx: vDSP_Length = 0
+                vDSP_maxvi(logitsFull + sp * vocab, 1, &maxVal, &maxIdx, vDSP_Length(vocab))
+                tokens[sp] = UInt16(maxIdx)
+            }
+        }
+
+        var t2: [Double] = []
+        for _ in 0..<reps {
+            let s = GenerationClock.now()
+            cpuFull()
+            t2.append(machMilliseconds(GenerationClock.now() - s) * 1000)
+        }
+
+        // --- Method 3: vocab-chunked GEMM with streaming argmax ---
+        // Key: output chunk [spatial, vChunk] stays in L2 instead of 128MB full output
+        let vChunk = 1024
+        let partialBuf = UnsafeMutablePointer<Float>.allocate(capacity: spatial * vChunk)
+        defer { partialBuf.deallocate() }
+        var bestVals = [Float](repeating: 0, count: spatial)
+        var bestIdxs = [UInt16](repeating: 0, count: spatial)
+
+        func cpuVocabChunked() {
+            IOSurfaceLock(projSurf, [.readOnly], nil)
+            let base = IOSurfaceGetBaseAddress(projSurf).assumingMemoryBound(to: Float16.self)
+            for k in 0..<bneck {
+                for sp in 0..<spatial {
+                    projBuf[sp * bneck + k] = Float(base[k * spatial + sp])
+                }
+            }
+            IOSurfaceUnlock(projSurf, [.readOnly], nil)
+
+            for sp in 0..<spatial { bestVals[sp] = -.infinity; bestIdxs[sp] = 0 }
+
+            let nVChunks = (vocab + vChunk - 1) / vChunk
+            for vc in 0..<nVChunks {
+                let vStart = vc * vChunk
+                let vCount = min(vChunk, vocab - vStart)
+
+                BLAS.sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    m: Int32(spatial), n: Int32(vCount), k: Int32(bneck),
+                    alpha: 1.0, a: projBuf, lda: Int32(bneck),
+                    b: wF32 + vStart * bneck, ldb: Int32(bneck), beta: 0.0,
+                    c: partialBuf, ldc: Int32(vCount))
+
+                for sp in 0..<spatial {
+                    var maxVal: Float = 0; var maxIdx: vDSP_Length = 0
+                    vDSP_maxvi(partialBuf + sp * vCount, 1, &maxVal, &maxIdx, vDSP_Length(vCount))
+                    if maxVal > bestVals[sp] {
+                        bestVals[sp] = maxVal
+                        bestIdxs[sp] = UInt16(vStart + Int(maxIdx))
+                    }
+                }
+            }
+            for sp in 0..<spatial { tokens[sp] = bestIdxs[sp] }
+        }
+
+        var t3: [Double] = []
+        for _ in 0..<reps {
+            let s = GenerationClock.now()
+            cpuVocabChunked()
+            t3.append(machMilliseconds(GenerationClock.now() - s) * 1000)
+        }
+
+        // --- Method 4: vocab-chunked with smaller chunk (256) ---
+        let vChunkSmall = 256
+        let partialSmall = UnsafeMutablePointer<Float>.allocate(capacity: spatial * vChunkSmall)
+        defer { partialSmall.deallocate() }
+
+        func cpuVocabChunkedSmall() {
+            IOSurfaceLock(projSurf, [.readOnly], nil)
+            let base = IOSurfaceGetBaseAddress(projSurf).assumingMemoryBound(to: Float16.self)
+            for k in 0..<bneck {
+                for sp in 0..<spatial {
+                    projBuf[sp * bneck + k] = Float(base[k * spatial + sp])
+                }
+            }
+            IOSurfaceUnlock(projSurf, [.readOnly], nil)
+
+            for sp in 0..<spatial { bestVals[sp] = -.infinity; bestIdxs[sp] = 0 }
+
+            let nVChunks = (vocab + vChunkSmall - 1) / vChunkSmall
+            for vc in 0..<nVChunks {
+                let vStart = vc * vChunkSmall
+                let vCount = min(vChunkSmall, vocab - vStart)
+
+                BLAS.sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    m: Int32(spatial), n: Int32(vCount), k: Int32(bneck),
+                    alpha: 1.0, a: projBuf, lda: Int32(bneck),
+                    b: wF32 + vStart * bneck, ldb: Int32(bneck), beta: 0.0,
+                    c: partialSmall, ldc: Int32(vCount))
+
+                for sp in 0..<spatial {
+                    var maxVal: Float = 0; var maxIdx: vDSP_Length = 0
+                    vDSP_maxvi(partialSmall + sp * vCount, 1, &maxVal, &maxIdx, vDSP_Length(vCount))
+                    if maxVal > bestVals[sp] {
+                        bestVals[sp] = maxVal
+                        bestIdxs[sp] = UInt16(vStart + Int(maxIdx))
+                    }
+                }
+            }
+            for sp in 0..<spatial { tokens[sp] = bestIdxs[sp] }
+        }
+
+        var t4: [Double] = []
+        for _ in 0..<reps {
+            let s = GenerationClock.now()
+            cpuVocabChunkedSmall()
+            t4.append(machMilliseconds(GenerationClock.now() - s) * 1000)
+        }
+
+        // --- Method 5: bneck sweep (single-call BLAS) ---
+        print("=== Expansion [bneck → vocab=\(vocab)] × \(spatial) streams ===")
+        func med(_ a: [Double]) -> Double { let s = a.sorted(); return s[s.count / 2] }
+        print("  bneck=\(bneck) sp-chunked(128):    \(String(format: "%.1f", med(t1))) µs")
+        print("  bneck=\(bneck) single call (128M): \(String(format: "%.1f", med(t2))) µs")
+        print("  bneck=\(bneck) v-chunked(1024):    \(String(format: "%.1f", med(t3))) µs")
+        print("  bneck=\(bneck) v-chunked(256):     \(String(format: "%.1f", med(t4))) µs")
+
+        // --- Method 5: vocab-sharded parallel (force single-threaded BLAS per shard) ---
+        // Each of N cores handles vocab/N entries → output fits in L2
+        let nShards = 14
+        let shardSize = (vocab + nShards - 1) / nShards
+        // Pre-allocate per-shard output buffers (each ~9MB, fits in L2)
+        let shardBufs = (0..<nShards).map { _ in
+            UnsafeMutablePointer<Float>.allocate(capacity: spatial * shardSize)
+        }
+        defer { for b in shardBufs { b.deallocate() } }
+        // Per-shard partial argmax results
+        let shardBestVals = UnsafeMutablePointer<Float>.allocate(capacity: nShards * spatial)
+        let shardBestIdxs = UnsafeMutablePointer<Int32>.allocate(capacity: nShards * spatial)
+        defer { shardBestVals.deallocate(); shardBestIdxs.deallocate() }
+
+        func cpuSharded() {
+            IOSurfaceLock(projSurf, [.readOnly], nil)
+            let base = IOSurfaceGetBaseAddress(projSurf).assumingMemoryBound(to: Float16.self)
+            for k in 0..<bneck {
+                for sp in 0..<spatial {
+                    projBuf[sp * bneck + k] = Float(base[k * spatial + sp])
+                }
+            }
+            IOSurfaceUnlock(projSurf, [.readOnly], nil)
+
+            // Parallel sharded GEMM + local argmax
+            DispatchQueue.concurrentPerform(iterations: nShards) { shard in
+                let vStart = shard * shardSize
+                let vCount = min(shardSize, vocab - vStart)
+                guard vCount > 0 else { return }
+
+                let outBuf = shardBufs[shard]
+                // Single-threaded BLAS — each shard uses its own core's AMX
+                BLAS.sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    m: Int32(spatial), n: Int32(vCount), k: Int32(bneck),
+                    alpha: 1.0, a: projBuf, lda: Int32(bneck),
+                    b: wF32 + vStart * bneck, ldb: Int32(bneck), beta: 0.0,
+                    c: outBuf, ldc: Int32(vCount))
+
+                // Local argmax within this shard
+                for sp in 0..<spatial {
+                    var maxVal: Float = 0; var maxIdx: vDSP_Length = 0
+                    vDSP_maxvi(outBuf + sp * vCount, 1, &maxVal, &maxIdx, vDSP_Length(vCount))
+                    shardBestVals[shard * spatial + sp] = maxVal
+                    shardBestIdxs[shard * spatial + sp] = Int32(vStart + Int(maxIdx))
+                }
+            }
+
+            // Merge: find global best across shards (14 comparisons per lane)
+            for sp in 0..<spatial {
+                var gBest: Float = -.infinity
+                var gIdx: UInt16 = 0
+                for shard in 0..<nShards {
+                    let v = shardBestVals[shard * spatial + sp]
+                    if v > gBest {
+                        gBest = v
+                        gIdx = UInt16(shardBestIdxs[shard * spatial + sp])
+                    }
+                }
+                tokens[sp] = gIdx
+            }
+        }
+
+        var t5: [Double] = []
+        for _ in 0..<reps {
+            let s = GenerationClock.now()
+            cpuSharded()
+            t5.append(machMilliseconds(GenerationClock.now() - s) * 1000)
+        }
+        print("  bneck=\(bneck) sharded(\(nShards) cores): \(String(format: "%.1f", med(t5))) µs")
+    }
+
+    // MARK: - Pipelined groups sweep (trunk g vs head g)
+
+    func test_pipelined_groups_sweep_on_hardware() throws {
+        try requireGenerationHardware()
+
+        let dim = ModelConfig.dim
+        let layerCount = 6
+        let streamCount = 1024
+        let bneck = 64
+        let iters = 60
+        let warmup = 10
+
+        let weights = makeEchoRecurrentGenerationWeights(layerCount: layerCount)
+        let vocabSize = weights.vocabSize
+        let aneQueue = DispatchQueue(label: "ane.eval.gsweep", qos: .userInteractive)
+
+        for trunkG in [8, 16] {
+            for headG in [1] {
+                // Pipeline A
+                var trA = try LayerStorage<RWKVStyleFusedThreeLayerSession>(
+                    count: 2,
+                    throwingInitializer: { tripletIdx in
+                        let base = tripletIdx * 3
+                        return try RWKVStyleFusedThreeLayerSession(
+                            weights0: weights.layers[base], weights1: weights.layers[base + 1],
+                            weights2: weights.layers[base + 2], laneSpatial: streamCount, groups: trunkG)
+                    })
+                let headA = try FactoredGenerationRMSNormClassifierKernelSet(
+                    rmsFinal: weights.rmsFinal,
+                    classifierProjection: TensorBuffer(count: bneck * dim, zeroed: true),
+                    classifierExpansion: TensorBuffer(count: vocabSize * bneck, zeroed: true),
+                    vocabSize: vocabSize, bottleneck: bneck, laneSpatial: streamCount, groups: headG)
+                for i in 0..<3 { try trA[0].kernels.step.rebindInput(at: 1+i, to: trA[0].kernels.step.outputSurface(at: 1+i)) }
+                try trA[1].kernels.step.rebindInput(at: 0, to: trA[0].handles.xOut)
+                for i in 0..<3 { try trA[1].kernels.step.rebindInput(at: 1+i, to: trA[1].kernels.step.outputSurface(at: 1+i)) }
+                try headA.rmsNormClassifier.rebindInput(at: 0, to: trA[1].handles.xOut)
+                let headOutA = try headA.rmsNormClassifier.outputSurface(at: 0)
+                let t0xInA = trA[0].handles.xIn
+
+                // Pipeline B
+                var trB = try LayerStorage<RWKVStyleFusedThreeLayerSession>(
+                    count: 2,
+                    throwingInitializer: { tripletIdx in
+                        let base = tripletIdx * 3
+                        return try RWKVStyleFusedThreeLayerSession(
+                            weights0: weights.layers[base], weights1: weights.layers[base + 1],
+                            weights2: weights.layers[base + 2], laneSpatial: streamCount, groups: trunkG)
+                    })
+                let headB = try FactoredGenerationRMSNormClassifierKernelSet(
+                    rmsFinal: weights.rmsFinal,
+                    classifierProjection: TensorBuffer(count: bneck * dim, zeroed: true),
+                    classifierExpansion: TensorBuffer(count: vocabSize * bneck, zeroed: true),
+                    vocabSize: vocabSize, bottleneck: bneck, laneSpatial: streamCount, groups: headG)
+                for i in 0..<3 { try trB[0].kernels.step.rebindInput(at: 1+i, to: trB[0].kernels.step.outputSurface(at: 1+i)) }
+                try trB[1].kernels.step.rebindInput(at: 0, to: trB[0].handles.xOut)
+                for i in 0..<3 { try trB[1].kernels.step.rebindInput(at: 1+i, to: trB[1].kernels.step.outputSurface(at: 1+i)) }
+                try headB.rmsNormClassifier.rebindInput(at: 0, to: trB[1].handles.xOut)
+                let headOutB = try headB.rmsNormClassifier.outputSurface(at: 0)
+                let t0xInB = trB[0].handles.xIn
+
+                var tokensA = Array(repeating: UInt16(0), count: streamCount)
+                var tokensB = Array(repeating: UInt16(0), count: streamCount)
+
+                func embWrite(_ tokens: [UInt16], to surface: IOSurfaceRef) throws {
+                    try weights.embedding.withUnsafePointer { embPtr in
+                        try tokens.withUnsafeBufferPointer { tokenBuf in
+                            try SurfaceIO.writeEmbeddingBatchFP16(
+                                to: surface, channelOffset: 0, spatial: streamCount,
+                                embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
+                                tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount)
+                        }
+                    }
+                }
+
+                func argmax(from surface: IOSurfaceRef, into tokens: inout [UInt16]) throws {
+                    let r = try SurfaceIO.argmaxBatchFP16SpatialParallel(
+                        from: surface, channelOffset: 0, spatial: streamCount,
+                        channels: vocabSize, streamCount: streamCount, nBlocks: 32)
+                    for i in 0..<streamCount { tokens[i] = UInt16(r[i].index) }
+                }
+
+                // Prime
+                try embWrite(tokensA, to: t0xInA)
+                try trA[0].kernels.step.eval(); try trA[1].kernels.step.eval(); try headA.rmsNormClassifier.eval()
+                try embWrite(tokensB, to: t0xInB)
+
+                var pipeUs: [Double] = []
+                for iter in 0..<(warmup + iters) {
+                    let s = GenerationClock.now()
+                    var aneError: (any Error)?
+
+                    let g1 = DispatchGroup()
+                    g1.enter()
+                    aneQueue.async { [self] in
+                        defer { g1.leave() }
+                        do {
+                            try trB[0].kernels.step.eval(); try trB[1].kernels.step.eval()
+                            try headB.rmsNormClassifier.eval()
+                        } catch { aneError = error }
+                    }
+                    try argmax(from: headOutA, into: &tokensA)
+                    try embWrite(tokensA, to: t0xInA)
+                    g1.wait()
+                    if let e = aneError { throw e }
+
+                    let g2 = DispatchGroup()
+                    g2.enter()
+                    aneQueue.async { [self] in
+                        defer { g2.leave() }
+                        do {
+                            try trA[0].kernels.step.eval(); try trA[1].kernels.step.eval()
+                            try headA.rmsNormClassifier.eval()
+                        } catch { aneError = error }
+                    }
+                    try argmax(from: headOutB, into: &tokensB)
+                    try embWrite(tokensB, to: t0xInB)
+                    g2.wait()
+                    if let e = aneError { throw e }
+
+                    if iter >= warmup {
+                        pipeUs.append(machMilliseconds(GenerationClock.now() - s) * 1000)
+                    }
+                }
+                func median(_ a: [Double]) -> Double { let s = a.sorted(); return s[s.count / 2] }
+                let med = median(pipeUs)
+                let tps = Double(streamCount * 2) / med * 1_000_000
+                print("trunk_g=\(trunkG) head_g=\(headG) pipelined: median=\(String(format: "%.0f", med))µs tps=\(String(format: "%.0f", tps)) per_half=\(String(format: "%.0f", med/2))µs")
+            }
+        }
+    }
+
+    // MARK: - Triple-buffer probe
+
+    func test_triple_buffer_probe_on_hardware() throws {
+        try requireGenerationHardware()
+
+        let dim = ModelConfig.dim
+        let layerCount = 6
+        let streamCount = 1024
+        let groups = 8
+        let headGroups = 1
+        let bneck = 64
+        let iters = 60
+        let warmup = 10
+
+        let weights = makeEchoRecurrentGenerationWeights(layerCount: layerCount)
+        let vocabSize = weights.vocabSize
+
+        // Pipeline A
+        var trA = try LayerStorage<RWKVStyleFusedThreeLayerSession>(
+            count: 2,
+            throwingInitializer: { tripletIdx in
+                let base = tripletIdx * 3
+                return try RWKVStyleFusedThreeLayerSession(
+                    weights0: weights.layers[base], weights1: weights.layers[base + 1],
+                    weights2: weights.layers[base + 2], laneSpatial: streamCount, groups: groups)
+            })
+        let headA = try FactoredGenerationRMSNormClassifierKernelSet(
+            rmsFinal: weights.rmsFinal,
+            classifierProjection: TensorBuffer(count: bneck * dim, zeroed: true),
+            classifierExpansion: TensorBuffer(count: vocabSize * bneck, zeroed: true),
+            vocabSize: vocabSize, bottleneck: bneck, laneSpatial: streamCount, groups: headGroups)
+        for i in 0..<3 { try trA[0].kernels.step.rebindInput(at: 1+i, to: trA[0].kernels.step.outputSurface(at: 1+i)) }
+        try trA[1].kernels.step.rebindInput(at: 0, to: trA[0].handles.xOut)
+        for i in 0..<3 { try trA[1].kernels.step.rebindInput(at: 1+i, to: trA[1].kernels.step.outputSurface(at: 1+i)) }
+        try headA.rmsNormClassifier.rebindInput(at: 0, to: trA[1].handles.xOut)
+        let headOutA = try headA.rmsNormClassifier.outputSurface(at: 0)
+        let t0xInA = trA[0].handles.xIn
+
+        // Pipeline B
+        var trB = try LayerStorage<RWKVStyleFusedThreeLayerSession>(
+            count: 2,
+            throwingInitializer: { tripletIdx in
+                let base = tripletIdx * 3
+                return try RWKVStyleFusedThreeLayerSession(
+                    weights0: weights.layers[base], weights1: weights.layers[base + 1],
+                    weights2: weights.layers[base + 2], laneSpatial: streamCount, groups: groups)
+            })
+        let headB = try FactoredGenerationRMSNormClassifierKernelSet(
+            rmsFinal: weights.rmsFinal,
+            classifierProjection: TensorBuffer(count: bneck * dim, zeroed: true),
+            classifierExpansion: TensorBuffer(count: vocabSize * bneck, zeroed: true),
+            vocabSize: vocabSize, bottleneck: bneck, laneSpatial: streamCount, groups: headGroups)
+        for i in 0..<3 { try trB[0].kernels.step.rebindInput(at: 1+i, to: trB[0].kernels.step.outputSurface(at: 1+i)) }
+        try trB[1].kernels.step.rebindInput(at: 0, to: trB[0].handles.xOut)
+        for i in 0..<3 { try trB[1].kernels.step.rebindInput(at: 1+i, to: trB[1].kernels.step.outputSurface(at: 1+i)) }
+        try headB.rmsNormClassifier.rebindInput(at: 0, to: trB[1].handles.xOut)
+        let headOutB = try headB.rmsNormClassifier.outputSurface(at: 0)
+        let t0xInB = trB[0].handles.xIn
+
+        // Pipeline C
+        var trC = try LayerStorage<RWKVStyleFusedThreeLayerSession>(
+            count: 2,
+            throwingInitializer: { tripletIdx in
+                let base = tripletIdx * 3
+                return try RWKVStyleFusedThreeLayerSession(
+                    weights0: weights.layers[base], weights1: weights.layers[base + 1],
+                    weights2: weights.layers[base + 2], laneSpatial: streamCount, groups: groups)
+            })
+        let headC = try FactoredGenerationRMSNormClassifierKernelSet(
+            rmsFinal: weights.rmsFinal,
+            classifierProjection: TensorBuffer(count: bneck * dim, zeroed: true),
+            classifierExpansion: TensorBuffer(count: vocabSize * bneck, zeroed: true),
+            vocabSize: vocabSize, bottleneck: bneck, laneSpatial: streamCount, groups: headGroups)
+        for i in 0..<3 { try trC[0].kernels.step.rebindInput(at: 1+i, to: trC[0].kernels.step.outputSurface(at: 1+i)) }
+        try trC[1].kernels.step.rebindInput(at: 0, to: trC[0].handles.xOut)
+        for i in 0..<3 { try trC[1].kernels.step.rebindInput(at: 1+i, to: trC[1].kernels.step.outputSurface(at: 1+i)) }
+        try headC.rmsNormClassifier.rebindInput(at: 0, to: trC[1].handles.xOut)
+        let headOutC = try headC.rmsNormClassifier.outputSurface(at: 0)
+        let t0xInC = trC[0].handles.xIn
+
+        var tokensA = Array(repeating: UInt16(0), count: streamCount)
+        var tokensB = Array(repeating: UInt16(0), count: streamCount)
+        var tokensC = Array(repeating: UInt16(0), count: streamCount)
+
+        let aneQueue = DispatchQueue(label: "ane.eval.triple", qos: .userInteractive)
+
+        func embWrite(_ tokens: [UInt16], to surface: IOSurfaceRef) throws {
+            try weights.embedding.withUnsafePointer { embPtr in
+                try tokens.withUnsafeBufferPointer { tokenBuf in
+                    try SurfaceIO.writeEmbeddingBatchFP16(
+                        to: surface, channelOffset: 0, spatial: streamCount,
+                        embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
+                        tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount
+                    )
+                }
+            }
+        }
+
+        func argmax(from surface: IOSurfaceRef, into tokens: inout [UInt16]) throws {
+            let r = try SurfaceIO.argmaxBatchFP16SpatialParallel(
+                from: surface, channelOffset: 0, spatial: streamCount,
+                channels: vocabSize, streamCount: streamCount, nBlocks: 32
+            )
+            for i in 0..<streamCount { tokens[i] = UInt16(r[i].index) }
+        }
+
+        // Prime all pipelines
+        try embWrite(tokensA, to: t0xInA)
+        try trA[0].kernels.step.eval(); try trA[1].kernels.step.eval(); try headA.rmsNormClassifier.eval()
+        try embWrite(tokensB, to: t0xInB)
+        try trB[0].kernels.step.eval(); try trB[1].kernels.step.eval(); try headB.rmsNormClassifier.eval()
+        try embWrite(tokensC, to: t0xInC)
+
+        // Triple-buffered pipeline
+        var tripleUs: [Double] = []
+        for iter in 0..<(warmup + iters) {
+            let s = GenerationClock.now()
+            var aneError: (any Error)?
+
+            // Phase 1: eval C || argmax A + emb A
+            let g1 = DispatchGroup()
+            g1.enter()
+            aneQueue.async { [self] in
+                defer { g1.leave() }
+                do {
+                    try trC[0].kernels.step.eval()
+                    try trC[1].kernels.step.eval()
+                    try headC.rmsNormClassifier.eval()
+                } catch { aneError = error }
+            }
+            try argmax(from: headOutA, into: &tokensA)
+            try embWrite(tokensA, to: t0xInA)
+            g1.wait()
+            if let e = aneError { throw e }
+
+            // Phase 2: eval A || argmax B + emb B
+            let g2 = DispatchGroup()
+            g2.enter()
+            aneQueue.async { [self] in
+                defer { g2.leave() }
+                do {
+                    try trA[0].kernels.step.eval()
+                    try trA[1].kernels.step.eval()
+                    try headA.rmsNormClassifier.eval()
+                } catch { aneError = error }
+            }
+            try argmax(from: headOutB, into: &tokensB)
+            try embWrite(tokensB, to: t0xInB)
+            g2.wait()
+            if let e = aneError { throw e }
+
+            // Phase 3: eval B || argmax C + emb C
+            let g3 = DispatchGroup()
+            g3.enter()
+            aneQueue.async { [self] in
+                defer { g3.leave() }
+                do {
+                    try trB[0].kernels.step.eval()
+                    try trB[1].kernels.step.eval()
+                    try headB.rmsNormClassifier.eval()
+                } catch { aneError = error }
+            }
+            try argmax(from: headOutC, into: &tokensC)
+            try embWrite(tokensC, to: t0xInC)
+            g3.wait()
+            if let e = aneError { throw e }
+
+            if iter >= warmup {
+                tripleUs.append(machMilliseconds(GenerationClock.now() - s) * 1000)
+            }
+        }
+        func median(_ a: [Double]) -> Double { let s = a.sorted(); return s[s.count / 2] }
+        let triMed = median(tripleUs)
+        let totalTokens = streamCount * 3
+        let triTPS = Double(totalTokens) / triMed * 1_000_000
+        print("=== Triple-buffer (3x\(streamCount) streams) ===")
+        print("  median=\(String(format: "%.0f", triMed))µs (\(String(format: "%.0f", triMed/3))µs/third)")
+        print("  aggregate TPS: \(String(format: "%.0f", triTPS))")
+        print("  per-third effective TPS: \(String(format: "%.0f", Double(streamCount) / (triMed / 3) * 1e6))")
+    }
+
+    // MARK: - Pipelined stream-count sweep
+
+    func test_pipelined_stream_sweep_on_hardware() throws {
+        try requireGenerationHardware()
+
+        let dim = ModelConfig.dim
+        let layerCount = 6
+        let groups = 8
+        let headGroups = 1
+        let bneck = 64
+        let iters = 60
+
+        for streamCount in [256, 512, 768, 1024] {
+            let weights = makeEchoRecurrentGenerationWeights(layerCount: layerCount)
+            let vocabSize = weights.vocabSize
+
+            // Pipeline A
+            var tripletsA = try LayerStorage<RWKVStyleFusedThreeLayerSession>(
+                count: layerCount / 3,
+                throwingInitializer: { tripletIdx in
+                    let base = tripletIdx * 3
+                    return try RWKVStyleFusedThreeLayerSession(
+                        weights0: weights.layers[base],
+                        weights1: weights.layers[base + 1],
+                        weights2: weights.layers[base + 2],
+                        laneSpatial: streamCount,
+                        groups: groups
+                    )
+                }
+            )
+            let headA = try FactoredGenerationRMSNormClassifierKernelSet(
+                rmsFinal: weights.rmsFinal,
+                classifierProjection: TensorBuffer(count: bneck * dim, zeroed: true),
+                classifierExpansion: TensorBuffer(count: vocabSize * bneck, zeroed: true),
+                vocabSize: vocabSize, bottleneck: bneck,
+                laneSpatial: streamCount, groups: headGroups
+            )
+
+            // Pipeline B
+            var tripletsB = try LayerStorage<RWKVStyleFusedThreeLayerSession>(
+                count: layerCount / 3,
+                throwingInitializer: { tripletIdx in
+                    let base = tripletIdx * 3
+                    return try RWKVStyleFusedThreeLayerSession(
+                        weights0: weights.layers[base],
+                        weights1: weights.layers[base + 1],
+                        weights2: weights.layers[base + 2],
+                        laneSpatial: streamCount,
+                        groups: groups
+                    )
+                }
+            )
+            let headB = try FactoredGenerationRMSNormClassifierKernelSet(
+                rmsFinal: weights.rmsFinal,
+                classifierProjection: TensorBuffer(count: bneck * dim, zeroed: true),
+                classifierExpansion: TensorBuffer(count: vocabSize * bneck, zeroed: true),
+                vocabSize: vocabSize, bottleneck: bneck,
+                laneSpatial: streamCount, groups: headGroups
+            )
+
+            // Rebind A
+            for i in 0..<3 {
+                let sOut = try tripletsA[0].kernels.step.outputSurface(at: 1 + i)
+                try tripletsA[0].kernels.step.rebindInput(at: 1 + i, to: sOut)
+            }
+            try tripletsA[1].kernels.step.rebindInput(at: 0, to: tripletsA[0].handles.xOut)
+            for i in 0..<3 {
+                let sOut = try tripletsA[1].kernels.step.outputSurface(at: 1 + i)
+                try tripletsA[1].kernels.step.rebindInput(at: 1 + i, to: sOut)
+            }
+            try headA.rmsNormClassifier.rebindInput(at: 0, to: tripletsA[1].handles.xOut)
+            let headOutA = try headA.rmsNormClassifier.outputSurface(at: 0)
+            let t0xInA = tripletsA[0].handles.xIn
+
+            // Rebind B
+            for i in 0..<3 {
+                let sOut = try tripletsB[0].kernels.step.outputSurface(at: 1 + i)
+                try tripletsB[0].kernels.step.rebindInput(at: 1 + i, to: sOut)
+            }
+            try tripletsB[1].kernels.step.rebindInput(at: 0, to: tripletsB[0].handles.xOut)
+            for i in 0..<3 {
+                let sOut = try tripletsB[1].kernels.step.outputSurface(at: 1 + i)
+                try tripletsB[1].kernels.step.rebindInput(at: 1 + i, to: sOut)
+            }
+            try headB.rmsNormClassifier.rebindInput(at: 0, to: tripletsB[1].handles.xOut)
+            let headOutB = try headB.rmsNormClassifier.outputSurface(at: 0)
+            let t0xInB = tripletsB[0].handles.xIn
+
+            var tokensA = Array(repeating: UInt16(0), count: streamCount)
+            var tokensB = Array(repeating: UInt16(0), count: streamCount)
+            let aneQueue = DispatchQueue(label: "ane.eval.\(streamCount)", qos: .userInteractive)
+
+            func embWrite(_ tokens: [UInt16], to surface: IOSurfaceRef) throws {
+                try weights.embedding.withUnsafePointer { embPtr in
+                    try tokens.withUnsafeBufferPointer { tokenBuf in
+                        try SurfaceIO.writeEmbeddingBatchFP16(
+                            to: surface, channelOffset: 0, spatial: streamCount,
+                            embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
+                            tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount
+                        )
+                    }
+                }
+            }
+
+            func argmax(from surface: IOSurfaceRef, into tokens: inout [UInt16]) throws {
+                let r = try SurfaceIO.argmaxBatchFP16SpatialParallel(
+                    from: surface, channelOffset: 0, spatial: streamCount,
+                    channels: vocabSize, streamCount: streamCount, nBlocks: 32
+                )
+                for i in 0..<streamCount { tokens[i] = UInt16(r[i].index) }
+            }
+
+            // Prime
+            try embWrite(tokensA, to: t0xInA)
+            try tripletsA[0].kernels.step.eval()
+            try tripletsA[1].kernels.step.eval()
+            try headA.rmsNormClassifier.eval()
+            try embWrite(tokensB, to: t0xInB)
+
+            // Warmup + timed
+            var pipeUs: [Double] = []
+            for iter in 0..<(10 + iters) {
+                let s = GenerationClock.now()
+                var aneError: (any Error)?
+
+                // Eval B on ANE || CPU: argmax A + emb A
+                let g1 = DispatchGroup()
+                g1.enter()
+                aneQueue.async { [self] in
+                    defer { g1.leave() }
+                    do {
+                        try tripletsB[0].kernels.step.eval()
+                        try tripletsB[1].kernels.step.eval()
+                        try headB.rmsNormClassifier.eval()
+                    } catch { aneError = error }
+                }
+                try argmax(from: headOutA, into: &tokensA)
+                try embWrite(tokensA, to: t0xInA)
+                g1.wait()
+                if let e = aneError { throw e }
+
+                // Eval A on ANE || CPU: argmax B + emb B
+                let g2 = DispatchGroup()
+                g2.enter()
+                aneQueue.async { [self] in
+                    defer { g2.leave() }
+                    do {
+                        try tripletsA[0].kernels.step.eval()
+                        try tripletsA[1].kernels.step.eval()
+                        try headA.rmsNormClassifier.eval()
+                    } catch { aneError = error }
+                }
+                try argmax(from: headOutB, into: &tokensB)
+                try embWrite(tokensB, to: t0xInB)
+                g2.wait()
+                if let e = aneError { throw e }
+
+                if iter >= 10 {
+                    pipeUs.append(machMilliseconds(GenerationClock.now() - s) * 1000)
+                }
+            }
+            func median(_ a: [Double]) -> Double { let s = a.sorted(); return s[s.count / 2] }
+            let med = median(pipeUs)
+            let tps = Double(streamCount * 2) / med * 1_000_000
+            print("streams=\(streamCount) pipelined: median=\(String(format: "%.0f", med))µs (\(String(format: "%.0f", med/2))µs/half) aggregate_tps=\(String(format: "%.0f", tps))")
+        }
+    }
+
+    // MARK: - Head optimization sweep
+
+    func test_head_optimization_sweep_on_hardware() throws {
+        try requireGenerationHardware()
+
+        let dim = ModelConfig.dim
+        let layerCount = 6
+        let streamCount = 1024
+        let iters = 50
+
+        // 1) Trunk g=8, vary head groups
+        print("=== Head groups sweep at 1024 streams, trunk g=8 ===")
+        for headG in [1, 8] {
+            do {
+                try runSpatialScalingPoint(
+                    streamCount: streamCount, laneSpatial: streamCount, dim: dim,
+                    layerCount: layerCount, groups: 8, headGroups: headG, iters: iters
+                )
+            } catch {
+                print("trunk_g=8 head_g=\(headG): FAILED (\(error))")
+            }
+        }
+
+        // 2) Bottleneck sweep (64, 128, 256) at g=8, head_g=1
+        print("\n=== Bottleneck sweep at 1024 streams, g=8, head_g=1 ===")
+        for bneck in [64, 128, 256] {
+            do {
+                let weights = makeEchoRecurrentGenerationWeights(layerCount: layerCount)
+
+                var tripletSessions = try LayerStorage<RWKVStyleFusedThreeLayerSession>(
+                    count: layerCount / 3,
+                    throwingInitializer: { tripletIdx in
+                        let base = tripletIdx * 3
+                        return try RWKVStyleFusedThreeLayerSession(
+                            weights0: weights.layers[base],
+                            weights1: weights.layers[base + 1],
+                            weights2: weights.layers[base + 2],
+                            laneSpatial: streamCount,
+                            groups: 8
+                        )
+                    }
+                )
+                let factoredHead = try FactoredGenerationRMSNormClassifierKernelSet(
+                    rmsFinal: weights.rmsFinal,
+                    classifierProjection: TensorBuffer(count: bneck * dim, zeroed: true),
+                    classifierExpansion: TensorBuffer(count: weights.vocabSize * bneck, zeroed: true),
+                    vocabSize: weights.vocabSize,
+                    bottleneck: bneck,
+                    laneSpatial: streamCount,
+                    groups: 1
+                )
+
+                // Rebind
+                for i in 0..<3 {
+                    let sOut = try tripletSessions[0].kernels.step.outputSurface(at: 1 + i)
+                    try tripletSessions[0].kernels.step.rebindInput(at: 1 + i, to: sOut)
+                }
+                let t0xOut = tripletSessions[0].handles.xOut
+                try tripletSessions[1].kernels.step.rebindInput(at: 0, to: t0xOut)
+                for i in 0..<3 {
+                    let sOut = try tripletSessions[1].kernels.step.outputSurface(at: 1 + i)
+                    try tripletSessions[1].kernels.step.rebindInput(at: 1 + i, to: sOut)
+                }
+                let t1xOut = tripletSessions[1].handles.xOut
+                try factoredHead.rmsNormClassifier.rebindInput(at: 0, to: t1xOut)
+                let headOut = try factoredHead.rmsNormClassifier.outputSurface(at: 0)
+                let t0xIn = tripletSessions[0].handles.xIn
+                let vocabSize = weights.vocabSize
+                var tokens = Array(repeating: UInt16(0), count: streamCount)
+
+                // Warmup
+                for _ in 0..<5 {
+                    try weights.embedding.withUnsafePointer { embPtr in
+                        try tokens.withUnsafeBufferPointer { tokenBuf in
+                            try SurfaceIO.writeEmbeddingBatchFP16(
+                                to: t0xIn, channelOffset: 0, spatial: streamCount,
+                                embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
+                                tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount
+                            )
+                        }
+                    }
+                    try tripletSessions[0].kernels.step.eval()
+                    try tripletSessions[1].kernels.step.eval()
+                    try factoredHead.rmsNormClassifier.eval()
+                    let r = try SurfaceIO.argmaxBatchFP16SpatialParallel(
+                        from: headOut, channelOffset: 0, spatial: streamCount,
+                        channels: vocabSize, streamCount: streamCount, nBlocks: 32
+                    )
+                    for i in 0..<streamCount { tokens[i] = UInt16(r[i].index) }
+                }
+
+                // Timed
+                var stepUs: [Double] = []
+                var evalUs: [Double] = []
+                var argmaxUs: [Double] = []
+                for _ in 0..<iters {
+                    let s0 = GenerationClock.now()
+                    try weights.embedding.withUnsafePointer { embPtr in
+                        try tokens.withUnsafeBufferPointer { tokenBuf in
+                            try SurfaceIO.writeEmbeddingBatchFP16(
+                                to: t0xIn, channelOffset: 0, spatial: streamCount,
+                                embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
+                                tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount
+                            )
+                        }
+                    }
+                    try tripletSessions[0].kernels.step.eval()
+                    try tripletSessions[1].kernels.step.eval()
+                    try factoredHead.rmsNormClassifier.eval()
+                    let s1 = GenerationClock.now()
+                    let r = try SurfaceIO.argmaxBatchFP16SpatialParallel(
+                        from: headOut, channelOffset: 0, spatial: streamCount,
+                        channels: vocabSize, streamCount: streamCount, nBlocks: 32
+                    )
+                    let s2 = GenerationClock.now()
+                    evalUs.append(machMilliseconds(s1 - s0) * 1000)
+                    argmaxUs.append(machMilliseconds(s2 - s1) * 1000)
+                    stepUs.append(machMilliseconds(s2 - s0) * 1000)
+                    for i in 0..<streamCount { tokens[i] = UInt16(r[i].index) }
+                }
+                func median(_ a: [Double]) -> Double { let s = a.sorted(); return s[s.count / 2] }
+                let med = median(stepUs)
+                let tps = Double(streamCount) / med * 1_000_000
+                print("  bneck=\(bneck): median=\(String(format: "%.0f", med))µs tps=\(String(format: "%.0f", tps)) eval=\(String(format: "%.0f", median(evalUs)))µs argmax=\(String(format: "%.0f", median(argmaxUs)))µs")
+            } catch {
+                print("  bneck=\(bneck): FAILED (\(error))")
+            }
+        }
+    }
+
+    // MARK: - nBlocks sweep at 512
+
+    func test_nblocks_sweep_512_on_hardware() throws {
+        try requireGenerationHardware()
+
+        let dim = ModelConfig.dim
+        let layerCount = 6
+        let groups = 8
+        let streamCount = 512
+        let laneSpatial = 512
+        let iters = 60
+
+        let weights = makeEchoRecurrentGenerationWeights(layerCount: layerCount)
+
+        var tripletSessions = try LayerStorage<RWKVStyleFusedThreeLayerSession>(
+            count: layerCount / 3,
+            throwingInitializer: { tripletIdx in
+                let base = tripletIdx * 3
+                return try RWKVStyleFusedThreeLayerSession(
+                    weights0: weights.layers[base],
+                    weights1: weights.layers[base + 1],
+                    weights2: weights.layers[base + 2],
+                    laneSpatial: laneSpatial,
+                    groups: groups
+                )
+            }
+        )
+        let factoredHead = try FactoredGenerationRMSNormClassifierKernelSet(
+            rmsFinal: weights.rmsFinal,
+            classifierProjection: TensorBuffer(count: 128 * dim, zeroed: true),
+            classifierExpansion: TensorBuffer(count: weights.vocabSize * 128, zeroed: true),
+            vocabSize: weights.vocabSize,
+            bottleneck: 128,
+            laneSpatial: laneSpatial,
+            groups: groups
+        )
+
+        // Rebind
+        for i in 0..<3 {
+            let sOut = try tripletSessions[0].kernels.step.outputSurface(at: 1 + i)
+            try tripletSessions[0].kernels.step.rebindInput(at: 1 + i, to: sOut)
+        }
+        let t0xOut = tripletSessions[0].handles.xOut
+        try tripletSessions[1].kernels.step.rebindInput(at: 0, to: t0xOut)
+        for i in 0..<3 {
+            let sOut = try tripletSessions[1].kernels.step.outputSurface(at: 1 + i)
+            try tripletSessions[1].kernels.step.rebindInput(at: 1 + i, to: sOut)
+        }
+        let t1xOut = tripletSessions[1].handles.xOut
+        try factoredHead.rmsNormClassifier.rebindInput(at: 0, to: t1xOut)
+        let headOut = try factoredHead.rmsNormClassifier.outputSurface(at: 0)
+        let t0xIn = tripletSessions[0].handles.xIn
+        let vocabSize = weights.vocabSize
+
+        print("=== nBlocks sweep at 512 streams, g=\(groups) ===")
+        for nBlocks in [4, 8, 16, 32] {
+            var tokens = Array(repeating: UInt16(0), count: streamCount)
+            // Warmup
+            for _ in 0..<5 {
+                try weights.embedding.withUnsafePointer { embPtr in
+                    try tokens.withUnsafeBufferPointer { tokenBuf in
+                        try SurfaceIO.writeEmbeddingBatchFP16(
+                            to: t0xIn, channelOffset: 0, spatial: laneSpatial,
+                            embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
+                            tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount
+                        )
+                    }
+                }
+                try tripletSessions[0].kernels.step.eval()
+                try tripletSessions[1].kernels.step.eval()
+                try factoredHead.rmsNormClassifier.eval()
+                let r = try SurfaceIO.argmaxBatchFP16SpatialParallel(
+                    from: headOut, channelOffset: 0, spatial: laneSpatial,
+                    channels: vocabSize, streamCount: streamCount, nBlocks: nBlocks
+                )
+                for i in 0..<streamCount { tokens[i] = UInt16(r[i].index) }
+            }
+            // Timed
+            var stepUs: [Double] = []
+            for _ in 0..<iters {
+                let s = GenerationClock.now()
+                try weights.embedding.withUnsafePointer { embPtr in
+                    try tokens.withUnsafeBufferPointer { tokenBuf in
+                        try SurfaceIO.writeEmbeddingBatchFP16(
+                            to: t0xIn, channelOffset: 0, spatial: laneSpatial,
+                            embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
+                            tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount
+                        )
+                    }
+                }
+                try tripletSessions[0].kernels.step.eval()
+                try tripletSessions[1].kernels.step.eval()
+                try factoredHead.rmsNormClassifier.eval()
+                let r = try SurfaceIO.argmaxBatchFP16SpatialParallel(
+                    from: headOut, channelOffset: 0, spatial: laneSpatial,
+                    channels: vocabSize, streamCount: streamCount, nBlocks: nBlocks
+                )
+                stepUs.append(machMilliseconds(GenerationClock.now() - s) * 1000)
+                for i in 0..<streamCount { tokens[i] = UInt16(r[i].index) }
+            }
+            func median(_ a: [Double]) -> Double { let s = a.sorted(); return s[s.count / 2] }
+            let med = median(stepUs)
+            let tps = Double(streamCount) / med * 1_000_000
+            print("  nBlocks=\(nBlocks): median=\(String(format: "%.0f", med))µs tps=\(String(format: "%.0f", tps))")
+        }
+    }
+
+    // MARK: - 1024+ stream sweep
+
+    func test_1024_plus_stream_sweep_on_hardware() throws {
+        try requireGenerationHardware()
+
+        let dim = ModelConfig.dim
+        let layerCount = 6
+        let iters = 50
+
+        // Groups sweep at 1024 streams
+        print("=== Groups sweep at spatial=1024 ===")
+        for testGroups in [1, 8, 16, 32] {
+            do {
+                try runSpatialScalingPoint(
+                    streamCount: 1024, laneSpatial: 1024, dim: dim,
+                    layerCount: layerCount, groups: testGroups, headGroups: testGroups, iters: iters
+                )
+            } catch {
+                print("g=\(testGroups) spatial=1024 streams=1024: FAILED (\(error))")
+            }
+        }
+
+        // nBlocks sweep at 1024 with g=8 (best from 512 sweep)
+        print("\n=== nBlocks sweep at 1024 streams, g=8 ===")
+        do {
+            let groups = 8
+            let weights = makeEchoRecurrentGenerationWeights(layerCount: layerCount)
+
+            var tripletSessions = try LayerStorage<RWKVStyleFusedThreeLayerSession>(
+                count: layerCount / 3,
+                throwingInitializer: { tripletIdx in
+                    let base = tripletIdx * 3
+                    return try RWKVStyleFusedThreeLayerSession(
+                        weights0: weights.layers[base],
+                        weights1: weights.layers[base + 1],
+                        weights2: weights.layers[base + 2],
+                        laneSpatial: 1024,
+                        groups: groups
+                    )
+                }
+            )
+            let factoredHead = try FactoredGenerationRMSNormClassifierKernelSet(
+                rmsFinal: weights.rmsFinal,
+                classifierProjection: TensorBuffer(count: 128 * dim, zeroed: true),
+                classifierExpansion: TensorBuffer(count: weights.vocabSize * 128, zeroed: true),
+                vocabSize: weights.vocabSize,
+                bottleneck: 128,
+                laneSpatial: 1024,
+                groups: groups
+            )
+
+            // Rebind
+            for i in 0..<3 {
+                let sOut = try tripletSessions[0].kernels.step.outputSurface(at: 1 + i)
+                try tripletSessions[0].kernels.step.rebindInput(at: 1 + i, to: sOut)
+            }
+            let t0xOut = tripletSessions[0].handles.xOut
+            try tripletSessions[1].kernels.step.rebindInput(at: 0, to: t0xOut)
+            for i in 0..<3 {
+                let sOut = try tripletSessions[1].kernels.step.outputSurface(at: 1 + i)
+                try tripletSessions[1].kernels.step.rebindInput(at: 1 + i, to: sOut)
+            }
+            let t1xOut = tripletSessions[1].handles.xOut
+            try factoredHead.rmsNormClassifier.rebindInput(at: 0, to: t1xOut)
+            let headOut = try factoredHead.rmsNormClassifier.outputSurface(at: 0)
+            let t0xIn = tripletSessions[0].handles.xIn
+            let vocabSize = weights.vocabSize
+            var tokens = Array(repeating: UInt16(0), count: 1024)
+
+            for nBlocks in [4, 8, 16, 32] {
+                // Warmup
+                for _ in 0..<5 {
+                    try weights.embedding.withUnsafePointer { embPtr in
+                        try tokens.withUnsafeBufferPointer { tokenBuf in
+                            try SurfaceIO.writeEmbeddingBatchFP16(
+                                to: t0xIn, channelOffset: 0, spatial: 1024,
+                                embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
+                                tokenIDs: tokenBuf.baseAddress!, streamCount: 1024
+                            )
+                        }
+                    }
+                    try tripletSessions[0].kernels.step.eval()
+                    try tripletSessions[1].kernels.step.eval()
+                    try factoredHead.rmsNormClassifier.eval()
+                    let r = try SurfaceIO.argmaxBatchFP16SpatialParallel(
+                        from: headOut, channelOffset: 0, spatial: 1024,
+                        channels: vocabSize, streamCount: 1024, nBlocks: nBlocks
+                    )
+                    for i in 0..<1024 { tokens[i] = UInt16(r[i].index) }
+                }
+                // Timed
+                var stepUs: [Double] = []
+                for _ in 0..<iters {
+                    let s = GenerationClock.now()
+                    try weights.embedding.withUnsafePointer { embPtr in
+                        try tokens.withUnsafeBufferPointer { tokenBuf in
+                            try SurfaceIO.writeEmbeddingBatchFP16(
+                                to: t0xIn, channelOffset: 0, spatial: 1024,
+                                embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
+                                tokenIDs: tokenBuf.baseAddress!, streamCount: 1024
+                            )
+                        }
+                    }
+                    try tripletSessions[0].kernels.step.eval()
+                    try tripletSessions[1].kernels.step.eval()
+                    try factoredHead.rmsNormClassifier.eval()
+                    let r = try SurfaceIO.argmaxBatchFP16SpatialParallel(
+                        from: headOut, channelOffset: 0, spatial: 1024,
+                        channels: vocabSize, streamCount: 1024, nBlocks: nBlocks
+                    )
+                    stepUs.append(machMilliseconds(GenerationClock.now() - s) * 1000)
+                    for i in 0..<1024 { tokens[i] = UInt16(r[i].index) }
+                }
+                func median(_ a: [Double]) -> Double { let s = a.sorted(); return s[s.count / 2] }
+                let med = median(stepUs)
+                let tps = 1024.0 / med * 1_000_000
+                print("  nBlocks=\(nBlocks): median=\(String(format: "%.0f", med))µs tps=\(String(format: "%.0f", tps))")
+            }
+        } catch {
+            print("  1024 nBlocks sweep: FAILED (\(error))")
+        }
+
+        // Try 2048 streams
+        print("\n=== 2048 stream probe ===")
+        for testGroups in [8, 16] {
+            do {
+                try runSpatialScalingPoint(
+                    streamCount: 2048, laneSpatial: 2048, dim: dim,
+                    layerCount: layerCount, groups: testGroups, headGroups: testGroups, iters: 30
+                )
+            } catch {
+                print("g=\(testGroups) spatial=2048 streams=2048: FAILED (\(error))")
+            }
+        }
+    }
+
+    // MARK: - Cycle 8: GPU expansion+argmax approaches comparison
+
+    func test_metal_expansion_compiletime_bneck_microbenchmark() throws {
+        try requireGenerationHardware()
+
+        let bneck = 64
+        let vocab = 32000
+        let reps = 40
+
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw XCTSkip("No Metal device")
+        }
+        guard let cmdQueue = device.makeCommandQueue() else {
+            throw XCTSkip("No command queue")
+        }
+
+        // Expansion weights [vocab, bneck] in fp16
+        let wF16 = UnsafeMutablePointer<Float16>.allocate(capacity: vocab * bneck)
+        defer { wF16.deallocate() }
+        for i in 0..<(vocab * bneck) { wF16[i] = Float16.random(in: -0.01...0.01) }
+        let wBuf = UnsafeBufferPointer(start: wF16, count: vocab * bneck)
+
+        // fp32 weights for CPU reference
+        let wF32 = UnsafeMutablePointer<Float>.allocate(capacity: vocab * bneck)
+        defer { wF32.deallocate() }
+        for i in 0..<(vocab * bneck) { wF32[i] = Float(wF16[i]) }
+
+        func med(_ a: [Double]) -> Double { let s = a.sorted(); return s[s.count / 2] }
+
+        print("=== Expansion+argmax GPU approaches (BNECK=\(bneck), vocab=\(vocab)) ===")
+
+        for spatial in [1024, 2048] {
+            print("\n--- spatial=\(spatial) ---")
+
+            // Create IOSurface [1, bneck, 1, spatial] fp16 (ANE channel-first layout)
+            let surfProps: [CFString: Any] = [
+                kIOSurfaceWidth: spatial,
+                kIOSurfaceHeight: bneck,
+                kIOSurfaceBytesPerElement: 2,
+                kIOSurfaceBytesPerRow: spatial * 2,
+                kIOSurfaceAllocSize: bneck * spatial * 2,
+            ]
+            let projSurf = IOSurfaceCreate(surfProps as CFDictionary)!
+            IOSurfaceLock(projSurf, [], nil)
+            let surfPtr = IOSurfaceGetBaseAddress(projSurf).assumingMemoryBound(to: Float16.self)
+            for i in 0..<(bneck * spatial) { surfPtr[i] = Float16.random(in: -1...1) }
+            IOSurfaceUnlock(projSurf, [], nil)
+
+            // --- CPU BLAS reference (for correctness) ---
+            let projBufF32 = UnsafeMutablePointer<Float>.allocate(capacity: spatial * bneck)
+            defer { projBufF32.deallocate() }
+            let logitsBuf = UnsafeMutablePointer<Float>.allocate(capacity: spatial * vocab)
+            defer { logitsBuf.deallocate() }
+
+            IOSurfaceLock(projSurf, [.readOnly], nil)
+            let base = IOSurfaceGetBaseAddress(projSurf).assumingMemoryBound(to: Float16.self)
+            for k in 0..<bneck {
+                for sp in 0..<spatial {
+                    projBufF32[sp * bneck + k] = Float(base[k * spatial + sp])
+                }
+            }
+            IOSurfaceUnlock(projSurf, [.readOnly], nil)
+
+            BLAS.sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                m: Int32(spatial), n: Int32(vocab), k: Int32(bneck),
+                alpha: 1.0, a: projBufF32, lda: Int32(bneck),
+                b: wF32, ldb: Int32(bneck), beta: 0.0,
+                c: logitsBuf, ldc: Int32(vocab))
+
+            var cpuRefTokens = [UInt16](repeating: 0, count: spatial)
+            for sp in 0..<spatial {
+                var maxVal: Float = 0; var maxIdx: vDSP_Length = 0
+                vDSP_maxvi(logitsBuf + sp * vocab, 1, &maxVal, &maxIdx, vDSP_Length(vocab))
+                cpuRefTokens[sp] = UInt16(maxIdx)
+            }
+
+            // --- Method 1: Custom Metal shader (compile-time BNECK) ---
+            let metalExpander = try MetalExpansionArgmax(
+                wExpand: wBuf, bottleneck: bneck, vocabSize: vocab, spatial: spatial)
+            for _ in 0..<3 { _ = try metalExpander.run(projectedSurface: projSurf) }
+            var t1: [Double] = []
+            var metalTokens: [UInt16] = []
+            for _ in 0..<reps {
+                let s = mach_absolute_time()
+                let result = try metalExpander.run(projectedSurface: projSurf)
+                t1.append(machMilliseconds(mach_absolute_time() - s) * 1000)
+                if metalTokens.isEmpty { metalTokens = Array(result) }
+            }
+            let match1 = cpuRefTokens.indices.filter { metalTokens[$0] == cpuRefTokens[$0] }.count
+            print("  Custom shader:  \(String(format: "%8.1f", med(t1))) µs  match=\(match1)/\(spatial)")
+
+            // --- Method 2: MPS matmul + CPU argmax ---
+            // proj from IOSurface: [bneck, spatial] row-major fp16
+            // w: [vocab, bneck] row-major fp16
+            // We want: result[s, v] = Σ_k proj[k, s] * w[v, k]
+            //         = (proj^T * w^T)[s, v]
+            // MPS: C = op(A) * op(B)
+            //   A = proj [bneck × spatial], transposeLeft = true → [spatial × bneck]
+            //   B = w [vocab × bneck], transposeRight = true → [bneck × vocab]
+            //   C = [spatial × vocab]
+
+            // Create MPS buffers
+            let projBufMetal: MTLBuffer
+            do {
+                IOSurfaceLock(projSurf, [.readOnly], nil)
+                let baseAddr = IOSurfaceGetBaseAddress(projSurf)
+                let byteCount = bneck * spatial * MemoryLayout<Float16>.stride
+                projBufMetal = device.makeBuffer(bytes: baseAddr, length: byteCount, options: .storageModeShared)!
+                IOSurfaceUnlock(projSurf, [.readOnly], nil)
+            }
+
+            let wBufMetal = device.makeBuffer(bytes: wF16, length: vocab * bneck * 2, options: .storageModeShared)!
+            let outBufMetal = device.makeBuffer(length: spatial * vocab * 2, options: .storageModeShared)!
+
+            // MPS matrix descriptors
+            let projDesc = MPSMatrixDescriptor(
+                rows: bneck, columns: spatial,
+                rowBytes: spatial * 2,
+                dataType: .float16)
+            let wDesc = MPSMatrixDescriptor(
+                rows: vocab, columns: bneck,
+                rowBytes: bneck * 2,
+                dataType: .float16)
+            let outDesc = MPSMatrixDescriptor(
+                rows: spatial, columns: vocab,
+                rowBytes: vocab * 2,
+                dataType: .float16)
+
+            let projMat = MPSMatrix(buffer: projBufMetal, descriptor: projDesc)
+            let wMat = MPSMatrix(buffer: wBufMetal, descriptor: wDesc)
+            let outMat = MPSMatrix(buffer: outBufMetal, descriptor: outDesc)
+
+            let matmul = MPSMatrixMultiplication(
+                device: device,
+                transposeLeft: true,
+                transposeRight: true,
+                resultRows: spatial,
+                resultColumns: vocab,
+                interiorColumns: bneck,
+                alpha: 1.0,
+                beta: 0.0)
+
+            // Warmup
+            for _ in 0..<3 {
+                let cb = cmdQueue.makeCommandBuffer()!
+                matmul.encode(commandBuffer: cb, leftMatrix: projMat, rightMatrix: wMat, resultMatrix: outMat)
+                cb.commit(); cb.waitUntilCompleted()
+            }
+
+            var t2: [Double] = []
+            var mpsTokens = [UInt16](repeating: 0, count: spatial)
+            for rep in 0..<reps {
+                let s = mach_absolute_time()
+                let cb = cmdQueue.makeCommandBuffer()!
+                matmul.encode(commandBuffer: cb, leftMatrix: projMat, rightMatrix: wMat, resultMatrix: outMat)
+                cb.commit(); cb.waitUntilCompleted()
+                // CPU argmax over fp16 output
+                let outPtr = outBufMetal.contents().assumingMemoryBound(to: Float16.self)
+                for sp in 0..<spatial {
+                    var best: Float16 = -Float16.infinity
+                    var bestIdx: UInt16 = 0
+                    let row = outPtr + sp * vocab
+                    for v in 0..<vocab {
+                        if row[v] > best { best = row[v]; bestIdx = UInt16(v) }
+                    }
+                    mpsTokens[sp] = bestIdx
+                }
+                t2.append(machMilliseconds(mach_absolute_time() - s) * 1000)
+            }
+            let match2 = cpuRefTokens.indices.filter { mpsTokens[$0] == cpuRefTokens[$0] }.count
+            print("  MPS+CPU argmax: \(String(format: "%8.1f", med(t2))) µs  match=\(match2)/\(spatial)")
+
+            // --- Method 3: MPS matmul only (no argmax, GPU time only) ---
+            var t3: [Double] = []
+            for _ in 0..<reps {
+                let s = mach_absolute_time()
+                let cb = cmdQueue.makeCommandBuffer()!
+                matmul.encode(commandBuffer: cb, leftMatrix: projMat, rightMatrix: wMat, resultMatrix: outMat)
+                cb.commit(); cb.waitUntilCompleted()
+                t3.append(machMilliseconds(mach_absolute_time() - s) * 1000)
+            }
+            print("  MPS matmul only:\(String(format: "%8.1f", med(t3))) µs  (no argmax)")
+
+            // --- Method 4: CPU BLAS sharded (14 cores) for comparison ---
+            let nShards = 14
+            let shardSize = (vocab + nShards - 1) / nShards
+            let shardBufs = (0..<nShards).map { _ in
+                UnsafeMutablePointer<Float>.allocate(capacity: spatial * shardSize)
+            }
+            defer { for b in shardBufs { b.deallocate() } }
+            let shardBestVals = UnsafeMutablePointer<Float>.allocate(capacity: nShards * spatial)
+            let shardBestIdxs = UnsafeMutablePointer<Int32>.allocate(capacity: nShards * spatial)
+            defer { shardBestVals.deallocate(); shardBestIdxs.deallocate() }
+
+            var t4: [Double] = []
+            for _ in 0..<reps {
+                let s = mach_absolute_time()
+                DispatchQueue.concurrentPerform(iterations: nShards) { shard in
+                    let vStart = shard * shardSize
+                    let vCount = min(shardSize, vocab - vStart)
+                    guard vCount > 0 else { return }
+                    BLAS.sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                        m: Int32(spatial), n: Int32(vCount), k: Int32(bneck),
+                        alpha: 1.0, a: projBufF32, lda: Int32(bneck),
+                        b: wF32 + vStart * bneck, ldb: Int32(bneck), beta: 0.0,
+                        c: shardBufs[shard], ldc: Int32(vCount))
+                    for sp in 0..<spatial {
+                        var maxVal: Float = 0; var maxIdx: vDSP_Length = 0
+                        vDSP_maxvi(shardBufs[shard] + sp * vCount, 1, &maxVal, &maxIdx, vDSP_Length(vCount))
+                        shardBestVals[shard * spatial + sp] = maxVal
+                        shardBestIdxs[shard * spatial + sp] = Int32(vStart + Int(maxIdx))
+                    }
+                }
+                t4.append(machMilliseconds(mach_absolute_time() - s) * 1000)
+            }
+            print("  CPU sharded(14):\(String(format: "%8.1f", med(t4))) µs")
+
+            // --- Method 5: MPS matmul + GPU argmax (full pipeline) ---
+            let mpsExpander = try MPSExpansionArgmax(
+                wExpand: wBuf, bottleneck: bneck, vocabSize: vocab, spatial: spatial)
+            for _ in 0..<3 { _ = try mpsExpander.run(projectedSurface: projSurf) }
+            var t5: [Double] = []
+            var mpsGpuTokens: [UInt16] = []
+            for _ in 0..<reps {
+                let s = mach_absolute_time()
+                let result = try mpsExpander.run(projectedSurface: projSurf)
+                t5.append(machMilliseconds(mach_absolute_time() - s) * 1000)
+                if mpsGpuTokens.isEmpty { mpsGpuTokens = Array(result) }
+            }
+            let match5 = cpuRefTokens.indices.filter { mpsGpuTokens[$0] == cpuRefTokens[$0] }.count
+            print("  MPS+GPU argmax: \(String(format: "%8.1f", med(t5))) µs  match=\(match5)/\(spatial)")
+        }
+    }
+
+    // MARK: - Cycle 8: Projection-only head + Metal expansion pipeline benchmark
+
+    func test_projection_head_metal_expansion_pipeline_on_hardware() throws {
+        try requireGenerationHardware()
+
+        let dim = ModelConfig.dim
+        let layerCount = 6
+        let bneck = 64
+        let iters = 60
+        let warmup = 10
+
+        let weights = makeEchoRecurrentGenerationWeights(layerCount: layerCount)
+        let vocabSize = weights.vocabSize
+
+        // Expansion weights [vocab, bneck] in fp16
+        let wF16 = UnsafeMutablePointer<Float16>.allocate(capacity: vocabSize * bneck)
+        defer { wF16.deallocate() }
+        for i in 0..<(vocabSize * bneck) { wF16[i] = Float16.random(in: -0.01...0.01) }
+        let wBuf = UnsafeBufferPointer(start: wF16, count: vocabSize * bneck)
+
+        let aneQueue = DispatchQueue(label: "ane.eval.projmetal", qos: .userInteractive)
+
+        print("=== Projection-only head + Metal expansion pipeline ===")
+
+        for streamCount in [16384] {
+            for trunkGroups in [16] {
+
+            do { // catch compile failures for larger spatial values
+
+            // Pipeline A: trunk + projection-only head
+            var trA = try LayerStorage<RWKVStyleFusedThreeLayerSession>(
+                count: 2,
+                throwingInitializer: { tripletIdx in
+                    let base = tripletIdx * 3
+                    return try RWKVStyleFusedThreeLayerSession(
+                        weights0: weights.layers[base], weights1: weights.layers[base + 1],
+                        weights2: weights.layers[base + 2], laneSpatial: streamCount, groups: trunkGroups)
+                })
+            let projHeadA = try GenerationRMSNormProjectionKernelSet(
+                rmsFinal: weights.rmsFinal,
+                classifierProjection: TensorBuffer(count: bneck * dim, zeroed: true),
+                bottleneck: bneck, laneSpatial: streamCount, groups: 1)
+            // Chain trunk → head
+            for i in 0..<3 { try trA[0].kernels.step.rebindInput(at: 1+i, to: trA[0].kernels.step.outputSurface(at: 1+i)) }
+            try trA[1].kernels.step.rebindInput(at: 0, to: trA[0].handles.xOut)
+            for i in 0..<3 { try trA[1].kernels.step.rebindInput(at: 1+i, to: trA[1].kernels.step.outputSurface(at: 1+i)) }
+            try projHeadA.rmsNormProjection.rebindInput(at: 0, to: trA[1].handles.xOut)
+            let projOutA = try projHeadA.rmsNormProjection.outputSurface(at: 0)
+            let t0xInA = trA[0].handles.xIn
+
+            // Pipeline B: trunk + projection-only head
+            var trB = try LayerStorage<RWKVStyleFusedThreeLayerSession>(
+                count: 2,
+                throwingInitializer: { tripletIdx in
+                    let base = tripletIdx * 3
+                    return try RWKVStyleFusedThreeLayerSession(
+                        weights0: weights.layers[base], weights1: weights.layers[base + 1],
+                        weights2: weights.layers[base + 2], laneSpatial: streamCount, groups: trunkGroups)
+                })
+            let projHeadB = try GenerationRMSNormProjectionKernelSet(
+                rmsFinal: weights.rmsFinal,
+                classifierProjection: TensorBuffer(count: bneck * dim, zeroed: true),
+                bottleneck: bneck, laneSpatial: streamCount, groups: 1)
+            for i in 0..<3 { try trB[0].kernels.step.rebindInput(at: 1+i, to: trB[0].kernels.step.outputSurface(at: 1+i)) }
+            try trB[1].kernels.step.rebindInput(at: 0, to: trB[0].handles.xOut)
+            for i in 0..<3 { try trB[1].kernels.step.rebindInput(at: 1+i, to: trB[1].kernels.step.outputSurface(at: 1+i)) }
+            try projHeadB.rmsNormProjection.rebindInput(at: 0, to: trB[1].handles.xOut)
+            let projOutB = try projHeadB.rmsNormProjection.outputSurface(at: 0)
+            let t0xInB = trB[0].handles.xIn
+
+            // MPS expansion+argmax for both pipelines
+            let metalA = try MPSExpansionArgmax(
+                wExpand: wBuf, bottleneck: bneck, vocabSize: vocabSize, spatial: streamCount)
+            let metalB = try MPSExpansionArgmax(
+                wExpand: wBuf, bottleneck: bneck, vocabSize: vocabSize, spatial: streamCount)
+
+            var tokensA = Array(repeating: UInt16(0), count: streamCount)
+            var tokensB = Array(repeating: UInt16(0), count: streamCount)
+
+            func embWrite(_ tokens: [UInt16], to surface: IOSurfaceRef) throws {
+                try weights.embedding.withUnsafePointer { embPtr in
+                    try tokens.withUnsafeBufferPointer { tokenBuf in
+                        try SurfaceIO.writeEmbeddingBatchFP16(
+                            to: surface, channelOffset: 0, spatial: streamCount,
+                            embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
+                            tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount)
+                    }
+                }
+            }
+
+            // Prime pipeline A
+            try embWrite(tokensA, to: t0xInA)
+            try trA[0].kernels.step.eval(); try trA[1].kernels.step.eval()
+            try projHeadA.rmsNormProjection.eval()
+            // Get initial tokens from Metal expansion
+            let initResult = try metalA.run(projectedSurface: projOutA)
+            for i in 0..<streamCount { tokensA[i] = initResult[i] }
+
+            // Prime pipeline B
+            try embWrite(tokensB, to: t0xInB)
+
+            // First: measure individual ANE dispatch times (non-pipelined, serial)
+            var trip0Us: [Double] = []
+            var trip1Us: [Double] = []
+            var headUs: [Double] = []
+            for iter in 0..<(10 + 30) {
+                try embWrite(tokensA, to: t0xInA)
+                let t0s = mach_absolute_time()
+                try trA[0].kernels.step.eval()
+                let t0e = mach_absolute_time()
+                try trA[1].kernels.step.eval()
+                let t1e = mach_absolute_time()
+                try projHeadA.rmsNormProjection.eval()
+                let the = mach_absolute_time()
+                if iter >= 10 {
+                    trip0Us.append(machMilliseconds(t0e - t0s) * 1000)
+                    trip1Us.append(machMilliseconds(t1e - t0e) * 1000)
+                    headUs.append(machMilliseconds(the - t1e) * 1000)
+                }
+                let r = try metalA.run(projectedSurface: projOutA)
+                for i in 0..<streamCount { tokensA[i] = r[i] }
+            }
+            func med(_ a: [Double]) -> Double { let s = a.sorted(); return s[s.count / 2] }
+            print("  dispatch timing (serial, non-pipelined):")
+            print("    triplet0=\(String(format: "%.1f", med(trip0Us))) µs, " +
+                  "triplet1=\(String(format: "%.1f", med(trip1Us))) µs, " +
+                  "head=\(String(format: "%.1f", med(headUs))) µs, " +
+                  "total=\(String(format: "%.1f", med(trip0Us) + med(trip1Us) + med(headUs))) µs")
+
+            // Re-prime pipelines for pipelined benchmark
+            tokensA = Array(repeating: UInt16(0), count: streamCount)
+            try embWrite(tokensA, to: t0xInA)
+            try trA[0].kernels.step.eval(); try trA[1].kernels.step.eval()
+            try projHeadA.rmsNormProjection.eval()
+            do {
+                let rePrime = try metalA.run(projectedSurface: projOutA)
+                for i in 0..<streamCount { tokensA[i] = rePrime[i] }
+            }
+            tokensB = Array(repeating: UInt16(0), count: streamCount)
+            try embWrite(tokensB, to: t0xInB)
+
+            var pipeUs: [Double] = []
+            var mpsUs: [Double] = []
+            var embedUs: [Double] = []
+            var aneWaitUs: [Double] = []
+            for iter in 0..<(warmup + iters) {
+                let s = GenerationClock.now()
+                var aneError: (any Error)?
+
+                // ANE: eval pipeline B (trunk + proj head)
+                let g1 = DispatchGroup()
+                g1.enter()
+                aneQueue.async {
+                    defer { g1.leave() }
+                    do {
+                        try trB[0].kernels.step.eval(); try trB[1].kernels.step.eval()
+                        try projHeadB.rmsNormProjection.eval()
+                    } catch { aneError = error }
+                }
+                // CPU/Metal: process pipeline A results (expansion+argmax + embed)
+                let mpsStart = mach_absolute_time()
+                let resultA = try metalA.run(projectedSurface: projOutA)
+                for i in 0..<streamCount { tokensA[i] = resultA[i] }
+                let mpsEnd = mach_absolute_time()
+                let embStart = mach_absolute_time()
+                try embWrite(tokensA, to: t0xInA)
+                let embEnd = mach_absolute_time()
+                let waitStart = mach_absolute_time()
+                g1.wait()
+                let waitEnd = mach_absolute_time()
+                if let e = aneError { throw e }
+
+                // ANE: eval pipeline A (trunk + proj head)
+                let g2 = DispatchGroup()
+                g2.enter()
+                aneQueue.async {
+                    defer { g2.leave() }
+                    do {
+                        try trA[0].kernels.step.eval(); try trA[1].kernels.step.eval()
+                        try projHeadA.rmsNormProjection.eval()
+                    } catch { aneError = error }
+                }
+                // CPU/Metal: process pipeline B results
+                let mpsStart2 = mach_absolute_time()
+                let resultB = try metalB.run(projectedSurface: projOutB)
+                for i in 0..<streamCount { tokensB[i] = resultB[i] }
+                let mpsEnd2 = mach_absolute_time()
+                let embStart2 = mach_absolute_time()
+                try embWrite(tokensB, to: t0xInB)
+                let embEnd2 = mach_absolute_time()
+                let waitStart2 = mach_absolute_time()
+                g2.wait()
+                let waitEnd2 = mach_absolute_time()
+                if let e = aneError { throw e }
+
+                let elapsed = machMilliseconds(GenerationClock.now() - s) * 1000
+                if iter >= warmup {
+                    pipeUs.append(elapsed)
+                    mpsUs.append(machMilliseconds(mpsEnd - mpsStart) * 1000 + machMilliseconds(mpsEnd2 - mpsStart2) * 1000)
+                    embedUs.append(machMilliseconds(embEnd - embStart) * 1000 + machMilliseconds(embEnd2 - embStart2) * 1000)
+                    aneWaitUs.append(machMilliseconds(waitEnd - waitStart) * 1000 + machMilliseconds(waitEnd2 - waitStart2) * 1000)
+                }
+            }
+
+            let sorted = pipeUs.sorted()
+            let medUs = sorted[sorted.count / 2]
+            let twoStepMs = medUs / 1000.0
+            let tps = Double(streamCount * 2) / twoStepMs * 1000.0
+            print("  proj+MPS g=\(trunkGroups) \(streamCount) streams: median two-step=\(String(format: "%.3f", twoStepMs)) ms, " +
+                  "\(String(format: "%.0f", tps)) TPS")
+            print("    breakdown: MPS=\(String(format: "%.1f", med(mpsUs))) µs, " +
+                  "embed=\(String(format: "%.1f", med(embedUs))) µs, " +
+                  "ANE wait=\(String(format: "%.1f", med(aneWaitUs))) µs")
+
+            // --- GPU full head path: skip ANE head eval, do RMSNorm+proj+expand+argmax on GPU ---
+            let rmsGammaFp16 = UnsafeMutablePointer<Float16>.allocate(capacity: dim)
+            defer { rmsGammaFp16.deallocate() }
+            weights.rmsFinal.withUnsafePointer { src in
+                for i in 0..<dim { rmsGammaFp16[i] = Float16(src[i]) }
+            }
+            let projWFp16 = UnsafeMutablePointer<Float16>.allocate(capacity: dim * bneck)
+            defer { projWFp16.deallocate() }
+            for i in 0..<(dim * bneck) { projWFp16[i] = Float16.random(in: -0.01...0.01) }
+
+            let gpuHeadA = try GPUFullHeadArgmax(
+                rmsGamma: UnsafeBufferPointer(start: rmsGammaFp16, count: dim),
+                wProject: UnsafeBufferPointer(start: projWFp16, count: dim * bneck),
+                wExpand: wBuf,
+                dim: dim, bottleneck: bneck, vocabSize: vocabSize, spatial: streamCount)
+            let gpuHeadB = try GPUFullHeadArgmax(
+                rmsGamma: UnsafeBufferPointer(start: rmsGammaFp16, count: dim),
+                wProject: UnsafeBufferPointer(start: projWFp16, count: dim * bneck),
+                wExpand: wBuf,
+                dim: dim, bottleneck: bneck, vocabSize: vocabSize, spatial: streamCount)
+
+            // Get trunk output surfaces (before head)
+            let trunkOutA = trA[1].handles.xOut
+            let trunkOutB = trB[1].handles.xOut
+
+            // Prime GPU head path
+            tokensA = Array(repeating: UInt16(0), count: streamCount)
+            try embWrite(tokensA, to: t0xInA)
+            try trA[0].kernels.step.eval(); try trA[1].kernels.step.eval()
+            do {
+                let r = try gpuHeadA.run(trunkSurface: trunkOutA)
+                for i in 0..<streamCount { tokensA[i] = r[i] }
+            }
+            tokensB = Array(repeating: UInt16(0), count: streamCount)
+            try embWrite(tokensB, to: t0xInB)
+
+            var gpuPipeUs: [Double] = []
+            var gpuHeadUs: [Double] = []
+            var gpuEmbedUs: [Double] = []
+            var gpuAneWaitUs: [Double] = []
+            for iter in 0..<(warmup + iters) {
+                let s = GenerationClock.now()
+                var aneError: (any Error)?
+
+                // ANE: trunk only for pipeline B (no head)
+                let g1 = DispatchGroup()
+                g1.enter()
+                aneQueue.async {
+                    defer { g1.leave() }
+                    do {
+                        try trB[0].kernels.step.eval(); try trB[1].kernels.step.eval()
+                    } catch { aneError = error }
+                }
+                // GPU: full head for pipeline A
+                let gpuS = mach_absolute_time()
+                let rA = try gpuHeadA.run(trunkSurface: trunkOutA)
+                for i in 0..<streamCount { tokensA[i] = rA[i] }
+                let gpuE = mach_absolute_time()
+                let embS = mach_absolute_time()
+                try embWrite(tokensA, to: t0xInA)
+                let embE = mach_absolute_time()
+                let wS = mach_absolute_time()
+                g1.wait()
+                let wE = mach_absolute_time()
+                if let e = aneError { throw e }
+
+                // ANE: trunk only for pipeline A (no head)
+                let g2 = DispatchGroup()
+                g2.enter()
+                aneQueue.async {
+                    defer { g2.leave() }
+                    do {
+                        try trA[0].kernels.step.eval(); try trA[1].kernels.step.eval()
+                    } catch { aneError = error }
+                }
+                // GPU: full head for pipeline B
+                let gpuS2 = mach_absolute_time()
+                let rB = try gpuHeadB.run(trunkSurface: trunkOutB)
+                for i in 0..<streamCount { tokensB[i] = rB[i] }
+                let gpuE2 = mach_absolute_time()
+                let embS2 = mach_absolute_time()
+                try embWrite(tokensB, to: t0xInB)
+                let embE2 = mach_absolute_time()
+                let wS2 = mach_absolute_time()
+                g2.wait()
+                let wE2 = mach_absolute_time()
+                if let e = aneError { throw e }
+
+                let elapsed = machMilliseconds(GenerationClock.now() - s) * 1000
+                if iter >= warmup {
+                    gpuPipeUs.append(elapsed)
+                    gpuHeadUs.append(machMilliseconds(gpuE - gpuS) * 1000 + machMilliseconds(gpuE2 - gpuS2) * 1000)
+                    gpuEmbedUs.append(machMilliseconds(embE - embS) * 1000 + machMilliseconds(embE2 - embS2) * 1000)
+                    gpuAneWaitUs.append(machMilliseconds(wE - wS) * 1000 + machMilliseconds(wE2 - wS2) * 1000)
+                }
+            }
+
+            let gpuSorted = gpuPipeUs.sorted()
+            let gpuMedUs = gpuSorted[gpuSorted.count / 2]
+            let gpuTwoStepMs = gpuMedUs / 1000.0
+            let gpuTps = Double(streamCount * 2) / gpuTwoStepMs * 1000.0
+            print("  GPU-head g=\(trunkGroups) \(streamCount) streams: median two-step=\(String(format: "%.3f", gpuTwoStepMs)) ms, " +
+                  "\(String(format: "%.0f", gpuTps)) TPS")
+            print("    breakdown: GPU-head=\(String(format: "%.1f", med(gpuHeadUs))) µs, " +
+                  "embed=\(String(format: "%.1f", med(gpuEmbedUs))) µs, " +
+                  "ANE wait=\(String(format: "%.1f", med(gpuAneWaitUs))) µs")
+
+            } catch {
+                print("  spatial=\(streamCount) COMPILE FAILED: \(error)")
+            }
+
+            } // end for trunkGroups
+        } // end for streamCount
+    }
+
+    // MARK: - Cycle 22: NoRMS recurrent pipeline (skip RMSNorm for faster ANE eval)
+
+    func test_norms_production_pipeline_on_hardware() throws {
+        try requireGenerationHardware()
+
+        let dim = ModelConfig.dim
+        let layerCount = 6
+        let bneck = 64
+        let iters = 60
+        let warmup = 10
+        let streamCount = 16384
+        let trunkGroups = 16
+
+        let weights = makeEchoRecurrentGenerationWeights(layerCount: layerCount)
+        let vocabSize = weights.vocabSize
+
+        let wF16 = UnsafeMutablePointer<Float16>.allocate(capacity: vocabSize * bneck)
+        defer { wF16.deallocate() }
+        for i in 0..<(vocabSize * bneck) { wF16[i] = Float16.random(in: -0.01...0.01) }
+        let wBuf = UnsafeBufferPointer(start: wF16, count: vocabSize * bneck)
+
+        let rmsGammaFp16 = UnsafeMutablePointer<Float16>.allocate(capacity: dim)
+        defer { rmsGammaFp16.deallocate() }
+        weights.rmsFinal.withUnsafePointer { src in
+            for i in 0..<dim { rmsGammaFp16[i] = Float16(src[i]) }
+        }
+        let projWFp16 = UnsafeMutablePointer<Float16>.allocate(capacity: dim * bneck)
+        defer { projWFp16.deallocate() }
+        for i in 0..<(dim * bneck) { projWFp16[i] = Float16.random(in: -0.01...0.01) }
+
+        let aneQueue = DispatchQueue(label: "ane.eval.norms", qos: .userInteractive)
+
+        print("=== Cycle 22: NoRMS pipeline via production RWKVStyleFusedThreeLayerSession ===")
+
+        for includeRMS in [true, false] {
+            let label = includeRMS ? "Full (RMSNorm)" : "NoRMS"
+
+            do {
+
+            // Pipeline A: 2 triplets
+            var trA = try LayerStorage<RWKVStyleFusedThreeLayerSession>(
+                count: 2,
+                throwingInitializer: { tripletIdx in
+                    let base = tripletIdx * 3
+                    return try RWKVStyleFusedThreeLayerSession(
+                        weights0: weights.layers[base], weights1: weights.layers[base + 1],
+                        weights2: weights.layers[base + 2], laneSpatial: streamCount,
+                        groups: trunkGroups, includeRMSNorm: includeRMS)
+                })
+            for i in 0..<3 { try trA[0].kernels.step.rebindInput(at: 1+i, to: trA[0].kernels.step.outputSurface(at: 1+i)) }
+            try trA[1].kernels.step.rebindInput(at: 0, to: trA[0].handles.xOut)
+            for i in 0..<3 { try trA[1].kernels.step.rebindInput(at: 1+i, to: trA[1].kernels.step.outputSurface(at: 1+i)) }
+            let trunkOutA = trA[1].handles.xOut
+            let t0xInA = trA[0].handles.xIn
+
+            // Pipeline B: 2 triplets
+            var trB = try LayerStorage<RWKVStyleFusedThreeLayerSession>(
+                count: 2,
+                throwingInitializer: { tripletIdx in
+                    let base = tripletIdx * 3
+                    return try RWKVStyleFusedThreeLayerSession(
+                        weights0: weights.layers[base], weights1: weights.layers[base + 1],
+                        weights2: weights.layers[base + 2], laneSpatial: streamCount,
+                        groups: trunkGroups, includeRMSNorm: includeRMS)
+                })
+            for i in 0..<3 { try trB[0].kernels.step.rebindInput(at: 1+i, to: trB[0].kernels.step.outputSurface(at: 1+i)) }
+            try trB[1].kernels.step.rebindInput(at: 0, to: trB[0].handles.xOut)
+            for i in 0..<3 { try trB[1].kernels.step.rebindInput(at: 1+i, to: trB[1].kernels.step.outputSurface(at: 1+i)) }
+            let trunkOutB = trB[1].handles.xOut
+            let t0xInB = trB[0].handles.xIn
+
+            // GPU full head for both pipelines
+            let gpuHeadA = try GPUFullHeadArgmax(
+                rmsGamma: UnsafeBufferPointer(start: rmsGammaFp16, count: dim),
+                wProject: UnsafeBufferPointer(start: projWFp16, count: dim * bneck),
+                wExpand: wBuf, dim: dim, bottleneck: bneck, vocabSize: vocabSize, spatial: streamCount)
+            let gpuHeadB = try GPUFullHeadArgmax(
+                rmsGamma: UnsafeBufferPointer(start: rmsGammaFp16, count: dim),
+                wProject: UnsafeBufferPointer(start: projWFp16, count: dim * bneck),
+                wExpand: wBuf, dim: dim, bottleneck: bneck, vocabSize: vocabSize, spatial: streamCount)
+
+            var tokensA = Array(repeating: UInt16(0), count: streamCount)
+            var tokensB = Array(repeating: UInt16(0), count: streamCount)
+
+            func embWrite(_ tokens: [UInt16], to surface: IOSurfaceRef) throws {
+                try weights.embedding.withUnsafePointer { embPtr in
+                    try tokens.withUnsafeBufferPointer { tokenBuf in
+                        try SurfaceIO.writeEmbeddingBatchFP16(
+                            to: surface, channelOffset: 0, spatial: streamCount,
+                            embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
+                            tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount)
+                    }
+                }
+            }
+
+            // Serial dispatch timing
+            var trip0Us: [Double] = []
+            var trip1Us: [Double] = []
+            try embWrite(tokensA, to: t0xInA)
+            for iter in 0..<(10 + 30) {
+                let t0s = mach_absolute_time()
+                try trA[0].kernels.step.eval()
+                let t0e = mach_absolute_time()
+                try trA[1].kernels.step.eval()
+                let t1e = mach_absolute_time()
+                if iter >= 10 {
+                    trip0Us.append(machMilliseconds(t0e - t0s) * 1000)
+                    trip1Us.append(machMilliseconds(t1e - t0e) * 1000)
+                }
+            }
+            func med(_ a: [Double]) -> Double { let s = a.sorted(); return s[s.count / 2] }
+            print("  \(label) serial: trip0=\(String(format: "%.1f", med(trip0Us))) µs, " +
+                  "trip1=\(String(format: "%.1f", med(trip1Us))) µs, " +
+                  "total=\(String(format: "%.1f", med(trip0Us) + med(trip1Us))) µs")
+
+            // Prime GPU head path
+            tokensA = Array(repeating: UInt16(0), count: streamCount)
+            try embWrite(tokensA, to: t0xInA)
+            try trA[0].kernels.step.eval(); try trA[1].kernels.step.eval()
+            do { let r = try gpuHeadA.run(trunkSurface: trunkOutA); for i in 0..<streamCount { tokensA[i] = r[i] } }
+            tokensB = Array(repeating: UInt16(0), count: streamCount)
+            try embWrite(tokensB, to: t0xInB)
+
+            // Pipelined benchmark
+            var pipeUs: [Double] = []
+            var gpuHeadUs: [Double] = []
+            var aneWaitUs: [Double] = []
+            for iter in 0..<(warmup + iters) {
+                let s = GenerationClock.now()
+                var aneError: (any Error)?
+
+                let g1 = DispatchGroup()
+                g1.enter()
+                aneQueue.async { defer { g1.leave() }
+                    do { try trB[0].kernels.step.eval(); try trB[1].kernels.step.eval() } catch { aneError = error }
+                }
+                let gpuS = mach_absolute_time()
+                let rA = try gpuHeadA.run(trunkSurface: trunkOutA)
+                for i in 0..<streamCount { tokensA[i] = rA[i] }
+                let gpuE = mach_absolute_time()
+                try embWrite(tokensA, to: t0xInA)
+                let wS = mach_absolute_time()
+                g1.wait()
+                let wE = mach_absolute_time()
+                if let e = aneError { throw e }
+
+                let g2 = DispatchGroup()
+                g2.enter()
+                aneQueue.async { defer { g2.leave() }
+                    do { try trA[0].kernels.step.eval(); try trA[1].kernels.step.eval() } catch { aneError = error }
+                }
+                let gpuS2 = mach_absolute_time()
+                let rB = try gpuHeadB.run(trunkSurface: trunkOutB)
+                for i in 0..<streamCount { tokensB[i] = rB[i] }
+                let gpuE2 = mach_absolute_time()
+                try embWrite(tokensB, to: t0xInB)
+                let wS2 = mach_absolute_time()
+                g2.wait()
+                let wE2 = mach_absolute_time()
+                if let e = aneError { throw e }
+
+                let elapsed = machMilliseconds(GenerationClock.now() - s) * 1000
+                if iter >= warmup {
+                    pipeUs.append(elapsed)
+                    gpuHeadUs.append(machMilliseconds(gpuE - gpuS) * 1000 + machMilliseconds(gpuE2 - gpuS2) * 1000)
+                    aneWaitUs.append(machMilliseconds(wE - wS) * 1000 + machMilliseconds(wE2 - wS2) * 1000)
+                }
+            }
+
+            let sorted = pipeUs.sorted()
+            let medUs = sorted[sorted.count / 2]
+            let twoStepMs = medUs / 1000.0
+            let tps = Double(streamCount * 2) / twoStepMs * 1000.0
+            print("  \(label) pipeline: median two-step=\(String(format: "%.3f", twoStepMs)) ms, " +
+                  "\(String(format: "%.0f", tps)) TPS")
+            print("    GPU-head=\(String(format: "%.1f", med(gpuHeadUs))) µs, " +
+                  "ANE wait=\(String(format: "%.1f", med(aneWaitUs))) µs")
+
+            } catch {
+                print("  \(label) FAILED: \(error)")
+            }
+        } // end for includeRMS
+    }
+
+    // MARK: - Cycle 27: Fused expand+argmax (no logits materialization)
+
+    func test_cycle27_fused_expand_argmax_probe() throws {
+        try requireGenerationHardware()
+
+        let bneck = 64  // production bottleneck
+        let vocab = 32000
+        let spatial = 16384
+        let warmup = 5
+        let iters = 20
+
+        guard let device = MTLCreateSystemDefaultDevice() else { return XCTFail("No Metal") }
+        guard let queue = device.makeCommandQueue() else { return XCTFail("No queue") }
+
+        // --- V2 kernel: 1 simdgroup per row, proj in threadgroup memory, SIMD reduction ---
+        let v2Source = """
+        #include <metal_stdlib>
+        using namespace metal;
+
+        #define ROWS_PER_TG 8
+        #define BNECK \(bneck)
+
+        kernel void fused_expand_argmax_v2(
+            const device half *proj [[buffer(0)]],
+            const device half *wExpand [[buffer(1)]],
+            device ushort *output [[buffer(2)]],
+            constant uint &spatial_c [[buffer(3)]],
+            constant uint &vocab_c [[buffer(4)]],
+            uint tg_id [[threadgroup_position_in_grid]],
+            uint sg_id [[simdgroup_index_in_threadgroup]],
+            uint sg_lane [[thread_index_in_simdgroup]]
+        ) {
+            uint row = tg_id * ROWS_PER_TG + sg_id;
+            if (row >= spatial_c) return;
+
+            // Load proj vector into threadgroup memory (cooperative per simdgroup)
+            threadgroup half sharedProj[ROWS_PER_TG][BNECK];
+            for (uint k = sg_lane; k < BNECK; k += 32) {
+                sharedProj[sg_id][k] = proj[row * BNECK + k];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // Each of 32 lanes handles ~1000 vocab entries
+            float localMax = -INFINITY;
+            uint localIdx = 0;
+
+            for (uint v = sg_lane; v < vocab_c; v += 32) {
+                const device half *wRow = wExpand + v * BNECK;
+                float dot = 0.0f;
+                for (uint k = 0; k < BNECK; k++) {
+                    dot = fma(float(sharedProj[sg_id][k]), float(wRow[k]), dot);
+                }
+                if (dot > localMax) {
+                    localMax = dot;
+                    localIdx = v;
+                }
+            }
+
+            // SIMD reduction
+            for (ushort offset = 16; offset > 0; offset >>= 1) {
+                float otherVal = simd_shuffle_down(localMax, offset);
+                uint otherIdx = simd_shuffle_down(localIdx, offset);
+                if (otherVal > localMax) {
+                    localMax = otherVal;
+                    localIdx = otherIdx;
+                }
+            }
+
+            if (sg_lane == 0) {
+                output[row] = ushort(localIdx);
+            }
+        }
+        """
+
+        let lib: MTLLibrary
+        do { lib = try device.makeLibrary(source: v2Source, options: nil) }
+        catch { return XCTFail("V2 compile FAILED: \(error)") }
+        guard let fn = lib.makeFunction(name: "fused_expand_argmax_v2") else {
+            return XCTFail("missing function")
+        }
+        let pso: MTLComputePipelineState
+        do { pso = try device.makeComputePipelineState(function: fn) }
+        catch { return XCTFail("pipeline build FAILED: \(error)") }
+
+        print("=== Cycle 27: Fused expand+argmax V2 (1 SG/row, SIMD reduction) ===")
+        print("  Kernel compiled OK. maxThreads=\(pso.maxTotalThreadsPerThreadgroup)")
+
+        // --- Allocate and fill ---
+        let projBuf = device.makeBuffer(length: spatial * bneck * 2, options: .storageModeShared)!
+        let outBuf = device.makeBuffer(length: spatial * 2, options: .storageModeShared)!
+        let projPtr = projBuf.contents().assumingMemoryBound(to: Float16.self)
+        for i in 0..<(spatial * bneck) { projPtr[i] = Float16.random(in: -0.1...0.1) }
+
+        let wExpandPtr = UnsafeMutablePointer<Float16>.allocate(capacity: vocab * bneck)
+        defer { wExpandPtr.deallocate() }
+        for i in 0..<(vocab * bneck) { wExpandPtr[i] = Float16.random(in: -0.01...0.01) }
+        let wExpandBuf = device.makeBuffer(bytes: wExpandPtr, length: vocab * bneck * 2, options: .storageModeShared)!
+
+        // MPS ground truth
+        let logitsBuf = device.makeBuffer(length: spatial * vocab * 2, options: .storageModeShared)!
+        let mpsOutBuf = device.makeBuffer(length: spatial * 2, options: .storageModeShared)!
+        let expandMM = MPSMatrixMultiplication(
+            device: device, transposeLeft: false, transposeRight: true,
+            resultRows: spatial, resultColumns: vocab, interiorColumns: bneck,
+            alpha: 1.0, beta: 0.0)
+        let argLib = try device.makeLibrary(source: MPSExpansionArgmax.argmaxShaderSource, options: nil)
+        guard let argFn = argLib.makeFunction(name: "row_argmax_fp16") else { return XCTFail("no argmax fn") }
+        let argPSO = try device.makeComputePipelineState(function: argFn)
+
+        func runMPS() {
+            let cb = queue.makeCommandBuffer()!
+            let pDesc = MPSMatrixDescriptor(rows: spatial, columns: bneck, rowBytes: bneck * 2, dataType: .float16)
+            let wDesc = MPSMatrixDescriptor(rows: vocab, columns: bneck, rowBytes: bneck * 2, dataType: .float16)
+            let lDesc = MPSMatrixDescriptor(rows: spatial, columns: vocab, rowBytes: vocab * 2, dataType: .float16)
+            expandMM.encode(commandBuffer: cb,
+                leftMatrix: MPSMatrix(buffer: projBuf, descriptor: pDesc),
+                rightMatrix: MPSMatrix(buffer: wExpandBuf, descriptor: wDesc),
+                resultMatrix: MPSMatrix(buffer: logitsBuf, descriptor: lDesc))
+            let enc = cb.makeComputeCommandEncoder()!
+            enc.setComputePipelineState(argPSO)
+            enc.setBuffer(logitsBuf, offset: 0, index: 0)
+            enc.setBuffer(mpsOutBuf, offset: 0, index: 1)
+            var v32 = UInt32(vocab)
+            enc.setBytes(&v32, length: 4, index: 2)
+            enc.dispatchThreadgroups(
+                MTLSize(width: spatial, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: min(256, Int(argPSO.maxTotalThreadsPerThreadgroup)), height: 1, depth: 1))
+            enc.endEncoding()
+            cb.commit(); cb.waitUntilCompleted()
+        }
+
+        func runFusedV2() {
+            let cb = queue.makeCommandBuffer()!
+            let enc = cb.makeComputeCommandEncoder()!
+            enc.setComputePipelineState(pso)
+            enc.setBuffer(projBuf, offset: 0, index: 0)
+            enc.setBuffer(wExpandBuf, offset: 0, index: 1)
+            enc.setBuffer(outBuf, offset: 0, index: 2)
+            var sp = UInt32(spatial); enc.setBytes(&sp, length: 4, index: 3)
+            var vc = UInt32(vocab); enc.setBytes(&vc, length: 4, index: 4)
+            let numTG = (spatial + 7) / 8  // ROWS_PER_TG = 8
+            enc.dispatchThreadgroups(
+                MTLSize(width: numTG, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+            enc.endEncoding()
+            cb.commit(); cb.waitUntilCompleted()
+        }
+
+        // --- Correctness ---
+        runMPS()
+        runFusedV2()
+        let mpsResult = mpsOutBuf.contents().assumingMemoryBound(to: UInt16.self)
+        let fusedResult = outBuf.contents().assumingMemoryBound(to: UInt16.self)
+        var mismatches = 0
+        for i in 0..<spatial {
+            if mpsResult[i] != fusedResult[i] { mismatches += 1 }
+        }
+        print("  Correctness: \(mismatches)/\(spatial) mismatches")
+
+        // --- Timing ---
+        for _ in 0..<warmup { runMPS() }
+        var mpsMs: [Double] = []
+        for _ in 0..<iters {
+            let s = mach_absolute_time(); runMPS(); mpsMs.append(machMilliseconds(mach_absolute_time() - s))
+        }
+        for _ in 0..<warmup { runFusedV2() }
+        var fusedMs: [Double] = []
+        for _ in 0..<iters {
+            let s = mach_absolute_time(); runFusedV2(); fusedMs.append(machMilliseconds(mach_absolute_time() - s))
+        }
+
+        // --- Chunked MPS: 4 batches of 4096 rows, reusing 256MB logits buffer ---
+        let chunkSize = 4096
+        let numChunks = (spatial + chunkSize - 1) / chunkSize
+        let chunkLogitsBuf = device.makeBuffer(length: chunkSize * vocab * 2, options: .storageModeShared)!
+        let chunkOutBuf = device.makeBuffer(length: spatial * 2, options: .storageModeShared)!
+        var chunkExpandMMs: [MPSMatrixMultiplication] = []
+        for _ in 0..<numChunks {
+            chunkExpandMMs.append(MPSMatrixMultiplication(
+                device: device, transposeLeft: false, transposeRight: true,
+                resultRows: chunkSize, resultColumns: vocab, interiorColumns: bneck,
+                alpha: 1.0, beta: 0.0))
+        }
+
+        func runChunkedMPS() {
+            let cb = queue.makeCommandBuffer()!
+            let wDesc = MPSMatrixDescriptor(rows: vocab, columns: bneck, rowBytes: bneck * 2, dataType: .float16)
+            let wMat = MPSMatrix(buffer: wExpandBuf, descriptor: wDesc)
+            let lDesc = MPSMatrixDescriptor(rows: chunkSize, columns: vocab, rowBytes: vocab * 2, dataType: .float16)
+
+            for c in 0..<numChunks {
+                let rowOff = c * chunkSize
+                let pDesc = MPSMatrixDescriptor(rows: chunkSize, columns: bneck, rowBytes: bneck * 2, dataType: .float16)
+                let pMat = MPSMatrix(buffer: projBuf, offset: rowOff * bneck * 2, descriptor: pDesc)
+                let lMat = MPSMatrix(buffer: chunkLogitsBuf, descriptor: lDesc)
+                chunkExpandMMs[c].encode(commandBuffer: cb, leftMatrix: pMat, rightMatrix: wMat, resultMatrix: lMat)
+
+                let enc = cb.makeComputeCommandEncoder()!
+                enc.setComputePipelineState(argPSO)
+                enc.setBuffer(chunkLogitsBuf, offset: 0, index: 0)
+                enc.setBuffer(chunkOutBuf, offset: rowOff * 2, index: 1)
+                var v32 = UInt32(vocab)
+                enc.setBytes(&v32, length: 4, index: 2)
+                enc.dispatchThreadgroups(
+                    MTLSize(width: chunkSize, height: 1, depth: 1),
+                    threadsPerThreadgroup: MTLSize(width: min(256, Int(argPSO.maxTotalThreadsPerThreadgroup)), height: 1, depth: 1))
+                enc.endEncoding()
+            }
+            cb.commit(); cb.waitUntilCompleted()
+        }
+
+        for _ in 0..<warmup { runChunkedMPS() }
+        var chunkedMs: [Double] = []
+        for _ in 0..<iters {
+            let s = mach_absolute_time(); runChunkedMPS(); chunkedMs.append(machMilliseconds(mach_absolute_time() - s))
+        }
+
+        let mpsMed = mpsMs.sorted()[mpsMs.count / 2]
+        let fusedMed = fusedMs.sorted()[fusedMs.count / 2]
+        let chunkedMed = chunkedMs.sorted()[chunkedMs.count / 2]
+        print("  MPS expand+argmax (1GB):   \(String(format: "%.3f", mpsMed)) ms median")
+        print("  Chunked MPS (4×256MB):     \(String(format: "%.3f", chunkedMed)) ms median")
+        print("  Fused V2 expand+argmax:    \(String(format: "%.3f", fusedMed)) ms median")
+        print("  Chunked delta: \(String(format: "%+.3f", chunkedMed - mpsMed)) ms (\(String(format: "%+.1f", (chunkedMed/mpsMed - 1) * 100))%)")
+        print("  Fused delta:   \(String(format: "%+.3f", fusedMed - mpsMed)) ms (\(String(format: "%+.1f", (fusedMed/mpsMed - 1) * 100))%)")
+
+        // --- bneck sweep: MPS expand+argmax at different bottleneck sizes ---
+        print("  --- bneck sweep (MPS expand+argmax only) ---")
+        for bk in [16, 32, 48, 64] {
+            let swProjBuf = device.makeBuffer(length: spatial * bk * 2, options: .storageModeShared)!
+            let swProjPtr = swProjBuf.contents().assumingMemoryBound(to: Float16.self)
+            for i in 0..<(spatial * bk) { swProjPtr[i] = Float16.random(in: -0.1...0.1) }
+            let swWPtr = UnsafeMutablePointer<Float16>.allocate(capacity: vocab * bk)
+            defer { swWPtr.deallocate() }
+            for i in 0..<(vocab * bk) { swWPtr[i] = Float16.random(in: -0.01...0.01) }
+            let swWBuf = device.makeBuffer(bytes: swWPtr, length: vocab * bk * 2, options: .storageModeShared)!
+            let swLogBuf = device.makeBuffer(length: spatial * vocab * 2, options: .storageModeShared)!
+            let swOutBuf = device.makeBuffer(length: spatial * 2, options: .storageModeShared)!
+            let swMM = MPSMatrixMultiplication(
+                device: device, transposeLeft: false, transposeRight: true,
+                resultRows: spatial, resultColumns: vocab, interiorColumns: bk,
+                alpha: 1.0, beta: 0.0)
+
+            func swRun() {
+                let cb = queue.makeCommandBuffer()!
+                let pd = MPSMatrixDescriptor(rows: spatial, columns: bk, rowBytes: bk * 2, dataType: .float16)
+                let wd = MPSMatrixDescriptor(rows: vocab, columns: bk, rowBytes: bk * 2, dataType: .float16)
+                let ld = MPSMatrixDescriptor(rows: spatial, columns: vocab, rowBytes: vocab * 2, dataType: .float16)
+                swMM.encode(commandBuffer: cb,
+                    leftMatrix: MPSMatrix(buffer: swProjBuf, descriptor: pd),
+                    rightMatrix: MPSMatrix(buffer: swWBuf, descriptor: wd),
+                    resultMatrix: MPSMatrix(buffer: swLogBuf, descriptor: ld))
+                let enc = cb.makeComputeCommandEncoder()!
+                enc.setComputePipelineState(argPSO)
+                enc.setBuffer(swLogBuf, offset: 0, index: 0)
+                enc.setBuffer(swOutBuf, offset: 0, index: 1)
+                var v32 = UInt32(vocab)
+                enc.setBytes(&v32, length: 4, index: 2)
+                enc.dispatchThreadgroups(
+                    MTLSize(width: spatial, height: 1, depth: 1),
+                    threadsPerThreadgroup: MTLSize(width: min(256, Int(argPSO.maxTotalThreadsPerThreadgroup)), height: 1, depth: 1))
+                enc.endEncoding()
+                cb.commit(); cb.waitUntilCompleted()
+            }
+            for _ in 0..<warmup { swRun() }
+            var swMs: [Double] = []
+            for _ in 0..<iters { let s = mach_absolute_time(); swRun(); swMs.append(machMilliseconds(mach_absolute_time() - s)) }
+            let swMed = swMs.sorted()[swMs.count / 2]
+            print("    bneck=\(bk): \(String(format: "%.3f", swMed)) ms")
+        }
+    }
+
+    // MARK: - Cycle 25: GPUPipelinedHead Production Test
+
+    func test_cycle25_gpu_pipelined_head_on_hardware() throws {
+        try requireGenerationHardware()
+
+        let dim = ModelConfig.dim
+        let layerCount = 6
+        let bneck = 32
+        let streamCount = 16384
+        let trunkGroups = 16
+        let warmup = 10
+        let iters = 60
+
+        let weights = makeEchoRecurrentGenerationWeights(layerCount: layerCount)
+        let vocabSize = weights.vocabSize
+
+        let wF16 = UnsafeMutablePointer<Float16>.allocate(capacity: vocabSize * bneck)
+        defer { wF16.deallocate() }
+        for i in 0..<(vocabSize * bneck) { wF16[i] = Float16.random(in: -0.01...0.01) }
+        let wBuf = UnsafeBufferPointer(start: wF16, count: vocabSize * bneck)
+
+        let rmsGammaFp16 = UnsafeMutablePointer<Float16>.allocate(capacity: dim)
+        defer { rmsGammaFp16.deallocate() }
+        weights.rmsFinal.withUnsafePointer { src in
+            for i in 0..<dim { rmsGammaFp16[i] = Float16(src[i]) }
+        }
+        let projWFp16 = UnsafeMutablePointer<Float16>.allocate(capacity: dim * bneck)
+        defer { projWFp16.deallocate() }
+        for i in 0..<(dim * bneck) { projWFp16[i] = Float16.random(in: -0.01...0.01) }
+
+        let embFp16 = UnsafeMutablePointer<Float16>.allocate(capacity: vocabSize * dim)
+        defer { embFp16.deallocate() }
+        weights.embedding.withUnsafePointer { src in
+            for i in 0..<(vocabSize * dim) { embFp16[i] = Float16(src[i]) }
+        }
+
+        let aneQueue = DispatchQueue(label: "ane.eval.c25", qos: .userInteractive)
+
+        print("=== Cycle 25: GPUPipelinedHead (3L NoRMS + GPU embed) ===")
+
+        do {
+            // 3L NoRMS — 1 triplet per pipeline slot
+            var trA = try LayerStorage<RWKVStyleFusedThreeLayerSession>(
+                count: 1,
+                throwingInitializer: { _ in
+                    try RWKVStyleFusedThreeLayerSession(
+                        weights0: weights.layers[0], weights1: weights.layers[1],
+                        weights2: weights.layers[2], laneSpatial: streamCount,
+                        groups: trunkGroups, includeRMSNorm: false)
+                })
+            for i in 0..<3 { try trA[0].kernels.step.rebindInput(at: 1+i, to: trA[0].kernels.step.outputSurface(at: 1+i)) }
+            let trunkOutA = trA[0].handles.xOut
+            let t0xInA = trA[0].handles.xIn
+
+            var trB = try LayerStorage<RWKVStyleFusedThreeLayerSession>(
+                count: 1,
+                throwingInitializer: { _ in
+                    try RWKVStyleFusedThreeLayerSession(
+                        weights0: weights.layers[0], weights1: weights.layers[1],
+                        weights2: weights.layers[2], laneSpatial: streamCount,
+                        groups: trunkGroups, includeRMSNorm: false)
+                })
+            for i in 0..<3 { try trB[0].kernels.step.rebindInput(at: 1+i, to: trB[0].kernels.step.outputSurface(at: 1+i)) }
+            let trunkOutB = trB[0].handles.xOut
+            let t0xInB = trB[0].handles.xIn
+
+            // GPUPipelinedHead (RMSNorm + proj + expand + argmax + embed, single CB)
+            let headA = try GPUPipelinedHead(
+                rmsGamma: UnsafeBufferPointer(start: rmsGammaFp16, count: dim),
+                wProject: UnsafeBufferPointer(start: projWFp16, count: dim * bneck),
+                wExpand: wBuf,
+                embeddingFP16: UnsafeBufferPointer(start: embFp16, count: vocabSize * dim),
+                dim: dim, bottleneck: bneck, vocabSize: vocabSize, spatial: streamCount)
+            let headB = try GPUPipelinedHead(
+                rmsGamma: UnsafeBufferPointer(start: rmsGammaFp16, count: dim),
+                wProject: UnsafeBufferPointer(start: projWFp16, count: dim * bneck),
+                wExpand: wBuf,
+                embeddingFP16: UnsafeBufferPointer(start: embFp16, count: vocabSize * dim),
+                dim: dim, bottleneck: bneck, vocabSize: vocabSize, spatial: streamCount)
+
+            // CPU embed for initial priming
+            func cpuEmbWrite(_ surface: IOSurfaceRef) throws {
+                let tokens = Array(repeating: UInt16(0), count: streamCount)
+                try weights.embedding.withUnsafePointer { embPtr in
+                    try tokens.withUnsafeBufferPointer { tokenBuf in
+                        try SurfaceIO.writeEmbeddingBatchFP16(
+                            to: surface, channelOffset: 0, spatial: streamCount,
+                            embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
+                            tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount)
+                    }
+                }
+            }
+
+            // Prime
+            try cpuEmbWrite(t0xInA)
+            try cpuEmbWrite(t0xInB)
+            try trA[0].kernels.step.eval()
+            _ = try headA.runAndEmbed(trunkSurface: trunkOutA, embedSurface: t0xInA)
+            try trB[0].kernels.step.eval()
+
+            // Pipelined benchmark
+            var pipeUs: [Double] = []
+            var headUs: [Double] = []
+            var aneWaitUs: [Double] = []
+            for iter in 0..<(warmup + iters) {
+                let s = GenerationClock.now()
+                var aneError: (any Error)?
+
+                let g1 = DispatchGroup()
+                g1.enter()
+                aneQueue.async { defer { g1.leave() }
+                    do { try trB[0].kernels.step.eval() } catch { aneError = error }
+                }
+                let hs = mach_absolute_time()
+                _ = try headA.runAndEmbed(trunkSurface: trunkOutA, embedSurface: t0xInA)
+                let he = mach_absolute_time()
+                let ws = mach_absolute_time()
+                g1.wait()
+                let we = mach_absolute_time()
+                if let e = aneError { throw e }
+
+                let g2 = DispatchGroup()
+                g2.enter()
+                aneQueue.async { defer { g2.leave() }
+                    do { try trA[0].kernels.step.eval() } catch { aneError = error }
+                }
+                let hs2 = mach_absolute_time()
+                _ = try headB.runAndEmbed(trunkSurface: trunkOutB, embedSurface: t0xInB)
+                let he2 = mach_absolute_time()
+                let ws2 = mach_absolute_time()
+                g2.wait()
+                let we2 = mach_absolute_time()
+                if let e = aneError { throw e }
+
+                let elapsed = machMilliseconds(GenerationClock.now() - s) * 1000
+                if iter >= warmup {
+                    pipeUs.append(elapsed)
+                    headUs.append(machMilliseconds(he - hs) * 1000 + machMilliseconds(he2 - hs2) * 1000)
+                    aneWaitUs.append(machMilliseconds(we - ws) * 1000 + machMilliseconds(we2 - ws2) * 1000)
+                }
+            }
+
+            func med(_ a: [Double]) -> Double { let s = a.sorted(); return s[s.count / 2] }
+
+            // ---- A/B control: same ANE config, GPUFullHeadArgmax + CPU embed ----
+            let controlA = try GPUFullHeadArgmax(
+                rmsGamma: UnsafeBufferPointer(start: rmsGammaFp16, count: dim),
+                wProject: UnsafeBufferPointer(start: projWFp16, count: dim * bneck),
+                wExpand: wBuf, dim: dim, bottleneck: bneck, vocabSize: vocabSize, spatial: streamCount)
+            let controlB = try GPUFullHeadArgmax(
+                rmsGamma: UnsafeBufferPointer(start: rmsGammaFp16, count: dim),
+                wProject: UnsafeBufferPointer(start: projWFp16, count: dim * bneck),
+                wExpand: wBuf, dim: dim, bottleneck: bneck, vocabSize: vocabSize, spatial: streamCount)
+
+            var tokensA = Array(repeating: UInt16(0), count: streamCount)
+            var tokensB = Array(repeating: UInt16(0), count: streamCount)
+
+            try cpuEmbWrite(t0xInA)
+            try cpuEmbWrite(t0xInB)
+            try trA[0].kernels.step.eval()
+            do { let r = try controlA.run(trunkSurface: trunkOutA); for i in 0..<streamCount { tokensA[i] = r[i] } }
+            try weights.embedding.withUnsafePointer { embPtr in
+                try tokensA.withUnsafeBufferPointer { tBuf in
+                    try SurfaceIO.writeEmbeddingBatchFP16(
+                        to: t0xInA, channelOffset: 0, spatial: streamCount,
+                        embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
+                        tokenIDs: tBuf.baseAddress!, streamCount: streamCount)
+                }
+            }
+            try trB[0].kernels.step.eval()
+
+            var ctrlUs: [Double] = []
+            for iter in 0..<(warmup + iters) {
+                let s = GenerationClock.now()
+                var aneError: (any Error)?
+
+                let g1 = DispatchGroup()
+                g1.enter()
+                aneQueue.async { defer { g1.leave() }
+                    do { try trB[0].kernels.step.eval() } catch { aneError = error }
+                }
+                let rA = try controlA.run(trunkSurface: trunkOutA)
+                for i in 0..<streamCount { tokensA[i] = rA[i] }
+                try weights.embedding.withUnsafePointer { embPtr in
+                    try tokensA.withUnsafeBufferPointer { tBuf in
+                        try SurfaceIO.writeEmbeddingBatchFP16(
+                            to: t0xInA, channelOffset: 0, spatial: streamCount,
+                            embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
+                            tokenIDs: tBuf.baseAddress!, streamCount: streamCount)
+                    }
+                }
+                g1.wait()
+                if let e = aneError { throw e }
+
+                let g2 = DispatchGroup()
+                g2.enter()
+                aneQueue.async { defer { g2.leave() }
+                    do { try trA[0].kernels.step.eval() } catch { aneError = error }
+                }
+                let rB = try controlB.run(trunkSurface: trunkOutB)
+                for i in 0..<streamCount { tokensB[i] = rB[i] }
+                try weights.embedding.withUnsafePointer { embPtr in
+                    try tokensB.withUnsafeBufferPointer { tBuf in
+                        try SurfaceIO.writeEmbeddingBatchFP16(
+                            to: t0xInB, channelOffset: 0, spatial: streamCount,
+                            embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
+                            tokenIDs: tBuf.baseAddress!, streamCount: streamCount)
+                    }
+                }
+                g2.wait()
+                if let e = aneError { throw e }
+
+                let elapsed = machMilliseconds(GenerationClock.now() - s) * 1000
+                if iter >= warmup { ctrlUs.append(elapsed) }
+            }
+
+            let cMed = ctrlUs.sorted()[ctrlUs.count / 2]
+            let cTps = Double(streamCount * 2) / (cMed / 1000.0) * 1000.0
+
+            let medUs = pipeUs.sorted()[pipeUs.count / 2]
+            let tps = Double(streamCount * 2) / (medUs / 1000.0) * 1000.0
+            print("  GPUPipelinedHead:  median two-step=\(String(format: "%.3f", medUs / 1000)) ms, \(String(format: "%.0f", tps)) TPS")
+            print("    full-head=\(String(format: "%.1f", med(headUs))) µs, ANE-wait=\(String(format: "%.1f", med(aneWaitUs))) µs")
+            print("  Control (CPU embed): median two-step=\(String(format: "%.3f", cMed / 1000)) ms, \(String(format: "%.0f", cTps)) TPS")
+            print("  A/B delta: \(String(format: "%+.0f", tps - cTps)) TPS (\(String(format: "%+.1f", (tps/cTps - 1) * 100))%)")
+
+        } catch {
+            print("  FAILED: \(error)")
+        }
+    }
+
+    // MARK: - Cycle 28: bneck reduction sweep (pipelined)
+
+    func test_cycle28_bneck_reduction_pipeline() throws {
+        try requireGenerationHardware()
+
+        let dim = ModelConfig.dim
+        let streamCount = 16384
+        let trunkGroups = 16
+        let warmup = 10
+        let iters = 60
+
+        let weights = makeEchoRecurrentGenerationWeights(layerCount: 6)
+        let vocabSize = weights.vocabSize
+
+        // Shared ANE trunk (bneck-independent)
+        var trA = try LayerStorage<RWKVStyleFusedThreeLayerSession>(
+            count: 1,
+            throwingInitializer: { _ in
+                try RWKVStyleFusedThreeLayerSession(
+                    weights0: weights.layers[0], weights1: weights.layers[1],
+                    weights2: weights.layers[2], laneSpatial: streamCount,
+                    groups: trunkGroups, includeRMSNorm: false)
+            })
+        for i in 0..<3 { try trA[0].kernels.step.rebindInput(at: 1+i, to: trA[0].kernels.step.outputSurface(at: 1+i)) }
+        let trunkOutA = trA[0].handles.xOut
+        let t0xInA = trA[0].handles.xIn
+
+        var trB = try LayerStorage<RWKVStyleFusedThreeLayerSession>(
+            count: 1,
+            throwingInitializer: { _ in
+                try RWKVStyleFusedThreeLayerSession(
+                    weights0: weights.layers[0], weights1: weights.layers[1],
+                    weights2: weights.layers[2], laneSpatial: streamCount,
+                    groups: trunkGroups, includeRMSNorm: false)
+            })
+        for i in 0..<3 { try trB[0].kernels.step.rebindInput(at: 1+i, to: trB[0].kernels.step.outputSurface(at: 1+i)) }
+        let trunkOutB = trB[0].handles.xOut
+        let t0xInB = trB[0].handles.xIn
+
+        let aneQueue = DispatchQueue(label: "ane.eval.c28", qos: .userInteractive)
+
+        let rmsGammaFp16 = UnsafeMutablePointer<Float16>.allocate(capacity: dim)
+        defer { rmsGammaFp16.deallocate() }
+        weights.rmsFinal.withUnsafePointer { src in
+            for i in 0..<dim { rmsGammaFp16[i] = Float16(src[i]) }
+        }
+        let embFp16 = UnsafeMutablePointer<Float16>.allocate(capacity: vocabSize * dim)
+        defer { embFp16.deallocate() }
+        weights.embedding.withUnsafePointer { src in
+            for i in 0..<(vocabSize * dim) { embFp16[i] = Float16(src[i]) }
+        }
+
+        func cpuEmbWrite(_ surface: IOSurfaceRef) throws {
+            let tokens = Array(repeating: UInt16(0), count: streamCount)
+            try weights.embedding.withUnsafePointer { embPtr in
+                try tokens.withUnsafeBufferPointer { tokenBuf in
+                    try SurfaceIO.writeEmbeddingBatchFP16(
+                        to: surface, channelOffset: 0, spatial: streamCount,
+                        embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
+                        tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount)
+                }
+            }
+        }
+
+        func med(_ a: [Double]) -> Double { let s = a.sorted(); return s[s.count / 2] }
+
+        print("=== Cycle 28: bneck reduction sweep (3L NoRMS pipelined) ===")
+
+        var results: [(bneck: Int, tps: Double, headUs: Double, aneWaitUs: Double)] = []
+
+        for bneck in [64, 32, 16] {
+            let projWFp16 = UnsafeMutablePointer<Float16>.allocate(capacity: dim * bneck)
+            defer { projWFp16.deallocate() }
+            for i in 0..<(dim * bneck) { projWFp16[i] = Float16.random(in: -0.01...0.01) }
+
+            let wF16 = UnsafeMutablePointer<Float16>.allocate(capacity: vocabSize * bneck)
+            defer { wF16.deallocate() }
+            for i in 0..<(vocabSize * bneck) { wF16[i] = Float16.random(in: -0.01...0.01) }
+            let wBuf = UnsafeBufferPointer(start: wF16, count: vocabSize * bneck)
+
+            let headA = try GPUPipelinedHead(
+                rmsGamma: UnsafeBufferPointer(start: rmsGammaFp16, count: dim),
+                wProject: UnsafeBufferPointer(start: projWFp16, count: dim * bneck),
+                wExpand: wBuf,
+                embeddingFP16: UnsafeBufferPointer(start: embFp16, count: vocabSize * dim),
+                dim: dim, bottleneck: bneck, vocabSize: vocabSize, spatial: streamCount)
+            let headB = try GPUPipelinedHead(
+                rmsGamma: UnsafeBufferPointer(start: rmsGammaFp16, count: dim),
+                wProject: UnsafeBufferPointer(start: projWFp16, count: dim * bneck),
+                wExpand: wBuf,
+                embeddingFP16: UnsafeBufferPointer(start: embFp16, count: vocabSize * dim),
+                dim: dim, bottleneck: bneck, vocabSize: vocabSize, spatial: streamCount)
+
+            try cpuEmbWrite(t0xInA)
+            try cpuEmbWrite(t0xInB)
+            try trA[0].kernels.step.eval()
+            _ = try headA.runAndEmbed(trunkSurface: trunkOutA, embedSurface: t0xInA)
+            try trB[0].kernels.step.eval()
+
+            var pipeUs: [Double] = []
+            var headUsArr: [Double] = []
+            var aneWaitArr: [Double] = []
+            for iter in 0..<(warmup + iters) {
+                let s = GenerationClock.now()
+                var aneError: (any Error)?
+
+                let g1 = DispatchGroup()
+                g1.enter()
+                aneQueue.async { defer { g1.leave() }
+                    do { try trB[0].kernels.step.eval() } catch { aneError = error }
+                }
+                let hs = mach_absolute_time()
+                _ = try headA.runAndEmbed(trunkSurface: trunkOutA, embedSurface: t0xInA)
+                let he = mach_absolute_time()
+                let ws = mach_absolute_time()
+                g1.wait()
+                let we = mach_absolute_time()
+                if let e = aneError { throw e }
+
+                let g2 = DispatchGroup()
+                g2.enter()
+                aneQueue.async { defer { g2.leave() }
+                    do { try trA[0].kernels.step.eval() } catch { aneError = error }
+                }
+                let hs2 = mach_absolute_time()
+                _ = try headB.runAndEmbed(trunkSurface: trunkOutB, embedSurface: t0xInB)
+                let he2 = mach_absolute_time()
+                let ws2 = mach_absolute_time()
+                g2.wait()
+                let we2 = mach_absolute_time()
+                if let e = aneError { throw e }
+
+                let elapsed = machMilliseconds(GenerationClock.now() - s) * 1000
+                if iter >= warmup {
+                    pipeUs.append(elapsed)
+                    headUsArr.append(machMilliseconds(he - hs) * 1000 + machMilliseconds(he2 - hs2) * 1000)
+                    aneWaitArr.append(machMilliseconds(we - ws) * 1000 + machMilliseconds(we2 - ws2) * 1000)
+                }
+            }
+
+            let medUs = med(pipeUs)
+            let tps = Double(streamCount * 2) / (medUs / 1000.0) * 1000.0
+            let hMed = med(headUsArr)
+            let awMed = med(aneWaitArr)
+            results.append((bneck: bneck, tps: tps, headUs: hMed, aneWaitUs: awMed))
+            print("  bneck=\(bneck): \(String(format: "%.0f", tps)) TPS, two-step=\(String(format: "%.3f", medUs / 1000)) ms, head=\(String(format: "%.1f", hMed)) µs, ANE-wait=\(String(format: "%.1f", awMed)) µs")
+        }
+
+        if results.count >= 2 {
+            let base = results[0]
+            for i in 1..<results.count {
+                let exp = results[i]
+                let delta = (exp.tps / base.tps - 1.0) * 100.0
+                print("  bneck=\(exp.bneck) vs bneck=\(base.bneck): \(String(format: "%+.1f", delta))% TPS")
+            }
+        }
     }
 
     // MARK: - ANE eval-only micro-benchmark
