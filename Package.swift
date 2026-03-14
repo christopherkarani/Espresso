@@ -120,5 +120,16 @@ let package = Package(
             path: "Tests/CrossValidationTests",
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
+        .target(
+            name: "ANEGraphIR",
+            path: "Sources/ANEGraphIR",
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
+            name: "ANEGraphIRTests",
+            dependencies: ["ANEGraphIR"],
+            path: "Tests/ANEGraphIRTests",
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
     ]
 )
