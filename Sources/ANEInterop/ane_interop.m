@@ -1314,24 +1314,19 @@ bool ane_interop_rebind_input(ANEHandle *handle, int index, IOSurfaceRef newSurf
     @autoreleasepool {
         if (!handle || !newSurface) return false;
         if (index < 0 || index >= handle->nInputs) return false;
+        if (handle->inputBytes && handle->inputBytes[index] > 0 &&
+            IOSurfaceGetAllocSize(newSurface) < (size_t)handle->inputBytes[index]) return false;
 
         ane_interop_init();
         if (!g_ANEReq || !g_ANEIO) return false;
-
-        // Replace the surface (retain new, release old if different)
-        IOSurfaceRef old = handle->ioInputs[index];
-        if (old != newSurface) {
-            CFRetain(newSurface);
-            handle->ioInputs[index] = newSurface;
-            if (old) CFRelease(old);
-        }
 
         // Rebuild the _ANERequest with updated surface bindings
         NSMutableArray *wIns = [NSMutableArray arrayWithCapacity:(NSUInteger)handle->nInputs];
         NSMutableArray *iIdx = [NSMutableArray arrayWithCapacity:(NSUInteger)handle->nInputs];
         for (int i = 0; i < handle->nInputs; i++) {
+            IOSurfaceRef surface = (i == index) ? newSurface : handle->ioInputs[i];
             id obj = ((id(*)(Class,SEL,IOSurfaceRef))objc_msgSend)(
-                g_ANEIO, @selector(objectWithIOSurface:), handle->ioInputs[i]);
+                g_ANEIO, @selector(objectWithIOSurface:), surface);
             if (!obj) return false;
             [wIns addObject:obj];
             [iIdx addObject:@(i)];
@@ -1348,20 +1343,39 @@ bool ane_interop_rebind_input(ANEHandle *handle, int index, IOSurfaceRef newSurf
 
         id perfStats = handle->perfStats ? (__bridge id)handle->perfStats : nil;
         id newReq = nil;
+        SEL reqSelPerf = @selector(requestWithInputs:inputIndices:outputs:outputIndices:perfStats:procedureIndex:);
+        SEL reqSelPerfWB = @selector(requestWithInputs:inputIndices:outputs:outputIndices:weightsBuffer:perfStats:procedureIndex:);
+        SEL reqSel = @selector(requestWithInputs:inputIndices:outputs:outputIndices:procedureIndex:);
+        SEL reqSelWB = @selector(requestWithInputs:inputIndices:outputs:outputIndices:weightsBuffer:procedureIndex:);
         if (perfStats) {
-            newReq = ((id(*)(Class,SEL,id,id,id,id,id,id))objc_msgSend)(
-                g_ANEReq, @selector(requestWithInputs:inputIndices:outputs:outputIndices:perfStats:procedureIndex:),
-                wIns, iIdx, wOuts, oIdx, perfStats, @0);
+            if ([g_ANEReq respondsToSelector:reqSelPerf]) {
+                newReq = ((id(*)(Class,SEL,id,id,id,id,id,id))objc_msgSend)(
+                    g_ANEReq, reqSelPerf, wIns, iIdx, wOuts, oIdx, perfStats, @0);
+            } else if ([g_ANEReq respondsToSelector:reqSelPerfWB]) {
+                newReq = ((id(*)(Class,SEL,id,id,id,id,id,id,id))objc_msgSend)(
+                    g_ANEReq, reqSelPerfWB, wIns, iIdx, wOuts, oIdx, nil, perfStats, @0);
+            }
         } else {
-            newReq = ((id(*)(Class,SEL,id,id,id,id,id))objc_msgSend)(
-                g_ANEReq, @selector(requestWithInputs:inputIndices:outputs:outputIndices:procedureIndex:),
-                wIns, iIdx, wOuts, oIdx, @0);
+            if ([g_ANEReq respondsToSelector:reqSel]) {
+                newReq = ((id(*)(Class,SEL,id,id,id,id,id))objc_msgSend)(
+                    g_ANEReq, reqSel, wIns, iIdx, wOuts, oIdx, @0);
+            } else if ([g_ANEReq respondsToSelector:reqSelWB]) {
+                newReq = ((id(*)(Class,SEL,id,id,id,id,id,id))objc_msgSend)(
+                    g_ANEReq, reqSelWB, wIns, iIdx, wOuts, oIdx, nil, @0);
+            }
         }
         if (!newReq) return false;
 
-        // Swap requests
+        IOSurfaceRef oldSurface = handle->ioInputs[index];
         void *oldReq = handle->request;
+        if (oldSurface != newSurface) {
+            CFRetain(newSurface);
+            handle->ioInputs[index] = newSurface;
+        }
         handle->request = (void *)CFBridgingRetain(newReq);
+        if (oldSurface != newSurface && oldSurface) {
+            CFRelease(oldSurface);
+        }
         if (oldReq) CFRelease(oldReq);
 
         return true;

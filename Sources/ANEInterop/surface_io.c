@@ -443,12 +443,13 @@ bool ane_interop_io_write_embedding_batch_fp16(
     int ch_off,
     int spatial,
     const float *embedding_table,
+    int vocab_size,
     int dim,
     const uint16_t *token_ids,
     int stream_count) {
 
     if (!surface || !embedding_table || !token_ids) return false;
-    if (ch_off < 0 || spatial <= 0 || dim <= 0 || stream_count <= 0) return false;
+    if (ch_off < 0 || spatial <= 0 || vocab_size <= 0 || dim <= 0 || stream_count <= 0) return false;
     if (stream_count > spatial) return false;
     if (dim > INT_MAX - ch_off) return false;
 
@@ -484,7 +485,9 @@ bool ane_interop_io_write_embedding_batch_fp16(
             /* Pre-compute row pointers for each stream (avoid repeated multiply in inner loop) */
             const float *embRows[32768];
             for (int s = 0; s < stream_count; s++) {
-                embRows[s] = embedding_table + (size_t)token_ids[s] * (size_t)dim;
+                int token = (int)token_ids[s];
+                if (token < 0 || token >= vocab_size) goto cleanup;
+                embRows[s] = embedding_table + (size_t)token * (size_t)dim;
             }
 
             for (int c = 0; c < dim; c++) {
@@ -512,6 +515,7 @@ bool ane_interop_io_write_embedding_batch_fp16(
         /* Scalar fallback */
         for (int s = 0; s < stream_count; s++) {
             int token = (int)token_ids[s];
+            if (token < 0 || token >= vocab_size) goto cleanup;
             const float *embRow = embedding_table + (size_t)token * (size_t)dim;
             for (int c = 0; c < dim; c++) {
                 size_t idx = (size_t)(ch_off + c) * spatialSz + (size_t)s;
@@ -1191,17 +1195,33 @@ bool ane_interop_io_argmax_batch_fp16_spatial_nolock(
     if (!surface || !out_indices || !out_values) return false;
     if (ch_off < 0 || spatial <= 0 || channels <= 0 || stream_count <= 0) return false;
     if (stream_count > spatial) return false;
+    if (channels > INT_MAX - ch_off) return false;
+    if (channels > (int)UINT16_MAX + 1) return false;
     if (n_blocks <= 1) n_blocks = 1;
     if (n_blocks > 32) n_blocks = 32;
     if (channels < n_blocks * 2) n_blocks = 1;
-    if (spatial > 32768 || (spatial % 8) != 0) n_blocks = 1;
+    if (spatial > 32768 || (spatial % 8) != 0) {
+        return ane_interop_io_argmax_batch_fp16_spatial(
+            surface, ch_off, spatial, channels, stream_count,
+            out_indices, out_values);
+    }
 
     /* No lock — caller guarantees coherency */
     const void *base = IOSurfaceGetBaseAddress(surface);
     if (!base) return false;
+    size_t spatialSz = (size_t)spatial;
+    size_t maxCh = (size_t)(ch_off + channels - 1);
+    size_t maxIdxElems;
+    if (mul_size_overflow(maxCh, spatialSz, &maxIdxElems)) return false;
+    size_t elemCount;
+    if (add_size_overflow(maxIdxElems, (size_t)(spatial - 1), &maxIdxElems)) return false;
+    if (add_size_overflow(maxIdxElems, 1, &elemCount)) return false;
+    size_t bytes;
+    if (mul_size_overflow(elemCount, sizeof(_Float16), &bytes)) return false;
+    if (bytes > IOSurfaceGetAllocSize(surface)) return false;
 
     const _Float16 *srcF16 = (const _Float16 *)base;
-    const _Float16 *src_offset = srcF16 + (size_t)ch_off * (size_t)spatial;
+    const _Float16 *src_offset = srcF16 + (size_t)ch_off * spatialSz;
 
     if (n_blocks <= 1) {
         /* Serial path */
@@ -1367,10 +1387,12 @@ bool ane_interop_fused_expansion_argmax_fp16(
 
 #if defined(__aarch64__) || defined(__arm64__)
     if (!proj_surface || !expansion_weights_fp16 || !out_indices || !out_values) return false;
-    if (spatial <= 0 || bottleneck <= 0 || groups <= 0 || vocab_size <= 0) return false;
+    if (proj_ch_off < 0 || spatial <= 0 || bottleneck <= 0 || groups <= 0 || vocab_size <= 0) return false;
     if (stream_count <= 0 || stream_count > spatial) return false;
     if (spatial > 32768 || (spatial % 8) != 0) return false;
     if (bottleneck % groups != 0 || vocab_size % groups != 0) return false;
+    if (vocab_size > (int)UINT16_MAX + 1) return false;
+    if (bottleneck > INT_MAX - proj_ch_off) return false;
     if (n_blocks <= 1) n_blocks = 1;
     if (n_blocks > 32) n_blocks = 32;
     if (vocab_size < n_blocks * 2) n_blocks = 1;
@@ -1388,6 +1410,28 @@ bool ane_interop_fused_expansion_argmax_fp16(
     }
     const void *base = IOSurfaceGetBaseAddress(proj_surface);
     if (!base) {
+        IOSurfaceUnlock(proj_surface, kIOSurfaceLockReadOnly, NULL);
+        free(proj_local);
+        return false;
+    }
+    size_t spatialSz = (size_t)spatial;
+    size_t maxCh = (size_t)(proj_ch_off + bottleneck - 1);
+    size_t maxIdxElems;
+    if (mul_size_overflow(maxCh, spatialSz, &maxIdxElems)) {
+        IOSurfaceUnlock(proj_surface, kIOSurfaceLockReadOnly, NULL);
+        free(proj_local);
+        return false;
+    }
+    size_t elemCount;
+    if (add_size_overflow(maxIdxElems, (size_t)(spatial - 1), &maxIdxElems) ||
+        add_size_overflow(maxIdxElems, 1, &elemCount)) {
+        IOSurfaceUnlock(proj_surface, kIOSurfaceLockReadOnly, NULL);
+        free(proj_local);
+        return false;
+    }
+    size_t proj_bytes;
+    if (mul_size_overflow(elemCount, sizeof(_Float16), &proj_bytes) ||
+        proj_bytes > IOSurfaceGetAllocSize(proj_surface)) {
         IOSurfaceUnlock(proj_surface, kIOSurfaceLockReadOnly, NULL);
         free(proj_local);
         return false;
