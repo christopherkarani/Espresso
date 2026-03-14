@@ -53,10 +53,13 @@ prompts/
 scripts/
 !scripts/
 scripts/*
+scripts/internal/
+scripts/internal/**
 !scripts/ensure_coreml_model.sh
 !scripts/generate_coreml_model.py
 !scripts/reproduce_local_real_artifact_claim.sh
 !scripts/run_power_benchmark.sh
+!scripts/README.md
 tasks/
 AGENTS.md
 CLAUDE.md
