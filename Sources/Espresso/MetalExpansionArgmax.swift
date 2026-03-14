@@ -153,13 +153,19 @@ public final class MPSExpansionArgmax {
     }
 
     /// Run MPS matmul + GPU argmax on projected ANE output surface.
-    public func run(projectedSurface: IOSurfaceRef) throws(MetalExpansionArgmaxError) -> UnsafeBufferPointer<UInt16> {
+    public func run(projectedSurface: IOSurfaceRef) throws(MetalExpansionArgmaxError) -> [UInt16] {
         let length = try requiredFP16SurfaceBytes(channels: bottleneck, spatial: spatial)
 
         // Copy IOSurface data into Metal buffer
         let status = IOSurfaceLock(projectedSurface, [.readOnly], nil)
         guard status == 0 else { throw .surfaceLockFailed(status) }
-        let baseAddress = try validatedLockedSurfaceBaseAddress(projectedSurface, requiredBytes: length)
+        let baseAddress: UnsafeMutableRawPointer
+        do {
+            baseAddress = try validatedLockedSurfaceBaseAddress(projectedSurface, requiredBytes: length)
+        } catch {
+            IOSurfaceUnlock(projectedSurface, [.readOnly], nil)
+            throw error
+        }
         memcpy(projBuffer.contents(), baseAddress, length)
         IOSurfaceUnlock(projectedSurface, [.readOnly], nil)
 
@@ -213,7 +219,7 @@ public final class MPSExpansionArgmax {
         }
 
         let ptr = outputBuffer.contents().assumingMemoryBound(to: UInt16.self)
-        return UnsafeBufferPointer(start: ptr, count: spatial)
+        return Array(UnsafeBufferPointer(start: ptr, count: spatial))
     }
 
     // MARK: - GPU Argmax Shader
@@ -418,13 +424,19 @@ public final class GPUFullHeadArgmax {
     }
 
     /// Run full GPU head pipeline on trunk output surface.
-    public func run(trunkSurface: IOSurfaceRef) throws(MetalExpansionArgmaxError) -> UnsafeBufferPointer<UInt16> {
+    public func run(trunkSurface: IOSurfaceRef) throws(MetalExpansionArgmaxError) -> [UInt16] {
         let trunkBytes = try requiredFP16SurfaceBytes(channels: dim, spatial: spatial)
 
         // 1. Copy trunk output to GPU buffer
         let lockStatus = IOSurfaceLock(trunkSurface, [.readOnly], nil)
         guard lockStatus == 0 else { throw .surfaceLockFailed(lockStatus) }
-        let baseAddress = try validatedLockedSurfaceBaseAddress(trunkSurface, requiredBytes: trunkBytes)
+        let baseAddress: UnsafeMutableRawPointer
+        do {
+            baseAddress = try validatedLockedSurfaceBaseAddress(trunkSurface, requiredBytes: trunkBytes)
+        } catch {
+            IOSurfaceUnlock(trunkSurface, [.readOnly], nil)
+            throw error
+        }
         memcpy(trunkBuffer.contents(), baseAddress, trunkBytes)
         IOSurfaceUnlock(trunkSurface, [.readOnly], nil)
 
@@ -488,7 +500,8 @@ public final class GPUFullHeadArgmax {
             throw .commandExecutionFailed(cb.error?.localizedDescription ?? "status=\(cb.status.rawValue)")
         }
 
-        return UnsafeBufferPointer(start: outputBuffer.contents().assumingMemoryBound(to: UInt16.self), count: spatial)
+        let ptr = outputBuffer.contents().assumingMemoryBound(to: UInt16.self)
+        return Array(UnsafeBufferPointer(start: ptr, count: spatial))
     }
 
     // MARK: - RMSNorm Shader
@@ -555,6 +568,7 @@ public final class GPUPipelinedHead {
     private let logitsBuffer: MTLBuffer     // [spatial, vocab] fp16
     private let outputBuffer: MTLBuffer     // [spatial] uint16
     private let embeddingBuffer: MTLBuffer  // [vocab, dim] fp16
+    private let embedOutBuffer: MTLBuffer   // [dim, spatial] fp16 staging for embed write
 
     public let dim: Int
     public let bottleneck: Int
@@ -657,6 +671,9 @@ public final class GPUPipelinedHead {
         guard let embBuf = device.makeBuffer(bytes: embeddingFP16.baseAddress!, length: embSize, options: .storageModeShared) else {
             throw .bufferAllocationFailed
         }
+        guard let embedOutBuf = device.makeBuffer(length: trunkSize, options: .storageModeShared) else {
+            throw .bufferAllocationFailed
+        }
 
         self.device = device
         self.commandQueue = queue
@@ -673,6 +690,7 @@ public final class GPUPipelinedHead {
         self.logitsBuffer = logitsBuf
         self.outputBuffer = outBuf
         self.embeddingBuffer = embBuf
+        self.embedOutBuffer = embedOutBuf
         self.dim = dim
         self.bottleneck = bottleneck
         self.vocabSize = vocabSize
@@ -681,46 +699,32 @@ public final class GPUPipelinedHead {
 
     /// Run full pipeline: RMSNorm → proj → expand → argmax → embed write.
     /// Writes embedded tokens directly to `embedSurface` in channel-first layout.
-    /// Returns pointer to token IDs (internal buffer, valid until next call).
+    /// Returns token IDs as a copied array.
     public func runAndEmbed(
         trunkSurface: IOSurfaceRef,
         embedSurface: IOSurfaceRef
-    ) throws(MetalExpansionArgmaxError) -> UnsafeBufferPointer<UInt16> {
+    ) throws(MetalExpansionArgmaxError) -> [UInt16] {
         let trunkBytes = try requiredFP16SurfaceBytes(channels: dim, spatial: spatial)
 
-        // Copy trunk output to GPU buffer
+        // 1. Copy trunk output to GPU buffer (lock/unlock immediately)
         let lockStatus = IOSurfaceLock(trunkSurface, [.readOnly], nil)
         guard lockStatus == 0 else { throw .surfaceLockFailed(lockStatus) }
-        let trunkBaseAddress = try validatedLockedSurfaceBaseAddress(trunkSurface, requiredBytes: trunkBytes)
+        let trunkBaseAddress: UnsafeMutableRawPointer
+        do {
+            trunkBaseAddress = try validatedLockedSurfaceBaseAddress(trunkSurface, requiredBytes: trunkBytes)
+        } catch {
+            IOSurfaceUnlock(trunkSurface, [.readOnly], nil)
+            throw error
+        }
         memcpy(trunkBuffer.contents(), trunkBaseAddress, trunkBytes)
         IOSurfaceUnlock(trunkSurface, [.readOnly], nil)
 
-        // Bind embed surface as Metal buffer
-        let embedLock = IOSurfaceLock(embedSurface, [], nil)
-        guard embedLock == 0 else { throw .surfaceLockFailed(embedLock) }
-        let embedBaseAddress: UnsafeMutableRawPointer
-        do {
-            embedBaseAddress = try validatedLockedSurfaceBaseAddress(embedSurface, requiredBytes: trunkBytes)
-        } catch {
-            IOSurfaceUnlock(embedSurface, [], nil)
-            throw error
-        }
-        guard let embedOutBuffer = device.makeBuffer(
-            bytesNoCopy: embedBaseAddress,
-            length: trunkBytes, options: .storageModeShared, deallocator: nil
-        ) else {
-            IOSurfaceUnlock(embedSurface, [], nil)
-            throw .bufferBindingFailed
-        }
-
         guard let cb = commandQueue.makeCommandBuffer() else {
-            IOSurfaceUnlock(embedSurface, [], nil)
             throw .commandBufferUnavailable
         }
 
-        // 1. GPU RMSNorm in-place
+        // 2. GPU RMSNorm in-place
         guard let rmsEnc = cb.makeComputeCommandEncoder() else {
-            IOSurfaceUnlock(embedSurface, [], nil)
             throw .commandEncoderUnavailable
         }
         rmsEnc.setComputePipelineState(rmsNormPipeline)
@@ -734,7 +738,7 @@ public final class GPUPipelinedHead {
             threadsPerThreadgroup: MTLSize(width: rmsTpg, height: 1, depth: 1))
         rmsEnc.endEncoding()
 
-        // 2. MPS projection
+        // 3. MPS projection
         let trunkDesc = MPSMatrixDescriptor(rows: dim, columns: spatial, rowBytes: spatial * 2, dataType: .float16)
         let projWDesc = MPSMatrixDescriptor(rows: bottleneck, columns: dim, rowBytes: dim * 2, dataType: .float16)
         let projOutDesc = MPSMatrixDescriptor(rows: spatial, columns: bottleneck, rowBytes: bottleneck * 2, dataType: .float16)
@@ -743,7 +747,7 @@ public final class GPUPipelinedHead {
         let projOutMat = MPSMatrix(buffer: projOutBuffer, descriptor: projOutDesc)
         projMatmul.encode(commandBuffer: cb, leftMatrix: trunkMat, rightMatrix: projWMat, resultMatrix: projOutMat)
 
-        // 3. MPS expansion
+        // 4. MPS expansion
         let projDesc2 = MPSMatrixDescriptor(rows: spatial, columns: bottleneck, rowBytes: bottleneck * 2, dataType: .float16)
         let expandWDesc = MPSMatrixDescriptor(rows: vocabSize, columns: bottleneck, rowBytes: bottleneck * 2, dataType: .float16)
         let logitsDesc = MPSMatrixDescriptor(rows: spatial, columns: vocabSize, rowBytes: vocabSize * 2, dataType: .float16)
@@ -752,9 +756,8 @@ public final class GPUPipelinedHead {
         let logitsMat = MPSMatrix(buffer: logitsBuffer, descriptor: logitsDesc)
         expandMatmul.encode(commandBuffer: cb, leftMatrix: projMat2, rightMatrix: expandWMat, resultMatrix: logitsMat)
 
-        // 4. GPU argmax
+        // 5. GPU argmax
         guard let argEnc = cb.makeComputeCommandEncoder() else {
-            IOSurfaceUnlock(embedSurface, [], nil)
             throw .commandEncoderUnavailable
         }
         argEnc.setComputePipelineState(argmaxPipeline)
@@ -768,9 +771,8 @@ public final class GPUPipelinedHead {
             threadsPerThreadgroup: MTLSize(width: argTpg, height: 1, depth: 1))
         argEnc.endEncoding()
 
-        // 5. GPU embed write to ANE input surface
+        // 6. GPU embed write to staging buffer (not directly to IOSurface)
         guard let embedEnc = cb.makeComputeCommandEncoder() else {
-            IOSurfaceUnlock(embedSurface, [], nil)
             throw .commandEncoderUnavailable
         }
         embedEnc.setComputePipelineState(embedPipeline)
@@ -787,13 +789,140 @@ public final class GPUPipelinedHead {
 
         cb.commit()
         cb.waitUntilCompleted()
-        IOSurfaceUnlock(embedSurface, [], nil)
 
         if cb.status != .completed {
             throw .commandExecutionFailed(cb.error?.localizedDescription ?? "status=\(cb.status.rawValue)")
         }
 
-        return UnsafeBufferPointer(start: outputBuffer.contents().assumingMemoryBound(to: UInt16.self), count: spatial)
+        // 7. Copy embed results back to IOSurface (lock only after GPU completes)
+        let embedWriteLock = IOSurfaceLock(embedSurface, [], nil)
+        guard embedWriteLock == 0 else { throw .surfaceLockFailed(embedWriteLock) }
+        memcpy(IOSurfaceGetBaseAddress(embedSurface), embedOutBuffer.contents(), trunkBytes)
+        IOSurfaceUnlock(embedSurface, [], nil)
+
+        let ptr = outputBuffer.contents().assumingMemoryBound(to: UInt16.self)
+        return Array(UnsafeBufferPointer(start: ptr, count: spatial))
+    }
+
+    /// Pre-bind IOSurfaces for zero-copy access. Returns opaque binding tokens.
+    /// Call once at pipeline setup; use `runPreBound` in the hot loop.
+    public func preBind(
+        trunkSurface: IOSurfaceRef,
+        embedSurface: IOSurfaceRef
+    ) throws(MetalExpansionArgmaxError) -> PreBoundSurfaces {
+        let trunkBytes = dim * spatial * MemoryLayout<Float16>.stride
+
+        IOSurfaceLock(trunkSurface, [.readOnly], nil)
+        guard let trunkBuf = device.makeBuffer(
+            bytesNoCopy: IOSurfaceGetBaseAddress(trunkSurface),
+            length: trunkBytes, options: .storageModeShared, deallocator: nil
+        ) else {
+            IOSurfaceUnlock(trunkSurface, [.readOnly], nil)
+            throw .bufferBindingFailed
+        }
+        IOSurfaceUnlock(trunkSurface, [.readOnly], nil)
+
+        IOSurfaceLock(embedSurface, [], nil)
+        guard let embedBuf = device.makeBuffer(
+            bytesNoCopy: IOSurfaceGetBaseAddress(embedSurface),
+            length: trunkBytes, options: .storageModeShared, deallocator: nil
+        ) else {
+            IOSurfaceUnlock(embedSurface, [], nil)
+            throw .bufferBindingFailed
+        }
+        IOSurfaceUnlock(embedSurface, [], nil)
+
+        return PreBoundSurfaces(trunkBuffer: trunkBuf, embedBuffer: embedBuf)
+    }
+
+    /// Opaque binding for pre-bound IOSurfaces.
+    public struct PreBoundSurfaces {
+        internal let trunkBuffer: MTLBuffer
+        internal let embedBuffer: MTLBuffer
+    }
+
+    /// Zero-copy hot path: reads trunk directly from pre-bound IOSurface buffer,
+    /// writes embed directly to pre-bound IOSurface buffer. No CPU memcpy or
+    /// IOSurface lock/unlock in the critical path.
+    public func runPreBound(
+        _ binding: PreBoundSurfaces
+    ) throws(MetalExpansionArgmaxError) -> [UInt16] {
+        guard let cb = commandQueue.makeCommandBuffer() else { throw .commandBufferUnavailable }
+
+        // 1. Blit trunk surface → trunkBuffer (GPU copy, avoids CPU memcpy)
+        guard let blit = cb.makeBlitCommandEncoder() else { throw .commandEncoderUnavailable }
+        blit.copy(from: binding.trunkBuffer, sourceOffset: 0,
+                  to: trunkBuffer, destinationOffset: 0,
+                  size: dim * spatial * MemoryLayout<Float16>.stride)
+        blit.endEncoding()
+
+        // 2. GPU RMSNorm in-place on trunkBuffer
+        guard let rmsEnc = cb.makeComputeCommandEncoder() else { throw .commandEncoderUnavailable }
+        rmsEnc.setComputePipelineState(rmsNormPipeline)
+        rmsEnc.setBuffer(trunkBuffer, offset: 0, index: 0)
+        rmsEnc.setBuffer(gammaBuffer, offset: 0, index: 1)
+        var dims = (UInt32(dim), UInt32(spatial))
+        withUnsafeBytes(of: &dims) { rmsEnc.setBytes($0.baseAddress!, length: $0.count, index: 2) }
+        let rmsTpg = min(256, Int(rmsNormPipeline.maxTotalThreadsPerThreadgroup))
+        rmsEnc.dispatchThreadgroups(
+            MTLSize(width: (spatial + rmsTpg - 1) / rmsTpg, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: rmsTpg, height: 1, depth: 1))
+        rmsEnc.endEncoding()
+
+        // 3. MPS projection
+        let trunkDesc = MPSMatrixDescriptor(rows: dim, columns: spatial, rowBytes: spatial * 2, dataType: .float16)
+        let projWDesc = MPSMatrixDescriptor(rows: bottleneck, columns: dim, rowBytes: dim * 2, dataType: .float16)
+        let projOutDesc = MPSMatrixDescriptor(rows: spatial, columns: bottleneck, rowBytes: bottleneck * 2, dataType: .float16)
+        let trunkMat = MPSMatrix(buffer: trunkBuffer, descriptor: trunkDesc)
+        let projWMat = MPSMatrix(buffer: projWBuffer, descriptor: projWDesc)
+        let projOutMat = MPSMatrix(buffer: projOutBuffer, descriptor: projOutDesc)
+        projMatmul.encode(commandBuffer: cb, leftMatrix: trunkMat, rightMatrix: projWMat, resultMatrix: projOutMat)
+
+        // 4. MPS expansion
+        let projDesc2 = MPSMatrixDescriptor(rows: spatial, columns: bottleneck, rowBytes: bottleneck * 2, dataType: .float16)
+        let expandWDesc = MPSMatrixDescriptor(rows: vocabSize, columns: bottleneck, rowBytes: bottleneck * 2, dataType: .float16)
+        let logitsDesc = MPSMatrixDescriptor(rows: spatial, columns: vocabSize, rowBytes: vocabSize * 2, dataType: .float16)
+        let projMat2 = MPSMatrix(buffer: projOutBuffer, descriptor: projDesc2)
+        let expandWMat = MPSMatrix(buffer: expandWBuffer, descriptor: expandWDesc)
+        let logitsMat = MPSMatrix(buffer: logitsBuffer, descriptor: logitsDesc)
+        expandMatmul.encode(commandBuffer: cb, leftMatrix: projMat2, rightMatrix: expandWMat, resultMatrix: logitsMat)
+
+        // 5. GPU argmax
+        guard let argEnc = cb.makeComputeCommandEncoder() else { throw .commandEncoderUnavailable }
+        argEnc.setComputePipelineState(argmaxPipeline)
+        argEnc.setBuffer(logitsBuffer, offset: 0, index: 0)
+        argEnc.setBuffer(outputBuffer, offset: 0, index: 1)
+        var vocabU32 = UInt32(vocabSize)
+        argEnc.setBytes(&vocabU32, length: 4, index: 2)
+        let argTpg = min(256, Int(argmaxPipeline.maxTotalThreadsPerThreadgroup))
+        argEnc.dispatchThreadgroups(
+            MTLSize(width: spatial, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: argTpg, height: 1, depth: 1))
+        argEnc.endEncoding()
+
+        // 6. GPU embed write directly to pre-bound ANE input surface
+        guard let embedEnc = cb.makeComputeCommandEncoder() else { throw .commandEncoderUnavailable }
+        embedEnc.setComputePipelineState(embedPipeline)
+        embedEnc.setBuffer(outputBuffer, offset: 0, index: 0)
+        embedEnc.setBuffer(embeddingBuffer, offset: 0, index: 1)
+        embedEnc.setBuffer(binding.embedBuffer, offset: 0, index: 2)
+        var sp = UInt32(spatial)
+        embedEnc.setBytes(&sp, length: 4, index: 3)
+        let embedTpg = min(256, Int(embedPipeline.maxTotalThreadsPerThreadgroup))
+        embedEnc.dispatchThreadgroups(
+            MTLSize(width: (spatial + embedTpg - 1) / embedTpg, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: embedTpg, height: 1, depth: 1))
+        embedEnc.endEncoding()
+
+        cb.commit()
+        cb.waitUntilCompleted()
+
+        if cb.status != .completed {
+            throw .commandExecutionFailed(cb.error?.localizedDescription ?? "status=\(cb.status.rawValue)")
+        }
+
+        let ptr = outputBuffer.contents().assumingMemoryBound(to: UInt16.self)
+        return Array(UnsafeBufferPointer(start: ptr, count: spatial))
     }
 
     // MARK: - Embed Write Shader
@@ -910,12 +1039,18 @@ public final class FusedExpansionArgmax {
     }
 
     /// Run fused matmul+argmax on projected ANE output surface.
-    public func run(projectedSurface: IOSurfaceRef) throws(MetalExpansionArgmaxError) -> UnsafeBufferPointer<UInt16> {
+    public func run(projectedSurface: IOSurfaceRef) throws(MetalExpansionArgmaxError) -> [UInt16] {
         let length = try requiredFP16SurfaceBytes(channels: bottleneck, spatial: spatial)
 
         let status = IOSurfaceLock(projectedSurface, [.readOnly], nil)
         guard status == 0 else { throw .surfaceLockFailed(status) }
-        let baseAddress = try validatedLockedSurfaceBaseAddress(projectedSurface, requiredBytes: length)
+        let baseAddress: UnsafeMutableRawPointer
+        do {
+            baseAddress = try validatedLockedSurfaceBaseAddress(projectedSurface, requiredBytes: length)
+        } catch {
+            IOSurfaceUnlock(projectedSurface, [.readOnly], nil)
+            throw error
+        }
         memcpy(projBuffer.contents(), baseAddress, length)
         IOSurfaceUnlock(projectedSurface, [.readOnly], nil)
 
@@ -947,7 +1082,7 @@ public final class FusedExpansionArgmax {
         }
 
         let ptr = outputBuffer.contents().assumingMemoryBound(to: UInt16.self)
-        return UnsafeBufferPointer(start: ptr, count: spatial)
+        return Array(UnsafeBufferPointer(start: ptr, count: spatial))
     }
 
     // MARK: - Fused Shader
@@ -1143,8 +1278,8 @@ public final class MetalExpansionArgmax {
     }
 
     /// Run expansion+argmax on projected ANE output surface.
-    /// Returns pointer to internal output buffer containing uint16 token IDs.
-    public func run(projectedSurface: IOSurfaceRef) throws(MetalExpansionArgmaxError) -> UnsafeBufferPointer<UInt16> {
+    /// Returns token IDs as a copied array.
+    public func run(projectedSurface: IOSurfaceRef) throws(MetalExpansionArgmaxError) -> [UInt16] {
         let length = try requiredFP16SurfaceBytes(channels: bottleneck, spatial: spatial)
 
         let status = IOSurfaceLock(projectedSurface, [.readOnly], nil)
@@ -1202,12 +1337,12 @@ public final class MetalExpansionArgmax {
         }
 
         let ptr = outputBuffer.contents().assumingMemoryBound(to: UInt16.self)
-        return UnsafeBufferPointer(start: ptr, count: spatial)
+        return Array(UnsafeBufferPointer(start: ptr, count: spatial))
     }
 
     /// Run expansion+argmax from pre-allocated inputBuffer (caller must fill it first).
     /// Avoids IOSurface lock and per-call buffer creation overhead.
-    public func runPreBound() throws(MetalExpansionArgmaxError) -> UnsafeBufferPointer<UInt16> {
+    public func runPreBound() throws(MetalExpansionArgmaxError) -> [UInt16] {
         guard let commandBuffer = commandQueue.makeCommandBuffer() else {
             throw .commandBufferUnavailable
         }
@@ -1240,7 +1375,7 @@ public final class MetalExpansionArgmax {
         }
 
         let ptr = outputBuffer.contents().assumingMemoryBound(to: UInt16.self)
-        return UnsafeBufferPointer(start: ptr, count: spatial)
+        return Array(UnsafeBufferPointer(start: ptr, count: spatial))
     }
 
     // MARK: - Metal Shader

@@ -6,7 +6,7 @@
 
 #if defined(__aarch64__) || defined(__arm64__)
 #include <arm_neon.h>
-#define ARGMAX_MAX_NVECS 4096  /* supports up to spatial=32768 */
+#define ARGMAX_MAX_NVECS 64  /* supports up to spatial=512 (512/8=64) */
 #endif
 
 #include "ane_interop.h"
@@ -542,6 +542,7 @@ bool ane_interop_io_argmax_batch_fp16_spatial(
     if (!surface || !out_indices || !out_values) return false;
     if (ch_off < 0 || spatial <= 0 || channels <= 0 || stream_count <= 0) return false;
     if (stream_count > spatial) return false;
+    if (channels > 65535) return false;  /* uint16_t index overflow guard */
     if (channels > INT_MAX - ch_off) return false;
 
     size_t spatialSz = (size_t)spatial;
@@ -1037,7 +1038,7 @@ typedef struct {
     uint16_t *partial_indices;  /* [spatial] */
 } argmax_block_ctx;
 
-static void neon_partial_argmax(void *ctx_ptr) {
+static bool neon_partial_argmax(void *ctx_ptr) {
     argmax_block_ctx *ctx = (argmax_block_ctx *)ctx_ptr;
     const _Float16 *base = ctx->base;
     const int spatial = ctx->spatial;
@@ -1045,6 +1046,8 @@ static void neon_partial_argmax(void *ctx_ptr) {
     const int ch_end = ctx->ch_end;
     const int nvecs = spatial / 8;
     const size_t spatialSz = (size_t)spatial;
+
+    if (nvecs > ARGMAX_MAX_NVECS) return false;
 
     float16x8_t bestV[ARGMAX_MAX_NVECS];
     uint16x8_t bestI[ARGMAX_MAX_NVECS];
@@ -1070,6 +1073,7 @@ static void neon_partial_argmax(void *ctx_ptr) {
         vst1q_f16(ctx->partial_values + v * 8, bestV[v]);
         vst1q_u16(ctx->partial_indices + v * 8, bestI[v]);
     }
+    return true;
 }
 
 #endif /* __aarch64__ */
@@ -1095,6 +1099,7 @@ bool ane_interop_io_argmax_batch_fp16_spatial_parallel(
     if (!surface || !out_indices || !out_values) return false;
     if (ch_off < 0 || spatial <= 0 || channels <= 0 || stream_count <= 0) return false;
     if (stream_count > spatial) return false;
+    if (channels > 65535) return false;  /* uint16_t index overflow guard */
     if (spatial > 32768 || (spatial % 8) != 0) {
         return ane_interop_io_argmax_batch_fp16_spatial(
             surface, ch_off, spatial, channels, stream_count,
@@ -1196,7 +1201,7 @@ bool ane_interop_io_argmax_batch_fp16_spatial_nolock(
     if (ch_off < 0 || spatial <= 0 || channels <= 0 || stream_count <= 0) return false;
     if (stream_count > spatial) return false;
     if (channels > INT_MAX - ch_off) return false;
-    if (channels > (int)UINT16_MAX + 1) return false;
+    if (channels > (int)UINT16_MAX + 1) return false;  /* uint16_t index overflow guard */
     if (n_blocks <= 1) n_blocks = 1;
     if (n_blocks > 32) n_blocks = 32;
     if (channels < n_blocks * 2) n_blocks = 1;
@@ -1314,7 +1319,7 @@ typedef struct {
     uint16_t *partial_indices;  /* [spatial] best indices */
 } fused_exp_argmax_ctx;
 
-static void neon_fused_expansion_argmax(fused_exp_argmax_ctx *ctx) {
+static bool neon_fused_expansion_argmax(fused_exp_argmax_ctx *ctx) {
     const int spatial = ctx->spatial;
     const int groups = ctx->groups;
     const int cols_per_group = ctx->cols_per_group;
@@ -1323,6 +1328,9 @@ static void neon_fused_expansion_argmax(fused_exp_argmax_ctx *ctx) {
     const int nvecs = spatial / 8;
     const _Float16 *proj = ctx->proj;
     const _Float16 *weights = ctx->weights;
+
+    if (nvecs > ARGMAX_MAX_NVECS) return false;
+    if (vocab_size > 65535) return false;
 
     float16x8_t bestV[ARGMAX_MAX_NVECS];
     uint16x8_t bestI[ARGMAX_MAX_NVECS];
@@ -1368,6 +1376,7 @@ static void neon_fused_expansion_argmax(fused_exp_argmax_ctx *ctx) {
         vst1q_f16(ctx->partial_values + v * 8, bestV[v]);
         vst1q_u16(ctx->partial_indices + v * 8, bestI[v]);
     }
+    return true;
 }
 
 #endif /* __aarch64__ */
@@ -1389,6 +1398,7 @@ bool ane_interop_fused_expansion_argmax_fp16(
     if (!proj_surface || !expansion_weights_fp16 || !out_indices || !out_values) return false;
     if (proj_ch_off < 0 || spatial <= 0 || bottleneck <= 0 || groups <= 0 || vocab_size <= 0) return false;
     if (stream_count <= 0 || stream_count > spatial) return false;
+    if (vocab_size > 65535) return false;  /* uint16_t index overflow guard */
     if (spatial > 32768 || (spatial % 8) != 0) return false;
     if (bottleneck % groups != 0 || vocab_size % groups != 0) return false;
     if (vocab_size > (int)UINT16_MAX + 1) return false;

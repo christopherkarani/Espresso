@@ -400,6 +400,10 @@ public struct ANEKernel: ~Copyable {
 
     /// Replace an input surface and rebuild the ANE request.
     /// Used for surface sharing between kernels (zero-copy I/O chaining).
+    ///
+    /// - Precondition: Must not be called concurrently with `eval()` or other
+    ///   mutations on this kernel. The caller is responsible for ensuring
+    ///   exclusive access. Calling during a concurrent eval corrupts the handle.
     public func rebindInput(at index: Int, to surface: IOSurfaceRef) throws(ANEError) {
         let checkedIndex = try Self.checkedSurfaceIndex(index)
         guard ane_interop_rebind_input(handle, checkedIndex, surface) else {

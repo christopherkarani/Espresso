@@ -2553,27 +2553,27 @@ final class GenerationHarnessHardwareTests: XCTestCase {
 
             for _ in 0..<maxNewTokens {
                 // Half 1: eval B on background, CPU processes A
-                var aneError: (any Error)?
+                let aneErrorBox = LockedBox<(any Error)?>(nil)
                 let sem1 = DispatchSemaphore(value: 0)
                 DispatchQueue.global(qos: .userInteractive).async { [self] in
-                    do { try evalAll(&trB, head: headB) } catch { aneError = error }
+                    do { try evalAll(&trB, head: headB) } catch { aneErrorBox.withValue { $0 = error } }
                     sem1.signal()
                 }
                 try argmax(from: headOutA, into: &tokensA)
                 try embWrite(tokensA, to: t0xInA)
                 sem1.wait()
-                if let e = aneError { throw e }
+                if let e = aneErrorBox.withValue({ $0 }) { throw e }
 
                 // Half 2: eval A on background, CPU processes B
                 let sem2 = DispatchSemaphore(value: 0)
                 DispatchQueue.global(qos: .userInteractive).async { [self] in
-                    do { try evalAll(&trA, head: headA) } catch { aneError = error }
+                    do { try evalAll(&trA, head: headA) } catch { aneErrorBox.withValue { $0 = error } }
                     sem2.signal()
                 }
                 try argmax(from: headOutB, into: &tokensB)
                 try embWrite(tokensB, to: t0xInB)
                 sem2.wait()
-                if let e = aneError { throw e }
+                if let e = aneErrorBox.withValue({ $0 }) { throw e }
             }
 
             if iter >= warmup {
@@ -2582,7 +2582,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         }
 
         return ConcurrentGenerationScalingSample(
-            streamCount: streamCount * 2,  // 2 pipeline halves
+            streamCount: streamCount * 2,  // 2 pipeline halves: total logical sequences across both
             tokensPerStream: maxNewTokens,
             compileTimeMs: compileTimeMs,
             roundLatenciesMs: roundLatenciesMs
@@ -3723,7 +3723,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
             let t = GenerationClock.now()
             let _ = try SurfaceIO.argmaxBatchFP16SpatialParallel(
                 from: headOut, channelOffset: 0, spatial: laneSpatial,
-                channels: vocabSize, streamCount: streamCount, nBlocks: 8
+                channels: vocabSize, streamCount: streamCount, nBlocks: 4
             )
             par4Us.append(machMicroseconds(GenerationClock.now() - t))
         }
@@ -4983,7 +4983,6 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         IOSurfaceLock(headOut, .readOnly, nil)
         let baseAddr = IOSurfaceGetBaseAddress(headOut)
         let metalBuf = device.makeBuffer(bytesNoCopy: baseAddr, length: surfaceSize, options: .storageModeShared, deallocator: nil)!
-        IOSurfaceUnlock(headOut, .readOnly, nil)
 
         // Output buffers
         let indexBuf = device.makeBuffer(length: laneSpatial * MemoryLayout<Int32>.size, options: .storageModeShared)!
@@ -5007,6 +5006,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
             cb.commit()
             cb.waitUntilCompleted()
         }
+        IOSurfaceUnlock(headOut, .readOnly, nil)
 
         // Benchmark Metal argmax
         var metalTimesUs: [Double] = []
@@ -5434,16 +5434,20 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         }
     }
 
-    private func machMicroseconds(_ deltaTicks: UInt64) -> Double {
+    private static let timebaseInfo: mach_timebase_info_data_t = {
         var info = mach_timebase_info_data_t()
         mach_timebase_info(&info)
+        return info
+    }()
+
+    private func machMicroseconds(_ deltaTicks: UInt64) -> Double {
+        let info = Self.timebaseInfo
         let nanos = Double(deltaTicks) * Double(info.numer) / Double(info.denom)
         return nanos / 1_000.0
     }
 
     private func machMilliseconds(_ deltaTicks: UInt64) -> Double {
-        var info = mach_timebase_info_data_t()
-        mach_timebase_info(&info)
+        let info = Self.timebaseInfo
         let nanos = Double(deltaTicks) * Double(info.numer) / Double(info.denom)
         return nanos / 1_000_000.0
     }
@@ -6494,7 +6498,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         for _ in 0..<warmup {
             // Step A: eval A on ANE while CPU does argmax+embWrite for B
             try embWrite(tokensA, to: t0xInA)
-            var aneError: (any Error)?
+            let aneErrorBox = LockedBox<(any Error)?>(nil)
             let group = DispatchGroup()
             group.enter()
             aneQueue.async { [self] in
@@ -6503,11 +6507,11 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                     try tripletsA[0].kernels.step.eval()
                     try tripletsA[1].kernels.step.eval()
                     try headA.rmsNormClassifier.eval()
-                } catch { aneError = error }
+                } catch { aneErrorBox.withValue { $0 = error } }
             }
             // CPU side: nothing to overlap yet in warmup
             group.wait()
-            if let e = aneError { throw e }
+            if let e = aneErrorBox.withValue({ $0 }) { throw e }
             try argmax(from: headOutA, into: &tokensA)
 
             // Step B
@@ -6519,10 +6523,10 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                     try tripletsB[0].kernels.step.eval()
                     try tripletsB[1].kernels.step.eval()
                     try headB.rmsNormClassifier.eval()
-                } catch { aneError = error }
+                } catch { aneErrorBox.withValue { $0 = error } }
             }
             group.wait()
-            if let e = aneError { throw e }
+            if let e = aneErrorBox.withValue({ $0 }) { throw e }
             try argmax(from: headOutB, into: &tokensB)
         }
 
@@ -6532,7 +6536,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         var dbUs: [Double] = []
         for _ in 0..<iters {
             let s = GenerationClock.now()
-            var aneError: (any Error)?
+            let aneErrorBox = LockedBox<(any Error)?>(nil)
 
             // Half 1: eval A on ANE, CPU does argmax(B) + embWrite(A)
             // But wait — embWrite(A) must happen BEFORE evalA starts!
@@ -6546,13 +6550,13 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                     try tripletsA[0].kernels.step.eval()
                     try tripletsA[1].kernels.step.eval()
                     try headA.rmsNormClassifier.eval()
-                } catch { aneError = error }
+                } catch { aneErrorBox.withValue { $0 = error } }
             }
             // Overlap: argmax on B (from previous cycle's result)
             // Note: argmax B was already done at end of previous cycle, tokens are ready
             // Actually in steady state, we can overlap embWrite(B) here instead
             g1.wait()
-            if let e = aneError { throw e }
+            if let e = aneErrorBox.withValue({ $0 }) { throw e }
             try argmax(from: headOutA, into: &tokensA)
 
             // Half 2: eval B on ANE, CPU overlaps
@@ -6565,10 +6569,10 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                     try tripletsB[0].kernels.step.eval()
                     try tripletsB[1].kernels.step.eval()
                     try headB.rmsNormClassifier.eval()
-                } catch { aneError = error }
+                } catch { aneErrorBox.withValue { $0 = error } }
             }
             g2.wait()
-            if let e = aneError { throw e }
+            if let e = aneErrorBox.withValue({ $0 }) { throw e }
             try argmax(from: headOutB, into: &tokensB)
 
             dbUs.append(machMilliseconds(GenerationClock.now() - s) * 1000)
@@ -6595,7 +6599,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         var pipeUs: [Double] = []
         for _ in 0..<(warmup + iters) {
             let s = GenerationClock.now()
-            var aneError: (any Error)?
+            let aneErrorBox = LockedBox<(any Error)?>(nil)
 
             // Launch eval B on ANE thread
             let g = DispatchGroup()
@@ -6606,7 +6610,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                     try tripletsB[0].kernels.step.eval()
                     try tripletsB[1].kernels.step.eval()
                     try headB.rmsNormClassifier.eval()
-                } catch { aneError = error }
+                } catch { aneErrorBox.withValue { $0 = error } }
             }
 
             // CPU: argmax A + embWrite A (for next cycle)
@@ -6614,7 +6618,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
             try embWrite(tokensA, to: t0xInA)
 
             g.wait()
-            if let e = aneError { throw e }
+            if let e = aneErrorBox.withValue({ $0 }) { throw e }
 
             // Now swap A and B references for next cycle
             // Since we can't actually swap the kernel sets, we alternate
@@ -6627,7 +6631,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                     try tripletsA[0].kernels.step.eval()
                     try tripletsA[1].kernels.step.eval()
                     try headA.rmsNormClassifier.eval()
-                } catch { aneError = error }
+                } catch { aneErrorBox.withValue { $0 = error } }
             }
 
             // CPU: argmax B + embWrite B
@@ -6635,12 +6639,9 @@ final class GenerationHarnessHardwareTests: XCTestCase {
             try embWrite(tokensB, to: t0xInB)
 
             g2.wait()
-            if let e = aneError { throw e }
+            if let e = aneErrorBox.withValue({ $0 }) { throw e }
 
             let elapsed = machMilliseconds(GenerationClock.now() - s) * 1000
-            if pipeUs.count >= warmup {
-                // Only count after warmup
-            }
             pipeUs.append(elapsed)
         }
         let pipeTimed = Array(pipeUs.dropFirst(warmup))
@@ -6743,19 +6744,19 @@ final class GenerationHarnessHardwareTests: XCTestCase {
             let s = GenerationClock.now()
 
             // Half 1: eval B on pthread, CPU does argmax A + emb A
-            var aneError: (any Error)?
+            let aneErrorBox = LockedBox<(any Error)?>(nil)
             let sem1 = DispatchSemaphore(value: 0)
             DispatchQueue.global(qos: .userInteractive).async { [self] in
                 do {
                     try trB[0].kernels.step.eval(); try trB[1].kernels.step.eval()
                     try headB.rmsNormClassifier.eval()
-                } catch { aneError = error }
+                } catch { aneErrorBox.withValue { $0 = error } }
                 sem1.signal()
             }
             try argmax(from: headOutA, into: &tokensA)
             try embWrite(tokensA, to: t0xInA)
             sem1.wait()
-            if let e = aneError { throw e }
+            if let e = aneErrorBox.withValue({ $0 }) { throw e }
 
             // Half 2: eval A on pthread, CPU does argmax B + emb B
             let sem2 = DispatchSemaphore(value: 0)
@@ -6763,13 +6764,13 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                 do {
                     try trA[0].kernels.step.eval(); try trA[1].kernels.step.eval()
                     try headA.rmsNormClassifier.eval()
-                } catch { aneError = error }
+                } catch { aneErrorBox.withValue { $0 = error } }
                 sem2.signal()
             }
             try argmax(from: headOutB, into: &tokensB)
             try embWrite(tokensB, to: t0xInB)
             sem2.wait()
-            if let e = aneError { throw e }
+            if let e = aneErrorBox.withValue({ $0 }) { throw e }
 
             if iter >= warmup {
                 pipeUs.append(machMilliseconds(GenerationClock.now() - s) * 1000)
@@ -6864,7 +6865,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                     try tokens.withUnsafeBufferPointer { tokenBuf in
                         try SurfaceIO.writeEmbeddingBatchFP16(
                             to: surface, channelOffset: 0, spatial: streamCount,
-                            embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
+                            embeddingTable: embPtr, vocabSize: testVocab, dim: dim,
                             tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount)
                     }
                 }
@@ -6891,26 +6892,26 @@ final class GenerationHarnessHardwareTests: XCTestCase {
             var pipeUs: [Double] = []
             for iter in 0..<(warmup + iters) {
                 let s = GenerationClock.now()
-                var aneError: (any Error)?
+                let aneErrorBox = LockedBox<(any Error)?>(nil)
                 let sem1 = DispatchSemaphore(value: 0)
                 DispatchQueue.global(qos: .userInteractive).async { [self] in
-                    do { try evalAll(&trB, head: headB) } catch { aneError = error }
+                    do { try evalAll(&trB, head: headB) } catch { aneErrorBox.withValue { $0 = error } }
                     sem1.signal()
                 }
                 try argmax(from: headOutA, into: &tokensA)
                 try embWrite(tokensA, to: t0xInA)
                 sem1.wait()
-                if let e = aneError { throw e }
+                if let e = aneErrorBox.withValue({ $0 }) { throw e }
 
                 let sem2 = DispatchSemaphore(value: 0)
                 DispatchQueue.global(qos: .userInteractive).async { [self] in
-                    do { try evalAll(&trA, head: headA) } catch { aneError = error }
+                    do { try evalAll(&trA, head: headA) } catch { aneErrorBox.withValue { $0 = error } }
                     sem2.signal()
                 }
                 try argmax(from: headOutB, into: &tokensB)
                 try embWrite(tokensB, to: t0xInB)
                 sem2.wait()
-                if let e = aneError { throw e }
+                if let e = aneErrorBox.withValue({ $0 }) { throw e }
 
                 if iter >= warmup {
                     pipeUs.append(machMilliseconds(GenerationClock.now() - s) * 1000)
@@ -7041,7 +7042,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                 try tokens.withUnsafeBufferPointer { tokenBuf in
                     try SurfaceIO.writeEmbeddingBatchFP16(
                         to: surface, channelOffset: 0, spatial: streamCount,
-                        embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
+                        embeddingTable: embPtr, vocabSize: fullVocab, dim: dim,
                         tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount)
                 }
             }
@@ -7072,7 +7073,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                     c: shardBufs[shard], ldc: Int32(vCount))
 
                 for sp in 0..<streamCount {
-                    var maxVal: Float = 0; var maxIdx: vDSP_Length = 0
+                    var maxVal: Float = -.infinity; var maxIdx: vDSP_Length = 0
                     vDSP_maxvi(shardBufs[shard] + sp * vCount, 1, &maxVal, &maxIdx, vDSP_Length(vCount))
                     shardBestVals[shard * streamCount + sp] = maxVal
                     shardBestIdxs[shard * streamCount + sp] = Int32(vStart + Int(maxIdx))
@@ -7115,27 +7116,27 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         var pipeUs: [Double] = []
         for iter in 0..<(warmup + iters) {
             let s = GenerationClock.now()
-            var aneError: (any Error)?
+            let aneErrorBox = LockedBox<(any Error)?>(nil)
 
             let sem1 = DispatchSemaphore(value: 0)
             DispatchQueue.global(qos: .userInteractive).async {
-                do { try evalAll(&trB, head: headB) } catch { aneError = error }
+                do { try evalAll(&trB, head: headB) } catch { aneErrorBox.withValue { $0 = error } }
                 sem1.signal()
             }
             cpuExpandArgmax(from: headOutA, into: &tokensA)
             try embWrite(tokensA, to: t0xInA)
             sem1.wait()
-            if let e = aneError { throw e }
+            if let e = aneErrorBox.withValue({ $0 }) { throw e }
 
             let sem2 = DispatchSemaphore(value: 0)
             DispatchQueue.global(qos: .userInteractive).async {
-                do { try evalAll(&trA, head: headA) } catch { aneError = error }
+                do { try evalAll(&trA, head: headA) } catch { aneErrorBox.withValue { $0 = error } }
                 sem2.signal()
             }
             cpuExpandArgmax(from: headOutB, into: &tokensB)
             try embWrite(tokensB, to: t0xInB)
             sem2.wait()
-            if let e = aneError { throw e }
+            if let e = aneErrorBox.withValue({ $0 }) { throw e }
 
             if iter >= warmup {
                 pipeUs.append(machMilliseconds(GenerationClock.now() - s) * 1000)
@@ -7251,7 +7252,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                     try tokens.withUnsafeBufferPointer { tokenBuf in
                         try SurfaceIO.writeEmbeddingBatchFP16(
                             to: surface, channelOffset: 0, spatial: streamCount,
-                            embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
+                            embeddingTable: embPtr, vocabSize: fullVocab, dim: dim,
                             tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount)
                     }
                 }
@@ -7279,26 +7280,26 @@ final class GenerationHarnessHardwareTests: XCTestCase {
             var pipeUs: [Double] = []
             for iter in 0..<(warmup + iters) {
                 let s = GenerationClock.now()
-                var aneError: (any Error)?
+                let aneErrorBox = LockedBox<(any Error)?>(nil)
                 let sem1 = DispatchSemaphore(value: 0)
                 DispatchQueue.global(qos: .userInteractive).async {
-                    do { try evalAll(&trB, head: headB) } catch { aneError = error }
+                    do { try evalAll(&trB, head: headB) } catch { aneErrorBox.withValue { $0 = error } }
                     sem1.signal()
                 }
                 try argmax(from: headOutA, into: &tokensA)
                 try embWrite(tokensA, to: t0xInA)
                 sem1.wait()
-                if let e = aneError { throw e }
+                if let e = aneErrorBox.withValue({ $0 }) { throw e }
 
                 let sem2 = DispatchSemaphore(value: 0)
                 DispatchQueue.global(qos: .userInteractive).async {
-                    do { try evalAll(&trA, head: headA) } catch { aneError = error }
+                    do { try evalAll(&trA, head: headA) } catch { aneErrorBox.withValue { $0 = error } }
                     sem2.signal()
                 }
                 try argmax(from: headOutB, into: &tokensB)
                 try embWrite(tokensB, to: t0xInB)
                 sem2.wait()
-                if let e = aneError { throw e }
+                if let e = aneErrorBox.withValue({ $0 }) { throw e }
 
                 if iter >= warmup {
                     pipeUs.append(machMilliseconds(GenerationClock.now() - s) * 1000)
@@ -7396,7 +7397,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                     b: wF32, ldb: Int32(bneck), beta: 0.0,
                     c: logitsChunk, ldc: Int32(vocab))
                 for i in 0..<count {
-                    var maxVal: Float = 0; var maxIdx: vDSP_Length = 0
+                    var maxVal: Float = -.infinity; var maxIdx: vDSP_Length = 0
                     vDSP_maxvi(logitsChunk + i * vocab, 1, &maxVal, &maxIdx, vDSP_Length(vocab))
                     tokens[start + i] = UInt16(maxIdx)
                 }
@@ -7429,7 +7430,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                 b: wF32, ldb: Int32(bneck), beta: 0.0,
                 c: logitsFull, ldc: Int32(vocab))
             for sp in 0..<spatial {
-                var maxVal: Float = 0; var maxIdx: vDSP_Length = 0
+                var maxVal: Float = -.infinity; var maxIdx: vDSP_Length = 0
                 vDSP_maxvi(logitsFull + sp * vocab, 1, &maxVal, &maxIdx, vDSP_Length(vocab))
                 tokens[sp] = UInt16(maxIdx)
             }
@@ -7474,7 +7475,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                     c: partialBuf, ldc: Int32(vCount))
 
                 for sp in 0..<spatial {
-                    var maxVal: Float = 0; var maxIdx: vDSP_Length = 0
+                    var maxVal: Float = -.infinity; var maxIdx: vDSP_Length = 0
                     vDSP_maxvi(partialBuf + sp * vCount, 1, &maxVal, &maxIdx, vDSP_Length(vCount))
                     if maxVal > bestVals[sp] {
                         bestVals[sp] = maxVal
@@ -7521,7 +7522,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                     c: partialSmall, ldc: Int32(vCount))
 
                 for sp in 0..<spatial {
-                    var maxVal: Float = 0; var maxIdx: vDSP_Length = 0
+                    var maxVal: Float = -.infinity; var maxIdx: vDSP_Length = 0
                     vDSP_maxvi(partialSmall + sp * vCount, 1, &maxVal, &maxIdx, vDSP_Length(vCount))
                     if maxVal > bestVals[sp] {
                         bestVals[sp] = maxVal
@@ -7587,7 +7588,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
 
                 // Local argmax within this shard
                 for sp in 0..<spatial {
-                    var maxVal: Float = 0; var maxIdx: vDSP_Length = 0
+                    var maxVal: Float = -.infinity; var maxIdx: vDSP_Length = 0
                     vDSP_maxvi(outBuf + sp * vCount, 1, &maxVal, &maxIdx, vDSP_Length(vCount))
                     shardBestVals[shard * spatial + sp] = maxVal
                     shardBestIdxs[shard * spatial + sp] = Int32(vStart + Int(maxIdx))
@@ -7707,7 +7708,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                 var pipeUs: [Double] = []
                 for iter in 0..<(warmup + iters) {
                     let s = GenerationClock.now()
-                    var aneError: (any Error)?
+                    let aneErrorBox = LockedBox<(any Error)?>(nil)
 
                     let g1 = DispatchGroup()
                     g1.enter()
@@ -7716,12 +7717,12 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                         do {
                             try trB[0].kernels.step.eval(); try trB[1].kernels.step.eval()
                             try headB.rmsNormClassifier.eval()
-                        } catch { aneError = error }
+                        } catch { aneErrorBox.withValue { $0 = error } }
                     }
                     try argmax(from: headOutA, into: &tokensA)
                     try embWrite(tokensA, to: t0xInA)
                     g1.wait()
-                    if let e = aneError { throw e }
+                    if let e = aneErrorBox.withValue({ $0 }) { throw e }
 
                     let g2 = DispatchGroup()
                     g2.enter()
@@ -7730,12 +7731,12 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                         do {
                             try trA[0].kernels.step.eval(); try trA[1].kernels.step.eval()
                             try headA.rmsNormClassifier.eval()
-                        } catch { aneError = error }
+                        } catch { aneErrorBox.withValue { $0 = error } }
                     }
                     try argmax(from: headOutB, into: &tokensB)
                     try embWrite(tokensB, to: t0xInB)
                     g2.wait()
-                    if let e = aneError { throw e }
+                    if let e = aneErrorBox.withValue({ $0 }) { throw e }
 
                     if iter >= warmup {
                         pipeUs.append(machMilliseconds(GenerationClock.now() - s) * 1000)
@@ -7866,7 +7867,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         var tripleUs: [Double] = []
         for iter in 0..<(warmup + iters) {
             let s = GenerationClock.now()
-            var aneError: (any Error)?
+            let aneErrorBox = LockedBox<(any Error)?>(nil)
 
             // Phase 1: eval C || argmax A + emb A
             let g1 = DispatchGroup()
@@ -7877,12 +7878,12 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                     try trC[0].kernels.step.eval()
                     try trC[1].kernels.step.eval()
                     try headC.rmsNormClassifier.eval()
-                } catch { aneError = error }
+                } catch { aneErrorBox.withValue { $0 = error } }
             }
             try argmax(from: headOutA, into: &tokensA)
             try embWrite(tokensA, to: t0xInA)
             g1.wait()
-            if let e = aneError { throw e }
+            if let e = aneErrorBox.withValue({ $0 }) { throw e }
 
             // Phase 2: eval A || argmax B + emb B
             let g2 = DispatchGroup()
@@ -7893,12 +7894,12 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                     try trA[0].kernels.step.eval()
                     try trA[1].kernels.step.eval()
                     try headA.rmsNormClassifier.eval()
-                } catch { aneError = error }
+                } catch { aneErrorBox.withValue { $0 = error } }
             }
             try argmax(from: headOutB, into: &tokensB)
             try embWrite(tokensB, to: t0xInB)
             g2.wait()
-            if let e = aneError { throw e }
+            if let e = aneErrorBox.withValue({ $0 }) { throw e }
 
             // Phase 3: eval B || argmax C + emb C
             let g3 = DispatchGroup()
@@ -7909,12 +7910,12 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                     try trB[0].kernels.step.eval()
                     try trB[1].kernels.step.eval()
                     try headB.rmsNormClassifier.eval()
-                } catch { aneError = error }
+                } catch { aneErrorBox.withValue { $0 = error } }
             }
             try argmax(from: headOutC, into: &tokensC)
             try embWrite(tokensC, to: t0xInC)
             g3.wait()
-            if let e = aneError { throw e }
+            if let e = aneErrorBox.withValue({ $0 }) { throw e }
 
             if iter >= warmup {
                 tripleUs.append(machMilliseconds(GenerationClock.now() - s) * 1000)
@@ -8053,7 +8054,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
             var pipeUs: [Double] = []
             for iter in 0..<(10 + iters) {
                 let s = GenerationClock.now()
-                var aneError: (any Error)?
+                let aneErrorBox = LockedBox<(any Error)?>(nil)
 
                 // Eval B on ANE || CPU: argmax A + emb A
                 let g1 = DispatchGroup()
@@ -8064,12 +8065,12 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                         try tripletsB[0].kernels.step.eval()
                         try tripletsB[1].kernels.step.eval()
                         try headB.rmsNormClassifier.eval()
-                    } catch { aneError = error }
+                    } catch { aneErrorBox.withValue { $0 = error } }
                 }
                 try argmax(from: headOutA, into: &tokensA)
                 try embWrite(tokensA, to: t0xInA)
                 g1.wait()
-                if let e = aneError { throw e }
+                if let e = aneErrorBox.withValue({ $0 }) { throw e }
 
                 // Eval A on ANE || CPU: argmax B + emb B
                 let g2 = DispatchGroup()
@@ -8080,12 +8081,12 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                         try tripletsA[0].kernels.step.eval()
                         try tripletsA[1].kernels.step.eval()
                         try headA.rmsNormClassifier.eval()
-                    } catch { aneError = error }
+                    } catch { aneErrorBox.withValue { $0 = error } }
                 }
                 try argmax(from: headOutB, into: &tokensB)
                 try embWrite(tokensB, to: t0xInB)
                 g2.wait()
-                if let e = aneError { throw e }
+                if let e = aneErrorBox.withValue({ $0 }) { throw e }
 
                 if iter >= 10 {
                     pipeUs.append(machMilliseconds(GenerationClock.now() - s) * 1000)
@@ -8542,7 +8543,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
 
             var cpuRefTokens = [UInt16](repeating: 0, count: spatial)
             for sp in 0..<spatial {
-                var maxVal: Float = 0; var maxIdx: vDSP_Length = 0
+                var maxVal: Float = -.infinity; var maxIdx: vDSP_Length = 0
                 vDSP_maxvi(logitsBuf + sp * vocab, 1, &maxVal, &maxIdx, vDSP_Length(vocab))
                 cpuRefTokens[sp] = UInt16(maxIdx)
             }
@@ -8678,7 +8679,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                         b: wF32 + vStart * bneck, ldb: Int32(bneck), beta: 0.0,
                         c: shardBufs[shard], ldc: Int32(vCount))
                     for sp in 0..<spatial {
-                        var maxVal: Float = 0; var maxIdx: vDSP_Length = 0
+                        var maxVal: Float = -.infinity; var maxIdx: vDSP_Length = 0
                         vDSP_maxvi(shardBufs[shard] + sp * vCount, 1, &maxVal, &maxIdx, vDSP_Length(vCount))
                         shardBestVals[shard * spatial + sp] = maxVal
                         shardBestIdxs[shard * spatial + sp] = Int32(vStart + Int(maxIdx))
@@ -8852,7 +8853,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
             var aneWaitUs: [Double] = []
             for iter in 0..<(warmup + iters) {
                 let s = GenerationClock.now()
-                var aneError: (any Error)?
+                let aneErrorBox = LockedBox<(any Error)?>(nil)
 
                 // ANE: eval pipeline B (trunk + proj head)
                 let g1 = DispatchGroup()
@@ -8862,7 +8863,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                     do {
                         try trB[0].kernels.step.eval(); try trB[1].kernels.step.eval()
                         try projHeadB.rmsNormProjection.eval()
-                    } catch { aneError = error }
+                    } catch { aneErrorBox.withValue { $0 = error } }
                 }
                 // CPU/Metal: process pipeline A results (expansion+argmax + embed)
                 let mpsStart = mach_absolute_time()
@@ -8875,7 +8876,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                 let waitStart = mach_absolute_time()
                 g1.wait()
                 let waitEnd = mach_absolute_time()
-                if let e = aneError { throw e }
+                if let e = aneErrorBox.withValue({ $0 }) { throw e }
 
                 // ANE: eval pipeline A (trunk + proj head)
                 let g2 = DispatchGroup()
@@ -8885,7 +8886,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                     do {
                         try trA[0].kernels.step.eval(); try trA[1].kernels.step.eval()
                         try projHeadA.rmsNormProjection.eval()
-                    } catch { aneError = error }
+                    } catch { aneErrorBox.withValue { $0 = error } }
                 }
                 // CPU/Metal: process pipeline B results
                 let mpsStart2 = mach_absolute_time()
@@ -8898,7 +8899,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                 let waitStart2 = mach_absolute_time()
                 g2.wait()
                 let waitEnd2 = mach_absolute_time()
-                if let e = aneError { throw e }
+                if let e = aneErrorBox.withValue({ $0 }) { throw e }
 
                 let elapsed = machMilliseconds(GenerationClock.now() - s) * 1000
                 if iter >= warmup {
@@ -8961,7 +8962,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
             var gpuAneWaitUs: [Double] = []
             for iter in 0..<(warmup + iters) {
                 let s = GenerationClock.now()
-                var aneError: (any Error)?
+                let aneErrorBox = LockedBox<(any Error)?>(nil)
 
                 // ANE: trunk only for pipeline B (no head)
                 let g1 = DispatchGroup()
@@ -8970,7 +8971,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                     defer { g1.leave() }
                     do {
                         try trB[0].kernels.step.eval(); try trB[1].kernels.step.eval()
-                    } catch { aneError = error }
+                    } catch { aneErrorBox.withValue { $0 = error } }
                 }
                 // GPU: full head for pipeline A
                 let gpuS = mach_absolute_time()
@@ -8983,7 +8984,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                 let wS = mach_absolute_time()
                 g1.wait()
                 let wE = mach_absolute_time()
-                if let e = aneError { throw e }
+                if let e = aneErrorBox.withValue({ $0 }) { throw e }
 
                 // ANE: trunk only for pipeline A (no head)
                 let g2 = DispatchGroup()
@@ -8992,7 +8993,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                     defer { g2.leave() }
                     do {
                         try trA[0].kernels.step.eval(); try trA[1].kernels.step.eval()
-                    } catch { aneError = error }
+                    } catch { aneErrorBox.withValue { $0 = error } }
                 }
                 // GPU: full head for pipeline B
                 let gpuS2 = mach_absolute_time()
@@ -9005,7 +9006,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                 let wS2 = mach_absolute_time()
                 g2.wait()
                 let wE2 = mach_absolute_time()
-                if let e = aneError { throw e }
+                if let e = aneErrorBox.withValue({ $0 }) { throw e }
 
                 let elapsed = machMilliseconds(GenerationClock.now() - s) * 1000
                 if iter >= warmup {
@@ -9163,12 +9164,12 @@ final class GenerationHarnessHardwareTests: XCTestCase {
             var aneWaitUs: [Double] = []
             for iter in 0..<(warmup + iters) {
                 let s = GenerationClock.now()
-                var aneError: (any Error)?
+                let aneErrorBox = LockedBox<(any Error)?>(nil)
 
                 let g1 = DispatchGroup()
                 g1.enter()
                 aneQueue.async { defer { g1.leave() }
-                    do { try trB[0].kernels.step.eval(); try trB[1].kernels.step.eval() } catch { aneError = error }
+                    do { try trB[0].kernels.step.eval(); try trB[1].kernels.step.eval() } catch { aneErrorBox.withValue { $0 = error } }
                 }
                 let gpuS = mach_absolute_time()
                 let rA = try gpuHeadA.run(trunkSurface: trunkOutA)
@@ -9178,12 +9179,12 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                 let wS = mach_absolute_time()
                 g1.wait()
                 let wE = mach_absolute_time()
-                if let e = aneError { throw e }
+                if let e = aneErrorBox.withValue({ $0 }) { throw e }
 
                 let g2 = DispatchGroup()
                 g2.enter()
                 aneQueue.async { defer { g2.leave() }
-                    do { try trA[0].kernels.step.eval(); try trA[1].kernels.step.eval() } catch { aneError = error }
+                    do { try trA[0].kernels.step.eval(); try trA[1].kernels.step.eval() } catch { aneErrorBox.withValue { $0 = error } }
                 }
                 let gpuS2 = mach_absolute_time()
                 let rB = try gpuHeadB.run(trunkSurface: trunkOutB)
@@ -9193,7 +9194,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                 let wS2 = mach_absolute_time()
                 g2.wait()
                 let wE2 = mach_absolute_time()
-                if let e = aneError { throw e }
+                if let e = aneErrorBox.withValue({ $0 }) { throw e }
 
                 let elapsed = machMilliseconds(GenerationClock.now() - s) * 1000
                 if iter >= warmup {
@@ -9596,12 +9597,12 @@ final class GenerationHarnessHardwareTests: XCTestCase {
             var aneWaitUs: [Double] = []
             for iter in 0..<(warmup + iters) {
                 let s = GenerationClock.now()
-                var aneError: (any Error)?
+                let aneErrorBox = LockedBox<(any Error)?>(nil)
 
                 let g1 = DispatchGroup()
                 g1.enter()
                 aneQueue.async { defer { g1.leave() }
-                    do { try trB[0].kernels.step.eval() } catch { aneError = error }
+                    do { try trB[0].kernels.step.eval() } catch { aneErrorBox.withValue { $0 = error } }
                 }
                 let hs = mach_absolute_time()
                 _ = try headA.runAndEmbed(trunkSurface: trunkOutA, embedSurface: t0xInA)
@@ -9609,12 +9610,12 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                 let ws = mach_absolute_time()
                 g1.wait()
                 let we = mach_absolute_time()
-                if let e = aneError { throw e }
+                if let e = aneErrorBox.withValue({ $0 }) { throw e }
 
                 let g2 = DispatchGroup()
                 g2.enter()
                 aneQueue.async { defer { g2.leave() }
-                    do { try trA[0].kernels.step.eval() } catch { aneError = error }
+                    do { try trA[0].kernels.step.eval() } catch { aneErrorBox.withValue { $0 = error } }
                 }
                 let hs2 = mach_absolute_time()
                 _ = try headB.runAndEmbed(trunkSurface: trunkOutB, embedSurface: t0xInB)
@@ -9622,7 +9623,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                 let ws2 = mach_absolute_time()
                 g2.wait()
                 let we2 = mach_absolute_time()
-                if let e = aneError { throw e }
+                if let e = aneErrorBox.withValue({ $0 }) { throw e }
 
                 let elapsed = machMilliseconds(GenerationClock.now() - s) * 1000
                 if iter >= warmup {
@@ -9664,12 +9665,12 @@ final class GenerationHarnessHardwareTests: XCTestCase {
             var ctrlUs: [Double] = []
             for iter in 0..<(warmup + iters) {
                 let s = GenerationClock.now()
-                var aneError: (any Error)?
+                let aneErrorBox = LockedBox<(any Error)?>(nil)
 
                 let g1 = DispatchGroup()
                 g1.enter()
                 aneQueue.async { defer { g1.leave() }
-                    do { try trB[0].kernels.step.eval() } catch { aneError = error }
+                    do { try trB[0].kernels.step.eval() } catch { aneErrorBox.withValue { $0 = error } }
                 }
                 let rA = try controlA.run(trunkSurface: trunkOutA)
                 for i in 0..<streamCount { tokensA[i] = rA[i] }
@@ -9682,12 +9683,12 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                     }
                 }
                 g1.wait()
-                if let e = aneError { throw e }
+                if let e = aneErrorBox.withValue({ $0 }) { throw e }
 
                 let g2 = DispatchGroup()
                 g2.enter()
                 aneQueue.async { defer { g2.leave() }
-                    do { try trA[0].kernels.step.eval() } catch { aneError = error }
+                    do { try trA[0].kernels.step.eval() } catch { aneErrorBox.withValue { $0 = error } }
                 }
                 let rB = try controlB.run(trunkSurface: trunkOutB)
                 for i in 0..<streamCount { tokensB[i] = rB[i] }
@@ -9700,7 +9701,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                     }
                 }
                 g2.wait()
-                if let e = aneError { throw e }
+                if let e = aneErrorBox.withValue({ $0 }) { throw e }
 
                 let elapsed = machMilliseconds(GenerationClock.now() - s) * 1000
                 if iter >= warmup { ctrlUs.append(elapsed) }
@@ -9825,12 +9826,12 @@ final class GenerationHarnessHardwareTests: XCTestCase {
             var aneWaitArr: [Double] = []
             for iter in 0..<(warmup + iters) {
                 let s = GenerationClock.now()
-                var aneError: (any Error)?
+                let aneErrorBox = LockedBox<(any Error)?>(nil)
 
                 let g1 = DispatchGroup()
                 g1.enter()
                 aneQueue.async { defer { g1.leave() }
-                    do { try trB[0].kernels.step.eval() } catch { aneError = error }
+                    do { try trB[0].kernels.step.eval() } catch { aneErrorBox.withValue { $0 = error } }
                 }
                 let hs = mach_absolute_time()
                 _ = try headA.runAndEmbed(trunkSurface: trunkOutA, embedSurface: t0xInA)
@@ -9838,12 +9839,12 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                 let ws = mach_absolute_time()
                 g1.wait()
                 let we = mach_absolute_time()
-                if let e = aneError { throw e }
+                if let e = aneErrorBox.withValue({ $0 }) { throw e }
 
                 let g2 = DispatchGroup()
                 g2.enter()
                 aneQueue.async { defer { g2.leave() }
-                    do { try trA[0].kernels.step.eval() } catch { aneError = error }
+                    do { try trA[0].kernels.step.eval() } catch { aneErrorBox.withValue { $0 = error } }
                 }
                 let hs2 = mach_absolute_time()
                 _ = try headB.runAndEmbed(trunkSurface: trunkOutB, embedSurface: t0xInB)
@@ -9851,7 +9852,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                 let ws2 = mach_absolute_time()
                 g2.wait()
                 let we2 = mach_absolute_time()
-                if let e = aneError { throw e }
+                if let e = aneErrorBox.withValue({ $0 }) { throw e }
 
                 let elapsed = machMilliseconds(GenerationClock.now() - s) * 1000
                 if iter >= warmup {
