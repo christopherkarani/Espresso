@@ -131,5 +131,17 @@ let package = Package(
             path: "Tests/ANEGraphIRTests",
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
+        .target(
+            name: "ANEPasses",
+            dependencies: ["ANEGraphIR"],
+            path: "Sources/ANEPasses",
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
+            name: "ANEPassesTests",
+            dependencies: ["ANEPasses", "ANEGraphIR"],
+            path: "Tests/ANEPassesTests",
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
     ]
 )
