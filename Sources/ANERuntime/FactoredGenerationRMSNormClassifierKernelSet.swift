@@ -30,25 +30,35 @@ public struct FactoredGenerationRMSNormClassifierKernelSet: ~Copyable {
         guard groups > 0 else {
             throw .invalidArguments("groups must be > 0")
         }
+        let dim = ModelConfig.dim
+        guard dim.isMultiple(of: groups) else {
+            throw .invalidArguments("dim \(dim) must be divisible by groups \(groups)")
+        }
+        guard bottleneck.isMultiple(of: groups) else {
+            throw .invalidArguments("bottleneck \(bottleneck) must be divisible by groups \(groups)")
+        }
+        guard vocabSize.isMultiple(of: groups) else {
+            throw .invalidArguments("vocabSize \(vocabSize) must be divisible by groups \(groups)")
+        }
         guard rmsFinal.count == ModelConfig.dim else {
             throw .invalidArguments("rmsFinal count \(rmsFinal.count) must equal dim \(ModelConfig.dim)")
         }
 
-        let dim = ModelConfig.dim
         let projColsPerGroup = dim / groups
         let expColsPerGroup = bottleneck / groups
 
-        // classifierProjection: full weight or grouped slice
         let projExpectedCount = bottleneck * projColsPerGroup
-        guard classifierProjection.count >= projExpectedCount else {
+        let projDenseCount = bottleneck * dim
+        guard classifierProjection.count == projExpectedCount || classifierProjection.count == projDenseCount else {
             throw .invalidArguments(
-                "classifierProjection count \(classifierProjection.count) too small for bottleneck \(bottleneck) * (dim/groups) \(projColsPerGroup)"
+                "classifierProjection count \(classifierProjection.count) must equal grouped \(projExpectedCount) or dense \(projDenseCount)"
             )
         }
         let expExpectedCount = vocabSize * expColsPerGroup
-        guard classifierExpansion.count >= expExpectedCount else {
+        let expDenseCount = vocabSize * bottleneck
+        guard classifierExpansion.count == expExpectedCount || classifierExpansion.count == expDenseCount else {
             throw .invalidArguments(
-                "classifierExpansion count \(classifierExpansion.count) too small for vocabSize \(vocabSize) * (bottleneck/groups) \(expColsPerGroup)"
+                "classifierExpansion count \(classifierExpansion.count) must equal grouped \(expExpectedCount) or dense \(expDenseCount)"
             )
         }
 
@@ -62,20 +72,8 @@ public struct FactoredGenerationRMSNormClassifierKernelSet: ~Copyable {
         let rmsBlob = rmsFinal.withUnsafeBufferPointer { ptr in
             WeightBlob.build(from: ptr, rows: 1, cols: dim)
         }
-        let projBlob = classifierProjection.withUnsafeBufferPointer { ptr in
-            if ptr.count == bottleneck * projColsPerGroup {
-                return WeightBlob.build(from: ptr, rows: bottleneck, cols: projColsPerGroup)
-            }
-            let sliced = UnsafeBufferPointer(start: ptr.baseAddress, count: bottleneck * projColsPerGroup)
-            return WeightBlob.build(from: sliced, rows: bottleneck, cols: projColsPerGroup)
-        }
-        let expBlob = classifierExpansion.withUnsafeBufferPointer { ptr in
-            if ptr.count == vocabSize * expColsPerGroup {
-                return WeightBlob.build(from: ptr, rows: vocabSize, cols: expColsPerGroup)
-            }
-            let sliced = UnsafeBufferPointer(start: ptr.baseAddress, count: vocabSize * expColsPerGroup)
-            return WeightBlob.build(from: sliced, rows: vocabSize, cols: expColsPerGroup)
-        }
+        let projBlob = GroupedWeightBlob.build(from: classifierProjection, rows: bottleneck, colsPerGroup: projColsPerGroup, groups: groups)
+        let expBlob = GroupedWeightBlob.build(from: classifierExpansion, rows: vocabSize, colsPerGroup: expColsPerGroup, groups: groups)
 
         self.rmsNormClassifier = try ANEKernel(
             milText: generator.milText,

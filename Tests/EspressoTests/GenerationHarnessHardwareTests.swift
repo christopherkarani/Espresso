@@ -1921,7 +1921,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
             try tokens.withUnsafeBufferPointer { tokenBuf in
                 try SurfaceIO.writeEmbeddingBatchFP16(
                     to: t0xIn, channelOffset: 0, spatial: laneSpatial,
-                    embeddingTable: embPtr, dim: dim,
+                    embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
                     tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount
                 )
             }
@@ -2417,7 +2417,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
             try tokens.withUnsafeBufferPointer { tokenBuf in
                 try SurfaceIO.writeEmbeddingBatchFP16(
                     to: t0xIn, channelOffset: 0, spatial: laneSpatial,
-                    embeddingTable: embPtr, dim: dim,
+                    embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
                     tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount
                 )
             }
@@ -2522,7 +2522,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                 try tokens.withUnsafeBufferPointer { tokenBuf in
                     try SurfaceIO.writeEmbeddingBatchFP16(
                         to: surface, channelOffset: 0, spatial: streamCount,
-                        embeddingTable: embPtr, dim: dim,
+                        embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
                         tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount)
                 }
             }
@@ -2677,7 +2677,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                 try tokens.withUnsafeBufferPointer { tokenBuf in
                     try SurfaceIO.writeEmbeddingBatchFP16(
                         to: t0xIn, channelOffset: 0, spatial: laneSpatial,
-                        embeddingTable: embPtr, dim: dim,
+                        embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
                         tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount
                     )
                 }
@@ -3032,7 +3032,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                     try tokens.withUnsafeBufferPointer { tokenBuf in
                         try SurfaceIO.writeEmbeddingBatchFP16(
                             to: t0xIn, channelOffset: 0, spatial: laneSpatial,
-                            embeddingTable: embPtr, dim: dim,
+                            embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
                             tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount
                         )
                     }
@@ -3054,7 +3054,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                     try tokens.withUnsafeBufferPointer { tokenBuf in
                         try SurfaceIO.writeEmbeddingBatchFP16(
                             to: t0xIn, channelOffset: 0, spatial: laneSpatial,
-                            embeddingTable: embPtr, dim: dim,
+                            embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
                             tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount
                         )
                     }
@@ -3078,7 +3078,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                     try tokens.withUnsafeBufferPointer { tokenBuf in
                         try SurfaceIO.writeEmbeddingBatchFP16(
                             to: t0xIn, channelOffset: 0, spatial: laneSpatial,
-                            embeddingTable: embPtr, dim: dim,
+                            embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
                             tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount
                         )
                     }
@@ -3104,7 +3104,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                     try tokens.withUnsafeBufferPointer { tokenBuf in
                         try SurfaceIO.writeEmbeddingBatchFP16(
                             to: t0xIn, channelOffset: 0, spatial: laneSpatial,
-                            embeddingTable: embPtr, dim: dim,
+                            embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
                             tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount
                         )
                     }
@@ -3212,18 +3212,22 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         for line in nfLines.suffix(20) { print(line) }
         print("=== END ===")
 
-        // === 6-LAYER TRUNK FUSION COMPILE PROBE (groups=16 hypothesis) ===
-        print("6-layer trunk fusion compile sweep (groups=16, smaller weights):")
+        // === TWO-TRIPLET TRUNK COMPILE PROBE (6 layers total via existing triplet kernels) ===
+        print("two-triplet trunk compile sweep (groups=16, smaller weights):")
         for testSpatial in [32, 128, 512] {
             let t = GenerationClock.now()
             do {
-                let _ = try RWKVStyleFusedSixLayerKernelSet(
+                let _ = try RWKVStyleFusedThreeLayerKernelSet(
                     weights0: weights.layers[0],
                     weights1: weights.layers[1],
                     weights2: weights.layers[2],
-                    weights3: weights.layers[3],
-                    weights4: weights.layers[4],
-                    weights5: weights.layers[5],
+                    laneSpatial: testSpatial,
+                    groups: 16
+                )
+                let _ = try RWKVStyleFusedThreeLayerKernelSet(
+                    weights0: weights.layers[3],
+                    weights1: weights.layers[4],
+                    weights2: weights.layers[5],
                     laneSpatial: testSpatial,
                     groups: 16
                 )
@@ -3235,13 +3239,17 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         // Also test groups=1 as control (should fail, confirming previous result)
         do {
             let t = GenerationClock.now()
-            let _ = try RWKVStyleFusedSixLayerKernelSet(
+            let _ = try RWKVStyleFusedThreeLayerKernelSet(
                 weights0: weights.layers[0],
                 weights1: weights.layers[1],
                 weights2: weights.layers[2],
-                weights3: weights.layers[3],
-                weights4: weights.layers[4],
-                weights5: weights.layers[5],
+                laneSpatial: 32,
+                groups: 1
+            )
+            let _ = try RWKVStyleFusedThreeLayerKernelSet(
+                weights0: weights.layers[3],
+                weights1: weights.layers[4],
+                weights2: weights.layers[5],
                 laneSpatial: 32,
                 groups: 1
             )
@@ -3328,7 +3336,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                 try tokens.withUnsafeBufferPointer { tokenBuf in
                     try SurfaceIO.writeEmbeddingBatchFP16(
                         to: baselineXIn, channelOffset: 0, spatial: laneSpatial,
-                        embeddingTable: embPtr, dim: dim,
+                        embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
                         tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount
                     )
                 }
@@ -3349,7 +3357,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                 try tokens.withUnsafeBufferPointer { tokenBuf in
                     try SurfaceIO.writeEmbeddingBatchFP16(
                         to: baselineXIn, channelOffset: 0, spatial: laneSpatial,
-                        embeddingTable: embPtr, dim: dim,
+                        embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
                         tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount
                     )
                 }
@@ -4372,7 +4380,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                 try tokens.withUnsafeBufferPointer { tokenBuf in
                     try SurfaceIO.writeEmbeddingBatchFP16(
                         to: t0xIn, channelOffset: 0, spatial: laneSpatial,
-                        embeddingTable: embPtr, dim: dim,
+                        embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
                         tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount
                     )
                 }
@@ -5152,7 +5160,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                 try tokens.withUnsafeBufferPointer { tokenBuf in
                     try SurfaceIO.writeEmbeddingBatchFP16(
                         to: t0xIn, channelOffset: 0, spatial: laneSpatial,
-                        embeddingTable: embPtr, dim: dim,
+                        embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
                         tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount
                     )
                 }
@@ -5306,7 +5314,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                 try tokens.withUnsafeBufferPointer { tokenBuf in
                     try SurfaceIO.writeEmbeddingBatchFP16(
                         to: t0xIn, channelOffset: 0, spatial: laneSpatial,
-                        embeddingTable: embPtr, dim: dim,
+                        embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
                         tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount
                     )
                 }
@@ -6425,7 +6433,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                 try tokens.withUnsafeBufferPointer { tokenBuf in
                     try SurfaceIO.writeEmbeddingBatchFP16(
                         to: surface, channelOffset: 0, spatial: streamCount,
-                        embeddingTable: embPtr, dim: dim,
+                        embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
                         tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount
                     )
                 }
@@ -6711,7 +6719,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                 try tokens.withUnsafeBufferPointer { tokenBuf in
                     try SurfaceIO.writeEmbeddingBatchFP16(
                         to: surface, channelOffset: 0, spatial: streamCount,
-                        embeddingTable: embPtr, dim: dim,
+                        embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
                         tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount)
                 }
             }
@@ -6856,7 +6864,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                     try tokens.withUnsafeBufferPointer { tokenBuf in
                         try SurfaceIO.writeEmbeddingBatchFP16(
                             to: surface, channelOffset: 0, spatial: streamCount,
-                            embeddingTable: embPtr, dim: dim,
+                            embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
                             tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount)
                     }
                 }
@@ -7033,7 +7041,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                 try tokens.withUnsafeBufferPointer { tokenBuf in
                     try SurfaceIO.writeEmbeddingBatchFP16(
                         to: surface, channelOffset: 0, spatial: streamCount,
-                        embeddingTable: embPtr, dim: dim,
+                        embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
                         tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount)
                 }
             }
@@ -7243,7 +7251,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                     try tokens.withUnsafeBufferPointer { tokenBuf in
                         try SurfaceIO.writeEmbeddingBatchFP16(
                             to: surface, channelOffset: 0, spatial: streamCount,
-                            embeddingTable: embPtr, dim: dim,
+                            embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
                             tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount)
                     }
                 }
@@ -7678,7 +7686,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                         try tokens.withUnsafeBufferPointer { tokenBuf in
                             try SurfaceIO.writeEmbeddingBatchFP16(
                                 to: surface, channelOffset: 0, spatial: streamCount,
-                                embeddingTable: embPtr, dim: dim,
+                                embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
                                 tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount)
                         }
                     }
@@ -7832,7 +7840,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                 try tokens.withUnsafeBufferPointer { tokenBuf in
                     try SurfaceIO.writeEmbeddingBatchFP16(
                         to: surface, channelOffset: 0, spatial: streamCount,
-                        embeddingTable: embPtr, dim: dim,
+                        embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
                         tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount
                     )
                 }
@@ -8019,7 +8027,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                     try tokens.withUnsafeBufferPointer { tokenBuf in
                         try SurfaceIO.writeEmbeddingBatchFP16(
                             to: surface, channelOffset: 0, spatial: streamCount,
-                            embeddingTable: embPtr, dim: dim,
+                            embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
                             tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount
                         )
                     }
@@ -8166,7 +8174,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                         try tokens.withUnsafeBufferPointer { tokenBuf in
                             try SurfaceIO.writeEmbeddingBatchFP16(
                                 to: t0xIn, channelOffset: 0, spatial: streamCount,
-                                embeddingTable: embPtr, dim: dim,
+                                embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
                                 tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount
                             )
                         }
@@ -8191,7 +8199,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                         try tokens.withUnsafeBufferPointer { tokenBuf in
                             try SurfaceIO.writeEmbeddingBatchFP16(
                                 to: t0xIn, channelOffset: 0, spatial: streamCount,
-                                embeddingTable: embPtr, dim: dim,
+                                embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
                                 tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount
                             )
                         }
@@ -8283,7 +8291,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                     try tokens.withUnsafeBufferPointer { tokenBuf in
                         try SurfaceIO.writeEmbeddingBatchFP16(
                             to: t0xIn, channelOffset: 0, spatial: laneSpatial,
-                            embeddingTable: embPtr, dim: dim,
+                            embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
                             tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount
                         )
                     }
@@ -8305,7 +8313,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                     try tokens.withUnsafeBufferPointer { tokenBuf in
                         try SurfaceIO.writeEmbeddingBatchFP16(
                             to: t0xIn, channelOffset: 0, spatial: laneSpatial,
-                            embeddingTable: embPtr, dim: dim,
+                            embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
                             tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount
                         )
                     }
@@ -8403,7 +8411,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                         try tokens.withUnsafeBufferPointer { tokenBuf in
                             try SurfaceIO.writeEmbeddingBatchFP16(
                                 to: t0xIn, channelOffset: 0, spatial: 1024,
-                                embeddingTable: embPtr, dim: dim,
+                                embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
                                 tokenIDs: tokenBuf.baseAddress!, streamCount: 1024
                             )
                         }
@@ -8425,7 +8433,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                         try tokens.withUnsafeBufferPointer { tokenBuf in
                             try SurfaceIO.writeEmbeddingBatchFP16(
                                 to: t0xIn, channelOffset: 0, spatial: 1024,
-                                embeddingTable: embPtr, dim: dim,
+                                embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
                                 tokenIDs: tokenBuf.baseAddress!, streamCount: 1024
                             )
                         }
@@ -8781,7 +8789,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                     try tokens.withUnsafeBufferPointer { tokenBuf in
                         try SurfaceIO.writeEmbeddingBatchFP16(
                             to: surface, channelOffset: 0, spatial: streamCount,
-                            embeddingTable: embPtr, dim: dim,
+                            embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
                             tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount)
                     }
                 }
@@ -9115,7 +9123,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                     try tokens.withUnsafeBufferPointer { tokenBuf in
                         try SurfaceIO.writeEmbeddingBatchFP16(
                             to: surface, channelOffset: 0, spatial: streamCount,
-                            embeddingTable: embPtr, dim: dim,
+                            embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
                             tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount)
                     }
                 }
@@ -9569,7 +9577,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                     try tokens.withUnsafeBufferPointer { tokenBuf in
                         try SurfaceIO.writeEmbeddingBatchFP16(
                             to: surface, channelOffset: 0, spatial: streamCount,
-                            embeddingTable: embPtr, dim: dim,
+                            embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
                             tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount)
                     }
                 }
@@ -9647,7 +9655,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                 try tokensA.withUnsafeBufferPointer { tBuf in
                     try SurfaceIO.writeEmbeddingBatchFP16(
                         to: t0xInA, channelOffset: 0, spatial: streamCount,
-                        embeddingTable: embPtr, dim: dim,
+                        embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
                         tokenIDs: tBuf.baseAddress!, streamCount: streamCount)
                 }
             }
@@ -9669,7 +9677,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                     try tokensA.withUnsafeBufferPointer { tBuf in
                         try SurfaceIO.writeEmbeddingBatchFP16(
                             to: t0xInA, channelOffset: 0, spatial: streamCount,
-                            embeddingTable: embPtr, dim: dim,
+                            embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
                             tokenIDs: tBuf.baseAddress!, streamCount: streamCount)
                     }
                 }
@@ -9687,7 +9695,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                     try tokensB.withUnsafeBufferPointer { tBuf in
                         try SurfaceIO.writeEmbeddingBatchFP16(
                             to: t0xInB, channelOffset: 0, spatial: streamCount,
-                            embeddingTable: embPtr, dim: dim,
+                            embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
                             tokenIDs: tBuf.baseAddress!, streamCount: streamCount)
                     }
                 }
@@ -9771,7 +9779,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                 try tokens.withUnsafeBufferPointer { tokenBuf in
                     try SurfaceIO.writeEmbeddingBatchFP16(
                         to: surface, channelOffset: 0, spatial: streamCount,
-                        embeddingTable: embPtr, dim: dim,
+                        embeddingTable: embPtr, vocabSize: vocabSize, dim: dim,
                         tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount)
                 }
             }
