@@ -436,12 +436,13 @@ struct ChainingPrepareProbeConfig {
 func chainingPrepareProbeSummary(
     options: BenchmarkOptions,
     probeConfig: ChainingPrepareProbeConfig,
+    outputDirectory: String,
     resultStatus: String,
     resultMetrics: [String: Any] = [:],
     probe: ANEChainingProbe? = nil,
     error: String? = nil
 ) -> [String: Any] {
-    var summary = RunMetadata.base(mode: "chaining-prepare-probe", options: options)
+    var summary = RunMetadata.base(mode: "chaining-prepare-probe", options: options, outputDirectory: outputDirectory)
     summary["probe_options"] = [
         "stats_surface_mode": probeConfig.statsSurfaceMode,
         "use_real_stats_surface": probeConfig.useRealStatsSurface,
@@ -515,6 +516,7 @@ if opts.probeChainingPrepare {
     let startedSummary = chainingPrepareProbeSummary(
         options: opts,
         probeConfig: probeConfig,
+        outputDirectory: outputDir,
         resultStatus: "started"
     )
     try? writeChainingPrepareProbeSummary(startedSummary, outputDir: outputDir)
@@ -526,6 +528,7 @@ if opts.probeChainingPrepare {
         let kernelCompiledSummary = chainingPrepareProbeSummary(
             options: opts,
             probeConfig: probeConfig,
+            outputDirectory: outputDir,
             resultStatus: "kernel_compiled",
             resultMetrics: [
                 "compile_elapsed_ms": compileElapsedMS,
@@ -560,6 +563,7 @@ if opts.probeChainingPrepare {
         let completedSummary = chainingPrepareProbeSummary(
             options: opts,
             probeConfig: probeConfig,
+            outputDirectory: outputDir,
             resultStatus: "completed",
             resultMetrics: [
                 "compile_elapsed_ms": compileElapsedMS,
@@ -576,6 +580,7 @@ if opts.probeChainingPrepare {
         let failedSummary = chainingPrepareProbeSummary(
             options: opts,
             probeConfig: probeConfig,
+            outputDirectory: outputDir,
             resultStatus: "failed",
             resultMetrics: [
                 "compile_elapsed_ms": compileElapsedMS,
@@ -763,7 +768,7 @@ if opts.decode {
         }
         try report.write(toFile: "\(outputDir)/summary.txt", atomically: true, encoding: .utf8)
         artifacts.append("summary.txt")
-        var summaryJSON = RunMetadata.base(mode: "decode", options: opts)
+        var summaryJSON = RunMetadata.base(mode: "decode", options: opts, outputDirectory: outputDir)
         summaryJSON["ane_decode"] = [
             "compile_time_ms": decodeResult.compileTimeMs,
             "timing_breakdown_ms": [
@@ -896,7 +901,7 @@ if opts.inferenceOnly {
 
         try report.write(toFile: "\(outputDir)/summary.txt", atomically: true, encoding: .utf8)
         artifacts.append("summary.txt")
-        var summaryJSON = RunMetadata.base(mode: "inference-only", options: opts)
+        var summaryJSON = RunMetadata.base(mode: "inference-only", options: opts, outputDirectory: outputDir)
         var inferenceEntry: [String: Any] = [
             "compile_time_ms": inferenceResult.compileTimeMs,
             "timing_breakdown_ms": [
@@ -921,6 +926,10 @@ if opts.inferenceOnly {
                 },
             ]
         }
+        summaryJSON["thermal"] = [
+            "before": thermalBefore,
+            "after": thermalAfter,
+        ]
         let manifest = artifactManifest(artifacts + ["summary.json"])
         summaryJSON["artifacts"] = manifest
         summaryJSON["artifact_count"] = manifest.count
@@ -1071,7 +1080,7 @@ do {
 
     try report.write(toFile: "\(outputDir)/summary.txt", atomically: true, encoding: .utf8)
     artifacts.append("summary.txt")
-    var summaryJSON = RunMetadata.base(mode: "full", options: opts)
+    var summaryJSON = RunMetadata.base(mode: "full", options: opts, outputDirectory: outputDir)
     summaryJSON["ane_direct"] = [
         "compile_time_ms": aneResult.compileTimeMs,
         "timing_breakdown_ms": [
@@ -1105,6 +1114,12 @@ do {
                     "metrics": benchmarkStats(entry.result),
                 ] as [String: Any]
             },
+        ]
+    }
+    if let thermalBefore, let thermalAfter {
+        summaryJSON["thermal"] = [
+            "before": thermalBefore,
+            "after": thermalAfter,
         ]
     }
     let manifest = artifactManifest(artifacts + ["summary.json"])

@@ -13,7 +13,7 @@ final class RWKVStyleFusedThreeLayerRMSNormClassifierGeneratorTests: XCTestCase 
         XCTAssertEqual(generator.inputByteSizes, [stateBytes, stateBytes, stateBytes, stateBytes])
         XCTAssertEqual(
             generator.outputByteSizes,
-            [stateBytes, stateBytes, stateBytes, stateBytes, vocab * lane * 2]
+            [stateBytes, stateBytes, stateBytes, stateBytes, vocab * lane * 2, 1 * lane * 2]
         )
     }
 
@@ -31,7 +31,7 @@ final class RWKVStyleFusedThreeLayerRMSNormClassifierGeneratorTests: XCTestCase 
                 "func main<ios18>(tensor<fp16, [1, \(dim), 1, \(lane)]> x, tensor<fp16, [1, \(dim), 1, \(lane)]> stateIn0, tensor<fp16, [1, \(dim), 1, \(lane)]> stateIn1, tensor<fp16, [1, \(dim), 1, \(lane)]> stateIn2)"
             )
         )
-        XCTAssertTrue(mil.contains("    } -> (xNext,stateOut0,stateOut1,stateOut2,logits);"))
+        XCTAssertTrue(mil.contains("    } -> (xNext,stateOut0,stateOut1,stateOut2,logits,maxVal);"))
     }
 
     func test_rwkv_style_fused_three_layer_rmsnorm_classifier_generator_contains_expected_weight_blobs_and_ops() {

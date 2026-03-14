@@ -1,8 +1,6 @@
 import ANETypes
 
 enum FLOPCalculator {
-    /// Total FLOPs for a single-layer transformer forward pass.
-    /// Counts multiply-accumulate as 2 FLOPs (1 mul + 1 add).
     static func forwardPassFLOPs(
         dim: Int = ModelConfig.dim,
         hidden: Int = ModelConfig.hidden,
@@ -10,37 +8,38 @@ enum FLOPCalculator {
         heads: Int = ModelConfig.heads
     ) -> Double {
         let headDim = dim / heads
+        let dimValue = Double(dim)
+        let hiddenValue = Double(hidden)
+        let seqValue = Double(seqLen)
+        let headValue = Double(heads)
+        let headDimValue = Double(headDim)
 
-        // QKV projections: 3 x (dim x dim x seqLen x 2)
-        let qkvFLOPs = 3.0 * Double(dim) * Double(dim) * Double(seqLen) * 2.0
+        let qkvProjections = 3.0 * dimValue * dimValue * seqValue * 2.0
+        let attentionScores = headValue * seqValue * seqValue * headDimValue * 2.0
+        let attentionValue = headValue * seqValue * seqValue * headDimValue * 2.0
+        let outputProjection = dimValue * dimValue * seqValue * 2.0
+        let swigluFFN = (
+            (hiddenValue * dimValue * seqValue * 2.0) +
+            (hiddenValue * dimValue * seqValue * 2.0) +
+            (dimValue * hiddenValue * seqValue * 2.0)
+        )
+        let siluActivation = hiddenValue * seqValue * 5.0
+        let softmax = headValue * seqValue * seqValue * 5.0
 
-        // Attention scores: Q @ K^T per head
-        let attnScoreFLOPs = Double(heads) * Double(seqLen) * Double(seqLen) * Double(headDim) * 2.0
-
-        // Attention x V per head
-        let attnValueFLOPs = Double(heads) * Double(seqLen) * Double(headDim) * Double(seqLen) * 2.0
-
-        // Output projection
-        let outputProjFLOPs = Double(dim) * Double(dim) * Double(seqLen) * 2.0
-
-        // FFN SwiGLU: W1, W3, W2
-        let ffnFLOPs = 3.0 * Double(hidden) * Double(dim) * Double(seqLen) * 2.0
-
-        // SiLU + Softmax (small but counted)
-        let siluFLOPs = 5.0 * Double(hidden) * Double(seqLen)
-        let softmaxFLOPs = 5.0 * Double(heads) * Double(seqLen) * Double(seqLen)
-
-        return qkvFLOPs + attnScoreFLOPs + attnValueFLOPs + outputProjFLOPs
-            + ffnFLOPs + siluFLOPs + softmaxFLOPs
+        return qkvProjections
+            + attentionScores
+            + attentionValue
+            + outputProjection
+            + swigluFFN
+            + siluActivation
+            + softmax
     }
 
-    /// Convert to TFLOPS given latency in milliseconds.
     static func sustainedTFLOPS(flops: Double, latencyMs: Double) -> Double {
         guard latencyMs > 0 else { return 0 }
-        return flops / (latencyMs / 1000.0) / 1e12
+        return flops / (latencyMs / 1_000.0) / 1_000_000_000_000.0
     }
 
-    /// ANE utilization percentage (M-series peak defaults to 18.0 TFLOPS).
     static func aneUtilization(sustainedTFLOPS: Double, peakTFLOPS: Double = 18.0) -> Double {
         guard peakTFLOPS > 0 else { return 0 }
         return (sustainedTFLOPS / peakTFLOPS) * 100.0

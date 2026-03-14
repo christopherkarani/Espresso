@@ -36,7 +36,7 @@ final class GenerationRMSNormClassifierKernelSetTests: XCTestCase {
         XCTAssertEqual(specs.count, 1)
         XCTAssertEqual(specs[0].kind, .rmsNormClassifier)
         XCTAssertEqual(specs[0].inputSizes, [ModelConfig.dim * 32 * 2])
-        XCTAssertEqual(specs[0].outputSizes, [ModelConfig.vocab * 32 * 2])
+        XCTAssertEqual(specs[0].outputSizes, [ModelConfig.vocab * 32 * 2, 1 * 32 * 2])
         XCTAssertEqual(specs[0].weights.count, 2)
         XCTAssertTrue(specs[0].milText.contains("rms_final.bin"))
         XCTAssertTrue(specs[0].milText.contains("classifier.bin"))

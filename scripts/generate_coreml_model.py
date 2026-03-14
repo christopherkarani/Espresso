@@ -1,29 +1,15 @@
 #!/usr/bin/env python3
-"""Generate a Core ML model matching the Espresso transformer architecture.
-
-Dimensions (from ModelConfig):
-  dim=768, hidden=2048, seqLen=256, heads=12, headDim=64
-
-Architecture:
-  Repeats the Espresso transformer block N times:
-  1. RMSNorm -> QKV Projection -> SDPA -> Output Projection + Residual
-  2. RMSNorm -> SwiGLU FFN (W1, W3, SiLU gate, W2) + Residual
-
-Usage:
-  /private/tmp/coremltools-venv312/bin/python3.12 scripts/generate_coreml_model.py --layers 6
-  # Output: benchmarks/models/transformer_6layer.mlpackage
-"""
+"""Generate a Core ML model matching the Espresso transformer architecture."""
 
 import argparse
 import os
 import pathlib
 
 import coremltools as ct
+import numpy as np
 from coremltools.converters.mil import Builder as mb
 from coremltools.converters.mil.mil import types
-import numpy as np
 
-# Match ModelConfig exactly
 DIM = 768
 HIDDEN = 2048
 SEQ_LEN = 256
@@ -33,9 +19,16 @@ WEIGHT_SCALE = 0.02
 RNG = np.random.default_rng(1234)
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Generate a Core ML transformer model for Espresso benchmarks.")
-    parser.add_argument("--layers", type=int, default=1, help="Number of transformer layers to stack")
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Generate a Core ML transformer model for Espresso benchmarks."
+    )
+    parser.add_argument(
+        "--layers",
+        type=int,
+        default=1,
+        help="Number of transformer layers to stack",
+    )
     parser.add_argument(
         "--weight-mode",
         choices=["random", "zero"],
@@ -52,7 +45,7 @@ def parse_args():
 
 
 def random_weight(shape):
-    return (RNG.standard_normal(shape).astype(np.float16) * WEIGHT_SCALE)
+    return RNG.standard_normal(shape).astype(np.float16) * WEIGHT_SCALE
 
 
 def make_weight(shape, mode: str):
@@ -130,9 +123,7 @@ def transformer_block(x, layer_index: int, weight_mode: str):
 
 def build_transformer_stack(layer_count: int, weight_mode: str):
     @mb.program(
-        input_specs=[
-            mb.TensorSpec(shape=(1, DIM, 1, SEQ_LEN), dtype=types.fp16),
-        ]
+        input_specs=[mb.TensorSpec(shape=(1, DIM, 1, SEQ_LEN), dtype=types.fp16)]
     )
     def transformer(x):
         current = x
@@ -153,13 +144,16 @@ def default_output_path(layer_count: int, script_dir: str) -> str:
     return os.path.join(output_dir, filename)
 
 
-def main():
+def main() -> None:
     args = parse_args()
     if args.layers <= 0:
         raise SystemExit("--layers must be > 0")
 
-    print(f"Generating Core ML transformer model...")
-    print(f"  layers={args.layers}, dim={DIM}, hidden={HIDDEN}, seq_len={SEQ_LEN}, heads={HEADS}, weight_mode={args.weight_mode}")
+    print("Generating Core ML transformer model...")
+    print(
+        f"  layers={args.layers}, dim={DIM}, hidden={HIDDEN}, "
+        f"seq_len={SEQ_LEN}, heads={HEADS}, weight_mode={args.weight_mode}"
+    )
 
     prog = build_transformer_stack(args.layers, args.weight_mode)
 

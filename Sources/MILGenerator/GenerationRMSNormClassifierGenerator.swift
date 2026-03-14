@@ -21,7 +21,7 @@ public struct GenerationRMSNormClassifierGenerator: MILProgramGenerator {
     }
 
     public var outputByteSizes: [Int] {
-        [vocabSize * laneSpatial * 2]
+        [vocabSize * laneSpatial * 2, 1 * laneSpatial * 2]
     }
 
     public var milText: String {
@@ -57,7 +57,10 @@ public struct GenerationRMSNormClassifierGenerator: MILProgramGenerator {
         b.appendLine(
             "        tensor<fp16, [1, \(vocab), 1, \(lane)]> logits = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Wcls,x=xn)[name=string(\"cls\")];"
         )
-        b.appendLine("    } -> (logits);")
+        b.appendLine("        tensor<int32, [1]> rmaxCh = const()[name=string(\"rmax_ch\"), val=tensor<int32, [1]>([1])];")
+        b.appendLine("        bool rmaxKd = const()[name=string(\"rmax_kd\"), val=bool(true)];")
+        b.appendLine("        tensor<fp16, [1,1,1,\(lane)]> maxVal = reduce_max(x=logits,axes=rmaxCh,keep_dims=rmaxKd)[name=string(\"maxval\")];")
+        b.appendLine("    } -> (logits,maxVal);")
         b.appendLine("}")
         return b.text
     }

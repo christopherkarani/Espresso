@@ -11,7 +11,7 @@ enum CoreMLBench {
     static func run(runner: BenchmarkRunner, modelPath: String) throws -> Result {
         printStderr("=== Core ML Baseline Benchmark ===")
 
-        let modelURL = URL(fileURLWithPath: modelPath)
+        let modelURL = URL(fileURLWithPath: modelPath, isDirectory: modelPath.hasSuffix(".mlpackage"))
         guard FileManager.default.fileExists(atPath: modelPath) else {
             printStderr("  ERROR: Core ML model not found at \(modelPath)")
             printStderr("  Run: python3 scripts/generate_coreml_model.py")
@@ -26,22 +26,15 @@ enum CoreMLBench {
         printStderr(String(format: "  Compiled in %.1f ms", compileTimeMs))
 
         // Measure model load time
-        let loadStart = ContinuousClock.now
         let configAll = MLModelConfiguration()
         configAll.computeUnits = .all
+        let loadStart = ContinuousClock.now
         let modelAll = try MLModel(contentsOf: compiledURL, configuration: configAll)
         let loadTimeMs = durationMs(ContinuousClock.now - loadStart)
         printStderr(String(format: "  Model loaded in %.1f ms (compute units: .all)", loadTimeMs))
 
         // Create input matching tensor dimensions: [1, dim, 1, seqLen]
-        let inputArray = try MLMultiArray(
-            shape: [1, NSNumber(value: ModelConfig.dim), 1, NSNumber(value: ModelConfig.seqLen)],
-            dataType: .float16
-        )
-        let count = ModelConfig.dim * ModelConfig.seqLen
-        for i in 0..<count {
-            inputArray[i] = NSNumber(value: Float.random(in: -0.1...0.1))
-        }
+        let inputArray = try makeRandomInput()
 
         // Input key "x" matches coremltools function parameter name
         let featureProvider = try MLDictionaryFeatureProvider(
@@ -231,6 +224,18 @@ enum CoreMLBench {
         )
         printStderr(String(format: "    Mean: %.3f ms/token, Median: %.3f ms/token", result.mean, result.median))
         return result
+    }
+
+    private static func makeRandomInput() throws -> MLMultiArray {
+        let input = try MLMultiArray(
+            shape: [1, NSNumber(value: ModelConfig.dim), 1, NSNumber(value: ModelConfig.seqLen)],
+            dataType: .float16
+        )
+        let pointer = input.dataPointer.bindMemory(to: Float16.self, capacity: input.count)
+        for index in 0..<input.count {
+            pointer[index] = Float16(Float.random(in: -0.1...0.1))
+        }
+        return input
     }
 
     private static func benchSeed() -> UInt64? {

@@ -91,6 +91,47 @@ public struct ANEKernel: ~Copyable {
         }
     }
 
+    static func compileWithRetry(
+        checkBudget: Bool,
+        compileAttempt: () -> OpaquePointer?,
+        lastCompileError: () -> Int32 = { ane_interop_last_compile_error() },
+        sleepAfterFailedAttempt: (Int) -> Void = ANECompileRetryPolicy.sleepAfterFailedAttempt,
+        writeRetryNotice: (String) -> Void = Self.writeCompileRetryNotice
+    ) throws(ANEError) -> OpaquePointer? {
+        var attemptIndex = 0
+
+        while true {
+            let handle: OpaquePointer?
+            if checkBudget {
+                CompileGate.lock.lock()
+                if CompileBudget.isExhausted {
+                    CompileGate.lock.unlock()
+                    throw .compileBudgetExhausted
+                }
+                handle = compileAttempt()
+                CompileGate.lock.unlock()
+            } else {
+                handle = compileAttempt()
+            }
+
+            if let handle {
+                return handle
+            }
+
+            let error = lastCompileError()
+            guard ANECompileRetryPolicy.shouldRetry(
+                lastCompileError: error,
+                attemptIndex: attemptIndex
+            ) else {
+                return nil
+            }
+
+            writeRetryNotice(ANECompileRetryPolicy.retryNotice(afterFailedAttempt: attemptIndex))
+            sleepAfterFailedAttempt(attemptIndex)
+            attemptIndex += 1
+        }
+    }
+
     /// Compile a MIL program with optional weight blobs into an ANE kernel.
     ///
     /// - Parameters:
@@ -189,22 +230,22 @@ public struct ANEKernel: ~Copyable {
             }
         }
 
-        let rawHandle: OpaquePointer?
-        if checkBudget {
-            CompileGate.lock.lock()
-            defer { CompileGate.lock.unlock() }
-            if CompileBudget.isExhausted {
-                throw .compileBudgetExhausted
-            }
-            rawHandle = compileHandle()
-        } else {
-            rawHandle = compileHandle()
-        }
+        let rawHandle = try Self.compileWithRetry(
+            checkBudget: checkBudget,
+            compileAttempt: compileHandle
+        )
 
         guard let rawHandle else {
             throw Self.mapInteropCompileError()
         }
         self.handle = rawHandle
+    }
+
+    private static func writeCompileRetryNotice(_ message: String) {
+        guard let data = (message + "\n").data(using: .utf8) else {
+            return
+        }
+        FileHandle.standardError.write(data)
     }
 
     /// Convenience: single-input, single-output kernel (most common case).

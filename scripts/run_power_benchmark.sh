@@ -1,54 +1,105 @@
 #!/bin/bash
-# Run power monitoring alongside the benchmark.
-# Requires: sudo access for powermetrics.
-#
-# Usage:
-#   ./scripts/run_power_benchmark.sh [ane|coreml|both]
 
 set -euo pipefail
 
 MODE="${1:-both}"
-RESULTS_DIR="benchmarks/results/power-$(date +%Y%m%d-%H%M%S)"
-mkdir -p "$RESULTS_DIR"
+MODEL_PATH="${2:-benchmarks/models/transformer_layer.mlpackage}"
+LAYERS="${LAYERS:-1}"
+COREML_WEIGHT_MODE="${COREML_WEIGHT_MODE:-random}"
+TIMESTAMP="$(date +%Y-%m-%d-%H%M%S)"
+RESULTS_DIR="benchmarks/results/power-${TIMESTAMP}"
+BENCH="./.build/release/espresso-bench"
+ENSURE_COREML_MODEL="./scripts/ensure_coreml_model.sh"
+POWER_PID=""
 
-echo "Power benchmark — results: $RESULTS_DIR"
-echo "Mode: $MODE"
-echo ""
+usage() {
+  cat <<'EOF'
+Usage: scripts/run_power_benchmark.sh [ane|coreml|both] [model-path]
 
-if [[ "$MODE" == "ane" || "$MODE" == "both" ]]; then
-    echo "=== ANE Direct (60s sustained) ==="
-    echo "Starting powermetrics in background (requires sudo)..."
-    sudo powermetrics \
-        --samplers cpu_power,gpu_power,ane_power \
-        --sample-interval 1000 \
-        -n 60 \
-        > "$RESULTS_DIR/power_ane_direct.log" 2>&1 &
-    POWER_PID=$!
+Runs `powermetrics` alongside `espresso-bench --sustained`.
+  ane     Runs ANE direct only (`--ane-only`)
+  coreml  Runs ANE + Core ML baseline
+  both    Runs both modes sequentially
+Set `LAYERS` in the environment to benchmark a model with more than one layer.
+EOF
+}
 
-    .build/release/EspressoBench --ane-only --sustained \
-        --output "$RESULTS_DIR/ane_direct"
+prepare_coreml_model() {
+  if [[ -e "${MODEL_PATH}" ]]; then
+    return 0
+  fi
 
-    wait $POWER_PID 2>/dev/null || true
-    echo "  Power log: $RESULTS_DIR/power_ane_direct.log"
+  if [[ ! -x "${ENSURE_COREML_MODEL}" ]]; then
+    echo "Core ML helper is missing or not executable: ${ENSURE_COREML_MODEL}" >&2
+    exit 1
+  fi
+
+  echo "Preparing Core ML baseline model at ${MODEL_PATH}"
+  "${ENSURE_COREML_MODEL}" \
+    --output "${MODEL_PATH}" \
+    --layers "${LAYERS}" \
+    --weight-mode "${COREML_WEIGHT_MODE}"
+}
+
+cleanup_powermetrics() {
+  if [[ -n "${POWER_PID}" ]]; then
+    kill "${POWER_PID}" >/dev/null 2>&1 || true
+    wait "${POWER_PID}" >/dev/null 2>&1 || true
+    POWER_PID=""
+  fi
+}
+
+trap cleanup_powermetrics EXIT INT TERM
+
+run_case() {
+  local label="$1"
+  shift
+
+  local bench_args=("$@")
+  local power_log="${RESULTS_DIR}/${label}-powermetrics.log"
+
+  echo "=== ${label} ==="
+  sudo powermetrics \
+    --samplers cpu_power,gpu_power,ane_power \
+    --sample-interval 1000 \
+    -n 60 \
+    >"${power_log}" 2>&1 &
+  POWER_PID=$!
+
+  "${BENCH}" \
+    --sustained \
+    --warmup 10 \
+    --iterations 100 \
+    --layers "${LAYERS}" \
+    --model "${MODEL_PATH}" \
+    --output "${RESULTS_DIR}/${label}" \
+    "${bench_args[@]}"
+
+  cleanup_powermetrics
+  echo "powermetrics log: ${power_log}"
+  echo
+}
+
+case "${MODE}" in
+  ane|coreml|both)
+    ;;
+  *)
+    usage
+    exit 1
+    ;;
+esac
+
+mkdir -p "${RESULTS_DIR}"
+swift build -c release --target EspressoBench
+
+if [[ "${MODE}" == "coreml" || "${MODE}" == "both" ]]; then
+  prepare_coreml_model
 fi
 
-if [[ "$MODE" == "coreml" || "$MODE" == "both" ]]; then
-    echo ""
-    echo "=== Core ML (60s sustained) ==="
-    echo "Starting powermetrics in background (requires sudo)..."
-    sudo powermetrics \
-        --samplers cpu_power,gpu_power,ane_power \
-        --sample-interval 1000 \
-        -n 60 \
-        > "$RESULTS_DIR/power_coreml.log" 2>&1 &
-    POWER_PID=$!
-
-    .build/release/EspressoBench --sustained \
-        --output "$RESULTS_DIR/coreml"
-
-    wait $POWER_PID 2>/dev/null || true
-    echo "  Power log: $RESULTS_DIR/power_coreml.log"
+if [[ "${MODE}" == "ane" || "${MODE}" == "both" ]]; then
+  run_case "ane" --ane-only
 fi
 
-echo ""
-echo "Done. Results in $RESULTS_DIR/"
+if [[ "${MODE}" == "coreml" || "${MODE}" == "both" ]]; then
+  run_case "coreml"
+fi

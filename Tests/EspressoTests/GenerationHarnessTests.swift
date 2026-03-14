@@ -798,6 +798,26 @@ final class GenerationHarnessTests: XCTestCase {
         XCTAssertEqual(trace.generatedTokens, [105, 110, 116, 32])
     }
 
+    func test_recurrent_generation_cpu_then_ane_backend_preserves_cpu_fallback_contract() throws {
+        let recurrentWeights = try LocalBigramArtifactBuilder.buildRecurrentWeights(
+            tokens: [35, 105, 110, 116, 32, 105, 110, 116, 32],
+            layerCount: 1,
+            vocabSize: ModelConfig.vocab
+        )
+        let model = try ANERecurrentGenerationModel(
+            weights: recurrentWeights,
+            layerCount: 1,
+            maxSequenceTokens: 32,
+            outputHeadBackend: .cpuThenANE,
+            trunkBackend: .identityZeroTrunk
+        )
+        var harness = DirectTokenSelectionGenerationHarness(model: model, strategy: .argmax)
+
+        let trace = try harness.generate(promptTokens: [35], maxNewTokens: 4)
+
+        XCTAssertEqual(trace.generatedTokens, [105, 110, 116, 32])
+    }
+
     func test_exact_two_token_identity_zero_trunk_backend_matches_local_bigram_exact_contract() throws {
         let recurrentWeights = try LocalBigramArtifactBuilder.buildRecurrentWeights(
             tokens: [35, 105, 110, 116, 32, 105, 110, 116, 32],

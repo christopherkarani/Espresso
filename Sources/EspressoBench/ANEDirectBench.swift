@@ -8,6 +8,7 @@ enum ANEDirectBench {
     struct Result {
         let benchmarkResult: BenchmarkResult
         let avgTimingBreakdown: (ane: Double, io: Double, elem: Double)
+        let kernelDispatches: Int
         let compileTimeMs: Double
         let kernelProfile: InferenceKernelProfile?
         let decodeKernelProfile: DecodeKernelProfile?
@@ -15,7 +16,7 @@ enum ANEDirectBench {
     }
 
     /// Main ANE benchmark. Inlines measurement loop to avoid ~Copyable closure captures.
-    static func run(warmup: Int, iterations: Int, nLayers: Int = 1) throws -> Result {
+    static func run(runner: BenchmarkRunner, nLayers: Int) throws -> Result {
         printStderr("=== ANE Direct Benchmark ===")
         printStderr("Setting up \(nLayers)-layer forward pass...")
 
@@ -50,8 +51,8 @@ enum ANEDirectBench {
         let accumulator = GradientAccumulator()
 
         // 6. Warmup — absorbs JIT, cache warming, first-run overhead
-        printStderr("Warmup: \(warmup) iterations...")
-        for _ in 0..<warmup {
+        printStderr("Warmup: \(runner.warmup) iterations...")
+        for _ in 0..<runner.warmup {
             var timings = StepTimingBreakdown()
             try ForwardPass.runTimed(
                 xCur: xCur,
@@ -63,12 +64,12 @@ enum ANEDirectBench {
         }
 
         // 7. Measured iterations
-        printStderr("Measuring: \(iterations) iterations...")
+        printStderr("Measuring: \(runner.iterations) iterations...")
         var latencies: [Double] = []
-        latencies.reserveCapacity(iterations)
+        latencies.reserveCapacity(runner.iterations)
         var totalTimings = StepTimingBreakdown()
 
-        for i in 0..<iterations {
+        for i in 0..<runner.iterations {
             var stepTimings = StepTimingBreakdown()
             let state = signposter.beginInterval("ForwardPass")
             let start = ContinuousClock.now
@@ -91,18 +92,26 @@ enum ANEDirectBench {
 
             if (i + 1) % 100 == 0 {
                 let currentMean = latencies.reduce(0, +) / Double(latencies.count)
-                printStderr(String(format: "  [ANE Direct] %d/%d — mean: %.3f ms", i + 1, iterations, currentMean))
+                printStderr(
+                    String(
+                        format: "  [ANE Direct] %d/%d mean %.3f ms",
+                        locale: Locale(identifier: "en_US_POSIX"),
+                        i + 1,
+                        runner.iterations,
+                        currentMean
+                    )
+                )
             }
         }
 
         let result = BenchmarkResult(
             label: "ANE Direct",
             latencies: latencies,
-            warmupCount: warmup,
-            iterationCount: iterations
+            warmupCount: runner.warmup,
+            iterationCount: runner.iterations
         )
 
-        let n = Double(iterations)
+        let n = Double(runner.iterations)
         let avgBreakdown = (
             ane: totalTimings.tAne / n,
             io: totalTimings.tIO / n,
@@ -114,10 +123,18 @@ enum ANEDirectBench {
         return Result(
             benchmarkResult: result,
             avgTimingBreakdown: avgBreakdown,
+            kernelDispatches: nLayers * ModelConfig.kernelsPerLayer,
             compileTimeMs: compileMs,
             kernelProfile: nil,
             decodeKernelProfile: nil,
             tokensPerSecond: nil
+        )
+    }
+
+    static func run(warmup: Int, iterations: Int, nLayers: Int = 1) throws -> Result {
+        try run(
+            runner: BenchmarkRunner(warmup: warmup, iterations: iterations),
+            nLayers: nLayers
         )
     }
 
@@ -239,6 +256,7 @@ enum ANEDirectBench {
         return Result(
             benchmarkResult: result,
             avgTimingBreakdown: avgBreakdown,
+            kernelDispatches: nLayers * 2,
             compileTimeMs: compileMs,
             kernelProfile: profiler?.profile,
             decodeKernelProfile: nil,
@@ -398,6 +416,7 @@ enum ANEDirectBench {
         return Result(
             benchmarkResult: result,
             avgTimingBreakdown: avgBreakdown,
+            kernelDispatches: nLayers * 2,
             compileTimeMs: compileMs,
             kernelProfile: nil,
             decodeKernelProfile: profiler?.profile,
@@ -431,14 +450,8 @@ enum ANEDirectBench {
 
         printStderr("Running sustained inference for \(Int(duration))s...")
 
-        let before = ThermalMonitor.currentState()
-        var samples: [(time: Double, state: String)] = []
-        let startTime = ContinuousClock.now
-        var lastSampleTime = 0.0
-        var elapsed = 0.0
         var iterCount = 0
-
-        while elapsed < duration {
+        let thermal = try ThermalMonitor.sustainedRun(duration: duration) {
             var timings = StepTimingBreakdown()
             try ForwardPass.runTimed(
                 xCur: xCur,
@@ -448,21 +461,13 @@ enum ANEDirectBench {
                 timings: &timings
             )
             iterCount += 1
-
-            elapsed = durationMs(ContinuousClock.now - startTime) / 1000.0
-
-            if elapsed - lastSampleTime >= 1.0 {
-                let state = ThermalMonitor.currentState()
-                samples.append((time: elapsed, state: state))
-                lastSampleTime = elapsed
-            }
         }
 
-        let after = ThermalMonitor.currentState()
+        let elapsed = thermal.samples.last?.time ?? duration
         printStderr("  Completed \(iterCount) forward passes in \(Int(elapsed))s")
-        printStderr("  Thermal: \(before) -> \(after)")
+        printStderr("  Thermal: \(thermal.before) -> \(thermal.after)")
 
-        return (before: before, after: after, samples: samples, iterations: iterCount)
+        return (before: thermal.before, after: thermal.after, samples: thermal.samples, iterations: iterCount)
     }
 
     // MARK: - Helpers

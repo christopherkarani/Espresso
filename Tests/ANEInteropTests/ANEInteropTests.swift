@@ -165,6 +165,29 @@ private func withEnvironmentValue<T>(
 }
 
 final class ANEInteropTests: XCTestCase {
+    func test_neon_argmax_f16_returns_first_max_index_for_vectorized_input() {
+        let input: [Float] = [
+            -3, 1, 2, 7, 9, 9, 4, 5,
+            8, 6, 10, 11, 12, 13, 14, 15,
+            99, 42, 99, 3, 2, 1, 0, -1,
+        ]
+        var fp16Storage = [UInt16](repeating: 0, count: input.count)
+        input.withUnsafeBufferPointer { src in
+            fp16Storage.withUnsafeMutableBytes { dst in
+                ane_interop_cvt_f32_to_f16(dst.baseAddress, src.baseAddress, Int32(input.count))
+            }
+        }
+
+        var index: Int32 = -1
+        var value: Float = -.infinity
+        fp16Storage.withUnsafeBytes { raw in
+            ane_interop_neon_argmax_f16(raw.baseAddress, Int32(input.count), &index, &value)
+        }
+
+        XCTAssertEqual(index, 16)
+        XCTAssertEqual(value, 99, accuracy: 0.001)
+    }
+
     func test_baseline_classifier_unavailable_when_runtime_is_missing() {
         let status = classifyANEBaseline(runtimeAvailable: false, compileSucceeded: true, evalSucceeded: true)
         XCTAssertEqual(status, .unavailable)

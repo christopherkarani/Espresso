@@ -66,7 +66,8 @@ final class RWKVStyleFusedThreeLayerRMSNormClassifierKernelSetTests: XCTestCase 
 
         XCTAssertEqual(specs.count, 1)
         XCTAssertEqual(specs[0].inputSizes, [stateBytes, stateBytes, stateBytes, stateBytes])
-        XCTAssertEqual(specs[0].outputSizes, [stateBytes, stateBytes, stateBytes, stateBytes, logitsBytes])
+        let maxValBytes = 1 * laneSpatial * 2
+        XCTAssertEqual(specs[0].outputSizes, [stateBytes, stateBytes, stateBytes, stateBytes, logitsBytes, maxValBytes])
         XCTAssertEqual(specs[0].weights.count, 17)
         XCTAssertTrue(specs[0].milText.contains("rwkv_rms0.bin"))
         XCTAssertTrue(specs[0].milText.contains("rwkv_rms2.bin"))

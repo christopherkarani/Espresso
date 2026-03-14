@@ -1,32 +1,144 @@
+import Darwin
 import Foundation
 import ANETypes
 import Espresso
 
 enum ResultsFormatter {
+    private static let locale = Locale(identifier: "en_US_POSIX")
+
     static func chipName() -> String {
-        func readSysctl(_ name: String) -> String? {
-            var size: size_t = 0
-            guard sysctlbyname(name, nil, &size, nil, 0) == 0, size > 0 else { return nil }
-            var buf = [UInt8](repeating: 0, count: size)
-            guard sysctlbyname(name, &buf, &size, nil, 0) == 0 else { return nil }
-            // Trim null terminator
-            if let nullIdx = buf.firstIndex(of: 0) { buf = Array(buf[..<nullIdx]) }
-            return String(decoding: buf, as: UTF8.self)
+        var length: size_t = 0
+        guard sysctlbyname("machdep.cpu.brand_string", nil, &length, nil, 0) == 0, length > 0 else {
+            return "Unknown"
         }
-        // Intel path
-        if let brand = readSysctl("machdep.cpu.brand_string") { return brand }
-        // Apple Silicon: hw.model gives Mac model identifier
-        if let model = readSysctl("hw.model") { return model }
-        return "Unknown"
+
+        var bytes = [CChar](repeating: 0, count: length)
+        guard sysctlbyname("machdep.cpu.brand_string", &bytes, &length, nil, 0) == 0 else {
+            return "Unknown"
+        }
+
+        let trimmed = bytes.prefix { $0 != 0 }
+        return String(decoding: trimmed.map { UInt8(bitPattern: $0) }, as: UTF8.self)
     }
 
     static func formatReport(
         aneResult: BenchmarkResult,
-        aneTimingBreakdown: (ane: Double, io: Double, elem: Double)?,
+        aneTimingBreakdown: (ane: Double, io: Double, elem: Double),
+        coreMLResults: [(label: String, result: BenchmarkResult)],
+        coreMLLoadTimeMs: Double?,
+        thermalBefore: String?,
+        thermalAfter: String?,
+        flopsPerPass: Double,
+        nLayers: Int
+    ) -> String {
+        let aneTFLOPS = FLOPCalculator.sustainedTFLOPS(flops: flopsPerPass, latencyMs: aneResult.median)
+        let aneUtilization = FLOPCalculator.aneUtilization(sustainedTFLOPS: aneTFLOPS)
+        let aneForwardPassesPerSecond = aneResult.median > 0 ? 1_000.0 / aneResult.median : 0
+
+        var lines: [String] = []
+        lines.append("EspressoBench Report")
+        lines.append("====================")
+        lines.append(
+            "Chip: \(chipName()) | Config: layers=\(nLayers) dim=\(ModelConfig.dim) hidden=\(ModelConfig.hidden) heads=\(ModelConfig.heads) seq=\(ModelConfig.seqLen)"
+        )
+        lines.append(
+            formatted("FLOPs per forward pass: %.3f GFLOPs", flopsPerPass / 1_000_000_000.0)
+        )
+        lines.append("")
+        lines.append("Latency Stats (ms)")
+        lines.append("------------------")
+        lines.append(tableHeader())
+        lines.append(tableRow(label: aneResult.label, result: aneResult))
+        for entry in coreMLResults {
+            lines.append(tableRow(label: entry.label, result: entry.result))
+        }
+        lines.append("")
+        lines.append("Throughput")
+        lines.append("----------")
+        lines.append(
+            formatted(
+                "%@: %.3f TFLOPS | %.2f%% peak utilization | %.2f forward passes/sec",
+                aneResult.label as NSString,
+                aneTFLOPS,
+                aneUtilization,
+                aneForwardPassesPerSecond
+            )
+        )
+        for entry in coreMLResults {
+            let tflops = FLOPCalculator.sustainedTFLOPS(flops: flopsPerPass, latencyMs: entry.result.median)
+            let utilization = FLOPCalculator.aneUtilization(sustainedTFLOPS: tflops)
+            let forwardPassesPerSecond = entry.result.median > 0 ? 1_000.0 / entry.result.median : 0
+            lines.append(
+                formatted(
+                    "%@: %.3f TFLOPS | %.2f%% peak utilization | %.2f forward passes/sec",
+                    entry.label,
+                    tflops,
+                    utilization,
+                    forwardPassesPerSecond
+                )
+            )
+        }
+        lines.append("")
+        lines.append("Time Breakdown (\(aneResult.label), avg ms)")
+        lines.append(String(repeating: "-", count: max(20, 20 + aneResult.label.count)))
+        let totalTime = aneTimingBreakdown.ane + aneTimingBreakdown.io + aneTimingBreakdown.elem
+        lines.append(
+            timeBreakdownRow(label: "ANE compute", value: aneTimingBreakdown.ane, total: totalTime)
+        )
+        lines.append(
+            timeBreakdownRow(label: "IO", value: aneTimingBreakdown.io, total: totalTime)
+        )
+        lines.append(
+            timeBreakdownRow(label: "CPU", value: aneTimingBreakdown.elem, total: totalTime)
+        )
+        if !coreMLResults.isEmpty {
+            lines.append("")
+            lines.append("Core ML Comparison")
+            lines.append("------------------")
+            if let coreMLLoadTimeMs {
+                lines.append(formatted("Core ML load time (.all): %.3f ms", coreMLLoadTimeMs))
+            }
+            for entry in coreMLResults {
+                let ratio = entry.result.median > 0 ? entry.result.median / aneResult.median : 0
+                lines.append(
+                    formatted(
+                        "%@: median %.3f ms | vs %@ %.2fx",
+                        entry.label,
+                        entry.result.median,
+                        aneResult.label as NSString,
+                        ratio
+                    )
+                )
+            }
+        }
+        if let thermalBefore, let thermalAfter {
+            lines.append("")
+            lines.append("Thermal State")
+            lines.append("-------------")
+            lines.append("Before: \(thermalBefore)")
+            lines.append("After:  \(thermalAfter)")
+        }
+
+        return lines.joined(separator: "\n") + "\n"
+    }
+
+    static func writeCSV(latencies: [Double], to path: String) throws {
+        var rows = ["iteration,latency_ms"]
+        rows.reserveCapacity(latencies.count + 1)
+        for (index, latency) in latencies.enumerated() {
+            rows.append(formatted("%d,%.6f", index + 1, latency))
+        }
+        let output = rows.joined(separator: "\n") + "\n"
+        try output.write(toFile: path, atomically: true, encoding: .utf8)
+    }
+
+    static func formatReport(
+        aneResult: BenchmarkResult,
+        aneTimingBreakdown: (ane: Double, io: Double, elem: Double),
         compileTimeMs: Double?,
-        inferenceResult: BenchmarkResult? = nil,
-        inferenceTimingBreakdown: (ane: Double, io: Double, elem: Double)? = nil,
-        inferenceCompileTimeMs: Double? = nil,
+        inferenceResult: BenchmarkResult?,
+        inferenceTimingBreakdown: (ane: Double, io: Double, elem: Double)?,
+        inferenceCompileTimeMs: Double?,
         coreMLResults: [(label: String, result: BenchmarkResult)]?,
         coreMLLoadTimeMs: Double?,
         thermalBefore: String?,
@@ -34,89 +146,63 @@ enum ResultsFormatter {
         flopsPerPass: Double,
         nLayers: Int
     ) -> String {
-        var out = ""
-        let chip = chipName()
-        let peakTFLOPS = 18.0
-
-        out += "=== ANE DIRECT BENCHMARK (TRAINING FORWARD) ===\n"
-        out += "Chip: \(chip)\n"
-        out += String(format: "ANE Peak: %.1f TFLOPS\n", peakTFLOPS)
-        out += "Workload: \(nLayers)-layer transformer, dim=\(ModelConfig.dim), "
-        out += "seq=\(ModelConfig.seqLen), heads=\(ModelConfig.heads), hidden=\(ModelConfig.hidden)\n"
-        out += String(format: "FLOPs per forward pass: %.2f GFLOPs\n", flopsPerPass / 1e9)
-        if let compileMs = compileTimeMs {
-            out += String(format: "Kernel compilation: %.1f ms (%d kernels)\n", compileMs, nLayers * 5)
+        var report = formatReport(
+            aneResult: aneResult,
+            aneTimingBreakdown: aneTimingBreakdown,
+            coreMLResults: coreMLResults ?? [],
+            coreMLLoadTimeMs: coreMLLoadTimeMs,
+            thermalBefore: thermalBefore,
+            thermalAfter: thermalAfter,
+            flopsPerPass: flopsPerPass,
+            nLayers: nLayers
+        )
+        if let compileTimeMs {
+            report += formatted("ANE direct compile time: %.3f ms\n", compileTimeMs)
         }
-        out += "\n"
-
-        out += formatLatencySection(aneResult, flopsPerPass: flopsPerPass, peakTFLOPS: peakTFLOPS)
-
-        if let breakdown = aneTimingBreakdown {
-            let total = breakdown.ane + breakdown.io + breakdown.elem
-            if total > 0 {
-                out += "--- Time Breakdown (avg per forward pass) ---\n"
-                out += String(format: "ANE kernel:    %.3f ms (%.1f%%)\n", breakdown.ane, breakdown.ane / total * 100)
-                out += String(format: "Surface I/O:   %.3f ms (%.1f%%)\n", breakdown.io, breakdown.io / total * 100)
-                out += String(format: "CPU element:   %.3f ms (%.1f%%)\n\n", breakdown.elem, breakdown.elem / total * 100)
-            }
+        if let inferenceResult {
+            report += "\n"
+            report += formatInferenceComparisonSection(
+                trainingResult: aneResult,
+                inferenceResult: inferenceResult,
+                inferenceTimingBreakdown: inferenceTimingBreakdown,
+                inferenceCompileTimeMs: inferenceCompileTimeMs,
+                coreMLResults: coreMLResults,
+                coreMLLoadTimeMs: coreMLLoadTimeMs,
+                flopsPerPass: flopsPerPass
+            )
         }
-
-        // Inference-optimized results
-        if let infResult = inferenceResult {
-            out += "=== ANE DIRECT BENCHMARK (INFERENCE, FUSED RESIDUALS) ===\n"
-            if let compileMs = inferenceCompileTimeMs {
-                out += String(format: "Kernel compilation: %.1f ms (%d kernels)\n", compileMs, nLayers * 2)
-            }
-            out += "\n"
-
-            out += formatLatencySection(infResult, flopsPerPass: flopsPerPass, peakTFLOPS: peakTFLOPS)
-
-            if let breakdown = inferenceTimingBreakdown {
-                let total = breakdown.ane + breakdown.io + breakdown.elem
-                if total > 0 {
-                    out += "--- Time Breakdown (avg per forward pass) ---\n"
-                    out += String(format: "ANE kernel:    %.3f ms (%.1f%%)\n", breakdown.ane, breakdown.ane / total * 100)
-                    out += String(format: "Surface I/O:   %.3f ms (%.1f%%)\n", breakdown.io, breakdown.io / total * 100)
-                    out += String(format: "CPU element:   %.3f ms (%.1f%%)\n\n", breakdown.elem, breakdown.elem / total * 100)
-                }
-            }
-
-            // Comparison: training vs inference
-            let speedup = aneResult.median / infResult.median
-            let savings = aneResult.median - infResult.median
-            out += "--- Training vs Inference ---\n"
-            out += String(format: "Training median:  %.3f ms\n", aneResult.median)
-            out += String(format: "Inference median: %.3f ms\n", infResult.median)
-            out += String(format: "Speedup: %.2fx (%.3f ms saved)\n\n", speedup, savings)
-        }
-
-        if let coreMLResults {
-            for (label, result) in coreMLResults {
-                out += "=== CORE ML BASELINE (\(label)) ===\n"
-                if let loadTime = coreMLLoadTimeMs, label.contains("all") {
-                    out += String(format: "Model load time: %.1f ms\n", loadTime)
-                }
-                out += formatLatencySection(result, flopsPerPass: flopsPerPass, peakTFLOPS: peakTFLOPS)
-
-                let trainingSpeedup = result.median / aneResult.median
-                out += "--- vs ANE Direct (Training) ---\n"
-                out += String(format: "Speedup (ANE Training vs this): %.2fx\n", trainingSpeedup)
-                if let infResult = inferenceResult {
-                    let inferenceSpeedup = result.median / infResult.median
-                    out += String(format: "Speedup (ANE Inference vs this): %.2fx\n", inferenceSpeedup)
-                }
-                out += "\n"
-            }
-        }
-
-        if let before = thermalBefore, let after = thermalAfter {
-            out += "=== POWER & THERMAL ===\n"
-            out += "Thermal state: \(before) -> \(after)\n\n"
-        }
-
-        return out
+        return report
     }
 
+    private static func tableHeader() -> String {
+        "Label                        Mean(ms) Median(ms)    P50(ms)    P95(ms)    P99(ms)    Min(ms)    Max(ms) StdDev(ms)"
+    }
+
+    private static func tableRow(label: String, result: BenchmarkResult) -> String {
+        formatted(
+            "%-28@ %10.3f %10.3f %10.3f %10.3f %10.3f %10.3f %10.3f %10.3f",
+            label as NSString,
+            result.mean,
+            result.median,
+            result.p50,
+            result.p95,
+            result.p99,
+            result.min,
+            result.max,
+            result.stddev
+        )
+    }
+
+    private static func timeBreakdownRow(label: String, value: Double, total: Double) -> String {
+        let percentage = total > 0 ? (value / total) * 100.0 : 0
+        return formatted("%-12@ %10.3f ms %8.2f%%", label as NSString, value, percentage)
+    }
+
+    private static func formatted(_ format: String, _ arguments: CVarArg...) -> String {
+        String(format: format, locale: locale, arguments: arguments)
+    }
+
+    // Compatibility shims for the pre-existing bench CLI. main.swift is rewritten later in this task.
     static func formatInferenceOnlyReport(
         inferenceResult: BenchmarkResult,
         inferenceTimingBreakdown: (ane: Double, io: Double, elem: Double)?,
@@ -128,52 +214,93 @@ enum ResultsFormatter {
         thermalBefore: String? = nil,
         thermalAfter: String? = nil
     ) -> String {
-        var out = ""
-        let chip = chipName()
-        let peakTFLOPS = 18.0
-
-        out += "=== ANE DIRECT BENCHMARK (INFERENCE ONLY) ===\n"
-        out += "Chip: \(chip)\n"
-        out += String(format: "ANE Peak: %.1f TFLOPS\n", peakTFLOPS)
-        out += "Workload: \(nLayers)-layer transformer, dim=\(ModelConfig.dim), "
-        out += "seq=\(ModelConfig.seqLen), heads=\(ModelConfig.heads), hidden=\(ModelConfig.hidden)\n"
-        out += String(format: "FLOPs per forward pass: %.2f GFLOPs\n", flopsPerPass / 1e9)
-        if let compileMs = inferenceCompileTimeMs {
-            out += String(format: "Kernel compilation: %.1f ms (%d kernels)\n", compileMs, nLayers * 2)
+        var report = formatReport(
+            aneResult: inferenceResult,
+            aneTimingBreakdown: inferenceTimingBreakdown ?? (0, 0, 0),
+            coreMLResults: coreMLResults ?? [],
+            coreMLLoadTimeMs: coreMLLoadTimeMs,
+            thermalBefore: thermalBefore,
+            thermalAfter: thermalAfter,
+            flopsPerPass: flopsPerPass,
+            nLayers: nLayers
+        )
+        if let inferenceCompileTimeMs {
+            report += formatted("Inference compile time: %.3f ms\n", inferenceCompileTimeMs)
         }
-        out += "\n"
+        return report
+    }
 
-        out += formatLatencySection(inferenceResult, flopsPerPass: flopsPerPass, peakTFLOPS: peakTFLOPS)
+    private static func formatInferenceComparisonSection(
+        trainingResult: BenchmarkResult,
+        inferenceResult: BenchmarkResult,
+        inferenceTimingBreakdown: (ane: Double, io: Double, elem: Double)?,
+        inferenceCompileTimeMs: Double?,
+        coreMLResults: [(label: String, result: BenchmarkResult)]?,
+        coreMLLoadTimeMs: Double?,
+        flopsPerPass: Double
+    ) -> String {
+        let inferenceTFLOPS = FLOPCalculator.sustainedTFLOPS(flops: flopsPerPass, latencyMs: inferenceResult.median)
+        let inferenceUtilization = FLOPCalculator.aneUtilization(sustainedTFLOPS: inferenceTFLOPS)
+        let inferenceForwardPassesPerSecond = inferenceResult.median > 0 ? 1_000.0 / inferenceResult.median : 0
+        let trainingToInferenceSpeedup = inferenceResult.median > 0 ? trainingResult.median / inferenceResult.median : 0
 
+        var lines: [String] = []
+        lines.append("Inference Comparison")
+        lines.append("--------------------")
+        if let inferenceCompileTimeMs {
+            lines.append(formatted("Inference compile time: %.3f ms", inferenceCompileTimeMs))
+        }
+        lines.append(tableHeader())
+        lines.append(tableRow(label: inferenceResult.label, result: inferenceResult))
+        for entry in coreMLResults ?? [] {
+            lines.append(tableRow(label: entry.label, result: entry.result))
+        }
+        lines.append("")
+        lines.append(
+            formatted(
+                "%@: %.3f TFLOPS | %.2f%% peak utilization | %.2f forward passes/sec",
+                inferenceResult.label as NSString,
+                inferenceTFLOPS,
+                inferenceUtilization,
+                inferenceForwardPassesPerSecond
+            )
+        )
+        lines.append(
+            formatted(
+                "Training vs inference speedup: %.2fx",
+                trainingToInferenceSpeedup
+            )
+        )
         if let breakdown = inferenceTimingBreakdown {
             let total = breakdown.ane + breakdown.io + breakdown.elem
-            if total > 0 {
-                out += "--- Time Breakdown (avg per forward pass) ---\n"
-                out += String(format: "ANE kernel:    %.3f ms (%.1f%%)\n", breakdown.ane, breakdown.ane / total * 100)
-                out += String(format: "Surface I/O:   %.3f ms (%.1f%%)\n", breakdown.io, breakdown.io / total * 100)
-                out += String(format: "CPU element:   %.3f ms (%.1f%%)\n\n", breakdown.elem, breakdown.elem / total * 100)
+            lines.append("")
+            lines.append("Time Breakdown (\(inferenceResult.label), avg ms)")
+            lines.append(String(repeating: "-", count: max(20, 20 + inferenceResult.label.count)))
+            lines.append(timeBreakdownRow(label: "ANE compute", value: breakdown.ane, total: total))
+            lines.append(timeBreakdownRow(label: "IO", value: breakdown.io, total: total))
+            lines.append(timeBreakdownRow(label: "CPU", value: breakdown.elem, total: total))
+        }
+        if let coreMLResults, !coreMLResults.isEmpty {
+            lines.append("")
+            lines.append("Core ML Comparison (vs inference)")
+            lines.append("-------------------------------")
+            if let coreMLLoadTimeMs {
+                lines.append(formatted("Core ML load time (.all): %.3f ms", coreMLLoadTimeMs))
+            }
+            for entry in coreMLResults {
+                let ratio = entry.result.median > 0 ? entry.result.median / inferenceResult.median : 0
+                lines.append(
+                    formatted(
+                        "%@: median %.3f ms | vs %@ %.2fx",
+                        entry.label,
+                        entry.result.median,
+                        inferenceResult.label as NSString,
+                        ratio
+                    )
+                )
             }
         }
-
-        if let coreMLResults {
-            for (label, result) in coreMLResults {
-                out += "=== CORE ML BASELINE (\(label)) ===\n"
-                if let loadTime = coreMLLoadTimeMs, label.contains("all") {
-                    out += String(format: "Model load time: %.1f ms\n", loadTime)
-                }
-                out += formatLatencySection(result, flopsPerPass: flopsPerPass, peakTFLOPS: peakTFLOPS)
-                let speedup = result.median / inferenceResult.median
-                out += "--- vs ANE Direct (Inference) ---\n"
-                out += String(format: "Speedup (ANE vs this): %.2fx\n\n", speedup)
-            }
-        }
-
-        if let before = thermalBefore, let after = thermalAfter {
-            out += "=== POWER & THERMAL ===\n"
-            out += "Thermal state: \(before) -> \(after)\n\n"
-        }
-
-        return out
+        return lines.joined(separator: "\n") + "\n"
     }
 
     static func formatDecodeReport(
@@ -187,99 +314,61 @@ enum ResultsFormatter {
         decodeSteps: Int,
         decodeMaxSeq: Int
     ) -> String {
-        var out = ""
-        let chip = chipName()
-
-        out += "=== ANE DIRECT BENCHMARK (AUTOREGRESSIVE DECODE) ===\n"
-        out += "Chip: \(chip)\n"
-        out += "Workload: \(nLayers)-layer transformer decode, dim=\(ModelConfig.dim), heads=\(ModelConfig.heads), hidden=\(ModelConfig.hidden)\n"
-        out += "Decode schedule: steps=\(decodeSteps), maxSeq=\(decodeMaxSeq)\n"
-        if let compileMs = decodeCompileTimeMs {
-            out += String(format: "Kernel compilation: %.1f ms (%d kernels)\n", compileMs, nLayers * 2)
+        var lines: [String] = []
+        lines.append("EspressoBench Decode Report")
+        lines.append("===========================")
+        lines.append("Chip: \(chipName()) | layers=\(nLayers) | decodeSteps=\(decodeSteps) | decodeMaxSeq=\(decodeMaxSeq)")
+        if let decodeCompileTimeMs {
+            lines.append(formatted("Decode compile time: %.3f ms", decodeCompileTimeMs))
         }
-        out += "\n"
-
-        out += "--- Token Latency (\(decodeResult.iterationCount) tokens, \(decodeResult.warmupCount) warmup tokens) ---\n"
-        out += String(format: "Mean:    %.3f ms\n", decodeResult.mean)
-        out += String(format: "Median:  %.3f ms\n", decodeResult.median)
-        out += String(format: "P95:     %.3f ms\n", decodeResult.p95)
-        out += String(format: "P99:     %.3f ms\n", decodeResult.p99)
-        out += String(format: "Stddev:  %.3f ms\n", decodeResult.stddev)
-        out += String(format: "Min:     %.3f ms\n", decodeResult.min)
-        out += String(format: "Max:     %.3f ms\n\n", decodeResult.max)
-
-        let aneTPS = decodeTokensPerSecond ?? (decodeResult.mean > 0 ? 1000.0 / decodeResult.mean : 0)
-        out += "--- Throughput ---\n"
-        out += String(format: "Tokens/sec: %.1f\n\n", aneTPS)
-
+        if let decodeTokensPerSecond {
+            lines.append(formatted("ANE tokens/sec: %.3f", decodeTokensPerSecond))
+        }
+        lines.append(tableHeader())
+        lines.append(tableRow(label: decodeResult.label, result: decodeResult))
+        for entry in coreMLDecodeResults ?? [] {
+            lines.append(tableRow(label: entry.label, result: entry.result))
+        }
         if let breakdown = decodeTimingBreakdown {
             let total = breakdown.ane + breakdown.io + breakdown.elem
-            if total > 0 {
-                out += "--- Time Breakdown (avg per token) ---\n"
-                out += String(format: "ANE kernel:    %.3f ms (%.1f%%)\n", breakdown.ane, breakdown.ane / total * 100)
-                out += String(format: "Surface I/O:   %.3f ms (%.1f%%)\n", breakdown.io, breakdown.io / total * 100)
-                out += String(format: "CPU element:   %.3f ms (%.1f%%)\n\n", breakdown.elem, breakdown.elem / total * 100)
+            lines.append("")
+            lines.append(timeBreakdownRow(label: "ANE compute", value: breakdown.ane, total: total))
+            lines.append(timeBreakdownRow(label: "IO", value: breakdown.io, total: total))
+            lines.append(timeBreakdownRow(label: "CPU", value: breakdown.elem, total: total))
+        }
+        if let coreMLLoadTimeMs {
+            lines.append("")
+            lines.append(formatted("Core ML decode load time: %.3f ms", coreMLLoadTimeMs))
+        }
+        if let coreMLDecodeResults, !coreMLDecodeResults.isEmpty {
+            lines.append("")
+            lines.append("Core ML Decode Comparison")
+            lines.append("------------------------")
+            for entry in coreMLDecodeResults {
+                let speedup = entry.result.median > 0 ? entry.result.median / decodeResult.median : 0
+                lines.append(
+                    formatted(
+                        "%@: median %.3f ms/token | %@ speedup %.2fx",
+                        entry.label,
+                        entry.result.median,
+                        decodeResult.label as NSString,
+                        speedup
+                    )
+                )
+            }
+            if let fastest = coreMLDecodeResults.min(by: { $0.result.median < $1.result.median })?.result {
+                let strictSpeedup = fastest.median > 0 ? fastest.median / decodeResult.median : 0
+                lines.append(
+                    formatted(
+                        "Fastest Core ML decode median %.3f ms/token | %@ speedup %.2fx",
+                        fastest.median,
+                        decodeResult.label as NSString,
+                        strictSpeedup
+                    )
+                )
             }
         }
-
-        if let coreMLDecodeResults {
-            let fastest = coreMLDecodeResults.min { $0.result.median < $1.result.median }?.result
-            for (label, result) in coreMLDecodeResults {
-                out += "=== CORE ML NAIVE DECODE (\(label)) ===\n"
-                if let loadTime = coreMLLoadTimeMs, label.contains(".all") {
-                    out += String(format: "Model load time: %.1f ms\n", loadTime)
-                }
-                out += String(format: "Mean:    %.3f ms/token\n", result.mean)
-                out += String(format: "Median:  %.3f ms/token\n", result.median)
-                out += String(format: "P95:     %.3f ms/token\n", result.p95)
-                out += String(format: "Tokens/sec: %.1f\n", result.mean > 0 ? 1000.0 / result.mean : 0)
-                let speedup = result.median / decodeResult.median
-                out += String(format: "Speedup (ANE vs this): %.2fx\n\n", speedup)
-            }
-            if let fastest {
-                let strictSpeedup = fastest.median / decodeResult.median
-                out += "--- Strict Gate (Fastest Core ML Naive Decode) ---\n"
-                out += String(format: "Fastest Core ML median: %.3f ms/token\n", fastest.median)
-                out += String(format: "ANE median: %.3f ms/token\n", decodeResult.median)
-                out += String(format: "Speedup: %.2fx\n\n", strictSpeedup)
-            }
-        }
-
-        return out
-    }
-
-    private static func formatLatencySection(
-        _ result: BenchmarkResult,
-        flopsPerPass: Double,
-        peakTFLOPS: Double
-    ) -> String {
-        var out = ""
-        let sustained = FLOPCalculator.sustainedTFLOPS(flops: flopsPerPass, latencyMs: result.median)
-        let utilPct = FLOPCalculator.aneUtilization(sustainedTFLOPS: sustained, peakTFLOPS: peakTFLOPS)
-        let fwdPerSec = 1000.0 / result.median
-
-        out += "--- Latency (\(result.iterationCount) iterations, \(result.warmupCount) warmup) ---\n"
-        out += String(format: "Mean:    %.3f ms\n", result.mean)
-        out += String(format: "Median:  %.3f ms\n", result.median)
-        out += String(format: "P95:     %.3f ms\n", result.p95)
-        out += String(format: "P99:     %.3f ms\n", result.p99)
-        out += String(format: "Stddev:  %.3f ms\n", result.stddev)
-        out += String(format: "Min:     %.3f ms\n", result.min)
-        out += String(format: "Max:     %.3f ms\n\n", result.max)
-
-        out += "--- Throughput ---\n"
-        out += String(format: "Sustained TFLOPS:   %.4f\n", sustained)
-        out += String(format: "ANE Utilization:    %.1f%%\n", utilPct)
-        out += String(format: "Forward passes/sec: %.0f\n\n", fwdPerSec)
-
-        return out
-    }
-
-    static func writeCSV(latencies: [Double], to path: String) throws {
-        let header = "iteration,latency_ms\n"
-        let rows = latencies.enumerated().map { "\($0.offset),\(String(format: "%.6f", $0.element))" }
-        let content = header + rows.joined(separator: "\n") + "\n"
-        try content.write(toFile: path, atomically: true, encoding: .utf8)
+        return lines.joined(separator: "\n") + "\n"
     }
 
     static func writeInferenceKernelProfileCSV(profile: InferenceKernelProfile, to path: String) throws {

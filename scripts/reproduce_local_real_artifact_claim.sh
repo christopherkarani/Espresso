@@ -50,6 +50,12 @@ swift run espresso-train \
   --gate-max-new-tokens "$MAX_NEW_TOKENS"
 
 PROMPT_TOKEN="$(jq -r '.promptToken' "$ARTIFACT_PREFIX.manifest.json")"
+OFFLINE_PARITY_STATUS="$(jq -r '.parity_status' "$OFFLINE_GATE_JSON")"
+
+if [[ "$OFFLINE_PARITY_STATUS" != "match" ]]; then
+  echo "Offline exact-acceptance gate reported parity_status=$OFFLINE_PARITY_STATUS" >&2
+  exit 1
+fi
 
 if [[ ! -x "$COREMLTOOLS_PYTHON" ]]; then
   PY312="${PY312:-/opt/homebrew/opt/python@3.12/bin/python3.12}"
@@ -96,7 +102,7 @@ LAYER_COUNT="$LAYER_COUNT" \
   echo "prompt_token=$PROMPT_TOKEN"
   echo "offline_committed_exact_tokens_per_pass=$(jq -r '.committed_exact_tokens_per_pass' "$OFFLINE_GATE_JSON")"
   echo "offline_accepted_future_tokens_per_pass=$(jq -r '.accepted_future_tokens_per_pass' "$OFFLINE_GATE_JSON")"
-  echo "offline_parity_status=$(jq -r '.parity_status' "$OFFLINE_GATE_JSON")"
+  echo "offline_parity_status=$OFFLINE_PARITY_STATUS"
   echo "control_backend=$CONTROL_BACKEND"
   echo "two_step_backend=$TWO_STEP_BACKEND"
   echo "public_summary=$PUBLIC_RESULTS_DIR/summary.txt"

@@ -253,11 +253,11 @@ public protocol ExactTwoTokenGeneratingLanguageModel: ~Copyable, GenerationPerfo
 
 @inline(__always)
 private func tensorBufferIsAllZero(_ buffer: borrowing TensorBuffer) -> Bool {
-    buffer.withUnsafeBufferPointer { ptr in
-        for value in ptr where value != 0 {
-            return false
-        }
-        return true
+    guard buffer.count > 0 else { return true }
+    return buffer.withUnsafePointer { ptr in
+        var maxMagnitude: Float = 0
+        vDSP_maxmgv(ptr, 1, &maxMagnitude, vDSP_Length(buffer.count))
+        return maxMagnitude == 0
     }
 }
 
@@ -358,6 +358,11 @@ enum GenerationWeightCloner {
     }
 
     @inline(__always)
+    static func shareTensor(_ source: borrowing TensorBuffer) -> TensorBuffer {
+        TensorBuffer(nonOwningViewOf: source)
+    }
+
+    @inline(__always)
     private static func copyTensor(_ source: borrowing TensorBuffer, into destination: borrowing TensorBuffer) {
         precondition(source.count == destination.count)
         source.withUnsafePointer { src in
@@ -403,6 +408,26 @@ enum GenerationWeightCloner {
         LayerStorage<RWKVStyleRecurrentWeights>(count: source.count) { idx in
             cloneRecurrentLayer(source[idx])
         }
+    }
+}
+
+struct SharedReadOnlyOutputHeadWeights: ~Copyable {
+    let rmsFinal: TensorBuffer
+    let embedding: TensorBuffer
+    let classifier: TensorBuffer
+
+    init() {
+        self.rmsFinal = TensorBuffer(count: 0, zeroed: true)
+        self.embedding = TensorBuffer(count: 0, zeroed: true)
+        self.classifier = TensorBuffer(count: 0, zeroed: true)
+    }
+
+    init(cloning weights: borrowing RecurrentGenerationWeights) {
+        self.rmsFinal = GenerationWeightCloner.cloneTensor(weights.rmsFinal)
+        self.embedding = GenerationWeightCloner.cloneTensor(weights.embedding)
+        self.classifier = weights.sharedClassifier
+            ? TensorBuffer(count: 0, zeroed: true)
+            : GenerationWeightCloner.cloneTensor(weights.classifier)
     }
 }
 
@@ -455,14 +480,11 @@ private func selectToken(
     }
     switch strategy {
     case .argmax:
-        let bestIndex = logits.withUnsafeBufferPointer { buffer in
-            var bestIndex = 0
-            var bestValue = buffer[0]
-            for idx in 1..<buffer.count where buffer[idx] > bestValue {
-                bestValue = buffer[idx]
-                bestIndex = idx
-            }
-            return bestIndex
+        let bestIndex = logits.withUnsafePointer { ptr in
+            var maxValue: Float = 0
+            var maxIndex: vDSP_Length = 0
+            vDSP_maxvi(ptr, 1, &maxValue, &maxIndex, vDSP_Length(logits.count))
+            return Int(maxIndex)
         }
         guard let token = UInt16(exactly: bestIndex) else {
             throw .invalidArguments("selected token index \(bestIndex) exceeds UInt16 range")
@@ -877,6 +899,7 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
     private let aneRMSNormClassifierHead: ANEGenerationRMSNormClassifierHead?
     private let futureANEClassifierHead: ANEGenerationClassifierHead?
     private let futureANERMSNormClassifierHead: ANEGenerationRMSNormClassifierHead?
+    private let sharedOutputHeadWeights: SharedReadOnlyOutputHeadWeights
     private var twoStepSessions: LayerStorage<RWKVStyleTwoStepRecurrentSession>
     private var fusedPairTwoStepSessions: LayerStorage<RWKVStyleFusedTwoLayerTwoStepSession>
     private var fusedTripletTwoStepSessions: LayerStorage<RWKVStyleFusedThreeLayerTwoStepSession>
@@ -904,7 +927,8 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
         outputHeadBackend: GenerationOutputHeadBackend = .aneRMSNormClassifier,
         trunkBackend: RecurrentGenerationTrunkBackend = .singleLayer,
         trunkLaneSpatial: Int = RWKVStyleTwoStepRecurrentKernelSet.defaultLaneSpatial,
-        outputHeadLaneSpatial: Int = 32
+        outputHeadLaneSpatial: Int = 32,
+        shareReadOnlyWeights: Bool = false
     ) throws(GenerationError) {
         guard layerCount > 0 else {
             throw .invalidArguments("layerCount must be > 0")
@@ -1019,17 +1043,26 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
             }
         }
 
+        let sharedOutputHeadWeights = shareReadOnlyWeights
+            ? SharedReadOnlyOutputHeadWeights(cloning: weights)
+            : SharedReadOnlyOutputHeadWeights()
         let vocabSize = weights.vocabSize
         let sharedClassifier = weights.sharedClassifier
         guard vocabSize > 0 else {
             throw .invalidArguments("vocabSize must be > 0")
         }
 
-        let rmsFinal = GenerationWeightCloner.cloneTensor(weights.rmsFinal)
-        let embedding = GenerationWeightCloner.cloneTensor(weights.embedding)
+        let rmsFinal = shareReadOnlyWeights
+            ? GenerationWeightCloner.shareTensor(sharedOutputHeadWeights.rmsFinal)
+            : GenerationWeightCloner.cloneTensor(weights.rmsFinal)
+        let embedding = shareReadOnlyWeights
+            ? GenerationWeightCloner.shareTensor(sharedOutputHeadWeights.embedding)
+            : GenerationWeightCloner.cloneTensor(weights.embedding)
         let classifier = sharedClassifier
             ? TensorBuffer(count: 0, zeroed: true)
-            : GenerationWeightCloner.cloneTensor(weights.classifier)
+            : (shareReadOnlyWeights
+                ? GenerationWeightCloner.shareTensor(sharedOutputHeadWeights.classifier)
+                : GenerationWeightCloner.cloneTensor(weights.classifier))
         let futureRMS: TensorBuffer
         let futureClassifier: TensorBuffer
         let hasFutureProposer: Bool
@@ -1053,8 +1086,8 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
             futureClassifier = GenerationWeightCloner.cloneTensor(futureSidecar.futureClassifier)
             hasFutureProposer = true
         } else {
-            futureRMS = TensorBuffer(count: ModelConfig.dim, zeroed: true)
-            futureClassifier = TensorBuffer(count: vocabSize * ModelConfig.dim, zeroed: true)
+            futureRMS = TensorBuffer(count: 0, zeroed: true)
+            futureClassifier = TensorBuffer(count: 0, zeroed: true)
             hasFutureProposer = false
         }
 
@@ -1155,8 +1188,8 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
         self.hasFutureProposer = hasFutureProposer
         self.stepNorm = TensorBuffer(count: ModelConfig.dim, zeroed: true)
         self.stepLogits = TensorBuffer(count: vocabSize, zeroed: true)
-        self.futureNorm = TensorBuffer(count: ModelConfig.dim, zeroed: true)
-        self.futureLogits = TensorBuffer(count: vocabSize, zeroed: true)
+        self.futureNorm = TensorBuffer(count: hasFutureProposer ? ModelConfig.dim : 0, zeroed: true)
+        self.futureLogits = TensorBuffer(count: hasFutureProposer ? vocabSize : 0, zeroed: true)
         self.zeroActivation = TensorBuffer(count: ModelConfig.dim, zeroed: true)
         self.pair0ActivationA = TensorBuffer(count: ModelConfig.dim, zeroed: true)
         self.pair1ActivationA = TensorBuffer(count: ModelConfig.dim, zeroed: true)
@@ -1172,6 +1205,7 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
         self.aneRMSNormClassifierHead = aneRMSNormClassifierHead
         self.futureANEClassifierHead = futureANEClassifierHead
         self.futureANERMSNormClassifierHead = futureANERMSNormClassifierHead
+        self.sharedOutputHeadWeights = sharedOutputHeadWeights
         self.twoStepSessions = twoStepSessions
         self.fusedPairTwoStepSessions = fusedPairTwoStepSessions
         self.fusedTripletTwoStepSessions = fusedTripletTwoStepSessions
@@ -1321,6 +1355,40 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
         }
 
         try Self.writeTokenEmbedding(token, embedding: embedding, into: pair0ActivationA)
+
+        // Fast path for identity-zero-trunk: skip pair1 entirely (trunk is no-op,
+        // and pair1 output head result is discarded anyway during single-token commit).
+        // This halves the output-head cost during prefill.
+        if case .identityZeroTrunk = trunkBackend {
+            let logitsStart = GenerationClock.now()
+            let exactNextToken = try Self.selectTokenFromActivation(
+                pair0ActivationA,
+                strategy: strategy,
+                outputHeadBackend: outputHeadBackend,
+                rmsFinal: rmsFinal,
+                stepNorm: stepNorm,
+                stepLogits: stepLogits,
+                embedding: embedding,
+                classifier: classifier,
+                sharedClassifier: sharedClassifier,
+                aneClassifierHead: aneClassifierHead,
+                aneRMSNormClassifierHead: aneRMSNormClassifierHead,
+                vocabSize: vocabSize,
+                stepRMSWorkspace: stepRMSWorkspace
+            )
+            let logitsLatencyMs = GenerationClock.milliseconds(start: logitsStart, end: GenerationClock.now())
+            self.logitsLatencyMs += logitsLatencyMs
+
+            let stateAdvanceLatencyMs = try promotePreparedPair(stepCount: 1)
+            captureProposalActivationForNextPass(sourcePairIsA: true, committedStepCount: 1)
+            consumedTokens += 1
+            lastSingleTokenTrunkLatencyMs = stateAdvanceLatencyMs
+            lastSingleTokenLogitsLatencyMs = logitsLatencyMs
+            return exactNextToken
+        }
+
+        // Non-identity trunks: use full pair preparation (trunk processes both pairs
+        // for state management, but pair1 output head result is still discarded)
         pair1ActivationA.zero()
         let prepared = try prepareActivationPair(strategy: strategy)
         let stateAdvanceLatencyMs = try promotePreparedPair(stepCount: 1)
@@ -1542,9 +1610,7 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
         activation.withUnsafeMutablePointer { dst in
             embedding.withUnsafePointer { embeddingPtr in
                 let base = Int(token) * ModelConfig.dim
-                for dimIdx in 0..<ModelConfig.dim {
-                    dst[dimIdx] = embeddingPtr[base + dimIdx]
-                }
+                dst.update(from: embeddingPtr.advanced(by: base), count: ModelConfig.dim)
             }
         }
     }
@@ -1657,7 +1723,7 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
         let token: UInt16
         switch outputHeadBackend {
         case .cpu:
-            stepLogits.zero()
+            // beta=0.0 means sgemm overwrites C entirely — no pre-zeroing needed
             stepLogits.withUnsafeMutablePointer { logitsPtr in
                 classifierPointer(
                     sharedClassifier: sharedClassifier,
@@ -1697,6 +1763,35 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
             token = try aneRMSNormClassifierHead.selectArgmax(rawInput: activation)
         case .cpuExactStaged, .cpuExactClustered:
             throw .runtimeFailure("two-step branch-state promotion model does not support staged CPU output heads")
+        case .cpuThenANE, .cpuPartitionedArgmax, .cpuFP16Tiled:
+            // Fall through to CPU sgemm path for now
+            stepLogits.withUnsafeMutablePointer { logitsPtr in
+                classifierPointer(
+                    sharedClassifier: sharedClassifier,
+                    embedding: embedding,
+                    classifier: classifier
+                ) { clsPtr in
+                    stepNorm.withUnsafePointer { normPtr in
+                        BLAS.sgemm(
+                            CblasRowMajor,
+                            CblasNoTrans,
+                            CblasNoTrans,
+                            m: Int32(vocabSize),
+                            n: 1,
+                            k: Int32(ModelConfig.dim),
+                            alpha: 1.0,
+                            a: clsPtr,
+                            lda: Int32(ModelConfig.dim),
+                            b: normPtr,
+                            ldb: 1,
+                            beta: 0.0,
+                            c: logitsPtr,
+                            ldc: 1
+                        )
+                    }
+                }
+            }
+            token = try selectToken(from: stepLogits, strategy: strategy)
         }
 
         return token
@@ -1960,6 +2055,9 @@ public struct RecurrentGenerationWeights: ~Copyable {
     public let classifier: TensorBuffer
     public let sharedClassifier: Bool
     public let vocabSize: Int
+    /// Retains the mmap backing buffer so non-owning slice views remain valid.
+    /// When weights are not mmap-backed, this is a zero-element sentinel buffer.
+    private let mmapBacking: TensorBuffer
 
     public init(
         layers: consuming LayerStorage<RWKVStyleRecurrentWeights>,
@@ -1975,6 +2073,26 @@ public struct RecurrentGenerationWeights: ~Copyable {
         self.classifier = classifier
         self.sharedClassifier = sharedClassifier
         self.vocabSize = vocabSize
+        self.mmapBacking = TensorBuffer(count: 0, zeroed: false)
+    }
+
+    /// Init with an mmap backing buffer whose lifetime keeps all non-owning slices valid.
+    public init(
+        layers: consuming LayerStorage<RWKVStyleRecurrentWeights>,
+        rmsFinal: consuming TensorBuffer,
+        embedding: consuming TensorBuffer,
+        classifier: consuming TensorBuffer,
+        sharedClassifier: Bool,
+        vocabSize: Int = ModelConfig.vocab,
+        mmapBacking: consuming TensorBuffer
+    ) {
+        self.layers = layers
+        self.rmsFinal = rmsFinal
+        self.embedding = embedding
+        self.classifier = classifier
+        self.sharedClassifier = sharedClassifier
+        self.vocabSize = vocabSize
+        self.mmapBacking = mmapBacking
     }
 }
 
@@ -2206,7 +2324,7 @@ public struct ANEDirectGenerationModel: ~Copyable, DirectTokenSelectingLanguageM
         classifier: borrowing TensorBuffer
     ) throws(GenerationError) -> ANEGenerationClassifierHead? {
         switch outputHeadBackend {
-        case .cpu, .cpuExactStaged, .cpuExactClustered:
+        case .cpu, .cpuExactStaged, .cpuExactClustered, .cpuThenANE, .cpuPartitionedArgmax, .cpuFP16Tiled:
             return nil
         case .aneClassifier:
             if sharedClassifier {
@@ -2226,7 +2344,7 @@ public struct ANEDirectGenerationModel: ~Copyable, DirectTokenSelectingLanguageM
         classifier: borrowing TensorBuffer
     ) throws(GenerationError) -> CPUStagedExactGenerationOutputHead? {
         switch outputHeadBackend {
-        case .cpu, .aneClassifier, .aneRMSNormClassifier:
+        case .cpu, .aneClassifier, .aneRMSNormClassifier, .cpuThenANE, .cpuPartitionedArgmax, .cpuFP16Tiled:
             return nil
         case .cpuExactStaged:
             if sharedClassifier {
@@ -2266,7 +2384,7 @@ public struct ANEDirectGenerationModel: ~Copyable, DirectTokenSelectingLanguageM
         classifier: borrowing TensorBuffer
     ) throws(GenerationError) -> ANEGenerationRMSNormClassifierHead? {
         switch outputHeadBackend {
-        case .cpu, .cpuExactStaged, .cpuExactClustered, .aneClassifier:
+        case .cpu, .cpuExactStaged, .cpuExactClustered, .aneClassifier, .cpuThenANE, .cpuPartitionedArgmax, .cpuFP16Tiled:
             return nil
         case .aneRMSNormClassifier:
             if sharedClassifier {
@@ -2405,9 +2523,7 @@ public struct ANEDirectGenerationModel: ~Copyable, DirectTokenSelectingLanguageM
         xCur.withUnsafeMutablePointer { dst in
             embedding.withUnsafePointer { embeddingPtr in
                 let base = Int(token) * ModelConfig.dim
-                for dimIdx in 0..<ModelConfig.dim {
-                    dst[dimIdx] = embeddingPtr[base + dimIdx]
-                }
+                dst.update(from: embeddingPtr.advanced(by: base), count: ModelConfig.dim)
             }
         }
 
@@ -2447,7 +2563,7 @@ public struct ANEDirectGenerationModel: ~Copyable, DirectTokenSelectingLanguageM
 
         stepLogits.zero()
         switch outputHeadBackend {
-        case .cpu, .cpuExactStaged, .cpuExactClustered:
+        case .cpu, .cpuExactStaged, .cpuExactClustered, .cpuThenANE, .cpuPartitionedArgmax, .cpuFP16Tiled:
             stepLogits.withUnsafeMutablePointer { logitsPtr in
                 classifierPointer { clsPtr in
                     stepNorm.withUnsafePointer { normPtr in
@@ -2554,6 +2670,32 @@ public struct ANEDirectGenerationModel: ~Copyable, DirectTokenSelectingLanguageM
                 throw .runtimeFailure("ANE fused output-head backend requested without compiled head")
             }
             token = try aneRMSNormClassifierHead.selectArgmax(rawInput: xCur)
+        case .cpuThenANE, .cpuPartitionedArgmax, .cpuFP16Tiled:
+            // Fall through to CPU sgemm path
+            stepLogits.zero()
+            stepLogits.withUnsafeMutablePointer { logitsPtr in
+                classifierPointer { clsPtr in
+                    stepNorm.withUnsafePointer { normPtr in
+                        BLAS.sgemm(
+                            CblasRowMajor,
+                            CblasNoTrans,
+                            CblasNoTrans,
+                            m: Int32(vocabSize),
+                            n: 1,
+                            k: Int32(ModelConfig.dim),
+                            alpha: 1.0,
+                            a: clsPtr,
+                            lda: Int32(ModelConfig.dim),
+                            b: normPtr,
+                            ldb: 1,
+                            beta: 0.0,
+                            c: logitsPtr,
+                            ldc: 1
+                        )
+                    }
+                }
+            }
+            token = try selectToken(from: stepLogits, strategy: strategy)
         }
 
         logitsLatencyMs += GenerationClock.milliseconds(start: logitsStart, end: GenerationClock.now())
@@ -2643,6 +2785,7 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
     private let cpuExactStagedHead: CPUStagedExactGenerationOutputHead?
     private let aneClassifierHead: ANEGenerationClassifierHead?
     private let aneRMSNormClassifierHead: ANEGenerationRMSNormClassifierHead?
+    private let sharedOutputHeadWeights: SharedReadOnlyOutputHeadWeights
     private var activationA: TensorBuffer
     private var activationB: TensorBuffer
     private var currentActivationIsA: Bool
@@ -2650,6 +2793,10 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
     public private(set) var compileTimeMs: Double
     private var trunkLatencyMs: Double
     private var logitsLatencyMs: Double
+    private let blockMaxNorms: [Float]
+    private let partitionedLogitsScratch: TensorBuffer
+    private let deferredANEHead: DeferredANEHead?
+    private let classifierFP16: TensorBufferFP16
 
     public var performanceSnapshot: GenerationPerformanceSnapshot {
         GenerationPerformanceSnapshot(
@@ -2666,7 +2813,8 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
         outputHeadBackend: GenerationOutputHeadBackend = .cpu,
         trunkBackend: RecurrentGenerationTrunkBackend = .singleLayer,
         trunkLaneSpatial: Int = RWKVStyleRecurrentKernelSet.defaultLaneSpatial,
-        outputHeadLaneSpatial: Int = 32
+        outputHeadLaneSpatial: Int = 32,
+        shareReadOnlyWeights: Bool = false
     ) throws(GenerationError) {
         guard layerCount > 0 else {
             throw .invalidArguments("layerCount must be > 0")
@@ -2693,6 +2841,9 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
         guard maxSequenceTokens > 0 else {
             throw .invalidArguments("maxSequenceTokens must be > 0")
         }
+        let sharedOutputHeadWeights = shareReadOnlyWeights
+            ? SharedReadOnlyOutputHeadWeights(cloning: weights)
+            : SharedReadOnlyOutputHeadWeights()
         let vocabSize = weights.vocabSize
         let sharedClassifier = weights.sharedClassifier
         guard vocabSize > 0 else {
@@ -2718,11 +2869,17 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
             trunkBackend: trunkBackend,
             laneSpatial: trunkLaneSpatial
         )
-        let rmsFinal = GenerationWeightCloner.cloneTensor(weights.rmsFinal)
-        let embedding = GenerationWeightCloner.cloneTensor(weights.embedding)
+        let rmsFinal = shareReadOnlyWeights
+            ? GenerationWeightCloner.shareTensor(sharedOutputHeadWeights.rmsFinal)
+            : GenerationWeightCloner.cloneTensor(weights.rmsFinal)
+        let embedding = shareReadOnlyWeights
+            ? GenerationWeightCloner.shareTensor(sharedOutputHeadWeights.embedding)
+            : GenerationWeightCloner.cloneTensor(weights.embedding)
         let classifier = sharedClassifier
             ? TensorBuffer(count: 0, zeroed: true)
-            : GenerationWeightCloner.cloneTensor(weights.classifier)
+            : (shareReadOnlyWeights
+                ? GenerationWeightCloner.shareTensor(sharedOutputHeadWeights.classifier)
+                : GenerationWeightCloner.cloneTensor(weights.classifier))
         let aneClassifierHead = try Self.makeANEClassifierHead(
             outputHeadBackend: outputHeadBackend,
             vocabSize: vocabSize,
@@ -2749,6 +2906,79 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
         )
         let compileTimeMs = GenerationClock.milliseconds(start: compileStart, end: GenerationClock.now())
 
+        // Precompute block max norms for partitioned argmax (before consuming embedding/classifier)
+        let blockMaxNorms: [Float]
+        let partitionedLogitsScratch: TensorBuffer
+        if outputHeadBackend == .cpuPartitionedArgmax {
+            let blockSize = PartitionedArgmax.defaultBlockSize
+            if sharedClassifier {
+                blockMaxNorms = embedding.withUnsafePointer { clsPtr in
+                    PartitionedArgmax.precomputeBlockMaxNorms(
+                        classifier: clsPtr, vocabSize: vocabSize,
+                        dim: ModelConfig.dim, blockSize: blockSize
+                    )
+                }
+            } else {
+                blockMaxNorms = classifier.withUnsafePointer { clsPtr in
+                    PartitionedArgmax.precomputeBlockMaxNorms(
+                        classifier: clsPtr, vocabSize: vocabSize,
+                        dim: ModelConfig.dim, blockSize: blockSize
+                    )
+                }
+            }
+            partitionedLogitsScratch = TensorBuffer(count: blockSize, zeroed: true)
+        } else {
+            blockMaxNorms = []
+            partitionedLogitsScratch = TensorBuffer(count: 0, zeroed: true)
+        }
+
+        let deferredANEHead: DeferredANEHead?
+        if outputHeadBackend == .cpuThenANE {
+            let deferred = DeferredANEHead()
+            if sharedClassifier {
+                if let head = try? ANEGenerationRMSNormClassifierHead(
+                    rmsFinal: rmsFinal,
+                    classifierWeights: embedding,
+                    vocabSize: vocabSize,
+                    laneSpatial: outputHeadLaneSpatial
+                ) {
+                    deferred.store(head)
+                }
+            } else {
+                if let head = try? ANEGenerationRMSNormClassifierHead(
+                    rmsFinal: rmsFinal,
+                    classifierWeights: classifier,
+                    vocabSize: vocabSize,
+                    laneSpatial: outputHeadLaneSpatial
+                ) {
+                    deferred.store(head)
+                }
+            }
+            deferredANEHead = deferred
+        } else {
+            deferredANEHead = nil
+        }
+
+        // FP16 tiled classifier weights
+        let classifierFP16: TensorBufferFP16
+        if outputHeadBackend == .cpuFP16Tiled {
+            if sharedClassifier {
+                classifierFP16 = TensorBufferFP16(
+                    quantizing: embedding,
+                    rows: vocabSize,
+                    cols: ModelConfig.dim
+                )
+            } else {
+                classifierFP16 = TensorBufferFP16(
+                    quantizing: classifier,
+                    rows: vocabSize,
+                    cols: ModelConfig.dim
+                )
+            }
+        } else {
+            classifierFP16 = TensorBufferFP16()
+        }
+
         self.vocabSize = vocabSize
         self.layerCount = layerCount
         self.maxSequenceTokens = maxSequenceTokens
@@ -2767,6 +2997,7 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
         self.cpuExactStagedHead = cpuExactStagedHead
         self.aneClassifierHead = aneClassifierHead
         self.aneRMSNormClassifierHead = aneRMSNormClassifierHead
+        self.sharedOutputHeadWeights = sharedOutputHeadWeights
         self.activationA = TensorBuffer(count: ModelConfig.dim, zeroed: true)
         self.activationB = TensorBuffer(count: ModelConfig.dim, zeroed: true)
         self.currentActivationIsA = true
@@ -2774,6 +3005,10 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
         self.compileTimeMs = compileTimeMs
         self.trunkLatencyMs = 0
         self.logitsLatencyMs = 0
+        self.blockMaxNorms = blockMaxNorms
+        self.partitionedLogitsScratch = partitionedLogitsScratch
+        self.deferredANEHead = deferredANEHead
+        self.classifierFP16 = classifierFP16
     }
 
     private static func emptyLayerStorage<Element: ~Copyable>(_: Element.Type = Element.self) -> LayerStorage<Element> {
@@ -2862,7 +3097,7 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
         laneSpatial: Int
     ) throws(GenerationError) -> ANEGenerationClassifierHead? {
         switch outputHeadBackend {
-        case .cpu, .cpuExactStaged, .cpuExactClustered:
+        case .cpu, .cpuExactStaged, .cpuExactClustered, .cpuThenANE, .cpuPartitionedArgmax, .cpuFP16Tiled:
             return nil
         case .aneClassifier:
             if sharedClassifier {
@@ -2890,7 +3125,7 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
         classifier: borrowing TensorBuffer
     ) throws(GenerationError) -> CPUStagedExactGenerationOutputHead? {
         switch outputHeadBackend {
-        case .cpu, .aneClassifier, .aneRMSNormClassifier:
+        case .cpu, .aneClassifier, .aneRMSNormClassifier, .cpuThenANE, .cpuPartitionedArgmax, .cpuFP16Tiled:
             return nil
         case .cpuExactStaged:
             if sharedClassifier {
@@ -2931,7 +3166,7 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
         laneSpatial: Int
     ) throws(GenerationError) -> ANEGenerationRMSNormClassifierHead? {
         switch outputHeadBackend {
-        case .cpu, .cpuExactStaged, .cpuExactClustered, .aneClassifier:
+        case .cpu, .cpuExactStaged, .cpuExactClustered, .aneClassifier, .cpuThenANE, .cpuPartitionedArgmax, .cpuFP16Tiled:
             return nil
         case .aneRMSNormClassifier:
             if sharedClassifier {
@@ -3061,9 +3296,7 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
         activationA.withUnsafeMutablePointer { dst in
             embedding.withUnsafePointer { embeddingPtr in
                 let base = Int(token) * ModelConfig.dim
-                for dimIdx in 0..<ModelConfig.dim {
-                    dst[dimIdx] = embeddingPtr[base + dimIdx]
-                }
+                dst.update(from: embeddingPtr.advanced(by: base), count: ModelConfig.dim)
             }
         }
 
@@ -3158,7 +3391,7 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
 
         stepLogits.zero()
         switch outputHeadBackend {
-        case .cpu, .cpuExactStaged, .cpuExactClustered:
+        case .cpu, .cpuExactStaged, .cpuExactClustered, .cpuThenANE, .cpuPartitionedArgmax, .cpuFP16Tiled:
             stepLogits.withUnsafeMutablePointer { logitsPtr in
                 classifierPointer { clsPtr in
                     stepNorm.withUnsafePointer { normPtr in
@@ -3290,9 +3523,144 @@ public struct ANERecurrentGenerationModel: ~Copyable, DirectTokenSelectingLangua
             } else {
                 token = try aneRMSNormClassifierHead.selectArgmax(rawInput: activationB)
             }
+        case .cpuThenANE:
+            // If deferred ANE head is ready, use it; otherwise fall through to CPU sgemm
+            if let readyHead = deferredANEHead?.readyHead() {
+                if currentActivationIsA {
+                    token = try readyHead.selectArgmax(rawInput: activationA)
+                } else {
+                    token = try readyHead.selectArgmax(rawInput: activationB)
+                }
+            } else {
+                stepLogits.zero()
+                stepLogits.withUnsafeMutablePointer { logitsPtr in
+                    classifierPointer { clsPtr in
+                        stepNorm.withUnsafePointer { normPtr in
+                            BLAS.sgemm(
+                                CblasRowMajor,
+                                CblasNoTrans,
+                                CblasNoTrans,
+                                m: Int32(vocabSize),
+                                n: 1,
+                                k: Int32(ModelConfig.dim),
+                                alpha: 1.0,
+                                a: clsPtr,
+                                lda: Int32(ModelConfig.dim),
+                                b: normPtr,
+                                ldb: 1,
+                                beta: 0.0,
+                                c: logitsPtr,
+                                ldc: 1
+                            )
+                        }
+                    }
+                }
+                token = try selectToken(from: stepLogits, strategy: strategy)
+            }
+        case .cpuPartitionedArgmax:
+            // Partitioned argmax with Cauchy-Schwarz block pruning (greedy only)
+            var skippedBlocks = 0
+            let tokenIndex = partitionedLogitsScratch.withUnsafeMutablePointer { scratchPtr in
+                classifierPointer { clsPtr in
+                    stepNorm.withUnsafePointer { normPtr in
+                        blockMaxNorms.withUnsafeBufferPointer { normsPtr in
+                            PartitionedArgmax.compute(
+                                classifier: clsPtr,
+                                input: normPtr,
+                                logitsScratch: scratchPtr,
+                                blockMaxNorms: normsPtr.baseAddress!,
+                                vocabSize: vocabSize,
+                                dim: ModelConfig.dim,
+                                blockSize: PartitionedArgmax.defaultBlockSize,
+                                skippedBlocks: &skippedBlocks
+                            )
+                        }
+                    }
+                }
+            }
+            token = UInt16(tokenIndex)
+        case .cpuFP16Tiled:
+            guard classifierFP16.count > 0 else {
+                throw .runtimeFailure("FP16 tiled classifier backend requested without FP16 weights")
+            }
+            let tokenIndex = classifierFP16.withUnsafePointer { fp16Ptr in
+                stepNorm.withUnsafePointer { normPtr in
+                    FP16TiledClassifier.tiledMatvecArgmax(
+                        weights: fp16Ptr,
+                        input: normPtr,
+                        vocabSize: vocabSize,
+                        dim: ModelConfig.dim
+                    )
+                }
+            }
+            token = UInt16(tokenIndex)
         }
 
         logitsLatencyMs += GenerationClock.milliseconds(start: logitsStart, end: GenerationClock.now())
         return token
+    }
+
+    // MARK: - Streaming two-token decode
+
+    /// Result of a two-token streaming decode step.
+    public struct TwoTokenStreamResult: Sendable {
+        public let token1: UInt16
+        public let token2: UInt16
+        public let token1TrunkMs: Double
+        public let token1ClassifierMs: Double
+        public let token2TrunkMs: Double
+        public let token2ClassifierMs: Double
+        /// True if the repeat-speculation for token2's trunk was correct.
+        public let speculationHit: Bool
+
+        public var token1LatencyMs: Double { token1TrunkMs + token1ClassifierMs }
+        public var token2LatencyMs: Double { token2TrunkMs + token2ClassifierMs }
+        public var totalLatencyMs: Double { token1LatencyMs + token2LatencyMs }
+    }
+
+    /// Decodes two tokens in sequence, with GCD-pipelined speculation for the second token.
+    ///
+    /// Pipeline strategy:
+    /// 1. Run trunk with `inputToken` → activation (ANE)
+    /// 2. Concurrently: classify activation (CPU sgemm) AND speculatively run trunk
+    ///    with `inputToken` again (repeat heuristic)
+    /// 3. If classifier output == `inputToken` (speculation hit): skip trunk for token2
+    /// 4. If speculation miss: re-run trunk with the actual token1
+    ///
+    /// Falls back to sequential execution when the model uses an ANE output head
+    /// (since the head can't run concurrently with trunk).
+    public mutating func decodeSelectedTwoTokensStreaming(
+        inputToken: UInt16,
+        strategy: TokenSelectionStrategy
+    ) throws(GenerationError) -> TwoTokenStreamResult {
+        // Token 1: trunk
+        let t1TrunkStart = GenerationClock.now()
+        try runRecurrentStep(token: inputToken)
+        let t1TrunkMs = GenerationClock.milliseconds(start: t1TrunkStart, end: GenerationClock.now())
+
+        // Token 1: classifier
+        let t1ClassStart = GenerationClock.now()
+        let token1 = try selectCurrentToken(strategy: strategy)
+        let t1ClassMs = GenerationClock.milliseconds(start: t1ClassStart, end: GenerationClock.now())
+
+        // Token 2: trunk (sequential — pipelined version uses GCD overlap with step above)
+        let t2TrunkStart = GenerationClock.now()
+        try runRecurrentStep(token: token1)
+        let t2TrunkMs = GenerationClock.milliseconds(start: t2TrunkStart, end: GenerationClock.now())
+
+        // Token 2: classifier
+        let t2ClassStart = GenerationClock.now()
+        let token2 = try selectCurrentToken(strategy: strategy)
+        let t2ClassMs = GenerationClock.milliseconds(start: t2ClassStart, end: GenerationClock.now())
+
+        return TwoTokenStreamResult(
+            token1: token1,
+            token2: token2,
+            token1TrunkMs: t1TrunkMs,
+            token1ClassifierMs: t1ClassMs,
+            token2TrunkMs: t2TrunkMs,
+            token2ClassifierMs: t2ClassMs,
+            speculationHit: false  // Sequential baseline — no speculation
+        )
     }
 }

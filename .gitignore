@@ -44,3 +44,32 @@ artifacts/benchmarks/*
 !artifacts/benchmarks/exact-decode-non-echo/latest.csv
 !artifacts/benchmarks/exact-decode-non-echo/latest.md
 scripts/__pycache__/
+.codex/skills/**/__pycache__/
+
+# Local macOS benchmark app source (kept local for now)
+Sources/EspressoBenchApp/
+Tests/EspressoBenchAppTests/
+scripts/package_espresso_bench_app.sh
+
+# Development / internal documentation
+docs/
+prompts/
+scripts/
+!scripts/
+scripts/*
+!scripts/ensure_coreml_model.sh
+!scripts/generate_coreml_model.py
+!scripts/reproduce_local_real_artifact_claim.sh
+!scripts/run_power_benchmark.sh
+tasks/
+AGENTS.md
+CLAUDE.md
+
+# Internal development directories
+archive/
+autoresearch-master/
+results/
+training/
+
+# Tooling version pins
+.swift-version
