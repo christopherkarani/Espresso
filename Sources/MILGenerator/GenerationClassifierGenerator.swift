@@ -25,22 +25,19 @@ public struct GenerationClassifierGenerator: MILProgramGenerator {
     }
 
     public var milText: String {
-        let dim = ModelConfig.dim
-        let vocab = vocabSize
-        let lane = laneSpatial
-
-        var b = MILBuilder(reserveCapacity: 2_048)
-        b.append(MILText.header)
-        b.appendLine("    func main<ios18>(tensor<fp16, [1, \(dim), 1, \(lane)]> x) {")
-        b.append(MILText.convConst)
-        b.appendLine(
-            "        tensor<fp16, [\(vocab), \(dim), 1, 1]> Wcls = const()[name=string(\"Wcls\"), val=tensor<fp16, [\(vocab), \(dim), 1, 1]>(BLOBFILE(path=string(\"@model_path/weights/classifier.bin\"), offset=uint64(64)))];"
-        )
-        b.appendLine(
-            "        tensor<fp16, [1, \(vocab), 1, \(lane)]> logits = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Wcls,x=x)[name=string(\"cls\")];"
-        )
-        b.appendLine("    } -> (logits);")
-        b.appendLine("}")
-        return b.text
+        LegacyGraphSupport.emitGraph { graph in
+            let x = try LegacyGraphSupport.input(&graph, name: "x", channels: ModelConfig.dim, spatial: laneSpatial)
+            let logits = try LegacyGraphSupport.conv(
+                &graph,
+                name: "logits",
+                input: x,
+                weightName: "Wcls",
+                outChannels: vocabSize,
+                inChannelsPerGroup: ModelConfig.dim,
+                spatial: laneSpatial,
+                weightPath: "@model_path/weights/classifier.bin"
+            )
+            try LegacyGraphSupport.setOutputs(&graph, [("logits", logits)])
+        }
     }
 }

@@ -1,0 +1,58 @@
+program(1.3)
+[buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, {"coremlc-version", "3505.4.1"}, {"coremltools-component-milinternal", ""}, {"coremltools-version", "9.0"}})]
+{
+    func main<ios18>(tensor<fp16, [1, 768, 1, 32]> x, tensor<fp16, [1, 768, 1, 32]> stateIn0, tensor<fp16, [1, 768, 1, 32]> stateIn1) {
+        tensor<int32, [1]> raxCh = const()[name=string("rax_ch"), val=tensor<int32, [1]>([1])];
+        bool kd = const()[name=string("kd"), val=bool(true)];
+        fp16 invd = const()[name=string("invd"), val=fp16(0.001302)];
+        fp16 eps = const()[name=string("eps"), val=fp16(0.00001)];
+        fp16 nhalf = const()[name=string("nhalf"), val=fp16(-0.5)];
+        string pt = const()[name=string("pt"), val=string("valid")];
+        tensor<int32, [2]> st = const()[name=string("st"), val=tensor<int32, [2]>([1,1])];
+        tensor<int32, [4]> pd = const()[name=string("pd"), val=tensor<int32, [4]>([0,0,0,0])];
+        tensor<int32, [2]> dl = const()[name=string("dl"), val=tensor<int32, [2]>([1,1])];
+        int32 gr = const()[name=string("gr"), val=int32(1)];
+        tensor<fp16, [1,768,1,32]> l0_sq = mul(x=x,y=x)[name=string("l0_sq")];
+        tensor<fp16, [1,1,1,32]> l0_ss = reduce_sum(x=l0_sq,axes=raxCh,keep_dims=kd)[name=string("l0_ss")];
+        tensor<fp16, [1,1,1,32]> l0_ss2 = mul(x=l0_ss,y=invd)[name=string("l0_ss2")];
+        tensor<fp16, [1,1,1,32]> l0_ss3 = add(x=l0_ss2,y=eps)[name=string("l0_ss3")];
+        tensor<fp16, [1,1,1,32]> l0_rrms = pow(x=l0_ss3,y=nhalf)[name=string("l0_rrms")];
+        tensor<fp16, [1,768,1,32]> l0_xr = mul(x=x,y=l0_rrms)[name=string("l0_xr")];
+        tensor<fp16, [1,768,1,1]> l0_rw = const()[name=string("l0_rw"), val=tensor<fp16, [1,768,1,1]>(BLOBFILE(path=string("@model_path/weights/rwkv_rms0.bin"), offset=uint64(64)))];
+        tensor<fp16, [1,768,1,32]> l0_xn = mul(x=l0_xr,y=l0_rw)[name=string("l0_xn")];
+        tensor<fp16, [768,768,1,1]> l0_Wx = const()[name=string("l0_Wx"), val=tensor<fp16, [768,768,1,1]>(BLOBFILE(path=string("@model_path/weights/wx0.bin"), offset=uint64(64)))];
+        tensor<fp16, [768,768,1,1]> l0_Ws = const()[name=string("l0_Ws"), val=tensor<fp16, [768,768,1,1]>(BLOBFILE(path=string("@model_path/weights/ws0.bin"), offset=uint64(64)))];
+        tensor<fp16, [768,768,1,1]> l0_Wd = const()[name=string("l0_Wd"), val=tensor<fp16, [768,768,1,1]>(BLOBFILE(path=string("@model_path/weights/wd0.bin"), offset=uint64(64)))];
+        tensor<fp16, [768,768,1,1]> l0_Wo = const()[name=string("l0_Wo"), val=tensor<fp16, [768,768,1,1]>(BLOBFILE(path=string("@model_path/weights/wo0.bin"), offset=uint64(64)))];
+        tensor<fp16, [1,768,1,32]> l0_xMix = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=l0_Wx,x=l0_xn)[name=string("l0_x_mix")];
+        tensor<fp16, [1,768,1,32]> l0_sMix = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=l0_Ws,x=stateIn0)[name=string("l0_s_mix")];
+        tensor<fp16, [1,768,1,32]> l0_carry = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=l0_Wd,x=stateIn0)[name=string("l0_carry")];
+        tensor<fp16, [1,768,1,32]> l0_mixPre = add(x=l0_xMix,y=l0_sMix)[name=string("l0_mix_pre")];
+        tensor<fp16, [1,768,1,32]> l0_gate = sigmoid(x=l0_mixPre)[name=string("l0_gate")];
+        tensor<fp16, [1,768,1,32]> l0_gatedCarry = mul(x=l0_carry,y=l0_gate)[name=string("l0_gated_carry")];
+        tensor<fp16, [1,768,1,32]> stateOut0 = add(x=l0_xMix,y=l0_gatedCarry)[name=string("l0_state_out")];
+        tensor<fp16, [1,768,1,32]> l0_proj = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=l0_Wo,x=stateOut0)[name=string("l0_proj")];
+        tensor<fp16, [1,768,1,32]> l0_xNext = add(x=x,y=l0_proj)[name=string("l0_x_next")];
+        tensor<fp16, [1,768,1,32]> l1_sq = mul(x=l0_xNext,y=l0_xNext)[name=string("l1_sq")];
+        tensor<fp16, [1,1,1,32]> l1_ss = reduce_sum(x=l1_sq,axes=raxCh,keep_dims=kd)[name=string("l1_ss")];
+        tensor<fp16, [1,1,1,32]> l1_ss2 = mul(x=l1_ss,y=invd)[name=string("l1_ss2")];
+        tensor<fp16, [1,1,1,32]> l1_ss3 = add(x=l1_ss2,y=eps)[name=string("l1_ss3")];
+        tensor<fp16, [1,1,1,32]> l1_rrms = pow(x=l1_ss3,y=nhalf)[name=string("l1_rrms")];
+        tensor<fp16, [1,768,1,32]> l1_xr = mul(x=l0_xNext,y=l1_rrms)[name=string("l1_xr")];
+        tensor<fp16, [1,768,1,1]> l1_rw = const()[name=string("l1_rw"), val=tensor<fp16, [1,768,1,1]>(BLOBFILE(path=string("@model_path/weights/rwkv_rms1.bin"), offset=uint64(64)))];
+        tensor<fp16, [1,768,1,32]> l1_xn = mul(x=l1_xr,y=l1_rw)[name=string("l1_xn")];
+        tensor<fp16, [768,768,1,1]> l1_Wx = const()[name=string("l1_Wx"), val=tensor<fp16, [768,768,1,1]>(BLOBFILE(path=string("@model_path/weights/wx1.bin"), offset=uint64(64)))];
+        tensor<fp16, [768,768,1,1]> l1_Ws = const()[name=string("l1_Ws"), val=tensor<fp16, [768,768,1,1]>(BLOBFILE(path=string("@model_path/weights/ws1.bin"), offset=uint64(64)))];
+        tensor<fp16, [768,768,1,1]> l1_Wd = const()[name=string("l1_Wd"), val=tensor<fp16, [768,768,1,1]>(BLOBFILE(path=string("@model_path/weights/wd1.bin"), offset=uint64(64)))];
+        tensor<fp16, [768,768,1,1]> l1_Wo = const()[name=string("l1_Wo"), val=tensor<fp16, [768,768,1,1]>(BLOBFILE(path=string("@model_path/weights/wo1.bin"), offset=uint64(64)))];
+        tensor<fp16, [1,768,1,32]> l1_xMix = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=l1_Wx,x=l1_xn)[name=string("l1_x_mix")];
+        tensor<fp16, [1,768,1,32]> l1_sMix = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=l1_Ws,x=stateIn1)[name=string("l1_s_mix")];
+        tensor<fp16, [1,768,1,32]> l1_carry = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=l1_Wd,x=stateIn1)[name=string("l1_carry")];
+        tensor<fp16, [1,768,1,32]> l1_mixPre = add(x=l1_xMix,y=l1_sMix)[name=string("l1_mix_pre")];
+        tensor<fp16, [1,768,1,32]> l1_gate = sigmoid(x=l1_mixPre)[name=string("l1_gate")];
+        tensor<fp16, [1,768,1,32]> l1_gatedCarry = mul(x=l1_carry,y=l1_gate)[name=string("l1_gated_carry")];
+        tensor<fp16, [1,768,1,32]> stateOut1 = add(x=l1_xMix,y=l1_gatedCarry)[name=string("l1_state_out")];
+        tensor<fp16, [1,768,1,32]> l1_proj = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=l1_Wo,x=stateOut1)[name=string("l1_proj")];
+        tensor<fp16, [1,768,1,32]> xNext = add(x=l0_xNext,y=l1_proj)[name=string("l1_x_next")];
+    } -> (xNext,stateOut0,stateOut1);
+}

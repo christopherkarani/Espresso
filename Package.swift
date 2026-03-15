@@ -35,7 +35,7 @@ let package = Package(
         ),
         .target(
             name: "MILGenerator",
-            dependencies: ["ANETypes"],
+            dependencies: ["ANETypes", "ANEGraphIR", "ANEBuilder", "ANECodegen", "ANEPasses"],
             path: "Sources/MILGenerator",
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
@@ -129,6 +129,49 @@ let package = Package(
             name: "ANEGraphIRTests",
             dependencies: ["ANEGraphIR"],
             path: "Tests/ANEGraphIRTests",
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .target(
+            name: "ANECodegen",
+            dependencies: ["ANEGraphIR"],
+            path: "Sources/ANECodegen",
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
+            name: "ANECodegenTests",
+            dependencies: ["ANECodegen", "ANEGraphIR"],
+            path: "Tests/ANECodegenTests",
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .target(
+            name: "ANEPasses",
+            dependencies: ["ANEGraphIR"],
+            path: "Sources/ANEPasses",
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
+            name: "ANEPassesTests",
+            dependencies: ["ANEPasses", "ANEGraphIR"],
+            path: "Tests/ANEPassesTests",
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .target(
+            name: "ANEBuilder",
+            dependencies: ["ANEGraphIR"],
+            path: "Sources/ANEBuilder",
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
+            name: "ANEBuilderTests",
+            dependencies: ["ANEBuilder", "ANEGraphIR"],
+            path: "Tests/ANEBuilderTests",
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
+            name: "MigrationParityTests",
+            dependencies: ["MILGenerator", "ANETypes", "ANEGraphIR", "ANEBuilder", "ANECodegen", "ANEPasses"],
+            path: "Tests/MigrationParityTests",
+            resources: [.process("Fixtures")],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
     ]

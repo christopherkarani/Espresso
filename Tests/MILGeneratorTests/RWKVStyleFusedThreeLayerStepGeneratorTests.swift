@@ -28,15 +28,10 @@ final class RWKVStyleFusedThreeLayerStepGeneratorTests: XCTestCase {
     }
 
     func test_rwkv_style_fused_three_layer_generator_has_four_inputs_and_four_outputs() {
-        let dim = ModelConfig.dim
         let mil = RWKVStyleFusedThreeLayerStepGenerator(laneSpatial: 32).milText
 
-        XCTAssertTrue(
-            mil.contains(
-                "func main<ios18>(tensor<fp16, [1, \(dim), 1, 32]> x, tensor<fp16, [1, \(dim), 1, 32]> stateIn0, tensor<fp16, [1, \(dim), 1, 32]> stateIn1, tensor<fp16, [1, \(dim), 1, 32]> stateIn2)"
-            )
-        )
-        XCTAssertTrue(mil.contains("-> (xNext,stateOut0,stateOut1,stateOut2);"))
+        XCTAssertEqual(extractMILInputNames(mil), ["x", "stateIn0", "stateIn1", "stateIn2"])
+        XCTAssertEqual(extractMILReturnTuple(mil), ["xNext", "stateOut0", "stateOut1", "stateOut2"])
     }
 
     func test_rwkv_style_fused_three_layer_generator_stays_inside_proven_op_subset() {

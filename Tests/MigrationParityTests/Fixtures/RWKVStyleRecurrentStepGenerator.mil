@@ -1,0 +1,37 @@
+program(1.3)
+[buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, {"coremlc-version", "3505.4.1"}, {"coremltools-component-milinternal", ""}, {"coremltools-version", "9.0"}})]
+{
+    func main<ios18>(tensor<fp16, [1, 768, 1, 32]> x, tensor<fp16, [1, 768, 1, 32]> stateIn) {
+        tensor<fp16, [1,768,1,32]> sq = mul(x=x,y=x)[name=string("sq")];
+        tensor<int32, [1]> raxCh = const()[name=string("rax_ch"), val=tensor<int32, [1]>([1])];
+        bool kd = const()[name=string("kd"), val=bool(true)];
+        tensor<fp16, [1,1,1,32]> ss = reduce_sum(x=sq,axes=raxCh,keep_dims=kd)[name=string("ss")];
+        fp16 invd = const()[name=string("invd"), val=fp16(0.001302)];
+        tensor<fp16, [1,1,1,32]> ss2 = mul(x=ss,y=invd)[name=string("ss2")];
+        fp16 eps = const()[name=string("eps"), val=fp16(0.00001)];
+        tensor<fp16, [1,1,1,32]> ss3 = add(x=ss2,y=eps)[name=string("ss3")];
+        fp16 nhalf = const()[name=string("nhalf"), val=fp16(-0.5)];
+        tensor<fp16, [1,1,1,32]> rrms = pow(x=ss3,y=nhalf)[name=string("rrms")];
+        tensor<fp16, [1,768,1,32]> xr = mul(x=x,y=rrms)[name=string("xr")];
+        tensor<fp16, [1,768,1,1]> rw = const()[name=string("rw"), val=tensor<fp16, [1,768,1,1]>(BLOBFILE(path=string("@model_path/weights/rwkv_rms.bin"), offset=uint64(64)))];
+        tensor<fp16, [1,768,1,32]> xn = mul(x=xr,y=rw)[name=string("xn")];
+        string pt = const()[name=string("pt"), val=string("valid")];
+        tensor<int32, [2]> st = const()[name=string("st"), val=tensor<int32, [2]>([1,1])];
+        tensor<int32, [4]> pd = const()[name=string("pd"), val=tensor<int32, [4]>([0,0,0,0])];
+        tensor<int32, [2]> dl = const()[name=string("dl"), val=tensor<int32, [2]>([1,1])];
+        int32 gr = const()[name=string("gr"), val=int32(1)];
+        tensor<fp16, [768,768,1,1]> Wx = const()[name=string("Wx"), val=tensor<fp16, [768,768,1,1]>(BLOBFILE(path=string("@model_path/weights/wx.bin"), offset=uint64(64)))];
+        tensor<fp16, [768,768,1,1]> Ws = const()[name=string("Ws"), val=tensor<fp16, [768,768,1,1]>(BLOBFILE(path=string("@model_path/weights/ws.bin"), offset=uint64(64)))];
+        tensor<fp16, [768,768,1,1]> Wd = const()[name=string("Wd"), val=tensor<fp16, [768,768,1,1]>(BLOBFILE(path=string("@model_path/weights/wd.bin"), offset=uint64(64)))];
+        tensor<fp16, [768,768,1,1]> Wo = const()[name=string("Wo"), val=tensor<fp16, [768,768,1,1]>(BLOBFILE(path=string("@model_path/weights/wo.bin"), offset=uint64(64)))];
+        tensor<fp16, [1,768,1,32]> xMix = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Wx,x=xn)[name=string("x_mix")];
+        tensor<fp16, [1,768,1,32]> sMix = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Ws,x=stateIn)[name=string("s_mix")];
+        tensor<fp16, [1,768,1,32]> carry = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Wd,x=stateIn)[name=string("carry")];
+        tensor<fp16, [1,768,1,32]> mixPre = add(x=xMix,y=sMix)[name=string("mix_pre")];
+        tensor<fp16, [1,768,1,32]> gate = sigmoid(x=mixPre)[name=string("gate")];
+        tensor<fp16, [1,768,1,32]> gatedCarry = mul(x=carry,y=gate)[name=string("gated_carry")];
+        tensor<fp16, [1,768,1,32]> stateOut = add(x=xMix,y=gatedCarry)[name=string("state_out")];
+        tensor<fp16, [1,768,1,32]> proj = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Wo,x=stateOut)[name=string("proj")];
+        tensor<fp16, [1,768,1,32]> xNext = add(x=x,y=proj)[name=string("x_next")];
+    } -> (xNext,stateOut);
+}

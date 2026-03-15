@@ -22,16 +22,14 @@ final class GenerationRMSNormClassifierGeneratorTests: XCTestCase {
             laneSpatial: laneSpatial
         ).milText
 
-        XCTAssertTrue(
-            mil.contains("func main<ios18>(tensor<fp16, [1, \(ModelConfig.dim), 1, \(laneSpatial)]> x)")
-        )
+        XCTAssertEqual(extractMILInputNames(mil), ["x"])
+        XCTAssertEqual(extractMILReturnTuple(mil), ["logits", "maxVal"])
         XCTAssertTrue(mil.contains("@model_path/weights/rms_final.bin"))
         XCTAssertTrue(mil.contains("@model_path/weights/classifier.bin"))
         XCTAssertTrue(mil.contains("reduce_sum"))
-        XCTAssertTrue(mil.contains("pow(x="))
-        XCTAssertTrue(mil.contains("tensor<fp16, [1,\(ModelConfig.dim),1,\(laneSpatial)]> xn = mul("))
-        XCTAssertTrue(mil.contains("tensor<fp16, [1, \(ModelConfig.vocab), 1, \(laneSpatial)]> logits = conv("))
-        XCTAssertTrue(mil.contains("-> (logits,maxVal);"))
+        XCTAssertTrue(mil.contains("pow("))
+        XCTAssertTrue(mil.contains("mul("))
+        XCTAssertTrue(mil.contains("conv("))
     }
 
     func test_generation_rmsnorm_classifier_generator_stays_inside_proven_op_subset() {

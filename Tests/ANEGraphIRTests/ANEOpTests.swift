@@ -2,7 +2,7 @@ import Testing
 @testable import ANEGraphIR
 
 @Test func allOpsPresent() {
-    #expect(ANEOp.allCases.count == 25)
+    #expect(ANEOp.allCases.count == 27)
 }
 
 @Test func isComputeForIONodes() {
@@ -16,7 +16,7 @@ import Testing
         .relu, .tanh, .sigmoid, .softmax, .exp,
         .pow, .sqrt, .rsqrt,
         .reduceMean, .reduceSum, .reduceMax,
-        .reshape, .transpose, .cast, .slice, .identity,
+        .reshape, .transpose, .cast, .slice, .sliceBySize, .concat, .identity,
         .concatBanned,
     ]
     for op in computeOps {
