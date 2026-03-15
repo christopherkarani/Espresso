@@ -472,6 +472,41 @@ void ane_interop_probe_realtime_eval(ANEHandle *handle,
 /// Check if the _ANEClient on a compiled handle supports the real-time eval selectors.
 bool ane_interop_runtime_has_realtime_eval(ANEHandle *handle);
 
+/// Compile and return handle + hex identifier for delta reuse.
+/// The hex string identifies the compiled artifact directory.
+ANEHandle *ane_interop_compile_with_id(const uint8_t *milText, size_t milLen,
+                                       const char **weightPaths,
+                                       const uint8_t **weightDatas,
+                                       const size_t *weightLens,
+                                       int weightCount,
+                                       int nInputs, const size_t *inputSizes,
+                                       int nOutputs, const size_t *outputSizes,
+                                       char *outHexId, size_t hexIdBufLen);
+
+/// Delta reload: load using an existing compiled net.plist from donorHexId.
+/// Creates a new model with the same MIL but new weights, copies the donor's
+/// compiled artifact, then calls loadWithQoS (skipping compileWithQoS).
+/// Does NOT increment the compile counter.
+ANEHandle *ane_interop_delta_reload(const uint8_t *milText, size_t milLen,
+                                    const char **weightPaths,
+                                    const uint8_t **weightDatas,
+                                    const size_t *weightLens,
+                                    int weightCount,
+                                    int nInputs, const size_t *inputSizes,
+                                    int nOutputs, const size_t *outputSizes,
+                                    const char *donorHexId);
+
+/// Fast reload: unload, replace weight files on disk, reload in-place.
+/// Does NOT increment the compile counter.
+bool ane_interop_fast_reload(ANEHandle *handle,
+                             const char **weightPaths,
+                             const uint8_t **weightDatas,
+                             const size_t *weightLens,
+                             int weightCount);
+
+/// Get the hex string identifier from an existing handle.
+bool ane_interop_get_hex_id(ANEHandle *handle, char *outHexId, size_t bufLen);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif
