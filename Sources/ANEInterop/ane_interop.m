@@ -56,6 +56,13 @@ static long ane_interop_env_long(const char *key, long defaultValue);
 static ANEEvalPath ane_interop_eval_path(void);
 static bool ane_interop_size_mul_overflow(size_t a, size_t b, size_t *out);
 static void ane_interop_remove_tmpdir(NSString *td);
+static bool ane_interop_write_weight_files(NSString *tmpDir,
+                                           const char **weightPaths,
+                                           const uint8_t **weightDatas,
+                                           const size_t *weightLens,
+                                           int weightCount,
+                                           BOOL atomically);
+static bool ane_interop_load_realtime_handle(ANEHandle *handle);
 
 static void ane_interop_trace_methods(Class cls, const char *label) {
     if (!ane_interop_trace_enabled() || !cls) return;
@@ -181,6 +188,70 @@ static bool ane_interop_write_model_tree(NSString *td,
     }
 
     return true;
+}
+
+static NSString *ane_interop_unique_reload_directory(NSString *prefix) {
+    return [NSTemporaryDirectory() stringByAppendingPathComponent:
+        [NSString stringWithFormat:@"%@-%@", prefix, [NSUUID UUID].UUIDString]];
+}
+
+static bool ane_interop_move_directory_entries(NSString *sourceDir,
+                                               NSString *destinationDir,
+                                               NSSet<NSString *> *excludedRootNames) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSError *error = nil;
+    NSArray<NSString *> *entries = [fm contentsOfDirectoryAtPath:sourceDir error:&error];
+    if (!entries) {
+        ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE);
+        return false;
+    }
+    if (![fm createDirectoryAtPath:destinationDir withIntermediateDirectories:YES attributes:nil error:&error]) {
+        ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE);
+        return false;
+    }
+
+    for (NSString *entry in entries) {
+        if ([excludedRootNames containsObject:entry]) {
+            continue;
+        }
+
+        NSString *sourcePath = [sourceDir stringByAppendingPathComponent:entry];
+        NSString *destinationPath = [destinationDir stringByAppendingPathComponent:entry];
+        if ([fm fileExistsAtPath:destinationPath]) {
+            [fm removeItemAtPath:destinationPath error:nil];
+        }
+        if (![fm moveItemAtPath:sourcePath toPath:destinationPath error:&error]) {
+            ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE);
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static NSDictionary *ane_interop_reload_with_fallback_options(id mdl,
+                                                              NSDictionary *preferredOptions,
+                                                              bool strictOptions,
+                                                              NSError **outError) {
+    NSError *loadError = nil;
+    NSDictionary *loadOptions = preferredOptions ?: @{};
+    if (((BOOL(*)(id,SEL,unsigned int,id,NSError**))objc_msgSend)(
+            mdl, @selector(loadWithQoS:options:error:), 21, loadOptions, &loadError)) {
+        if (outError) *outError = nil;
+        return loadOptions;
+    }
+
+    if ([loadOptions count] > 0 && !strictOptions) {
+        loadError = nil;
+        if (((BOOL(*)(id,SEL,unsigned int,id,NSError**))objc_msgSend)(
+                mdl, @selector(loadWithQoS:options:error:), 21, @{}, &loadError)) {
+            if (outError) *outError = nil;
+            return @{};
+        }
+    }
+
+    if (outError) *outError = loadError;
+    return nil;
 }
 
 static NSString *ane_interop_user_caches_directory(void) {
@@ -690,6 +761,33 @@ bool ane_interop_fast_reload(ANEHandle *handle,
         id mdl = (__bridge id)handle->model;
         NSDictionary *options = handle->evalOptions ? (__bridge NSDictionary *)handle->evalOptions : @{};
         NSString *td = (__bridge NSString *)handle->tmpDir;
+        const bool strictOptions = ane_interop_strict_options_enabled();
+        NSSet<NSString *> *preservedRootFiles = [NSSet setWithObjects:@"model.mil", @"net.plist", nil];
+        NSString *stageDir = ane_interop_unique_reload_directory(@"ane-fast-reload-stage");
+        NSString *backupDir = ane_interop_unique_reload_directory(@"ane-fast-reload-backup");
+        NSFileManager *fm = [NSFileManager defaultManager];
+        BOOL hadRealtimeLoaded = handle->realtimeLoaded;
+
+        if (![fm createDirectoryAtPath:stageDir withIntermediateDirectories:YES attributes:nil error:nil]) {
+            ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE);
+            return false;
+        }
+        if (![fm createDirectoryAtPath:backupDir withIntermediateDirectories:YES attributes:nil error:nil]) {
+            ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE);
+            ane_interop_remove_tmpdir(stageDir);
+            return false;
+        }
+        if (!ane_interop_write_weight_files(stageDir, weightPaths, weightDatas, weightLens, weightCount, NO)) {
+            ane_interop_remove_tmpdir(stageDir);
+            ane_interop_remove_tmpdir(backupDir);
+            return false;
+        }
+        if (!ane_interop_move_directory_entries(td, backupDir, preservedRootFiles)) {
+            ane_interop_move_directory_entries(backupDir, td, nil);
+            ane_interop_remove_tmpdir(stageDir);
+            ane_interop_remove_tmpdir(backupDir);
+            return false;
+        }
 
         if (handle->realtimeLoaded && handle->client && handle->clientModel) {
             id client = (__bridge id)handle->client;
@@ -708,68 +806,57 @@ bool ane_interop_fast_reload(ANEHandle *handle,
         NSError *e = nil;
         if (!((BOOL(*)(id,SEL,unsigned int,NSError**))objc_msgSend)(
                 mdl, @selector(unloadWithQoS:error:), 21, &e)) {
+            ane_interop_move_directory_entries(backupDir, td, nil);
+            ane_interop_remove_tmpdir(stageDir);
+            ane_interop_remove_tmpdir(backupDir);
+            if (hadRealtimeLoaded) {
+                ane_interop_load_realtime_handle(handle);
+            }
             ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE);
             return false;
         }
-
-        NSString *tdStd = [td stringByStandardizingPath];
-        NSString *tdPrefix = [tdStd hasSuffix:@"/"] ? tdStd : [tdStd stringByAppendingString:@"/"];
-        NSFileManager *fm = [NSFileManager defaultManager];
-        for (int i = 0; i < weightCount; i++) {
-            if (!weightPaths[i]) {
-                ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_INVALID_ARGUMENTS);
-                return false;
+        if (!ane_interop_move_directory_entries(stageDir, td, nil)) {
+            ane_interop_move_directory_entries(backupDir, td, nil);
+            NSError *restoreError = nil;
+            NSDictionary *restoredOptions = ane_interop_reload_with_fallback_options(
+                mdl, options, strictOptions, &restoreError
+            );
+            if (restoredOptions && restoredOptions != options) {
+                if (handle->evalOptions) {
+                    CFRelease(handle->evalOptions);
+                }
+                handle->evalOptions = (void *)CFBridgingRetain(restoredOptions);
             }
-            if (weightLens[i] > 0 && !weightDatas[i]) {
-                ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_INVALID_ARGUMENTS);
-                return false;
+            if (hadRealtimeLoaded) {
+                ane_interop_load_realtime_handle(handle);
             }
-
-            NSString *path = [NSString stringWithUTF8String:weightPaths[i]];
-            NSString *rel = path ? ane_interop_sanitized_relative_weight_path(path) : nil;
-            if (!rel) {
-                ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_INVALID_ARGUMENTS);
-                return false;
-            }
-
-            NSString *full = [[td stringByAppendingPathComponent:rel] stringByStandardizingPath];
-            if (![full hasPrefix:tdPrefix]) {
-                ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_INVALID_ARGUMENTS);
-                return false;
-            }
-            if (![fm createDirectoryAtPath:[full stringByDeletingLastPathComponent]
-               withIntermediateDirectories:YES attributes:nil error:nil]) {
-                ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE);
-                return false;
-            }
-
-            NSData *wd = [NSData dataWithBytesNoCopy:(void *)weightDatas[i]
-                                              length:weightLens[i]
-                                        freeWhenDone:NO];
-            if (!wd || ![wd writeToFile:full atomically:NO]) {
-                ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE);
-                return false;
-            }
+            ane_interop_remove_tmpdir(stageDir);
+            ane_interop_remove_tmpdir(backupDir);
+            return false;
         }
 
-        NSDictionary *loadOptions = options;
-        const bool strictOptions = ane_interop_strict_options_enabled();
-        e = nil;
-        if (!((BOOL(*)(id,SEL,unsigned int,id,NSError**))objc_msgSend)(
-                mdl, @selector(loadWithQoS:options:error:), 21, loadOptions, &e)) {
-            if ([loadOptions count] > 0 && !strictOptions) {
-                e = nil;
-                if (((BOOL(*)(id,SEL,unsigned int,id,NSError**))objc_msgSend)(
-                        mdl, @selector(loadWithQoS:options:error:), 21, @{}, &e)) {
-                    loadOptions = @{};
-                } else {
-                    ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE);
-                    return false;
+        NSDictionary *loadOptions = ane_interop_reload_with_fallback_options(
+            mdl, options, strictOptions, &e
+        );
+        if (!loadOptions) {
+            ane_interop_move_directory_entries(td, stageDir, preservedRootFiles);
+            ane_interop_move_directory_entries(backupDir, td, nil);
+            NSDictionary *restoredOptions = ane_interop_reload_with_fallback_options(
+                mdl, options, strictOptions, &e
+            );
+            if (restoredOptions && restoredOptions != options) {
+                if (handle->evalOptions) {
+                    CFRelease(handle->evalOptions);
                 }
-            } else {
-                ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE);
-                return false;
+                handle->evalOptions = (void *)CFBridgingRetain(restoredOptions);
             }
+            if (hadRealtimeLoaded) {
+                ane_interop_load_realtime_handle(handle);
+            }
+            ane_interop_remove_tmpdir(stageDir);
+            ane_interop_remove_tmpdir(backupDir);
+            ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE);
+            return false;
         }
 
         if (loadOptions != options) {
@@ -779,7 +866,12 @@ bool ane_interop_fast_reload(ANEHandle *handle,
             handle->evalOptions = (void *)CFBridgingRetain(loadOptions);
         }
 
+        if (hadRealtimeLoaded) {
+            ane_interop_load_realtime_handle(handle);
+        }
         handle->lastHwExecutionTimeNS = 0;
+        ane_interop_remove_tmpdir(stageDir);
+        ane_interop_remove_tmpdir(backupDir);
         return true;
     }
 }

@@ -297,9 +297,12 @@ public enum DeltaCompilation {
         let checkedWeights = try checkedWeightTuples(weights)
         let checkedInputs = try checkedByteSizes(inputSizes, label: "Input")
         let checkedOutputs = try checkedByteSizes(outputSizes, label: "Output")
-        let startCount = CompileBudget.currentCount
 
         ane_interop_init()
+        CompileGate.lock.lock()
+        defer { CompileGate.lock.unlock() }
+
+        let startCount = CompileBudget.currentCount
 
         let rawHandle = withPreparedBuffers(
             milData: milData,
@@ -340,6 +343,9 @@ public enum DeltaCompilation {
         weights: [(path: String, data: Data)]
     ) throws(ANEError) {
         let checkedWeights = try checkedWeightTuples(weights)
+        CompileGate.lock.lock()
+        defer { CompileGate.lock.unlock() }
+
         let startCount = CompileBudget.currentCount
 
         let ok = checkedWeights.isEmpty
