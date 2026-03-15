@@ -33,6 +33,12 @@ public enum ANEAttrs: Sendable, Equatable {
     /// Slice with begin/end indices per dimension.
     case slice(begin: [Int], end: [Int])
 
+    /// Slice with begin/size semantics, matching legacy MIL `slice_by_size`.
+    case sliceBySize(begin: [Int], size: [Int])
+
+    /// Concatenate tensors along an axis.
+    case concat(axis: Int, interleave: Bool)
+
     /// Scalar floating-point constant (for eps, scale factors, etc.)
     case scalar(Float)
 

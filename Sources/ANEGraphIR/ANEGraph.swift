@@ -77,9 +77,6 @@ public struct ANEGraph: Sendable {
 
     /// Replace the named graph outputs after validating ordering and references.
     public mutating func setGraphOutputs(_ ports: [GraphPort]) throws {
-        guard ports.map(\.name) == ports.map(\.name).sorted() else {
-            throw ANEGraphValidationError.unsortedGraphOutputs
-        }
         for port in ports {
             guard nodes.indices.contains(port.nodeIndex) else {
                 throw ANEGraphValidationError.invalidGraphOutputPort(
@@ -190,10 +187,6 @@ public struct ANEGraph: Sendable {
             guard nodes.indices.contains(port.nodeIndex) else {
                 return .invalidGraphInputPort(name: port.name, nodeIndex: port.nodeIndex)
             }
-        }
-
-        guard graphOutputs.map(\.name) == graphOutputs.map(\.name).sorted() else {
-            return .unsortedGraphOutputs
         }
 
         for port in graphOutputs {

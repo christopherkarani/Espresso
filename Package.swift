@@ -36,7 +36,7 @@ let package = Package(
         ),
         .target(
             name: "MILGenerator",
-            dependencies: ["ANETypes"],
+            dependencies: ["ANETypes", "ANEGraphIR", "ANEBuilder", "ANECodegen", "ANEPasses"],
             path: "Sources/MILGenerator",
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
@@ -178,6 +178,13 @@ let package = Package(
             name: "ModelSupportTests",
             dependencies: ["ModelSupport", "ANEGraphIR", "ANETypes", "ANEPasses"],
             path: "Tests/ModelSupportTests",
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
+            name: "MigrationParityTests",
+            dependencies: ["MILGenerator", "ANETypes", "ANEGraphIR", "ANEBuilder", "ANECodegen", "ANEPasses"],
+            path: "Tests/MigrationParityTests",
+            resources: [.process("Fixtures")],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
     ]

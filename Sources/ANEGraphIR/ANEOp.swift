@@ -22,7 +22,7 @@ public enum ANEOp: Sendable, Equatable, CaseIterable {
     case reduceMean, reduceSum, reduceMax
 
     // Shape manipulation
-    case reshape, transpose, cast, slice, identity
+    case reshape, transpose, cast, slice, sliceBySize, concat, identity
 
     // Exists solely for the validation pass to detect and reject
     case concatBanned
