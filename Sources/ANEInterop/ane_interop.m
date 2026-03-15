@@ -38,7 +38,31 @@ static int g_last_compile_error = ANE_INTEROP_COMPILE_ERROR_NONE;
 static int g_force_eval_failure = 0;
 static int g_live_handle_count = 0;
 
+typedef enum : int {
+    ANE_EVAL_INMEM = 0,
+    ANE_EVAL_CLIENT = 1,
+    ANE_EVAL_CLIENT_DIRECT = 2,
+    ANE_EVAL_REALTIME = 3,
+} ANEEvalPath;
+
 static bool ane_interop_trace_enabled(void);
+static void ane_interop_set_compile_error(int value);
+static NSString *ane_interop_sanitized_relative_weight_path(NSString *path);
+static bool ane_interop_perf_stats_enabled(void);
+static unsigned int ane_interop_perf_stats_anef_mask(void);
+static bool ane_interop_env_flag(const char *key);
+static bool ane_interop_strict_options_enabled(void);
+static long ane_interop_env_long(const char *key, long defaultValue);
+static ANEEvalPath ane_interop_eval_path(void);
+static bool ane_interop_size_mul_overflow(size_t a, size_t b, size_t *out);
+static void ane_interop_remove_tmpdir(NSString *td);
+static bool ane_interop_write_weight_files(NSString *tmpDir,
+                                           const char **weightPaths,
+                                           const uint8_t **weightDatas,
+                                           const size_t *weightLens,
+                                           int weightCount,
+                                           BOOL atomically);
+static bool ane_interop_load_realtime_handle(ANEHandle *handle);
 
 static void ane_interop_trace_methods(Class cls, const char *label) {
     if (!ane_interop_trace_enabled() || !cls) return;
@@ -60,6 +84,796 @@ static void ane_interop_trace_methods(Class cls, const char *label) {
         fprintf(stderr, "  - %s\n", sel_getName(sel));
     }
     free(instanceMethods);
+}
+
+static bool ane_interop_copy_hex_identifier_bytes(id mdl, char *outHexId, size_t bufLen) {
+    if (!mdl || !outHexId || bufLen == 0) return false;
+
+    id hx = ((id(*)(id,SEL))objc_msgSend)(mdl, @selector(hexStringIdentifier));
+    if (![hx isKindOfClass:[NSString class]]) return false;
+
+    const char *hexCString = [((NSString *)hx) UTF8String];
+    if (!hexCString) return false;
+
+    size_t needed = strlen(hexCString) + 1;
+    if (needed > bufLen) return false;
+
+    memcpy(outHexId, hexCString, needed);
+    return true;
+}
+
+static bool ane_interop_build_weight_dictionary(const char **weightPaths,
+                                                const uint8_t **weightDatas,
+                                                const size_t *weightLens,
+                                                int weightCount,
+                                                NSMutableDictionary **outWeights) {
+    NSMutableDictionary *weights = [NSMutableDictionary dictionaryWithCapacity:(NSUInteger)weightCount];
+    for (int i = 0; i < weightCount; i++) {
+        if (!weightPaths[i]) {
+            ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_INVALID_ARGUMENTS);
+            return false;
+        }
+        if (weightLens[i] > 0 && !weightDatas[i]) {
+            ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_INVALID_ARGUMENTS);
+            return false;
+        }
+
+        NSString *path = [NSString stringWithUTF8String:weightPaths[i]];
+        if (!path) {
+            ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_INVALID_ARGUMENTS);
+            return false;
+        }
+        if (weights[path] != nil) {
+            ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_DUPLICATE_WEIGHT_PATH);
+            return false;
+        }
+
+        NSData *wd = [NSData dataWithBytesNoCopy:(void *)weightDatas[i]
+                                          length:weightLens[i]
+                                    freeWhenDone:NO];
+        if (!wd) {
+            ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_INVALID_ARGUMENTS);
+            return false;
+        }
+
+        weights[path] = @{@"offset": @0, @"data": wd};
+    }
+
+    if (outWeights) {
+        *outWeights = weights;
+    }
+    return true;
+}
+
+static bool ane_interop_write_model_tree(NSString *td,
+                                         NSData *milData,
+                                         NSDictionary *weights,
+                                         BOOL atomically) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (![fm createDirectoryAtPath:[td stringByAppendingPathComponent:@"weights"]
+       withIntermediateDirectories:YES attributes:nil error:nil]) {
+        ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE);
+        return false;
+    }
+    if (![milData writeToFile:[td stringByAppendingPathComponent:@"model.mil"] atomically:YES]) {
+        ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE);
+        return false;
+    }
+
+    NSString *tdStd = [td stringByStandardizingPath];
+    NSString *tdPrefix = [tdStd hasSuffix:@"/"] ? tdStd : [tdStd stringByAppendingString:@"/"];
+    for (NSString *path in weights) {
+        NSString *rel = ane_interop_sanitized_relative_weight_path(path);
+        if (!rel) {
+            ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_INVALID_ARGUMENTS);
+            return false;
+        }
+
+        NSString *full = [[td stringByAppendingPathComponent:rel] stringByStandardizingPath];
+        if (![full hasPrefix:tdPrefix]) {
+            ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_INVALID_ARGUMENTS);
+            return false;
+        }
+        if (![fm createDirectoryAtPath:[full stringByDeletingLastPathComponent]
+           withIntermediateDirectories:YES attributes:nil error:nil]) {
+            ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE);
+            return false;
+        }
+
+        NSData *wd = weights[path][@"data"];
+        if (![wd writeToFile:full atomically:atomically]) {
+            ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE);
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static NSString *ane_interop_unique_reload_directory(NSString *prefix) {
+    return [NSTemporaryDirectory() stringByAppendingPathComponent:
+        [NSString stringWithFormat:@"%@-%@", prefix, [NSUUID UUID].UUIDString]];
+}
+
+static bool ane_interop_move_directory_entries(NSString *sourceDir,
+                                               NSString *destinationDir,
+                                               NSSet<NSString *> *excludedRootNames) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSError *error = nil;
+    NSArray<NSString *> *entries = [fm contentsOfDirectoryAtPath:sourceDir error:&error];
+    if (!entries) {
+        ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE);
+        return false;
+    }
+    if (![fm createDirectoryAtPath:destinationDir withIntermediateDirectories:YES attributes:nil error:&error]) {
+        ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE);
+        return false;
+    }
+
+    for (NSString *entry in entries) {
+        if ([excludedRootNames containsObject:entry]) {
+            continue;
+        }
+
+        NSString *sourcePath = [sourceDir stringByAppendingPathComponent:entry];
+        NSString *destinationPath = [destinationDir stringByAppendingPathComponent:entry];
+        if ([fm fileExistsAtPath:destinationPath]) {
+            [fm removeItemAtPath:destinationPath error:nil];
+        }
+        if (![fm moveItemAtPath:sourcePath toPath:destinationPath error:&error]) {
+            ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE);
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static NSDictionary *ane_interop_reload_with_fallback_options(id mdl,
+                                                              NSDictionary *preferredOptions,
+                                                              bool strictOptions,
+                                                              NSError **outError) {
+    NSError *loadError = nil;
+    NSDictionary *loadOptions = preferredOptions ?: @{};
+    if (((BOOL(*)(id,SEL,unsigned int,id,NSError**))objc_msgSend)(
+            mdl, @selector(loadWithQoS:options:error:), 21, loadOptions, &loadError)) {
+        if (outError) *outError = nil;
+        return loadOptions;
+    }
+
+    if ([loadOptions count] > 0 && !strictOptions) {
+        loadError = nil;
+        if (((BOOL(*)(id,SEL,unsigned int,id,NSError**))objc_msgSend)(
+                mdl, @selector(loadWithQoS:options:error:), 21, @{}, &loadError)) {
+            if (outError) *outError = nil;
+            return @{};
+        }
+    }
+
+    if (outError) *outError = loadError;
+    return nil;
+}
+
+static NSString *ane_interop_user_caches_directory(void) {
+    NSArray<NSString *> *candidates =
+        NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES);
+    if (candidates.count > 0) {
+        return candidates.firstObject;
+    }
+    return [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Caches"];
+}
+
+static bool ane_interop_copy_donor_net_plist(NSString *donorHexId, NSString *td) {
+    if (donorHexId.length == 0 || td.length == 0) {
+        ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_INVALID_ARGUMENTS);
+        return false;
+    }
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *source = [[ane_interop_user_caches_directory()
+        stringByAppendingPathComponent:donorHexId] stringByAppendingPathComponent:@"net.plist"];
+    NSString *destination = [td stringByAppendingPathComponent:@"net.plist"];
+
+    if (![fm fileExistsAtPath:source]) {
+        ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE);
+        return false;
+    }
+    if ([fm fileExistsAtPath:destination]) {
+        [fm removeItemAtPath:destination error:nil];
+    }
+    if (![fm copyItemAtPath:source toPath:destination error:nil]) {
+        ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE);
+        return false;
+    }
+    return true;
+}
+
+static NSDictionary *ane_interop_prepare_load_options(id mdl,
+                                                      bool wantPerfStats,
+                                                      id *outPerfStats,
+                                                      unsigned int *outPerfMask) {
+    id perfStats = nil;
+    unsigned int perfMask = 0;
+
+    if (wantPerfStats) {
+        Class perfClass = NSClassFromString(@"_ANEPerformanceStats");
+        SEL makeSel = @selector(statsWithRequestPerformanceBuffer:statsBufferSize:);
+        if (perfClass && [perfClass respondsToSelector:makeSel]) {
+            void *buf = NULL;
+            unsigned int bufSize = 0;
+            perfStats = ((id(*)(Class,SEL,void **, unsigned int *))objc_msgSend)(
+                perfClass, makeSel, &buf, &bufSize);
+        }
+    }
+
+    NSMutableDictionary *baseOptions = nil;
+    if (wantPerfStats || ane_interop_env_flag("ANE_DISABLE_POWER_SAVING") ||
+        ane_interop_env_flag("ANE_KEEP_MODEL_WIRED") || ane_interop_env_flag("ANE_ENABLE_LATE_LATCH") ||
+        ane_interop_env_flag("ANE_SKIP_PREPARE") || ane_interop_env_flag("ANE_ENABLE_FW_TO_FW_SIGNAL") ||
+        ane_interop_env_flag("ANE_DISABLE_IO_FENCES") || getenv("ANE_MEMORY_POOL_ID") != NULL) {
+        baseOptions = [NSMutableDictionary dictionary];
+    }
+
+    if (baseOptions && ane_interop_env_flag("ANE_DISABLE_POWER_SAVING")) {
+        baseOptions[@"kANEFEnablePowerSavingKey"] = @NO;
+    }
+    if (baseOptions && ane_interop_env_flag("ANE_KEEP_MODEL_WIRED")) {
+        baseOptions[@"kANEFKeepModelMemoryWiredKey"] = @YES;
+    }
+    if (baseOptions && ane_interop_env_flag("ANE_ENABLE_LATE_LATCH")) {
+        baseOptions[@"kANEFEnableLateLatchKey"] = @YES;
+    }
+    if (baseOptions && ane_interop_env_flag("ANE_SKIP_PREPARE")) {
+        baseOptions[@"kANEFSkipPreparePhaseKey"] = @YES;
+    }
+    if (baseOptions && ane_interop_env_flag("ANE_ENABLE_FW_TO_FW_SIGNAL")) {
+        baseOptions[@"kANEFEnableFWToFWSignal"] = @YES;
+    }
+    if (baseOptions && ane_interop_env_flag("ANE_DISABLE_IO_FENCES")) {
+        baseOptions[@"kANEFDisableIOFencesUseSharedEventsKey"] = @YES;
+    }
+    if (baseOptions && getenv("ANE_MEMORY_POOL_ID") != NULL) {
+        long mp = ane_interop_env_long("ANE_MEMORY_POOL_ID", -1);
+        if (mp >= 0) {
+            baseOptions[@"kANEFMemoryPoolIDKey"] = @(mp);
+        }
+    }
+
+    if (wantPerfStats && [mdl respondsToSelector:@selector(setPerfStatsMask:)]) {
+        perfMask = ane_interop_perf_stats_anef_mask();
+        Class perfClass = NSClassFromString(@"_ANEPerformanceStats");
+        SEL driverSel = @selector(driverMaskForANEFMask:);
+        if (perfClass && [perfClass respondsToSelector:driverSel]) {
+            perfMask = ((unsigned int(*)(Class,SEL,unsigned int))objc_msgSend)(perfClass, driverSel, perfMask);
+        }
+        ((void(*)(id,SEL,unsigned int))objc_msgSend)(mdl, @selector(setPerfStatsMask:), perfMask);
+
+        if (!baseOptions) {
+            baseOptions = [NSMutableDictionary dictionary];
+        }
+        baseOptions[@"kANEFPerformanceStatsMask"] = @(perfMask);
+        baseOptions[@"kANEFModelLoadPerformanceStats"] = @YES;
+    }
+
+    NSDictionary *finalOptions = baseOptions ? [baseOptions copy] : @{};
+    if (ane_interop_env_flag("ANE_USE_COMPILER_OPTIONS") &&
+        [mdl respondsToSelector:@selector(compilerOptionsWithOptions:isCompiledModelCached:)]) {
+        id computed = ((id(*)(id,SEL,id,BOOL))objc_msgSend)(
+            mdl, @selector(compilerOptionsWithOptions:isCompiledModelCached:), finalOptions, YES);
+        if ([computed isKindOfClass:[NSDictionary class]]) {
+            finalOptions = computed;
+        }
+    }
+
+    if (outPerfStats) *outPerfStats = perfStats;
+    if (outPerfMask) *outPerfMask = perfMask;
+    return finalOptions;
+}
+
+static id ane_interop_make_request_for_handle(ANEHandle *handle) {
+    if (!handle) return nil;
+
+    NSMutableArray *wIns = [NSMutableArray arrayWithCapacity:(NSUInteger)handle->nInputs];
+    NSMutableArray *iIdx = [NSMutableArray arrayWithCapacity:(NSUInteger)handle->nInputs];
+    for (int i = 0; i < handle->nInputs; i++) {
+        id obj = ((id(*)(Class,SEL,IOSurfaceRef))objc_msgSend)(
+            g_ANEIO, @selector(objectWithIOSurface:), handle->ioInputs[i]);
+        if (!obj) return nil;
+        [wIns addObject:obj];
+        [iIdx addObject:@(i)];
+    }
+
+    NSMutableArray *wOuts = [NSMutableArray arrayWithCapacity:(NSUInteger)handle->nOutputs];
+    NSMutableArray *oIdx = [NSMutableArray arrayWithCapacity:(NSUInteger)handle->nOutputs];
+    for (int i = 0; i < handle->nOutputs; i++) {
+        id obj = ((id(*)(Class,SEL,IOSurfaceRef))objc_msgSend)(
+            g_ANEIO, @selector(objectWithIOSurface:), handle->ioOutputs[i]);
+        if (!obj) return nil;
+        [wOuts addObject:obj];
+        [oIdx addObject:@(i)];
+    }
+
+    id perfStats = handle->perfStats ? (__bridge id)handle->perfStats : nil;
+    id req = nil;
+    SEL reqSelPerf = @selector(requestWithInputs:inputIndices:outputs:outputIndices:perfStats:procedureIndex:);
+    SEL reqSelPerfWB = @selector(requestWithInputs:inputIndices:outputs:outputIndices:weightsBuffer:perfStats:procedureIndex:);
+    SEL reqSel = @selector(requestWithInputs:inputIndices:outputs:outputIndices:procedureIndex:);
+    SEL reqSelWB = @selector(requestWithInputs:inputIndices:outputs:outputIndices:weightsBuffer:procedureIndex:);
+    if (perfStats) {
+        if ([g_ANEReq respondsToSelector:reqSelPerf]) {
+            req = ((id(*)(Class,SEL,id,id,id,id,id,id))objc_msgSend)(
+                g_ANEReq, reqSelPerf, wIns, iIdx, wOuts, oIdx, perfStats, @0);
+        } else if ([g_ANEReq respondsToSelector:reqSelPerfWB]) {
+            req = ((id(*)(Class,SEL,id,id,id,id,id,id,id))objc_msgSend)(
+                g_ANEReq, reqSelPerfWB, wIns, iIdx, wOuts, oIdx, nil, perfStats, @0);
+        }
+    } else {
+        if ([g_ANEReq respondsToSelector:reqSel]) {
+            req = ((id(*)(Class,SEL,id,id,id,id,id))objc_msgSend)(
+                g_ANEReq, reqSel, wIns, iIdx, wOuts, oIdx, @0);
+        } else if ([g_ANEReq respondsToSelector:reqSelWB]) {
+            req = ((id(*)(Class,SEL,id,id,id,id,id,id))objc_msgSend)(
+                g_ANEReq, reqSelWB, wIns, iIdx, wOuts, oIdx, nil, @0);
+        }
+    }
+    return req;
+}
+
+static ANEHandle *ane_interop_make_loaded_handle(id mdl,
+                                                 NSDictionary *finalOptions,
+                                                 id perfStats,
+                                                 bool perfStatsRequested,
+                                                 unsigned int perfMask,
+                                                 bool realtimeLoaded,
+                                                 NSString *td,
+                                                 int nInputs,
+                                                 const size_t *inputSizes,
+                                                 int nOutputs,
+                                                 const size_t *outputSizes) {
+    id client = nil;
+    id clientModel = nil;
+    if ([mdl respondsToSelector:@selector(sharedConnection)]) {
+        client = ((id(*)(id,SEL))objc_msgSend)(mdl, @selector(sharedConnection));
+    }
+    if ([mdl respondsToSelector:@selector(model)]) {
+        clientModel = ((id(*)(id,SEL))objc_msgSend)(mdl, @selector(model));
+    }
+
+    ANEHandle *h = (ANEHandle *)calloc(1, sizeof(ANEHandle));
+    if (!h) {
+        NSError *e = nil;
+        ((BOOL(*)(id,SEL,unsigned int,NSError**))objc_msgSend)(
+            mdl, @selector(unloadWithQoS:error:), 21, &e);
+        ane_interop_remove_tmpdir(td);
+        ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE);
+        return NULL;
+    }
+
+    h->model = (void *)CFBridgingRetain(mdl);
+    h->client = client ? (void *)CFBridgingRetain(client) : NULL;
+    h->clientModel = clientModel ? (void *)CFBridgingRetain(clientModel) : NULL;
+    h->perfStats = perfStats ? (void *)CFBridgingRetain(perfStats) : NULL;
+    h->perfStatsRequested = perfStatsRequested;
+    h->perfStatsMask = perfMask;
+    h->evalOptions = (void *)CFBridgingRetain(finalOptions ?: @{});
+    h->realtimeLoaded = realtimeLoaded;
+    h->tmpDir = (void *)CFBridgingRetain(td);
+    h->nInputs = nInputs;
+    h->nOutputs = nOutputs;
+    h->lastHwExecutionTimeNS = 0;
+
+    if (nInputs > 0) {
+        size_t inputMetaBytes = 0;
+        if (ane_interop_size_mul_overflow((size_t)nInputs, sizeof(size_t), &inputMetaBytes)) {
+            ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE);
+            ane_interop_free(h);
+            return NULL;
+        }
+        h->inputBytes = (size_t *)malloc(inputMetaBytes);
+        h->ioInputs = (IOSurfaceRef *)calloc((size_t)nInputs, sizeof(IOSurfaceRef));
+        if (!h->inputBytes || !h->ioInputs) {
+            ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE);
+            ane_interop_free(h);
+            return NULL;
+        }
+        memcpy(h->inputBytes, inputSizes, inputMetaBytes);
+        for (int i = 0; i < nInputs; i++) {
+            h->ioInputs[i] = ane_interop_create_surface(inputSizes[i]);
+            if (!h->ioInputs[i]) {
+                ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_SURFACE_ALLOCATION_FAILED);
+                ane_interop_free(h);
+                return NULL;
+            }
+        }
+    }
+
+    if (nOutputs > 0) {
+        size_t outputMetaBytes = 0;
+        if (ane_interop_size_mul_overflow((size_t)nOutputs, sizeof(size_t), &outputMetaBytes)) {
+            ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE);
+            ane_interop_free(h);
+            return NULL;
+        }
+        h->outputBytes = (size_t *)malloc(outputMetaBytes);
+        h->ioOutputs = (IOSurfaceRef *)calloc((size_t)nOutputs, sizeof(IOSurfaceRef));
+        if (!h->outputBytes || !h->ioOutputs) {
+            ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE);
+            ane_interop_free(h);
+            return NULL;
+        }
+        memcpy(h->outputBytes, outputSizes, outputMetaBytes);
+        for (int i = 0; i < nOutputs; i++) {
+            h->ioOutputs[i] = ane_interop_create_surface(outputSizes[i]);
+            if (!h->ioOutputs[i]) {
+                ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_SURFACE_ALLOCATION_FAILED);
+                ane_interop_free(h);
+                return NULL;
+            }
+        }
+    }
+
+    id req = ane_interop_make_request_for_handle(h);
+    if (!req) {
+        ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE);
+        ane_interop_free(h);
+        return NULL;
+    }
+    h->request = (void *)CFBridgingRetain(req);
+
+    h->liveHandleCounted = true;
+    __sync_fetch_and_add(&g_live_handle_count, 1);
+    ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_NONE);
+    return h;
+}
+
+bool ane_interop_get_hex_id(ANEHandle *handle, char *outHexId, size_t bufLen) {
+    ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_NONE);
+    if (!handle || !outHexId || bufLen == 0) {
+        ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_INVALID_ARGUMENTS);
+        return false;
+    }
+    if (!handle->model) {
+        ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE);
+        return false;
+    }
+    if (!ane_interop_copy_hex_identifier_bytes((__bridge id)handle->model, outHexId, bufLen)) {
+        ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE);
+        return false;
+    }
+    return true;
+}
+
+ANEHandle *ane_interop_compile_with_id(const uint8_t *milText, size_t milLen,
+                                       const char **weightPaths,
+                                       const uint8_t **weightDatas,
+                                       const size_t *weightLens,
+                                       int weightCount,
+                                       int nInputs, const size_t *inputSizes,
+                                       int nOutputs, const size_t *outputSizes,
+                                       char *outHexId, size_t hexIdBufLen) {
+    ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_NONE);
+    if (!outHexId || hexIdBufLen == 0) {
+        ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_INVALID_ARGUMENTS);
+        return NULL;
+    }
+
+    ANEHandle *handle = ane_interop_compile(
+        milText,
+        milLen,
+        weightPaths,
+        weightDatas,
+        weightLens,
+        weightCount,
+        nInputs,
+        inputSizes,
+        nOutputs,
+        outputSizes
+    );
+    if (!handle) {
+        return NULL;
+    }
+    if (!ane_interop_get_hex_id(handle, outHexId, hexIdBufLen)) {
+        ane_interop_free(handle);
+        return NULL;
+    }
+    return handle;
+}
+
+ANEHandle *ane_interop_delta_reload(const uint8_t *milText, size_t milLen,
+                                    const char **weightPaths,
+                                    const uint8_t **weightDatas,
+                                    const size_t *weightLens,
+                                    int weightCount,
+                                    int nInputs, const size_t *inputSizes,
+                                    int nOutputs, const size_t *outputSizes,
+                                    const char *donorHexId) {
+    @autoreleasepool {
+        ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_NONE);
+        if (!milText || milLen == 0 || !donorHexId) {
+            ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_INVALID_ARGUMENTS);
+            return NULL;
+        }
+        if (weightCount < 0 || nInputs < 0 || nOutputs < 0) {
+            ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_INVALID_ARGUMENTS);
+            return NULL;
+        }
+        if (weightCount > 0 && (!weightPaths || !weightDatas || !weightLens)) {
+            ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_INVALID_ARGUMENTS);
+            return NULL;
+        }
+        if (nInputs > 0 && !inputSizes) {
+            ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_INVALID_ARGUMENTS);
+            return NULL;
+        }
+        if (nOutputs > 0 && !outputSizes) {
+            ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_INVALID_ARGUMENTS);
+            return NULL;
+        }
+
+        NSString *donorHex = [NSString stringWithUTF8String:donorHexId];
+        if (!donorHex || donorHex.length == 0) {
+            ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_INVALID_ARGUMENTS);
+            return NULL;
+        }
+
+        ane_interop_init();
+        if (!g_ANEDesc || !g_ANEInMem || !g_ANEReq || !g_ANEIO) {
+            ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE);
+            return NULL;
+        }
+
+        NSData *milData = [NSData dataWithBytesNoCopy:(void *)milText length:milLen freeWhenDone:NO];
+        if (!milData) {
+            ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE);
+            return NULL;
+        }
+
+        NSMutableDictionary *weights = nil;
+        if (!ane_interop_build_weight_dictionary(weightPaths, weightDatas, weightLens, weightCount, &weights)) {
+            return NULL;
+        }
+
+        id desc = ((id(*)(Class,SEL,id,id,id))objc_msgSend)(
+            g_ANEDesc, @selector(modelWithMILText:weights:optionsPlist:),
+            milData, (id)(weightCount ? weights : @{}), nil);
+        if (!desc) {
+            ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE);
+            return NULL;
+        }
+
+        id mdl = ((id(*)(Class,SEL,id))objc_msgSend)(
+            g_ANEInMem, @selector(inMemoryModelWithDescriptor:), desc);
+        if (!mdl) {
+            ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE);
+            return NULL;
+        }
+
+        const bool wantPerfStats = ane_interop_perf_stats_enabled();
+        id perfStats = nil;
+        unsigned int perfMask = 0;
+        NSDictionary *finalOptions = ane_interop_prepare_load_options(
+            mdl, wantPerfStats, &perfStats, &perfMask
+        );
+
+        id hx = ((id(*)(id,SEL))objc_msgSend)(mdl, @selector(hexStringIdentifier));
+        if (![hx isKindOfClass:[NSString class]]) {
+            ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE);
+            return NULL;
+        }
+        NSString *td = [NSTemporaryDirectory() stringByAppendingPathComponent:hx];
+        if (!ane_interop_write_model_tree(td, milData, weightCount ? weights : @{}, YES)) {
+            ane_interop_remove_tmpdir(td);
+            return NULL;
+        }
+        if (!ane_interop_copy_donor_net_plist(donorHex, td)) {
+            ane_interop_remove_tmpdir(td);
+            return NULL;
+        }
+
+        NSError *e = nil;
+        const bool strictOptions = ane_interop_strict_options_enabled();
+        if (!((BOOL(*)(id,SEL,unsigned int,id,NSError**))objc_msgSend)(
+                mdl, @selector(loadWithQoS:options:error:), 21, finalOptions, &e)) {
+            if ([finalOptions count] > 0 && !strictOptions) {
+                e = nil;
+                if (((BOOL(*)(id,SEL,unsigned int,id,NSError**))objc_msgSend)(
+                        mdl, @selector(loadWithQoS:options:error:), 21, @{}, &e)) {
+                    finalOptions = @{};
+                } else {
+                    ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE);
+                    ane_interop_remove_tmpdir(td);
+                    return NULL;
+                }
+            } else {
+                ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE);
+                ane_interop_remove_tmpdir(td);
+                return NULL;
+            }
+        }
+
+        long qd = ane_interop_env_long("ANE_QUEUE_DEPTH", -1);
+        if (qd >= 0 && [mdl respondsToSelector:@selector(setQueueDepth:)]) {
+            if (qd > 127) qd = 127;
+            ((void(*)(id,SEL,char))objc_msgSend)(mdl, @selector(setQueueDepth:), (char)qd);
+        }
+
+        id client = nil;
+        id clientModel = nil;
+        if ([mdl respondsToSelector:@selector(sharedConnection)]) {
+            client = ((id(*)(id,SEL))objc_msgSend)(mdl, @selector(sharedConnection));
+        }
+        if ([mdl respondsToSelector:@selector(model)]) {
+            clientModel = ((id(*)(id,SEL))objc_msgSend)(mdl, @selector(model));
+        }
+
+        const bool wantsRealtime = (ane_interop_eval_path() == ANE_EVAL_REALTIME);
+        BOOL realtimeLoaded = NO;
+        if (wantsRealtime && client && clientModel) {
+            NSError *rtErr = nil;
+            if ([client respondsToSelector:@selector(beginRealTimeTask)]) {
+                ((BOOL(*)(id,SEL))objc_msgSend)(client, @selector(beginRealTimeTask));
+            }
+            if ([client respondsToSelector:@selector(loadRealTimeModel:options:qos:error:)]) {
+                realtimeLoaded = ((BOOL(*)(id,SEL,id,id,unsigned int,NSError**))objc_msgSend)(
+                    client, @selector(loadRealTimeModel:options:qos:error:), clientModel, finalOptions, 21, &rtErr);
+            }
+            if (!realtimeLoaded && [client respondsToSelector:@selector(endRealTimeTask)]) {
+                ((BOOL(*)(id,SEL))objc_msgSend)(client, @selector(endRealTimeTask));
+            }
+        }
+
+        return ane_interop_make_loaded_handle(
+            mdl,
+            finalOptions,
+            perfStats,
+            wantPerfStats,
+            perfMask,
+            realtimeLoaded ? true : false,
+            td,
+            nInputs,
+            inputSizes,
+            nOutputs,
+            outputSizes
+        );
+    }
+}
+
+bool ane_interop_fast_reload(ANEHandle *handle,
+                             const char **weightPaths,
+                             const uint8_t **weightDatas,
+                             const size_t *weightLens,
+                             int weightCount) {
+    @autoreleasepool {
+        ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_NONE);
+        if (!handle || !handle->model || !handle->tmpDir) {
+            ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_INVALID_ARGUMENTS);
+            return false;
+        }
+        if (weightCount < 0) {
+            ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_INVALID_ARGUMENTS);
+            return false;
+        }
+        if (weightCount > 0 && (!weightPaths || !weightDatas || !weightLens)) {
+            ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_INVALID_ARGUMENTS);
+            return false;
+        }
+
+        id mdl = (__bridge id)handle->model;
+        NSDictionary *options = handle->evalOptions ? (__bridge NSDictionary *)handle->evalOptions : @{};
+        NSString *td = (__bridge NSString *)handle->tmpDir;
+        const bool strictOptions = ane_interop_strict_options_enabled();
+        NSSet<NSString *> *preservedRootFiles = [NSSet setWithObjects:@"model.mil", @"net.plist", nil];
+        NSString *stageDir = ane_interop_unique_reload_directory(@"ane-fast-reload-stage");
+        NSString *backupDir = ane_interop_unique_reload_directory(@"ane-fast-reload-backup");
+        NSFileManager *fm = [NSFileManager defaultManager];
+        BOOL hadRealtimeLoaded = handle->realtimeLoaded;
+
+        if (![fm createDirectoryAtPath:stageDir withIntermediateDirectories:YES attributes:nil error:nil]) {
+            ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE);
+            return false;
+        }
+        if (![fm createDirectoryAtPath:backupDir withIntermediateDirectories:YES attributes:nil error:nil]) {
+            ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE);
+            ane_interop_remove_tmpdir(stageDir);
+            return false;
+        }
+        if (!ane_interop_write_weight_files(stageDir, weightPaths, weightDatas, weightLens, weightCount, NO)) {
+            ane_interop_remove_tmpdir(stageDir);
+            ane_interop_remove_tmpdir(backupDir);
+            return false;
+        }
+        if (!ane_interop_move_directory_entries(td, backupDir, preservedRootFiles)) {
+            ane_interop_move_directory_entries(backupDir, td, nil);
+            ane_interop_remove_tmpdir(stageDir);
+            ane_interop_remove_tmpdir(backupDir);
+            return false;
+        }
+
+        if (handle->realtimeLoaded && handle->client && handle->clientModel) {
+            id client = (__bridge id)handle->client;
+            id modelObj = (__bridge id)handle->clientModel;
+            NSError *rtErr = nil;
+            if ([client respondsToSelector:@selector(unloadRealTimeModel:options:qos:error:)]) {
+                ((BOOL(*)(id,SEL,id,id,unsigned int,NSError**))objc_msgSend)(
+                    client, @selector(unloadRealTimeModel:options:qos:error:), modelObj, options, 21, &rtErr);
+            }
+            if ([client respondsToSelector:@selector(endRealTimeTask)]) {
+                ((BOOL(*)(id,SEL))objc_msgSend)(client, @selector(endRealTimeTask));
+            }
+            handle->realtimeLoaded = false;
+        }
+
+        NSError *e = nil;
+        if (!((BOOL(*)(id,SEL,unsigned int,NSError**))objc_msgSend)(
+                mdl, @selector(unloadWithQoS:error:), 21, &e)) {
+            ane_interop_move_directory_entries(backupDir, td, nil);
+            ane_interop_remove_tmpdir(stageDir);
+            ane_interop_remove_tmpdir(backupDir);
+            if (hadRealtimeLoaded) {
+                ane_interop_load_realtime_handle(handle);
+            }
+            ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE);
+            return false;
+        }
+        if (!ane_interop_move_directory_entries(stageDir, td, nil)) {
+            ane_interop_move_directory_entries(backupDir, td, nil);
+            NSError *restoreError = nil;
+            NSDictionary *restoredOptions = ane_interop_reload_with_fallback_options(
+                mdl, options, strictOptions, &restoreError
+            );
+            if (restoredOptions && restoredOptions != options) {
+                if (handle->evalOptions) {
+                    CFRelease(handle->evalOptions);
+                }
+                handle->evalOptions = (void *)CFBridgingRetain(restoredOptions);
+            }
+            if (hadRealtimeLoaded) {
+                ane_interop_load_realtime_handle(handle);
+            }
+            ane_interop_remove_tmpdir(stageDir);
+            ane_interop_remove_tmpdir(backupDir);
+            return false;
+        }
+
+        NSDictionary *loadOptions = ane_interop_reload_with_fallback_options(
+            mdl, options, strictOptions, &e
+        );
+        if (!loadOptions) {
+            ane_interop_move_directory_entries(td, stageDir, preservedRootFiles);
+            ane_interop_move_directory_entries(backupDir, td, nil);
+            NSDictionary *restoredOptions = ane_interop_reload_with_fallback_options(
+                mdl, options, strictOptions, &e
+            );
+            if (restoredOptions && restoredOptions != options) {
+                if (handle->evalOptions) {
+                    CFRelease(handle->evalOptions);
+                }
+                handle->evalOptions = (void *)CFBridgingRetain(restoredOptions);
+            }
+            if (hadRealtimeLoaded) {
+                ane_interop_load_realtime_handle(handle);
+            }
+            ane_interop_remove_tmpdir(stageDir);
+            ane_interop_remove_tmpdir(backupDir);
+            ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE);
+            return false;
+        }
+
+        if (loadOptions != options) {
+            if (handle->evalOptions) {
+                CFRelease(handle->evalOptions);
+            }
+            handle->evalOptions = (void *)CFBridgingRetain(loadOptions);
+        }
+
+        if (hadRealtimeLoaded) {
+            ane_interop_load_realtime_handle(handle);
+        }
+        handle->lastHwExecutionTimeNS = 0;
+        ane_interop_remove_tmpdir(stageDir);
+        ane_interop_remove_tmpdir(backupDir);
+        return true;
+    }
 }
 
 static bool ane_interop_trace_enabled(void) {
@@ -152,13 +966,6 @@ static ANECompileCachePolicy ane_interop_compile_cache_policy(void) {
     return ANE_COMPILE_CACHE_AUTO;
 }
 
-typedef enum : int {
-    ANE_EVAL_INMEM = 0,
-    ANE_EVAL_CLIENT = 1,
-    ANE_EVAL_CLIENT_DIRECT = 2,
-    ANE_EVAL_REALTIME = 3,
-} ANEEvalPath;
-
 static ANEEvalPath ane_interop_eval_path(void) {
     const char *v = getenv("ANE_EVAL_PATH");
     if (!v || v[0] == '\0') return ANE_EVAL_INMEM;
@@ -230,6 +1037,289 @@ int ane_interop_probe_prepare_chaining(ANEHandle *handle) {
     default:
         return ANE_INTEROP_CHAINING_PROBE_UNAVAILABLE;
     }
+}
+
+static bool ane_interop_copy_hex_identifier_string(NSString *hexId,
+                                                   char *outHexId,
+                                                   size_t bufLen) {
+    if (!hexId || !outHexId || bufLen == 0) return false;
+    NSUInteger maxLength = (NSUInteger)bufLen;
+    return [hexId getCString:outHexId maxLength:maxLength encoding:NSUTF8StringEncoding];
+}
+
+static NSMutableDictionary *ane_interop_make_weights_dictionary(const char **weightPaths,
+                                                                const uint8_t **weightDatas,
+                                                                const size_t *weightLens,
+                                                                int weightCount) {
+    NSMutableDictionary *weights = [NSMutableDictionary dictionaryWithCapacity:(NSUInteger)weightCount];
+    for (int i = 0; i < weightCount; i++) {
+        if (!weightPaths[i]) {
+            ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_INVALID_ARGUMENTS);
+            return nil;
+        }
+        if (weightLens[i] > 0 && !weightDatas[i]) {
+            ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_INVALID_ARGUMENTS);
+            return nil;
+        }
+
+        NSString *path = [NSString stringWithUTF8String:weightPaths[i]];
+        if (!path) {
+            ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_INVALID_ARGUMENTS);
+            return nil;
+        }
+        if (weights[path] != nil) {
+            ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_DUPLICATE_WEIGHT_PATH);
+            return nil;
+        }
+
+        NSData *weightData = nil;
+        if (weightLens[i] == 0) {
+            weightData = [NSData data];
+        } else {
+            weightData = [NSData dataWithBytesNoCopy:(void *)weightDatas[i]
+                                              length:weightLens[i]
+                                        freeWhenDone:NO];
+        }
+        if (!weightData) {
+            ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_INVALID_ARGUMENTS);
+            return nil;
+        }
+
+        weights[path] = @{@"offset": @0, @"data": weightData};
+    }
+    return weights;
+}
+
+static bool ane_interop_write_weight_files(NSString *tmpDir,
+                                           const char **weightPaths,
+                                           const uint8_t **weightDatas,
+                                           const size_t *weightLens,
+                                           int weightCount,
+                                           BOOL atomically) {
+    if (!tmpDir) return false;
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *stdDir = [tmpDir stringByStandardizingPath];
+    NSString *dirPrefix = [stdDir hasSuffix:@"/"] ? stdDir : [stdDir stringByAppendingString:@"/"];
+
+    if (![fm createDirectoryAtPath:[tmpDir stringByAppendingPathComponent:@"weights"]
+       withIntermediateDirectories:YES attributes:nil error:nil]) {
+        return false;
+    }
+
+    for (int i = 0; i < weightCount; i++) {
+        if (!weightPaths[i]) return false;
+        if (weightLens[i] > 0 && !weightDatas[i]) return false;
+
+        NSString *path = [NSString stringWithUTF8String:weightPaths[i]];
+        NSString *rel = ane_interop_sanitized_relative_weight_path(path);
+        if (!rel) return false;
+
+        NSString *full = [[tmpDir stringByAppendingPathComponent:rel] stringByStandardizingPath];
+        if (![full hasPrefix:dirPrefix]) return false;
+
+        if (![fm createDirectoryAtPath:[full stringByDeletingLastPathComponent]
+           withIntermediateDirectories:YES attributes:nil error:nil]) {
+            return false;
+        }
+
+        NSData *data = nil;
+        if (weightLens[i] == 0) {
+            data = [NSData data];
+        } else {
+            data = [NSData dataWithBytesNoCopy:(void *)weightDatas[i]
+                                        length:weightLens[i]
+                                  freeWhenDone:NO];
+        }
+        if (!data) return false;
+        if (![data writeToFile:full atomically:atomically]) return false;
+    }
+
+    return true;
+}
+
+static bool ane_interop_allocate_handle_surfaces(ANEHandle *handle,
+                                                 int nInputs, const size_t *inputSizes,
+                                                 int nOutputs, const size_t *outputSizes) {
+    handle->nInputs = nInputs;
+    handle->nOutputs = nOutputs;
+
+    if (nInputs > 0) {
+        size_t inputMetaBytes = 0;
+        if (ane_interop_size_mul_overflow((size_t)nInputs, sizeof(size_t), &inputMetaBytes)) {
+            ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE);
+            return false;
+        }
+
+        handle->inputBytes = (size_t *)malloc(inputMetaBytes);
+        handle->ioInputs = (IOSurfaceRef *)calloc((size_t)nInputs, sizeof(IOSurfaceRef));
+        if (!handle->inputBytes || !handle->ioInputs) {
+            ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE);
+            return false;
+        }
+
+        memcpy(handle->inputBytes, inputSizes, inputMetaBytes);
+        for (int i = 0; i < nInputs; i++) {
+            handle->ioInputs[i] = ane_interop_create_surface(inputSizes[i]);
+            if (!handle->ioInputs[i]) {
+                ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_SURFACE_ALLOCATION_FAILED);
+                return false;
+            }
+        }
+    }
+
+    if (nOutputs > 0) {
+        size_t outputMetaBytes = 0;
+        if (ane_interop_size_mul_overflow((size_t)nOutputs, sizeof(size_t), &outputMetaBytes)) {
+            ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE);
+            return false;
+        }
+
+        handle->outputBytes = (size_t *)malloc(outputMetaBytes);
+        handle->ioOutputs = (IOSurfaceRef *)calloc((size_t)nOutputs, sizeof(IOSurfaceRef));
+        if (!handle->outputBytes || !handle->ioOutputs) {
+            ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE);
+            return false;
+        }
+
+        memcpy(handle->outputBytes, outputSizes, outputMetaBytes);
+        for (int i = 0; i < nOutputs; i++) {
+            handle->ioOutputs[i] = ane_interop_create_surface(outputSizes[i]);
+            if (!handle->ioOutputs[i]) {
+                ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_SURFACE_ALLOCATION_FAILED);
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+static id ane_interop_make_request_for_surfaces(IOSurfaceRef *inputs,
+                                                int nInputs,
+                                                IOSurfaceRef *outputs,
+                                                int nOutputs,
+                                                id perfStats) {
+    NSMutableArray *wrappedInputs = [NSMutableArray arrayWithCapacity:(NSUInteger)nInputs];
+    NSMutableArray *inputIndices = [NSMutableArray arrayWithCapacity:(NSUInteger)nInputs];
+    for (int i = 0; i < nInputs; i++) {
+        id obj = ((id(*)(Class,SEL,IOSurfaceRef))objc_msgSend)(
+            g_ANEIO, @selector(objectWithIOSurface:), inputs[i]);
+        if (!obj) return nil;
+        [wrappedInputs addObject:obj];
+        [inputIndices addObject:@(i)];
+    }
+
+    NSMutableArray *wrappedOutputs = [NSMutableArray arrayWithCapacity:(NSUInteger)nOutputs];
+    NSMutableArray *outputIndices = [NSMutableArray arrayWithCapacity:(NSUInteger)nOutputs];
+    for (int i = 0; i < nOutputs; i++) {
+        id obj = ((id(*)(Class,SEL,IOSurfaceRef))objc_msgSend)(
+            g_ANEIO, @selector(objectWithIOSurface:), outputs[i]);
+        if (!obj) return nil;
+        [wrappedOutputs addObject:obj];
+        [outputIndices addObject:@(i)];
+    }
+
+    id request = nil;
+    SEL reqSelPerf = @selector(requestWithInputs:inputIndices:outputs:outputIndices:perfStats:procedureIndex:);
+    SEL reqSelPerfWB = @selector(requestWithInputs:inputIndices:outputs:outputIndices:weightsBuffer:perfStats:procedureIndex:);
+    SEL reqSel = @selector(requestWithInputs:inputIndices:outputs:outputIndices:procedureIndex:);
+    SEL reqSelWB = @selector(requestWithInputs:inputIndices:outputs:outputIndices:weightsBuffer:procedureIndex:);
+
+    if (perfStats) {
+        if ([g_ANEReq respondsToSelector:reqSelPerf]) {
+            request = ((id(*)(Class,SEL,id,id,id,id,id,id))objc_msgSend)(
+                g_ANEReq, reqSelPerf, wrappedInputs, inputIndices, wrappedOutputs, outputIndices, perfStats, @0);
+        } else if ([g_ANEReq respondsToSelector:reqSelPerfWB]) {
+            request = ((id(*)(Class,SEL,id,id,id,id,id,id,id))objc_msgSend)(
+                g_ANEReq, reqSelPerfWB, wrappedInputs, inputIndices, wrappedOutputs, outputIndices, nil, perfStats, @0);
+        }
+    } else {
+        if ([g_ANEReq respondsToSelector:reqSel]) {
+            request = ((id(*)(Class,SEL,id,id,id,id,id))objc_msgSend)(
+                g_ANEReq, reqSel, wrappedInputs, inputIndices, wrappedOutputs, outputIndices, @0);
+        } else if ([g_ANEReq respondsToSelector:reqSelWB]) {
+            request = ((id(*)(Class,SEL,id,id,id,id,id,id))objc_msgSend)(
+                g_ANEReq, reqSelWB, wrappedInputs, inputIndices, wrappedOutputs, outputIndices, nil, @0);
+        }
+    }
+
+    return request;
+}
+
+static bool ane_interop_install_request_on_handle(ANEHandle *handle) {
+    if (!handle || !g_ANEReq || !g_ANEIO) return false;
+
+    id perfStats = handle->perfStats ? (__bridge id)handle->perfStats : nil;
+    id request = ane_interop_make_request_for_surfaces(
+        handle->ioInputs,
+        handle->nInputs,
+        handle->ioOutputs,
+        handle->nOutputs,
+        perfStats
+    );
+    if (!request) return false;
+
+    if (handle->request) {
+        CFRelease(handle->request);
+    }
+    handle->request = (void *)CFBridgingRetain(request);
+    return true;
+}
+
+static void ane_interop_apply_queue_depth(id model) {
+    long qd = ane_interop_env_long("ANE_QUEUE_DEPTH", -1);
+    if (qd >= 0 && [model respondsToSelector:@selector(setQueueDepth:)]) {
+        if (qd > 127) qd = 127;
+        ((void(*)(id,SEL,char))objc_msgSend)(model, @selector(setQueueDepth:), (char)qd);
+    }
+}
+
+static void ane_interop_unload_realtime_handle(ANEHandle *handle) {
+    if (!handle || !handle->realtimeLoaded || !handle->client || !handle->clientModel) return;
+
+    id client = (__bridge id)handle->client;
+    id modelObj = (__bridge id)handle->clientModel;
+    id options = handle->evalOptions ? (__bridge id)handle->evalOptions : @{};
+    NSError *err = nil;
+
+    if ([client respondsToSelector:@selector(unloadRealTimeModel:options:qos:error:)]) {
+        ((BOOL(*)(id,SEL,id,id,unsigned int,NSError**))objc_msgSend)(
+            client, @selector(unloadRealTimeModel:options:qos:error:), modelObj, options, 21, &err);
+    }
+    if ([client respondsToSelector:@selector(endRealTimeTask)]) {
+        ((BOOL(*)(id,SEL))objc_msgSend)(client, @selector(endRealTimeTask));
+    }
+    handle->realtimeLoaded = false;
+}
+
+static bool ane_interop_load_realtime_handle(ANEHandle *handle) {
+    if (!handle || !handle->client || !handle->clientModel) return false;
+    if (ane_interop_eval_path() != ANE_EVAL_REALTIME) {
+        handle->realtimeLoaded = false;
+        return true;
+    }
+
+    id client = (__bridge id)handle->client;
+    id modelObj = (__bridge id)handle->clientModel;
+    id options = handle->evalOptions ? (__bridge id)handle->evalOptions : @{};
+    NSError *err = nil;
+
+    if ([client respondsToSelector:@selector(beginRealTimeTask)]) {
+        ((BOOL(*)(id,SEL))objc_msgSend)(client, @selector(beginRealTimeTask));
+    }
+
+    BOOL loaded = NO;
+    if ([client respondsToSelector:@selector(loadRealTimeModel:options:qos:error:)]) {
+        loaded = ((BOOL(*)(id,SEL,id,id,unsigned int,NSError**))objc_msgSend)(
+            client, @selector(loadRealTimeModel:options:qos:error:), modelObj, options, 21, &err);
+    }
+
+    if (!loaded && [client respondsToSelector:@selector(endRealTimeTask)]) {
+        ((BOOL(*)(id,SEL))objc_msgSend)(client, @selector(endRealTimeTask));
+    }
+    handle->realtimeLoaded = loaded ? true : false;
+    return true;
 }
 
 ANEInteropChainingProbeStatsSurfaceMode ane_interop_chaining_probe_stats_surface_mode(void) {

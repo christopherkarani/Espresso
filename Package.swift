@@ -161,10 +161,35 @@ let package = Package(
             path: "Sources/ANEBuilder",
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
+        .target(
+            name: "DeltaCompilation",
+            dependencies: ["ANEInterop", "ANETypes", "ANERuntime"],
+            path: "Sources/DeltaCompilation",
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .target(
+            name: "LoRAAdapter",
+            dependencies: ["ANEGraphIR", "ANEBuilder", "ANETypes"],
+            path: "Sources/LoRAAdapter",
+            swiftSettings: [.swiftLanguageMode(.v6)],
+            linkerSettings: [.linkedFramework("IOSurface")]
+        ),
         .testTarget(
             name: "ANEBuilderTests",
             dependencies: ["ANEBuilder", "ANEGraphIR"],
             path: "Tests/ANEBuilderTests",
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
+            name: "DeltaCompilationTests",
+            dependencies: ["DeltaCompilation", "ANEGraphIR"],
+            path: "Tests/DeltaCompilationTests",
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
+            name: "LoRAAdapterTests",
+            dependencies: ["LoRAAdapter", "ANEGraphIR"],
+            path: "Tests/LoRAAdapterTests",
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         .testTarget(
