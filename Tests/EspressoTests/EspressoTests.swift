@@ -841,6 +841,7 @@ final class EspressoTests: XCTestCase {
         fillTensor(dy, value: 0.1)
 
         let scratch = BackwardScratch(dim: dim, hidden: hidden, seqLen: seq)
+        let rmsWorkspace = RMSNorm.Workspace(seqLen: seq)
         try BackwardPass.run(
             dy: dy,
             acts: actStorage,
@@ -849,6 +850,7 @@ final class EspressoTests: XCTestCase {
             grads: gradStorage,
             weights: weightsStorage,
             scratch: scratch,
+            rmsWorkspace: rmsWorkspace,
             accumulator: accumulator
         )
 
@@ -902,6 +904,7 @@ final class EspressoTests: XCTestCase {
         fillTensor(dy, value: 0.1)
 
         let scratch = BackwardScratch(dim: dim, hidden: hidden, seqLen: seq)
+        let rmsWorkspace = RMSNorm.Workspace(seqLen: seq)
         try BackwardPass.run(
             dy: dy,
             acts: actStorage,
@@ -910,6 +913,7 @@ final class EspressoTests: XCTestCase {
             grads: gradStorage,
             weights: weightsStorage,
             scratch: scratch,
+            rmsWorkspace: rmsWorkspace,
             accumulator: accumulator
         )
 
@@ -1589,6 +1593,7 @@ final class EspressoTests: XCTestCase {
         let dlogits = TensorBuffer(count: vocab * seqLen, zeroed: false)
         let dy = TensorBuffer(count: dim * seqLen, zeroed: false)
         let scratch = BackwardScratch(dim: dim, hidden: hidden, seqLen: seqLen)
+        let rmsWorkspace = RMSNorm.Workspace(seqLen: seqLen)
 
         let accumulator = GradientAccumulator()
 
@@ -1747,6 +1752,7 @@ final class EspressoTests: XCTestCase {
                     grads: grads,
                     weights: weights,
                     scratch: scratch,
+                    rmsWorkspace: rmsWorkspace,
                     accumulator: accumulator,
                     dim: dim,
                     hidden: hidden,

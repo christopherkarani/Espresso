@@ -72,6 +72,7 @@ public enum BackwardPass {
         }
     }
 
+    @available(*, deprecated, message: "Pass rmsWorkspace to avoid temporary workspace allocation.")
     public static func run(
         dy: borrowing TensorBuffer,
         acts: borrowing LayerStorage<LayerActivations>,
@@ -80,6 +81,41 @@ public enum BackwardPass {
         grads: borrowing LayerStorage<LayerGradients>,
         weights: borrowing LayerStorage<LayerWeights>,
         scratch: borrowing BackwardScratch,
+        accumulator: GradientAccumulator,
+        dim: Int = ModelConfig.dim,
+        hidden: Int = ModelConfig.hidden,
+        seqLen: Int = ModelConfig.seqLen,
+        heads: Int = ModelConfig.heads,
+        surfaceHandles: [LayerSurfaceHandles]? = nil
+    ) throws(ANEError) {
+        let rmsWorkspace = RMSNorm.Workspace(seqLen: seqLen)
+        try run(
+            dy: dy,
+            acts: acts,
+            kernels: kernels,
+            staticKernels: staticKernels,
+            grads: grads,
+            weights: weights,
+            scratch: scratch,
+            rmsWorkspace: rmsWorkspace,
+            accumulator: accumulator,
+            dim: dim,
+            hidden: hidden,
+            seqLen: seqLen,
+            heads: heads,
+            surfaceHandles: surfaceHandles
+        )
+    }
+
+    public static func run(
+        dy: borrowing TensorBuffer,
+        acts: borrowing LayerStorage<LayerActivations>,
+        kernels: borrowing LayerStorage<LayerKernelSet>,
+        staticKernels: borrowing LayerStorage<StaticKernel>,
+        grads: borrowing LayerStorage<LayerGradients>,
+        weights: borrowing LayerStorage<LayerWeights>,
+        scratch: borrowing BackwardScratch,
+        rmsWorkspace: borrowing RMSNorm.Workspace,
         accumulator: GradientAccumulator,
         dim: Int = ModelConfig.dim,
         hidden: Int = ModelConfig.hidden,
@@ -96,6 +132,7 @@ public enum BackwardPass {
             grads: grads,
             weights: weights,
             scratch: scratch,
+            rmsWorkspace: rmsWorkspace,
             accumulator: accumulator,
             dim: dim,
             hidden: hidden,
@@ -103,6 +140,43 @@ public enum BackwardPass {
             heads: heads,
             surfaceHandles: surfaceHandles,
             timings: &ignoredTimings
+        )
+    }
+
+    @available(*, deprecated, message: "Pass rmsWorkspace to avoid temporary workspace allocation.")
+    public static func runTimed(
+        dy: borrowing TensorBuffer,
+        acts: borrowing LayerStorage<LayerActivations>,
+        kernels: borrowing LayerStorage<LayerKernelSet>,
+        staticKernels: borrowing LayerStorage<StaticKernel>,
+        grads: borrowing LayerStorage<LayerGradients>,
+        weights: borrowing LayerStorage<LayerWeights>,
+        scratch: borrowing BackwardScratch,
+        accumulator: GradientAccumulator,
+        dim: Int = ModelConfig.dim,
+        hidden: Int = ModelConfig.hidden,
+        seqLen: Int = ModelConfig.seqLen,
+        heads: Int = ModelConfig.heads,
+        surfaceHandles: [LayerSurfaceHandles]? = nil,
+        timings: inout StepTimingBreakdown
+    ) throws(ANEError) {
+        let rmsWorkspace = RMSNorm.Workspace(seqLen: seqLen)
+        try runTimed(
+            dy: dy,
+            acts: acts,
+            kernels: kernels,
+            staticKernels: staticKernels,
+            grads: grads,
+            weights: weights,
+            scratch: scratch,
+            rmsWorkspace: rmsWorkspace,
+            accumulator: accumulator,
+            dim: dim,
+            hidden: hidden,
+            seqLen: seqLen,
+            heads: heads,
+            surfaceHandles: surfaceHandles,
+            timings: &timings
         )
     }
 
@@ -114,6 +188,7 @@ public enum BackwardPass {
         grads: borrowing LayerStorage<LayerGradients>,
         weights: borrowing LayerStorage<LayerWeights>,
         scratch: borrowing BackwardScratch,
+        rmsWorkspace: borrowing RMSNorm.Workspace,
         accumulator: GradientAccumulator,
         dim: Int = ModelConfig.dim,
         hidden: Int = ModelConfig.hidden,
@@ -274,7 +349,8 @@ public enum BackwardPass {
                                     x: x2Ptr,
                                     weights: wPtr,
                                     dim: dim,
-                                    seqLen: seqLen
+                                    seqLen: seqLen,
+                                    workspace: rmsWorkspace
                                 )
                             }
                         }
@@ -532,7 +608,8 @@ public enum BackwardPass {
                                     x: xPtr,
                                     weights: wPtr,
                                     dim: dim,
-                                    seqLen: seqLen
+                                    seqLen: seqLen,
+                                    workspace: rmsWorkspace
                                 )
                             }
                         }

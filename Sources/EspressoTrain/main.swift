@@ -731,6 +731,7 @@ enum EspressoTrainMain {
                     grads: grads,
                     weights: layers,
                     scratch: bwdScratch,
+                    rmsWorkspace: rmsWorkspace,
                     accumulator: accumulator,
                     dim: dim,
                     hidden: hidden,
