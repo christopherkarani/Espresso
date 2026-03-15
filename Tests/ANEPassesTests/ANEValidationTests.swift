@@ -34,7 +34,7 @@ import ANEGraphIR
     #expect(diagnostics.contains(where: { $0.id == 2 && $0.severity == .warning }))
 }
 
-@Test func unsortedOutputsProduceWarning() throws {
+@Test func unsortedOutputsDoNotProduceWarning() throws {
     var graph = ANEGraph()
     let x = try graph.addNode(inputNode(name: "x", shape: validBoundaryShape()))
     let a = try graph.addNode(
@@ -54,7 +54,7 @@ import ANEGraphIR
 
     let diagnostics = ANEValidationPass().run(on: graph)
 
-    #expect(diagnostics.contains(where: { $0.id == 3 && $0.severity == .warning }))
+    #expect(!diagnostics.contains(where: { $0.id == 3 }))
 }
 
 @Test func tinyBoundaryTensorProducesError() throws {

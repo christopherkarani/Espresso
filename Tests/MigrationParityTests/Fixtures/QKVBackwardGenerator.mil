@@ -1,0 +1,26 @@
+program(1.3)
+[buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, {"coremlc-version", "3505.4.1"}, {"coremltools-component-milinternal", ""}, {"coremltools-version", "9.0"}})]
+{
+    func main<ios18>(tensor<fp16, [1, 2304, 1, 256]> x) {
+        string pt = const()[name=string("pt"), val=string("valid")];
+        tensor<int32, [2]> st = const()[name=string("st"), val=tensor<int32, [2]>([1,1])];
+        tensor<int32, [4]> pd = const()[name=string("pd"), val=tensor<int32, [4]>([0,0,0,0])];
+        tensor<int32, [2]> dl = const()[name=string("dl"), val=tensor<int32, [2]>([1,1])];
+        int32 gr = const()[name=string("gr"), val=int32(1)];
+        tensor<int32, [4]> sz = const()[name=string("sz"), val=tensor<int32, [4]>([1,768,1,256])];
+        tensor<int32, [4]> b0 = const()[name=string("b0"), val=tensor<int32, [4]>([0,0,0,0])];
+        tensor<fp16, [1,768,1,256]> dq = slice_by_size(x=x,begin=b0,size=sz)[name=string("s0")];
+        tensor<int32, [4]> b1 = const()[name=string("b1"), val=tensor<int32, [4]>([0,768,0,0])];
+        tensor<fp16, [1,768,1,256]> dk = slice_by_size(x=x,begin=b1,size=sz)[name=string("s1")];
+        tensor<int32, [4]> b2 = const()[name=string("b2"), val=tensor<int32, [4]>([0,1536,0,0])];
+        tensor<fp16, [1,768,1,256]> dv = slice_by_size(x=x,begin=b2,size=sz)[name=string("s2")];
+        tensor<fp16, [768,768,1,1]> Wqt = const()[name=string("Wqt"), val=tensor<fp16, [768,768,1,1]>(BLOBFILE(path=string("@model_path/weights/wqt.bin"), offset=uint64(64)))];
+        tensor<fp16, [768,768,1,1]> Wkt = const()[name=string("Wkt"), val=tensor<fp16, [768,768,1,1]>(BLOBFILE(path=string("@model_path/weights/wkt.bin"), offset=uint64(64)))];
+        tensor<fp16, [768,768,1,1]> Wvt = const()[name=string("Wvt"), val=tensor<fp16, [768,768,1,1]>(BLOBFILE(path=string("@model_path/weights/wvt.bin"), offset=uint64(64)))];
+        tensor<fp16, [1,768,1,256]> dxq = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Wqt,x=dq)[name=string("cq")];
+        tensor<fp16, [1,768,1,256]> dxk = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Wkt,x=dk)[name=string("ck")];
+        tensor<fp16, [1,768,1,256]> dxv = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Wvt,x=dv)[name=string("cv")];
+        tensor<fp16, [1,768,1,256]> dxqk = add(x=dxq,y=dxk)[name=string("aqk")];
+        tensor<fp16, [1,768,1,256]> out = add(x=dxqk,y=dxv)[name=string("out")];
+    } -> (out);
+}

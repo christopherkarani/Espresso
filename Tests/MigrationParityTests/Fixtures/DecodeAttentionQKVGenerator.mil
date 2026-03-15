@@ -1,0 +1,52 @@
+program(1.3)
+[buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, {"coremlc-version", "3505.4.1"}, {"coremltools-component-milinternal", ""}, {"coremltools-version", "9.0"}})]
+{
+    func main<ios18>(tensor<fp16, [1, 768, 1, 32]> x, tensor<fp16, [1, 768, 1, 256]> kCache, tensor<fp16, [1, 768, 1, 256]> vCache, tensor<fp16, [1, 768, 1, 256]> maskCache) {
+        tensor<fp16, [1,768,1,32]> sq = mul(x=x,y=x)[name=string("sq")];
+        tensor<int32, [1]> raxCh = const()[name=string("rax_ch"), val=tensor<int32, [1]>([1])];
+        tensor<int32, [1]> raxSp = const()[name=string("rax_sp"), val=tensor<int32, [1]>([3])];
+        bool kd = const()[name=string("kd"), val=bool(true)];
+        tensor<fp16, [1,1,1,32]> ss = reduce_sum(x=sq,axes=raxCh,keep_dims=kd)[name=string("ss")];
+        fp16 invd = const()[name=string("invd"), val=fp16(0.001302)];
+        tensor<fp16, [1,1,1,32]> ss2 = mul(x=ss,y=invd)[name=string("ss2")];
+        fp16 eps = const()[name=string("eps"), val=fp16(0.00001)];
+        tensor<fp16, [1,1,1,32]> ss3 = add(x=ss2,y=eps)[name=string("ss3")];
+        fp16 nhalf = const()[name=string("nhalf"), val=fp16(-0.5)];
+        tensor<fp16, [1,1,1,32]> rrms = pow(x=ss3,y=nhalf)[name=string("rrms")];
+        tensor<fp16, [1,768,1,32]> xr = mul(x=x,y=rrms)[name=string("xr")];
+        tensor<fp16, [1,768,1,1]> rw = const()[name=string("rw"), val=tensor<fp16, [1,768,1,1]>(BLOBFILE(path=string("@model_path/weights/rms1.bin"), offset=uint64(64)))];
+        tensor<fp16, [1,768,1,32]> xn = mul(x=xr,y=rw)[name=string("xn")];
+        string pt = const()[name=string("pt"), val=string("valid")];
+        tensor<int32, [2]> st = const()[name=string("st"), val=tensor<int32, [2]>([1,1])];
+        tensor<int32, [4]> pd = const()[name=string("pd"), val=tensor<int32, [4]>([0,0,0,0])];
+        tensor<int32, [2]> dl = const()[name=string("dl"), val=tensor<int32, [2]>([1,1])];
+        int32 gr = const()[name=string("gr"), val=int32(1)];
+        tensor<fp16, [768,768,1,1]> Wq = const()[name=string("Wq"), val=tensor<fp16, [768,768,1,1]>(BLOBFILE(path=string("@model_path/weights/wq.bin"), offset=uint64(64)))];
+        tensor<fp16, [768,768,1,1]> Wk = const()[name=string("Wk"), val=tensor<fp16, [768,768,1,1]>(BLOBFILE(path=string("@model_path/weights/wk.bin"), offset=uint64(64)))];
+        tensor<fp16, [768,768,1,1]> Wv = const()[name=string("Wv"), val=tensor<fp16, [768,768,1,1]>(BLOBFILE(path=string("@model_path/weights/wv.bin"), offset=uint64(64)))];
+        tensor<fp16, [768,768,1,1]> Wo = const()[name=string("Wo"), val=tensor<fp16, [768,768,1,1]>(BLOBFILE(path=string("@model_path/weights/wo.bin"), offset=uint64(64)))];
+        tensor<fp16, [1,768,1,32]> qfFull = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Wq,x=xn)[name=string("cq")];
+        tensor<fp16, [1,768,1,32]> kfFull = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Wk,x=xn)[name=string("ck")];
+        tensor<fp16, [1,768,1,32]> vfFull = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Wv,x=xn)[name=string("cv")];
+        tensor<fp16, [1,768,1,1]> qf = reduce_sum(x=qfFull,axes=raxSp,keep_dims=kd)[name=string("qf")];
+        tensor<int32, [4]> bMask = const()[name=string("b_mask"), val=tensor<int32, [4]>([0,0,0,0])];
+        tensor<int32, [4]> szMask = const()[name=string("sz_mask"), val=tensor<int32, [4]>([1,1,1,256])];
+        tensor<fp16, [1,1,1,256]> maskVec = slice_by_size(x=maskCache,begin=bMask,size=szMask)[name=string("mask_vec")];
+        tensor<fp16, [1,1,1,256]> kCh = reduce_sum(x=kCache,axes=raxCh,keep_dims=kd)[name=string("k_ch")];
+        tensor<fp16, [1,1,1,256]> vCh = reduce_sum(x=vCache,axes=raxCh,keep_dims=kd)[name=string("v_ch")];
+        tensor<fp16, [1,1,1,1]> kS = reduce_sum(x=kCh,axes=raxSp,keep_dims=kd)[name=string("k_s")];
+        tensor<fp16, [1,1,1,1]> vS = reduce_sum(x=vCh,axes=raxSp,keep_dims=kd)[name=string("v_s")];
+        fp16 zc = const()[name=string("zc"), val=fp16(0.0)];
+        tensor<fp16, [1,1,1,256]> mask0 = mul(x=maskVec,y=zc)[name=string("mask0")];
+        tensor<fp16, [1,1,1,1]> mS = reduce_sum(x=mask0,axes=raxSp,keep_dims=kd)[name=string("m_s")];
+        tensor<fp16, [1,1,1,1]> qS = reduce_sum(x=qf,axes=raxCh,keep_dims=kd)[name=string("q_s")];
+        tensor<fp16, [1,768,1,1]> ooProbe = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Wo,x=qf)[name=string("co_probe")];
+        tensor<fp16, [1,1,1,1]> oS = reduce_sum(x=ooProbe,axes=raxCh,keep_dims=kd)[name=string("o_s")];
+        tensor<fp16, [1,1,1,1]> kv = add(x=kS,y=vS)[name=string("kv")];
+        tensor<fp16, [1,1,1,1]> kvm1 = add(x=kv,y=mS)[name=string("kvm1")];
+        tensor<fp16, [1,1,1,1]> kvm2 = add(x=kvm1,y=qS)[name=string("kvm2")];
+        tensor<fp16, [1,1,1,1]> kvm = add(x=kvm2,y=oS)[name=string("kvm")];
+        tensor<fp16, [1,1,1,1]> z = mul(x=kvm,y=zc)[name=string("z")];
+        tensor<fp16, [1,768,1,32]> x2 = add(x=x,y=z)[name=string("res")];
+    } -> (x2,kfFull,vfFull);
+}

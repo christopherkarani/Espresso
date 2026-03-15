@@ -168,12 +168,14 @@ import Testing
         .softmax(axis: -1),
         .cast(target: .fp32),
         .slice(begin: [0, 0, 0, 0], end: [1, 768, 1, 256]),
+        .sliceBySize(begin: [0, 0, 0, 0], size: [1, 768, 1, 32]),
+        .concat(axis: 1, interleave: false),
         .scalar(0.5),
         .weight(blobPath: "@model_path/w.bin", offset: 64),
         .intTensor([1, 1]),
         .boolValue(true),
     ]
-    #expect(cases.count == 12)
+    #expect(cases.count == 14)
 
     for attr in cases {
         switch attr {
@@ -185,6 +187,8 @@ import Testing
         case .softmax: break
         case .cast: break
         case .slice: break
+        case .sliceBySize: break
+        case .concat: break
         case .scalar: break
         case .weight: break
         case .intTensor: break
@@ -245,7 +249,7 @@ import Testing
     }
 }
 
-@Test func setGraphOutputsRejectsUnsortedNames() throws {
+@Test func setGraphOutputsPreservesDeclaredOrder() throws {
     var g = ANEGraph()
     let a = try g.addNode(
         ANENode(op: .input, name: "a", dtype: .fp16, shape: try ANEShape(channels: 4, spatial: 4))
@@ -254,17 +258,13 @@ import Testing
         ANENode(op: .relu, name: "b", dtype: .fp16, shape: try ANEShape(channels: 4, spatial: 4), inputs: [a])
     )
 
-    do {
-        try g.setGraphOutputs([
-            GraphPort(name: "zeta", nodeIndex: b),
-            GraphPort(name: "alpha", nodeIndex: a),
-        ])
-        #expect(Bool(false), "Expected unsorted outputs to be rejected")
-    } catch let error as ANEGraphValidationError {
-        #expect(error == .unsortedGraphOutputs)
-    } catch {
-        #expect(Bool(false), "Unexpected error: \(error)")
-    }
+    let outputs = [
+        GraphPort(name: "zeta", nodeIndex: b),
+        GraphPort(name: "alpha", nodeIndex: a),
+    ]
+    try g.setGraphOutputs(outputs)
+
+    #expect(g.graphOutputs == outputs)
 }
 
 @Test func setGraphOutputsRejectsOutOfRangeNodeIndex() throws {

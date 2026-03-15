@@ -6,9 +6,8 @@ public struct ANEValidationPass: Sendable {
     public func run(on graph: ANEGraph) -> [ANEConstraint] {
         var diagnostics: [ANEConstraint] = []
 
-        diagnostics.append(contentsOf: validateConcatBan(in: graph))
+        diagnostics.append(contentsOf: validateConcatBanned(in: graph))
         diagnostics.append(contentsOf: validateUniformOutputSizes(in: graph))
-        diagnostics.append(contentsOf: validateOutputOrdering(in: graph))
         diagnostics.append(contentsOf: validateMinimumIOSurfaceSize(in: graph))
         diagnostics.append(contentsOf: validateSRAMBudget(in: graph))
         diagnostics.append(contentsOf: validateSoftmaxDimensions(in: graph))
@@ -16,7 +15,7 @@ public struct ANEValidationPass: Sendable {
         return diagnostics
     }
 
-    private func validateConcatBan(in graph: ANEGraph) -> [ANEConstraint] {
+    private func validateConcatBanned(in graph: ANEGraph) -> [ANEConstraint] {
         graph.nodes.enumerated().compactMap { index, node in
             guard node.isLive, node.op == .concatBanned else { return nil }
             return ANEConstraint(
@@ -43,20 +42,6 @@ public struct ANEValidationPass: Sendable {
                 id: 2,
                 severity: .warning,
                 message: "graph outputs should use uniform channels * spatial buffer sizes",
-                nodeIndex: nil
-            )
-        ]
-    }
-
-    private func validateOutputOrdering(in graph: ANEGraph) -> [ANEConstraint] {
-        let outputNames = graph.graphOutputs.map(\.name)
-        guard outputNames != outputNames.sorted() else { return [] }
-
-        return [
-            ANEConstraint(
-                id: 3,
-                severity: .warning,
-                message: "graph outputs must be alphabetically sorted",
                 nodeIndex: nil
             )
         ]

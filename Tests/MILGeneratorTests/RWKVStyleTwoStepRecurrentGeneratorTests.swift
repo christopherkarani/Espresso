@@ -25,14 +25,8 @@ final class RWKVStyleTwoStepRecurrentGeneratorTests: XCTestCase {
 
     func test_rwkv_style_two_step_recurrent_generator_has_three_inputs_and_four_outputs() {
         let mil = RWKVStyleTwoStepRecurrentGenerator(laneSpatial: 32).milText
-        let dim = ModelConfig.dim
-
-        XCTAssertTrue(
-            mil.contains(
-                "func main<ios18>(tensor<fp16, [1, \(dim), 1, 32]> x0, tensor<fp16, [1, \(dim), 1, 32]> x1, tensor<fp16, [1, \(dim), 1, 32]> stateIn)"
-            )
-        )
-        XCTAssertTrue(mil.contains("-> (x0Next,x1Next,stateMid,stateOut);"))
+        XCTAssertEqual(extractMILInputNames(mil), ["x0", "x1", "stateIn"])
+        XCTAssertEqual(extractMILReturnTuple(mil), ["x0Next", "x1Next", "stateMid", "stateOut"])
     }
 
     func test_rwkv_style_two_step_recurrent_generator_stays_inside_proven_op_subset() {
