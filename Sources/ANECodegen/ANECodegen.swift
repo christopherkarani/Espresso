@@ -28,13 +28,12 @@ private struct Emitter: Sendable {
     private var outputPorts: [GraphPort] {
         let explicit = graph.graphOutputs
         if !explicit.isEmpty {
-            return explicit.sorted { $0.name < $1.name }
+            return explicit
         }
 
         return graph.nodes.enumerated()
             .filter { $0.element.isLive && $0.element.isOutput }
             .map { GraphPort(name: $0.element.name, nodeIndex: $0.offset) }
-            .sorted { $0.name < $1.name }
     }
 
     private var inputPorts: [GraphPort] {
@@ -50,9 +49,10 @@ private struct Emitter: Sendable {
     }
 
     func emit() -> String {
-        guard let topoOrder = graph.topoSort() else {
-            preconditionFailure("ANECodegen requires a valid topo-sorted graph")
+        guard graph.validate() == nil else {
+            preconditionFailure("ANECodegen requires a valid graph")
         }
+        let topoOrder = graph.nodes.indices.filter { graph.nodes[$0].isLive }
 
         let inputsByIndex = Dictionary(uniqueKeysWithValues: inputPorts.map { ($0.nodeIndex, $0) })
         let outputs = outputPorts
@@ -114,6 +114,12 @@ private struct Emitter: Sendable {
             case .slice:
                 lines.append(contentsOf: emitSlice(node, valueNames: valueNames))
                 valueNames[nodeIndex] = node.name
+            case .sliceBySize:
+                lines.append(contentsOf: emitSliceBySize(node, valueNames: valueNames))
+                valueNames[nodeIndex] = node.name
+            case .concat:
+                lines.append(contentsOf: emitConcat(node, valueNames: valueNames))
+                valueNames[nodeIndex] = node.name
             case .concatBanned:
                 preconditionFailure("concatBanned nodes must not reach ANECodegen")
             }
@@ -137,7 +143,7 @@ private struct Emitter: Sendable {
             returnNames.append(port.name)
         }
 
-        lines.append("    } -> (\(returnNames.sorted().joined(separator: ", ")));")
+        lines.append("    } -> (\(returnNames.joined(separator: ", ")));")
         lines.append("}")
         return lines.joined(separator: "\n") + "\n"
     }
@@ -163,7 +169,7 @@ private struct Emitter: Sendable {
             ]
         case .none:
             preconditionFailure("Const node \(node.name) is missing attrs")
-        case .conv, .matmul, .transpose, .reduce, .softmax, .cast, .slice:
+        case .conv, .matmul, .transpose, .reduce, .softmax, .cast, .slice, .sliceBySize, .concat:
             preconditionFailure("Const node \(node.name) has invalid attrs \(node.attrs)")
         }
     }
@@ -346,6 +352,41 @@ private struct Emitter: Sendable {
         ]
     }
 
+    private func emitSliceBySize(_ node: ANENode, valueNames: [Int: String]) -> [String] {
+        guard case .sliceBySize(let begin, let size) = node.attrs else {
+            preconditionFailure("SliceBySize node \(node.name) must have sliceBySize attrs")
+        }
+        precondition(node.inputs.count == 1, "SliceBySize node \(node.name) requires one input")
+
+        let xName = requireValueName(for: node.inputs[0], valueNames: valueNames, nodeName: node.name)
+        let rank = begin.count
+        let beginName = "\(node.name)_begin"
+        let sizeName = "\(node.name)_size"
+
+        return [
+            "        tensor<int32, [\(rank)]> \(beginName) = const()[name=string(\"\(beginName)\"), val=tensor<int32, [\(rank)]>([\(begin.map(String.init).joined(separator: ", "))])];",
+            "        tensor<int32, [\(rank)]> \(sizeName) = const()[name=string(\"\(sizeName)\"), val=tensor<int32, [\(rank)]>([\(size.map(String.init).joined(separator: ", "))])];",
+            "        \(tensorType(dtype: node.dtype, shape: node.shape)) \(node.name) = slice_by_size(begin=\(beginName), size=\(sizeName), x=\(xName))[name=string(\"\(node.name)\")];",
+        ]
+    }
+
+    private func emitConcat(_ node: ANENode, valueNames: [Int: String]) -> [String] {
+        guard case .concat(let axis, let interleave) = node.attrs else {
+            preconditionFailure("Concat node \(node.name) must have concat attrs")
+        }
+        precondition(!node.inputs.isEmpty, "Concat node \(node.name) requires inputs")
+
+        let axisName = "\(node.name)_axis"
+        let interleaveName = "\(node.name)_interleave"
+        let values = node.inputs.map { requireValueName(for: $0, valueNames: valueNames, nodeName: node.name) }
+
+        return [
+            "        int32 \(axisName) = const()[name=string(\"\(axisName)\"), val=int32(\(axis))];",
+            "        bool \(interleaveName) = const()[name=string(\"\(interleaveName)\"), val=bool(\(interleave ? "true" : "false"))];",
+            "        \(tensorType(dtype: node.dtype, shape: node.shape)) \(node.name) = concat(axis=\(axisName), interleave=\(interleaveName), values=(\(values.joined(separator: ","))))[name=string(\"\(node.name)\")];",
+        ]
+    }
+
     private func requireValueName(for nodeIndex: Int, valueNames: [Int: String], nodeName: String) -> String {
         guard let valueName = valueNames[nodeIndex] else {
             preconditionFailure("Node \(nodeName) references unavailable input index \(nodeIndex)")
@@ -365,6 +406,10 @@ private struct Emitter: Sendable {
             "conv"
         case .slice:
             "slice_by_index"
+        case .sliceBySize:
+            "slice_by_size"
+        case .concat:
+            "concat"
         case .input, .const, .concatBanned:
             preconditionFailure("No MIL op mapping for \(op)")
         default:

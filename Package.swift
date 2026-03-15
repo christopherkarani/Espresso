@@ -35,7 +35,7 @@ let package = Package(
         ),
         .target(
             name: "MILGenerator",
-            dependencies: ["ANETypes"],
+            dependencies: ["ANETypes", "ANEGraphIR", "ANEBuilder", "ANECodegen", "ANEPasses"],
             path: "Sources/MILGenerator",
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
@@ -190,6 +190,13 @@ let package = Package(
             name: "LoRAAdapterTests",
             dependencies: ["LoRAAdapter", "ANEGraphIR"],
             path: "Tests/LoRAAdapterTests",
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
+            name: "MigrationParityTests",
+            dependencies: ["MILGenerator", "ANETypes", "ANEGraphIR", "ANEBuilder", "ANECodegen", "ANEPasses"],
+            path: "Tests/MigrationParityTests",
+            resources: [.process("Fixtures")],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
     ]

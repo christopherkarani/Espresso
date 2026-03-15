@@ -1,0 +1,52 @@
+program(1.3)
+[buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, {"coremlc-version", "3505.4.1"}, {"coremltools-component-milinternal", ""}, {"coremltools-version", "9.0"}})]
+{
+    func main<ios18>(tensor<fp16, [1, 3072, 1, 256]> x) {
+        string pt = const()[name=string("pt"), val=string("valid")];
+        tensor<int32, [2]> st = const()[name=string("st"), val=tensor<int32, [2]>([1,1])];
+        tensor<int32, [4]> pd = const()[name=string("pd"), val=tensor<int32, [4]>([0,0,0,0])];
+        tensor<int32, [2]> dl = const()[name=string("dl"), val=tensor<int32, [2]>([1,1])];
+        int32 gr = const()[name=string("gr"), val=int32(1)];
+        tensor<int32, [4]> sz = const()[name=string("sz"), val=tensor<int32, [4]>([1,768,1,256])];
+        tensor<int32, [4]> b0 = const()[name=string("b0"), val=tensor<int32, [4]>([0,0,0,0])];
+        tensor<fp16, [1,768,1,256]> qf = slice_by_size(x=x,begin=b0,size=sz)[name=string("s0")];
+        tensor<int32, [4]> b1 = const()[name=string("b1"), val=tensor<int32, [4]>([0,768,0,0])];
+        tensor<fp16, [1,768,1,256]> kf = slice_by_size(x=x,begin=b1,size=sz)[name=string("s1")];
+        tensor<int32, [4]> b2 = const()[name=string("b2"), val=tensor<int32, [4]>([0,1536,0,0])];
+        tensor<fp16, [1,768,1,256]> vf = slice_by_size(x=x,begin=b2,size=sz)[name=string("s2")];
+        tensor<int32, [4]> b3 = const()[name=string("b3"), val=tensor<int32, [4]>([0,2304,0,0])];
+        tensor<fp16, [1,768,1,256]> dx2f = slice_by_size(x=x,begin=b3,size=sz)[name=string("s3")];
+        tensor<fp16, [768,768,1,1]> Wot = const()[name=string("Wot"), val=tensor<fp16, [768,768,1,1]>(BLOBFILE(path=string("@model_path/weights/wot.bin"), offset=uint64(64)))];
+        tensor<fp16, [1,768,1,256]> df = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Wot,x=dx2f)[name=string("cwo")];
+        tensor<int32, [4]> rsh = const()[name=string("rsh"), val=tensor<int32, [4]>([1,12,64,256])];
+        tensor<int32, [4]> pm = const()[name=string("pm"), val=tensor<int32, [4]>([0,1,3,2])];
+        tensor<fp16, [1,12,64,256]> qr = reshape(shape=rsh,x=qf)[name=string("rq")];
+        tensor<fp16, [1,12,256,64]> q = transpose(perm=pm,x=qr)[name=string("tq")];
+        tensor<fp16, [1,12,64,256]> kr = reshape(shape=rsh,x=kf)[name=string("rk")];
+        tensor<fp16, [1,12,256,64]> k = transpose(perm=pm,x=kr)[name=string("tk")];
+        tensor<fp16, [1,12,64,256]> vr = reshape(shape=rsh,x=vf)[name=string("rv")];
+        tensor<fp16, [1,12,256,64]> v = transpose(perm=pm,x=vr)[name=string("tv")];
+        tensor<fp16, [1,12,64,256]> dr = reshape(shape=rsh,x=df)[name=string("rd")];
+        tensor<fp16, [1,12,256,64]> da = transpose(perm=pm,x=dr)[name=string("td")];
+        bool bF = const()[name=string("bF"), val=bool(false)];
+        bool bT = const()[name=string("bT"), val=bool(true)];
+        tensor<fp16, [1,12,256,256]> sc1 = matmul(transpose_x=bF,transpose_y=bT,x=q,y=k)[name=string("mm1")];
+        fp16 scv = const()[name=string("scv"), val=fp16(0.125000)];
+        tensor<fp16, [1,12,256,256]> sc2 = mul(x=sc1,y=scv)[name=string("scl")];
+        tensor<fp16, [1,1,256,256]> cm = const()[name=string("cm"), val=tensor<fp16, [1,1,256,256]>(BLOBFILE(path=string("@model_path/weights/mask.bin"), offset=uint64(64)))];
+        tensor<fp16, [1,12,256,256]> ms = add(x=sc2,y=cm)[name=string("msk")];
+        int32 sax = const()[name=string("sax"), val=int32(-1)];
+        tensor<fp16, [1,12,256,256]> probs = softmax(axis=sax,x=ms)[name=string("sm")];
+        tensor<fp16, [1,12,256,64]> dv4 = matmul(transpose_x=bT,transpose_y=bF,x=probs,y=da)[name=string("dv")];
+        tensor<fp16, [1,12,256,256]> dp4 = matmul(transpose_x=bF,transpose_y=bT,x=da,y=v)[name=string("dp")];
+        tensor<fp16, [1,12,64,256]> dvt = transpose(perm=pm,x=dv4)[name=string("dvt")];
+        tensor<int32, [4]> dvs = const()[name=string("dvs"), val=tensor<int32, [4]>([1,768,1,256])];
+        tensor<fp16, [1,768,1,256]> dvf = reshape(shape=dvs,x=dvt)[name=string("dvf")];
+        tensor<int32, [4]> scs = const()[name=string("scs"), val=tensor<int32, [4]>([1,3072,1,256])];
+        tensor<fp16, [1,3072,1,256]> pf = reshape(shape=scs,x=probs)[name=string("pf")];
+        tensor<fp16, [1,3072,1,256]> dpf = reshape(shape=scs,x=dp4)[name=string("dpf")];
+        int32 cax = const()[name=string("cax"), val=int32(1)];
+        bool cid = const()[name=string("cid"), val=bool(false)];
+        tensor<fp16, [1,6912,1,256]> out = concat(axis=cax,interleave=cid,values=(dvf,pf,dpf))[name=string("cat")];
+    } -> (out);
+}
