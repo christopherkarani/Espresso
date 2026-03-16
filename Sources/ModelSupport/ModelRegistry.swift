@@ -55,11 +55,45 @@ public enum ModelRegistry {
         architecture: .llama
     )
 
+    /// Llama 3.2 1B — GQA (nKVHead=8), SwiGLU, RMSNorm.
+    /// Weights should be pre-processed offline: GQA heads expanded, RoPE rotations baked into Wq/Wk.
+    public static let llama3_2_1b = MultiModelConfig(
+        name: "llama3_2_1b",
+        nLayer: 16,
+        nHead: 32,
+        nKVHead: 8,
+        dModel: 2_048,
+        headDim: 64,
+        hiddenDim: 8_192,
+        vocab: 128_256,
+        maxSeq: 2_048,
+        normEps: 1e-5,
+        architecture: .llama
+    )
+
+    /// Llama 3.2 3B — GQA (nKVHead=8), SwiGLU, RMSNorm.
+    /// Weights should be pre-processed offline: GQA heads expanded, RoPE rotations baked into Wq/Wk.
+    public static let llama3_2_3b = MultiModelConfig(
+        name: "llama3_2_3b",
+        nLayer: 28,
+        nHead: 24,
+        nKVHead: 8,
+        dModel: 3_072,
+        headDim: 128,
+        hiddenDim: 8_192,
+        vocab: 128_256,
+        maxSeq: 2_048,
+        normEps: 1e-5,
+        architecture: .llama
+    )
+
     public static let all: [String: MultiModelConfig] = [
         gpt2_124m.name: gpt2_124m,
         stories110m.name: stories110m,
         smolLM_135m.name: smolLM_135m,
         tinyLlama_1_1b.name: tinyLlama_1_1b,
+        llama3_2_1b.name: llama3_2_1b,
+        llama3_2_3b.name: llama3_2_3b,
     ]
 
     public static func config(named name: String) -> MultiModelConfig? {
