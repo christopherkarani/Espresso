@@ -74,7 +74,7 @@ import ANECodegen
     fp16 scalar = const()[name=string("scalar"), val=fp16(1.0)];
     tensor<fp16, [1, 4, 1, 8]> c = conv(dilations=dl, groups=gr, pad=pd, pad_type=pt, strides=st, weight=W, x=x)[name=string("c")];
     tensor<fp16, [1, 4, 1, 8]> m = matmul(transpose_x=tx, transpose_y=ty, x=c, y=y)[name=string("m")];
-    tensor<fp16, [1, 1, 1, 8]> r = reduce_sum(axes=ax, keep_dims=kd, x=m)[name=string("r")];
+    tensor<fp16, [1, 1, 1, 8]> r = reduce_sum(x=m, axes=ax, keep_dims=kd)[name=string("r")];
     tensor<fp16, [1, 4, 1, 4]> s = slice_by_index(begin=b, begin_mask=bm, end=e, end_mask=em, squeeze_mask=sm, stride=st, x=m)[name=string("s")];
     """
 

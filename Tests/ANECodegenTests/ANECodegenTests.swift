@@ -126,9 +126,9 @@ import ANEGraphIR
     let mil = ANECodegen.emit(graph)
     #expect(mil.contains("tensor<int32, [1]> sum_axes"))
     #expect(mil.contains("bool sum_keep_dims"))
-    #expect(mil.contains("reduce_sum(axes=sum_axes, keep_dims=sum_keep_dims, x=x)"))
-    #expect(mil.contains("reduce_mean(axes=mean_axes, keep_dims=mean_keep_dims, x=x)"))
-    #expect(mil.contains("reduce_max(axes=max_axes, keep_dims=max_keep_dims, x=x)"))
+    #expect(mil.contains("reduce_sum(x=x, axes=sum_axes, keep_dims=sum_keep_dims)"))
+    #expect(mil.contains("reduce_mean(x=x, axes=mean_axes, keep_dims=mean_keep_dims)"))
+    #expect(mil.contains("reduce_max(x=x, axes=max_axes, keep_dims=max_keep_dims)"))
     _ = mean
     _ = sum
 }
