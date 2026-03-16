@@ -1,0 +1,36 @@
+{
+  "updated": "2026-03-17",
+  "hardware": "Apple M3 Max (16-core CPU, 40-core GPU, 16-core ANE)",
+  "os": "macOS 15.0",
+  "espresso_version": "1.1.0",
+  "results": [
+    {
+      "name": "Espresso ANE (recurrent fused, 6-layer)",
+      "framework": "Espresso",
+      "backend": "ANE",
+      "model": "stories110m (Llama, 6 layers)",
+      "ms_per_token": 1.929,
+      "tokens_per_sec": 519,
+      "notes": "Fused 3-layer recurrent decode + ANE classifier head + direct-select argmax"
+    },
+    {
+      "name": "Espresso ANE (direct transformer, 6-layer)",
+      "framework": "Espresso",
+      "backend": "ANE",
+      "model": "stories110m (Llama, 6 layers)",
+      "ms_per_token": 6.559,
+      "tokens_per_sec": 153,
+      "notes": "Transformer decode without recurrent fusion"
+    },
+    {
+      "name": "CoreML (cpuAndNeuralEngine baseline)",
+      "framework": "CoreML",
+      "backend": "CPU+ANE",
+      "model": "stories110m (Llama, 6 layers)",
+      "ms_per_token": 6.582,
+      "tokens_per_sec": 152,
+      "notes": "Apple CoreML default neural engine path"
+    }
+  ],
+  "speedup_vs_coreml": 3.41
+}

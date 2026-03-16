@@ -14,10 +14,40 @@ import ANETypes
     #expect(stories.architecture == .llama)
 }
 
-@Test func registryContainsAllFourModels() {
-    #expect(ModelRegistry.all.count == 4)
+@Test func registryContainsAllSixModels() {
+    #expect(ModelRegistry.all.count == 6)
     #expect(ModelRegistry.all["smolLM_135m"]?.nKVHead == 3)
     #expect(ModelRegistry.all["tinyLlama_1_1b"]?.nHead == 32)
+}
+
+@Test func llama3_2_1bConfigIsCorrect() throws {
+    let cfg = try #require(ModelRegistry.config(named: "llama3_2_1b"))
+    #expect(cfg.nLayer == 16)
+    #expect(cfg.nHead == 32)
+    #expect(cfg.nKVHead == 8)
+    #expect(cfg.dModel == 2048)
+    #expect(cfg.headDim == 64)
+    #expect(cfg.hiddenDim == 8192)
+    #expect(cfg.vocab == 128_256)
+    #expect(cfg.maxSeq == 2048)
+    #expect(cfg.architecture == .llama)
+    // dModel constraint: nHead * headDim
+    #expect(cfg.dModel == cfg.nHead * cfg.headDim)
+}
+
+@Test func llama3_2_3bConfigIsCorrect() throws {
+    let cfg = try #require(ModelRegistry.config(named: "llama3_2_3b"))
+    #expect(cfg.nLayer == 28)
+    #expect(cfg.nHead == 24)
+    #expect(cfg.nKVHead == 8)
+    #expect(cfg.dModel == 3072)
+    #expect(cfg.headDim == 128)
+    #expect(cfg.hiddenDim == 8192)
+    #expect(cfg.vocab == 128_256)
+    #expect(cfg.maxSeq == 2048)
+    #expect(cfg.architecture == .llama)
+    // dModel constraint: nHead * headDim
+    #expect(cfg.dModel == cfg.nHead * cfg.headDim)
 }
 
 @Test func multiModelConfigCoexistsWithANETypesModelConfig() {

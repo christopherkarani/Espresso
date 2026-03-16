@@ -31,8 +31,9 @@ autoresearch-results.tsv
 *.gguf
 *.safetensors
 
-# Benchmark outputs
-benchmarks/results/
+# Benchmark outputs (latest.json is tracked; per-run dumps are not)
+benchmarks/results/*
+!benchmarks/results/latest.json
 benchmarks/models/*.mlpackage
 
 # Generated artifacts (bench logs, history) and Python caches
@@ -53,6 +54,7 @@ docs/
 docs/*
 !docs/autoresearch/
 !docs/autoresearch/**
+!docs/benchmarks.md
 prompts/
 !docs/autoresearch/prompts/
 !docs/autoresearch/prompts/**
@@ -66,7 +68,11 @@ scripts/internal/**
 !scripts/reproduce_local_real_artifact_claim.sh
 !scripts/run_power_benchmark.sh
 !scripts/run_autoresearch_compare.sh
+!scripts/run_autoresearch_suite.sh
+!scripts/judge_suite_results.sh
+!scripts/benchmark-prompts.txt
 !scripts/setup_autoresearch_lane.sh
+!scripts/generate-benchmark-dashboard.sh
 !scripts/README.md
 tasks/
 AGENTS.md
