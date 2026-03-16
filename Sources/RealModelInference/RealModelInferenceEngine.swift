@@ -204,6 +204,45 @@ public struct RealModelInferenceEngine: ~Copyable {
         }
     }
 
+    private struct SpeculativeRuntimeKey: Hashable {
+        let draftLayerCount: Int
+        let maxSeq: Int
+    }
+
+    private final class CachedSpeculativeRuntimePair {
+        let key: SpeculativeRuntimeKey
+        var draftRuntime: HybridLayerRangeRuntime
+        var verifierRuntime: HybridLayerRangeRuntime
+
+        init(
+            key: SpeculativeRuntimeKey,
+            config: MultiModelConfig,
+            weightDirURL: URL,
+            assets: GPT2TopLevelAssets
+        ) throws {
+            self.key = key
+            self.draftRuntime = try HybridLayerRangeRuntime(
+                config: config,
+                weightDirURL: weightDirURL,
+                assets: assets,
+                layerRange: 0..<key.draftLayerCount,
+                maxSeq: key.maxSeq
+            )
+            self.verifierRuntime = try HybridLayerRangeRuntime(
+                config: config,
+                weightDirURL: weightDirURL,
+                assets: assets,
+                layerRange: key.draftLayerCount..<config.nLayer,
+                maxSeq: key.maxSeq
+            )
+        }
+
+        func resetAll(dim: Int) {
+            draftRuntime.reset(dim: dim)
+            verifierRuntime.reset(dim: dim)
+        }
+    }
+
     private struct HybridRuntimeCheckpoint: Sendable {
         let step: Int
     }
@@ -492,6 +531,7 @@ public struct RealModelInferenceEngine: ~Copyable {
     private var compiledHybridGreedyClassifier: LayerStorage<CompiledClassifier>
     private var compiledHybridGreedySpatial: Int
     private var hybridMetalAttention: MetalAttentionKernel?
+    private var speculativeRuntimeCache: [SpeculativeRuntimeKey: CachedSpeculativeRuntimePair]
     private let classifierBlockMaxNorms: [Float]
     private var classifierLogitsScratch: [Float]
 
@@ -526,6 +566,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         self.compiledHybridGreedyClassifier = Self.emptyStorage(CompiledClassifier.self)
         self.compiledHybridGreedySpatial = 0
         self.hybridMetalAttention = nil
+        self.speculativeRuntimeCache = [:]
         self.classifierBlockMaxNorms = classifierBlockMaxNorms
         self.classifierLogitsScratch = [Float](
             repeating: 0,
@@ -1646,36 +1687,24 @@ public struct RealModelInferenceEngine: ~Copyable {
             )
         }
 
-        let speculativeCompileStart = DispatchTime.now().uptimeNanoseconds
-        var draftRuntime = try HybridLayerRangeRuntime(
-            config: config,
-            weightDirURL: weightDirURL,
-            assets: gpt2Assets,
-            layerRange: 0..<draftLayerCount,
+        let (cachedRuntimePair, speculativeCompileTimeMs) = try cachedSpeculativeRuntimePair(
+            draftLayerCount: draftLayerCount,
             maxSeq: maxSeq
         )
-        var verifierRuntime = try HybridLayerRangeRuntime(
-            config: config,
-            weightDirURL: weightDirURL,
-            assets: gpt2Assets,
-            layerRange: draftLayerCount..<config.nLayer,
-            maxSeq: maxSeq
-        )
-        let totalCompileTimeMs = compileTimeMs + Self.milliseconds(
-            from: DispatchTime.now().uptimeNanoseconds - speculativeCompileStart
-        )
+        cachedRuntimePair.resetAll(dim: config.dModel)
+        let totalCompileTimeMs = compileTimeMs + speculativeCompileTimeMs
 
         let xCur = TensorBuffer(count: config.dModel, zeroed: true)
         for (position, token) in promptTokens.enumerated() {
             try writeIncrementalEmbedding(token: token, position: position, into: xCur)
             do {
-                try draftRuntime.advanceFromBuffer(
+                try cachedRuntimePair.draftRuntime.advanceFromBuffer(
                     xCur,
                     metalAttention: metalAttention,
                     dim: config.dModel
                 )
-                try verifierRuntime.advanceFromSurface(
-                    draftRuntime.finalSurface,
+                try cachedRuntimePair.verifierRuntime.advanceFromSurface(
+                    cachedRuntimePair.draftRuntime.finalSurface,
                     metalAttention: metalAttention,
                     dim: config.dModel
                 )
@@ -1719,12 +1748,12 @@ public struct RealModelInferenceEngine: ~Copyable {
         }
 
         while generatedTokens.count < effectiveMaxTokens {
-            let checkpoint = try draftRuntime.captureCheckpoint(dim: config.dModel)
+            let checkpoint = try cachedRuntimePair.draftRuntime.captureCheckpoint(dim: config.dModel)
             let proposedToken0: UInt16
             do {
-                proposedToken0 = try draftRuntime.selectGreedyToken(vocab: config.vocab)
+                proposedToken0 = try cachedRuntimePair.draftRuntime.selectGreedyToken(vocab: config.vocab)
                 try writeIncrementalEmbedding(token: proposedToken0, position: allTokens.count, into: xCur)
-                try draftRuntime.advanceFromBuffer(
+                try cachedRuntimePair.draftRuntime.advanceFromBuffer(
                     xCur,
                     metalAttention: metalAttention,
                     dim: config.dModel
@@ -1737,7 +1766,7 @@ public struct RealModelInferenceEngine: ~Copyable {
 
             let proposedToken1: UInt16
             do {
-                proposedToken1 = try draftRuntime.selectGreedyToken(vocab: config.vocab)
+                proposedToken1 = try cachedRuntimePair.draftRuntime.selectGreedyToken(vocab: config.vocab)
             } catch {
                 throw RealModelInferenceError.runtimeFailure(
                     "Hybrid speculative draft proposal-1 failed at generated token \(generatedTokens.count): \(error)"
@@ -1746,7 +1775,7 @@ public struct RealModelInferenceEngine: ~Copyable {
 
             let exactToken0: UInt16
             do {
-                exactToken0 = try verifierRuntime.selectGreedyToken(vocab: config.vocab)
+                exactToken0 = try cachedRuntimePair.verifierRuntime.selectGreedyToken(vocab: config.vocab)
             } catch {
                 throw RealModelInferenceError.runtimeFailure(
                     "Hybrid speculative verifier token-0 failed at generated token \(generatedTokens.count): \(error)"
@@ -1758,15 +1787,19 @@ public struct RealModelInferenceEngine: ~Copyable {
 
             if exactToken0 != proposedToken0 {
                 do {
-                    try draftRuntime.rollback(to: checkpoint, mutatedTokenCount: 1, dim: config.dModel)
+                    try cachedRuntimePair.draftRuntime.rollback(
+                        to: checkpoint,
+                        mutatedTokenCount: 1,
+                        dim: config.dModel
+                    )
                     try writeIncrementalEmbedding(token: exactToken0, position: allTokens.count, into: xCur)
-                    try draftRuntime.advanceFromBuffer(
+                    try cachedRuntimePair.draftRuntime.advanceFromBuffer(
                         xCur,
                         metalAttention: metalAttention,
                         dim: config.dModel
                     )
-                    try verifierRuntime.advanceFromSurface(
-                        draftRuntime.finalSurface,
+                    try cachedRuntimePair.verifierRuntime.advanceFromSurface(
+                        cachedRuntimePair.draftRuntime.finalSurface,
                         metalAttention: metalAttention,
                         dim: config.dModel
                     )
@@ -1786,8 +1819,8 @@ public struct RealModelInferenceEngine: ~Copyable {
             }
 
             do {
-                try verifierRuntime.advanceFromSurface(
-                    draftRuntime.finalSurface,
+                try cachedRuntimePair.verifierRuntime.advanceFromSurface(
+                    cachedRuntimePair.draftRuntime.finalSurface,
                     metalAttention: metalAttention,
                     dim: config.dModel
                 )
@@ -1807,7 +1840,7 @@ public struct RealModelInferenceEngine: ~Copyable {
 
             let exactToken1: UInt16
             do {
-                exactToken1 = try verifierRuntime.selectGreedyToken(vocab: config.vocab)
+                exactToken1 = try cachedRuntimePair.verifierRuntime.selectGreedyToken(vocab: config.vocab)
             } catch {
                 throw RealModelInferenceError.runtimeFailure(
                     "Hybrid speculative verifier token-1 failed at generated token \(generatedTokens.count): \(error)"
@@ -1820,13 +1853,13 @@ public struct RealModelInferenceEngine: ~Copyable {
             do {
                 let committedSecondToken = exactToken1 == proposedToken1 ? proposedToken1 : exactToken1
                 try writeIncrementalEmbedding(token: committedSecondToken, position: allTokens.count, into: xCur)
-                try draftRuntime.advanceFromBuffer(
+                try cachedRuntimePair.draftRuntime.advanceFromBuffer(
                     xCur,
                     metalAttention: metalAttention,
                     dim: config.dModel
                 )
-                try verifierRuntime.advanceFromSurface(
-                    draftRuntime.finalSurface,
+                try cachedRuntimePair.verifierRuntime.advanceFromSurface(
+                    cachedRuntimePair.draftRuntime.finalSurface,
                     metalAttention: metalAttention,
                     dim: config.dModel
                 )
@@ -1859,6 +1892,30 @@ public struct RealModelInferenceEngine: ~Copyable {
             compileTimeMs: totalCompileTimeMs,
             firstTokenLatencyMs: firstTokenLatencyMs
         )
+    }
+
+    private mutating func cachedSpeculativeRuntimePair(
+        draftLayerCount: Int,
+        maxSeq: Int
+    ) throws -> (CachedSpeculativeRuntimePair, Double) {
+        let key = SpeculativeRuntimeKey(
+            draftLayerCount: draftLayerCount,
+            maxSeq: maxSeq
+        )
+        if let cached = speculativeRuntimeCache[key] {
+            return (cached, 0)
+        }
+
+        let compileStart = DispatchTime.now().uptimeNanoseconds
+        let cached = try CachedSpeculativeRuntimePair(
+            key: key,
+            config: config,
+            weightDirURL: weightDirURL,
+            assets: gpt2Assets
+        )
+        speculativeRuntimeCache[key] = cached
+        let compileTimeMs = Self.milliseconds(from: DispatchTime.now().uptimeNanoseconds - compileStart)
+        return (cached, compileTimeMs)
     }
 
     private func encodePrompt(_ prompt: String) throws -> [UInt16] {

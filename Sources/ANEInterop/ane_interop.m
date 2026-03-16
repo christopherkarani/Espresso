@@ -288,6 +288,29 @@ static bool ane_interop_copy_donor_net_plist(NSString *donorHexId, NSString *td)
     return true;
 }
 
+static void ane_interop_persist_net_plist_to_cache(NSString *hexId, NSString *td) {
+    if (hexId.length == 0 || td.length == 0) {
+        return;
+    }
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *source = [td stringByAppendingPathComponent:@"net.plist"];
+    if (![fm fileExistsAtPath:source]) {
+        return;
+    }
+
+    NSString *cacheDir = [[ane_interop_user_caches_directory() stringByAppendingPathComponent:hexId]
+        stringByStandardizingPath];
+    NSString *destination = [cacheDir stringByAppendingPathComponent:@"net.plist"];
+    if (![fm createDirectoryAtPath:cacheDir withIntermediateDirectories:YES attributes:nil error:nil]) {
+        return;
+    }
+    if ([fm fileExistsAtPath:destination]) {
+        [fm removeItemAtPath:destination error:nil];
+    }
+    [fm copyItemAtPath:source toPath:destination error:nil];
+}
+
 static NSDictionary *ane_interop_prepare_load_options(id mdl,
                                                       bool wantPerfStats,
                                                       id *outPerfStats,
@@ -1975,7 +1998,24 @@ ANEHandle *ane_interop_compile(const uint8_t *milText, size_t milLen,
 
         NSError *e = nil;
         const bool strictOptions = ane_interop_strict_options_enabled();
-        if (!(cachePolicy == ANE_COMPILE_CACHE_PREFER_CACHED && compiledExists)) {
+        BOOL loadedFromCache = NO;
+        if (cachePolicy == ANE_COMPILE_CACHE_PREFER_CACHED && compiledExists) {
+            if (ane_interop_copy_donor_net_plist((NSString *)hx, td)) {
+                NSDictionary *loadOptions = ane_interop_reload_with_fallback_options(
+                    mdl, finalOptions, strictOptions, &e
+                );
+                if (loadOptions) {
+                    finalOptions = loadOptions;
+                    loadedFromCache = YES;
+                } else if (ane_interop_trace_enabled()) {
+                    fprintf(stderr, "ANE cached load failed, falling back to compile...\n");
+                }
+            } else if (ane_interop_trace_enabled()) {
+                fprintf(stderr, "ANE cached donor net.plist missing, falling back to compile...\n");
+            }
+        }
+
+        if (!loadedFromCache) {
             if (!((BOOL(*)(id,SEL,unsigned int,id,NSError**))objc_msgSend)(
                     mdl, @selector(compileWithQoS:options:error:), 21, finalOptions, &e)) {
                 // Retry without options (some host builds reject unknown keys).
@@ -2007,38 +2047,20 @@ ANEHandle *ane_interop_compile(const uint8_t *milText, size_t milLen,
                     return NULL;
                 }
             }
-        }
-        if (!((BOOL(*)(id,SEL,unsigned int,id,NSError**))objc_msgSend)(
-                mdl, @selector(loadWithQoS:options:error:), 21, finalOptions, &e)) {
-            // Retry without options (keep behavior symmetric with compile).
-            if ([finalOptions count] > 0) {
-                if (strictOptions) {
-                    fprintf(stderr, "ANE load failed with strict options (no fallback): %s\n",
-                            e ? [[e description] UTF8String] : "no error");
-                    ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE);
-                    ane_interop_remove_tmpdir(td);
-                    return NULL;
-                }
-                if (ane_interop_trace_enabled()) {
-                    fprintf(stderr, "ANE load retrying without options...\n");
-                }
-                e = nil;
-                if (((BOOL(*)(id,SEL,unsigned int,id,NSError**))objc_msgSend)(
-                        mdl, @selector(loadWithQoS:options:error:), 21, @{}, &e)) {
-                    finalOptions = @{};
-                } else {
-                    fprintf(stderr, "ANE load failed: %s\n", e ? [[e description] UTF8String] : "no error");
-                    ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE);
-                    ane_interop_remove_tmpdir(td);
-                    return NULL;
-                }
-            } else {
+
+            NSDictionary *loadOptions = ane_interop_reload_with_fallback_options(
+                mdl, finalOptions, strictOptions, &e
+            );
+            if (!loadOptions) {
                 fprintf(stderr, "ANE load failed: %s\n", e ? [[e description] UTF8String] : "no error");
                 ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE);
                 ane_interop_remove_tmpdir(td);
                 return NULL;
             }
+            finalOptions = loadOptions;
         }
+
+        ane_interop_persist_net_plist_to_cache((NSString *)hx, td);
 
         long qd = ane_interop_env_long("ANE_QUEUE_DEPTH", -1);
         if (qd >= 0 && [mdl respondsToSelector:@selector(setQueueDepth:)]) {
