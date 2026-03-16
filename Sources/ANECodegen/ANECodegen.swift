@@ -12,7 +12,7 @@ public struct ANECodegen: Sendable {
 private struct Emitter: Sendable {
     private static let headerLines = [
         "program(1.3)",
-        "[buildInfo = dict<string, string>({\"coremlc-component-MIL\": \"4.42.0\", \"coremlc-version\": \"3510.2.1\", \"coremltools-component-milinternal\": \"0.1.0\", \"coremltools-version\": \"8.1\"})]",
+        "[buildInfo = dict<string, string>({{\"coremlc-component-MIL\", \"3510.2.1\"}, {\"coremlc-version\", \"3505.4.1\"}, {\"coremltools-component-milinternal\", \"\"}, {\"coremltools-version\", \"9.0\"}})]",
         "{",
     ]
 
@@ -268,7 +268,7 @@ private struct Emitter: Sendable {
         return [
             "        tensor<int32, [1]> \(axesName) = const()[name=string(\"\(axesName)\"), val=tensor<int32, [1]>([\(axis)])];",
             "        bool \(keepDimsName) = const()[name=string(\"\(keepDimsName)\"), val=bool(\(keepDims ? "true" : "false"))];",
-            "        \(tensorType(dtype: node.dtype, shape: node.shape)) \(node.name) = \(milOpName(node.op))(axes=\(axesName), keep_dims=\(keepDimsName), x=\(xName))[name=string(\"\(node.name)\")];",
+            "        \(tensorType(dtype: node.dtype, shape: node.shape)) \(node.name) = \(milOpName(node.op))(x=\(xName), axes=\(axesName), keep_dims=\(keepDimsName))[name=string(\"\(node.name)\")];",
         ]
     }
 

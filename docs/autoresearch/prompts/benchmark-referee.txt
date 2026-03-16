@@ -1,0 +1,9 @@
+Read .autoresearch/program.md and begin the optimization loop.
+Work on the parent Espresso repo, not inside .autoresearch.
+You are the only lane allowed to run the official hardware throughput benchmark.
+Source .autoresearch/env.sh before benchmarking.
+Use .autoresearch/bench.sh as the benchmark contract.
+Keep the prompt, weights, tokenizer, and Core ML baseline constant across candidate branches.
+Validate candidates serially, require token_match and text_match to stay true, and record results in autoresearch-results.tsv.
+Do not optimize model code except to improve benchmark fidelity or result logging.
+Discard anything that changes benchmark semantics.

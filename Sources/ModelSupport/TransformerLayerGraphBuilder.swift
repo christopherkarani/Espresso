@@ -190,7 +190,7 @@ public struct TransformerLayerGraphBuilder {
 
 private extension ANEGraph {
     mutating func constWeight128(_ name: String, shape: ANEShape, blobPath: String) throws -> Int {
-        try constWeight(name, shape: shape, blobPath: blobPath, offset: 128)
+        try constWeight(name, shape: shape, blobPath: blobPath, offset: 64)
     }
 
     mutating func linear128(
@@ -260,13 +260,10 @@ private extension ANEGraph {
         gammaPath: String,
         betaPath: String
     ) throws -> Int {
-        let sum = try reduceSum("\(prefix)_sum", input: input, axis: 1, keepDims: true)
-        let invd = try constScalar("\(prefix)_invd", 1.0 / Float(dim))
-        let mean = try mul("\(prefix)_mean", x: sum, y: invd)
+        let mean = try reduceMean("\(prefix)_mean", input: input, axis: 1, keepDims: true)
         let centered = try sub("\(prefix)_centered", x: input, y: mean)
         let sq = try mul("\(prefix)_sq", x: centered, y: centered)
-        let ss = try reduceSum("\(prefix)_ss", input: sq, axis: 1, keepDims: true)
-        let variance = try mul("\(prefix)_var", x: ss, y: invd)
+        let variance = try reduceMean("\(prefix)_var", input: sq, axis: 1, keepDims: true)
         let epsNode = try constScalar("\(prefix)_eps", eps)
         let varEps = try add("\(prefix)_var_eps", x: variance, y: epsNode)
         let nhalf = try constScalar("\(prefix)_nhalf", -0.5)

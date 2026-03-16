@@ -1,0 +1,78 @@
+#!/bin/zsh
+set -euo pipefail
+
+ROOT_DIR="${0:A:h}"
+cd "$ROOT_DIR"
+
+LOCAL_CLANG_CACHE="${ROOT_DIR}/.build/clang-module-cache"
+mkdir -p "$LOCAL_CLANG_CACHE"
+
+run_generate() {
+  export CLANG_MODULE_CACHE_PATH="$LOCAL_CLANG_CACHE"
+  exec swift run --disable-sandbox espresso-generate "$@"
+}
+
+print_help() {
+  cat <<'EOF'
+Usage:
+  ./espresso
+  ./espresso "Hello"
+  ./espresso demo [prompt...]
+  ./espresso compare [options] [prompt...]
+  ./espresso bench [options] [prompt...]
+  ./espresso generate [options] [prompt...]
+  ./espresso doctor
+  ./espresso prepare
+  ./espresso install
+
+Examples:
+  ./espresso
+  ./espresso "Hello from Espresso"
+  ./espresso compare --no-power "Hello"
+  ./espresso bench --output-dir ./reports "Hello"
+  ./espresso doctor
+
+Notes:
+  - No arguments launches the managed GPT-2 TUI demo.
+  - A plain prompt without a subcommand also launches the TUI demo.
+  - First run may build Swift targets and bootstrap demo assets automatically.
+  - If startup fails, run ./espresso doctor.
+  - ./espresso install writes a shim that points at this checkout.
+EOF
+}
+
+install_launcher() {
+  local target_dir="${HOME}/.local/bin"
+  local target_path="${target_dir}/espresso"
+  mkdir -p "$target_dir"
+  cat > "$target_path" <<EOF
+#!/bin/zsh
+exec "${ROOT_DIR}/espresso" "\$@"
+EOF
+  chmod +x "$target_path"
+  echo "Installed launcher at ${target_path}"
+  echo "If needed, add ${target_dir} to your PATH."
+}
+
+if [[ $# -eq 0 ]]; then
+  run_generate demo
+fi
+
+case "$1" in
+  demo|compare|bench|generate|doctor)
+    run_generate "$@"
+    ;;
+  prepare)
+    shift
+    run_generate demo --prepare-demo "$@"
+    ;;
+  install)
+    install_launcher
+    ;;
+  help|-h|--help)
+    print_help
+    ;;
+  *)
+    run_generate demo "$@"
+    ;;
+esac

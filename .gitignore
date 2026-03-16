@@ -49,7 +49,13 @@ scripts/package_espresso_bench_app.sh
 
 # Development / internal documentation
 docs/
+!docs/
+docs/*
+!docs/autoresearch/
+!docs/autoresearch/**
 prompts/
+!docs/autoresearch/prompts/
+!docs/autoresearch/prompts/**
 scripts/
 !scripts/
 scripts/*
@@ -59,6 +65,8 @@ scripts/internal/**
 !scripts/generate_coreml_model.py
 !scripts/reproduce_local_real_artifact_claim.sh
 !scripts/run_power_benchmark.sh
+!scripts/run_autoresearch_compare.sh
+!scripts/setup_autoresearch_lane.sh
 !scripts/README.md
 tasks/
 AGENTS.md
@@ -72,3 +80,4 @@ training/
 
 # Tooling version pins
 .swift-version
+_reference/

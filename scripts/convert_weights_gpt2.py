@@ -56,19 +56,16 @@ def write_causal_masks(output_dir: Path, max_seq: int) -> None:
         size *= 2
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", default="gpt2", help="HuggingFace GPT-2 model name or local path")
-    parser.add_argument("--output", required=True, help="Output directory")
-    args = parser.parse_args()
-
-    output_dir = Path(args.output)
-    model = GPT2LMHeadModel.from_pretrained(args.model)
+def save_gpt2_artifacts(
+    model: GPT2LMHeadModel,
+    output_dir: Path,
+    metadata_name: str = "gpt2_124m",
+) -> None:
     state = model.state_dict()
     config = model.config
 
     metadata = {
-        "name": "gpt2_124m",
+        "name": metadata_name,
         "nLayer": config.n_layer,
         "nHead": config.n_head,
         "nKVHead": config.n_head,
@@ -119,6 +116,33 @@ def main() -> None:
         write_blob(state[f"{prefix}.mlp.c_proj.bias"], layer_dir / "b2.bin")
 
     write_causal_masks(output_dir, config.n_positions)
+
+
+def convert_pretrained_gpt2(
+    model_name: str,
+    output_dir: Path,
+    cache_dir: str | None = None,
+    metadata_name: str = "gpt2_124m",
+) -> None:
+    model = GPT2LMHeadModel.from_pretrained(model_name, cache_dir=cache_dir)
+    save_gpt2_artifacts(model, output_dir, metadata_name=metadata_name)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model", default="gpt2", help="HuggingFace GPT-2 model name or local path")
+    parser.add_argument("--output", required=True, help="Output directory")
+    parser.add_argument("--cache-dir", default=None, help="Optional Hugging Face cache directory")
+    parser.add_argument("--metadata-name", default="gpt2_124m", help="Name written into metadata.json")
+    args = parser.parse_args()
+
+    output_dir = Path(args.output)
+    convert_pretrained_gpt2(
+        args.model,
+        output_dir,
+        cache_dir=args.cache_dir,
+        metadata_name=args.metadata_name,
+    )
 
 
 if __name__ == "__main__":

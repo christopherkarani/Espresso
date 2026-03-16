@@ -436,6 +436,12 @@ final class MILGeneratorTests: XCTestCase {
 
         XCTAssertEqual(DecodeFFNGenerator(laneSpatial: lane).inputBytes, dim * lane * 2)
         XCTAssertEqual(DecodeFFNGenerator(laneSpatial: lane).outputByteSizes, [dim * lane * 2])
+        let decodeProjectionFFN = DecodeProjectionFFNGenerator(laneSpatial: lane)
+        XCTAssertEqual(
+            decodeProjectionFFN.inputByteSizes,
+            [dim * lane * MemoryLayout<Float>.stride, dim * lane * 2]
+        )
+        XCTAssertEqual(decodeProjectionFFN.outputByteSizes, [dim * lane * 2])
     }
 
     func test_decode_attention_generator_contains_expected_decode_ops() {
@@ -462,6 +468,33 @@ final class MILGeneratorTests: XCTestCase {
         XCTAssertTrue(mil.contains("sigmoid("))
         XCTAssertTrue(mil.contains("mul("))
         XCTAssertTrue(mil.contains("add("))
+    }
+
+    func test_decode_ffn_generator_gpt2_uses_layernorm_biases_and_gelu() {
+        let mil = DecodeFFNGenerator(architecture: .gpt2).milText
+        XCTAssertEqual(extractMILInputNames(mil), ["x"])
+        XCTAssertEqual(extractMILReturnTuple(mil), ["out"])
+        XCTAssertTrue(mil.contains("rms2.bin"))
+        XCTAssertTrue(mil.contains("rms2_beta.bin"))
+        XCTAssertTrue(mil.contains("b1.bin"))
+        XCTAssertTrue(mil.contains("b2.bin"))
+        XCTAssertTrue(mil.contains("tanh("))
+        XCTAssertFalse(mil.contains("w3.bin"))
+    }
+
+    func test_decode_projection_ffn_generator_gpt2_fuses_projection_layernorm_and_ffn() {
+        let mil = DecodeProjectionFFNGenerator(architecture: .gpt2).milText
+        XCTAssertEqual(extractMILInputNames(mil), ["context", "residual"])
+        XCTAssertEqual(extractMILReturnTuple(mil), ["out"])
+        XCTAssertTrue(mil.contains("context16"))
+        XCTAssertTrue(mil.contains("wo.bin"))
+        XCTAssertTrue(mil.contains("bo.bin"))
+        XCTAssertTrue(mil.contains("rms2.bin"))
+        XCTAssertTrue(mil.contains("rms2_beta.bin"))
+        XCTAssertTrue(mil.contains("b1.bin"))
+        XCTAssertTrue(mil.contains("b2.bin"))
+        XCTAssertTrue(mil.contains("tanh("))
+        XCTAssertFalse(mil.contains("w3.bin"))
     }
 
     func test_mil_builder_append_fp16_uses_fixed_posix_format() {
