@@ -1,0 +1,7 @@
+Read .autoresearch/program.md and follow it strictly.
+Work on the parent Espresso repo, not inside .autoresearch.
+You are not the benchmark referee.
+Do not run long ANE/Core ML throughput benchmarks or claim official wins.
+Focus on final norm, logits projection, argmax, sampling, and hidden-state readback cost in the real-model path.
+Use swift build and targeted non-hardware tests locally.
+Commit clean candidate improvements and hand them to the benchmark referee for validation with .autoresearch/bench.sh.

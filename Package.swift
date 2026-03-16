@@ -7,9 +7,11 @@ let package = Package(
     products: [
         .executable(name: "espresso-train", targets: ["EspressoTrain"]),
         .executable(name: "espresso-bench", targets: ["EspressoBench"]),
+        .executable(name: "espresso-generate", targets: ["EspressoGenerate"]),
         .executable(name: "espresso-multitoken-probe", targets: ["EspressoMultitokenProbe"]),
         .library(name: "Espresso", targets: ["Espresso"]),
         .library(name: "ModelSupport", targets: ["ModelSupport"]),
+        .library(name: "RealModelInference", targets: ["RealModelInference"]),
     ],
     targets: [
         .target(
@@ -210,6 +212,34 @@ let package = Package(
             dependencies: ["MILGenerator", "ANETypes", "ANEGraphIR", "ANEBuilder", "ANECodegen", "ANEPasses"],
             path: "Tests/MigrationParityTests",
             resources: [.process("Fixtures")],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .target(
+            name: "RealModelInference",
+            dependencies: ["ModelSupport", "ANEGraphIR", "ANEBuilder", "ANECodegen", "ANEPasses", "ANERuntime", "ANETypes", "ANEInterop", "CPUOps", "Espresso"],
+            path: "Sources/RealModelInference",
+            swiftSettings: [.swiftLanguageMode(.v6)],
+            linkerSettings: [
+                .linkedFramework("Accelerate"),
+                .linkedFramework("IOSurface"),
+            ]
+        ),
+        .executableTarget(
+            name: "EspressoGenerate",
+            dependencies: ["RealModelInference", "ModelSupport"],
+            path: "Sources/EspressoGenerate",
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
+            name: "EspressoGenerateTests",
+            dependencies: ["EspressoGenerate", "ModelSupport"],
+            path: "Tests/EspressoGenerateTests",
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
+            name: "RealModelInferenceTests",
+            dependencies: ["RealModelInference", "ModelSupport", "ANEGraphIR"],
+            path: "Tests/RealModelInferenceTests",
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
     ]

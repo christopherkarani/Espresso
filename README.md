@@ -28,6 +28,34 @@ Espresso compiles MIL programs straight to ANE silicon through reverse-engineere
   <img src=".github/assets/demo.gif" alt="Espresso generating tokens on ANE" width="700">
 </p>
 
+## Try The TUI
+
+From a fresh clone:
+
+```bash
+./espresso
+```
+
+That one command will:
+
+- build the local Swift targets if needed
+- bootstrap the managed GPT-2 demo assets on first run
+- launch the side-by-side Espresso vs Core ML TUI
+
+If `./espresso` does not start cleanly, run `./espresso doctor`.
+
+Useful follow-ups:
+
+```bash
+./espresso "Hello"
+./espresso doctor
+./espresso compare --no-power "Hello"
+./espresso install
+swift run espresso-generate demo
+```
+
+`./espresso install` writes a small shim to `~/.local/bin/espresso` that points back to this checkout, so future runs can use `espresso`.
+
 ## Benchmark
 
 | Path | ms/token | tok/s |
@@ -54,6 +82,8 @@ Machine-readable benchmark output is generated locally under `artifacts/benchmar
 ## Quick Start
 
 ```bash
+./espresso                            # first-run GPT-2 TUI demo
+./espresso doctor                     # check host readiness
 swift build                                              # build everything
 swift test                                               # unit tests (no ANE needed)
 swift run espresso-bench --ane-only --inference --layers 6  # benchmark

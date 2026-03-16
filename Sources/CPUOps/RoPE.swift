@@ -15,11 +15,17 @@ public enum RoPE {
         precondition(headDim > 0)
         precondition(headDim % 2 == 0)
 
+        let halfDim = headDim / 2
+        var freqs = [Float](repeating: 0, count: halfDim)
+        for idx in 0..<halfDim {
+            freqs[idx] = 1.0 / powf(10000.0, Float(2 * idx) / Float(headDim))
+        }
+
         for t in 0..<seqLen {
             for h in 0..<nHeads {
-                for i in stride(from: 0, to: headDim, by: 2) {
-                    let freq = 1.0 / powf(10000.0, Float(i) / Float(headDim))
-                    let value = Float(t) * freq
+                for idx in 0..<halfDim {
+                    let i = idx * 2
+                    let value = Float(t) * freqs[idx]
                     let cosv = cosf(value)
                     let sinv = sinf(value)
 
@@ -52,11 +58,17 @@ public enum RoPE {
         precondition(headDim > 0)
         precondition(headDim % 2 == 0)
 
+        let halfDim = headDim / 2
+        var freqs = [Float](repeating: 0, count: halfDim)
+        for idx in 0..<halfDim {
+            freqs[idx] = 1.0 / powf(10000.0, Float(2 * idx) / Float(headDim))
+        }
+
         for t in 0..<seqLen {
             for h in 0..<nHeads {
-                for i in stride(from: 0, to: headDim, by: 2) {
-                    let freq = 1.0 / powf(10000.0, Float(i) / Float(headDim))
-                    let value = Float(t) * freq
+                for idx in 0..<halfDim {
+                    let i = idx * 2
+                    let value = Float(t) * freqs[idx]
                     let cosv = cosf(value)
                     let sinv = sinf(value)
 

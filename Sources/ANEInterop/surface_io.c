@@ -174,6 +174,115 @@ cleanup:
     return ok;
 }
 
+bool ane_interop_io_copy_two_fp16_spatial_slices(
+    IOSurfaceRef dst0,
+    int dst0_ch_off,
+    int dst0_spatial_index,
+    int dst0_spatial,
+    IOSurfaceRef src0,
+    int src0_ch_off,
+    int src0_spatial_index,
+    int src0_spatial,
+    IOSurfaceRef dst1,
+    int dst1_ch_off,
+    int dst1_spatial_index,
+    int dst1_spatial,
+    IOSurfaceRef src1,
+    int src1_ch_off,
+    int src1_spatial_index,
+    int src1_spatial,
+    int channels
+) {
+    if (!dst0 || !src0 || !dst1 || !src1) return false;
+    if (dst0_ch_off < 0 || src0_ch_off < 0 || dst1_ch_off < 0 || src1_ch_off < 0) return false;
+    if (dst0_spatial_index < 0 || src0_spatial_index < 0 || dst1_spatial_index < 0 || src1_spatial_index < 0) return false;
+    if (dst0_spatial <= 0 || src0_spatial <= 0 || dst1_spatial <= 0 || src1_spatial <= 0 || channels < 0) return false;
+    if (channels == 0) return true;
+    if (dst0_spatial_index >= dst0_spatial || src0_spatial_index >= src0_spatial) return false;
+    if (dst1_spatial_index >= dst1_spatial || src1_spatial_index >= src1_spatial) return false;
+    if (channels > INT_MAX - dst0_ch_off || channels > INT_MAX - src0_ch_off) return false;
+    if (channels > INT_MAX - dst1_ch_off || channels > INT_MAX - src1_ch_off) return false;
+
+    bool lockedDst0 = false;
+    bool lockedDst1 = false;
+    bool lockedSrc0 = false;
+    bool lockedSrc1 = false;
+    bool ok = false;
+
+    if (IOSurfaceLock(dst0, 0, NULL) != kIOReturnSuccess) return false;
+    lockedDst0 = true;
+    if (dst1 != dst0) {
+        if (IOSurfaceLock(dst1, 0, NULL) != kIOReturnSuccess) goto cleanup;
+        lockedDst1 = true;
+    }
+    if (src0 != dst0 && src0 != dst1) {
+        if (IOSurfaceLock(src0, kIOSurfaceLockReadOnly, NULL) != kIOReturnSuccess) goto cleanup;
+        lockedSrc0 = true;
+    }
+    if (src1 != dst0 && src1 != dst1 && src1 != src0) {
+        if (IOSurfaceLock(src1, kIOSurfaceLockReadOnly, NULL) != kIOReturnSuccess) goto cleanup;
+        lockedSrc1 = true;
+    }
+
+    void *dst0Base = IOSurfaceGetBaseAddress(dst0);
+    void *dst1Base = IOSurfaceGetBaseAddress(dst1);
+    const void *src0Base = IOSurfaceGetBaseAddress(src0);
+    const void *src1Base = IOSurfaceGetBaseAddress(src1);
+    if (!dst0Base || !dst1Base || !src0Base || !src1Base) goto cleanup;
+
+    const size_t dst0SpatialSz = (size_t)dst0_spatial;
+    const size_t src0SpatialSz = (size_t)src0_spatial;
+    const size_t dst1SpatialSz = (size_t)dst1_spatial;
+    const size_t src1SpatialSz = (size_t)src1_spatial;
+
+    size_t dst0MaxIdxElems, src0MaxIdxElems, dst1MaxIdxElems, src1MaxIdxElems;
+    size_t dst0Elems, src0Elems, dst1Elems, src1Elems;
+    size_t dst0Bytes, src0Bytes, dst1Bytes, src1Bytes;
+
+    if (mul_size_overflow((size_t)(dst0_ch_off + channels - 1), dst0SpatialSz, &dst0MaxIdxElems)) goto cleanup;
+    if (mul_size_overflow((size_t)(src0_ch_off + channels - 1), src0SpatialSz, &src0MaxIdxElems)) goto cleanup;
+    if (mul_size_overflow((size_t)(dst1_ch_off + channels - 1), dst1SpatialSz, &dst1MaxIdxElems)) goto cleanup;
+    if (mul_size_overflow((size_t)(src1_ch_off + channels - 1), src1SpatialSz, &src1MaxIdxElems)) goto cleanup;
+    if (add_size_overflow(dst0MaxIdxElems, (size_t)dst0_spatial_index, &dst0MaxIdxElems)) goto cleanup;
+    if (add_size_overflow(src0MaxIdxElems, (size_t)src0_spatial_index, &src0MaxIdxElems)) goto cleanup;
+    if (add_size_overflow(dst1MaxIdxElems, (size_t)dst1_spatial_index, &dst1MaxIdxElems)) goto cleanup;
+    if (add_size_overflow(src1MaxIdxElems, (size_t)src1_spatial_index, &src1MaxIdxElems)) goto cleanup;
+    if (add_size_overflow(dst0MaxIdxElems, 1, &dst0Elems)) goto cleanup;
+    if (add_size_overflow(src0MaxIdxElems, 1, &src0Elems)) goto cleanup;
+    if (add_size_overflow(dst1MaxIdxElems, 1, &dst1Elems)) goto cleanup;
+    if (add_size_overflow(src1MaxIdxElems, 1, &src1Elems)) goto cleanup;
+    if (mul_size_overflow(dst0Elems, sizeof(_Float16), &dst0Bytes)) goto cleanup;
+    if (mul_size_overflow(src0Elems, sizeof(_Float16), &src0Bytes)) goto cleanup;
+    if (mul_size_overflow(dst1Elems, sizeof(_Float16), &dst1Bytes)) goto cleanup;
+    if (mul_size_overflow(src1Elems, sizeof(_Float16), &src1Bytes)) goto cleanup;
+
+    if (dst0Bytes > IOSurfaceGetAllocSize(dst0) || src0Bytes > IOSurfaceGetAllocSize(src0)) goto cleanup;
+    if (dst1Bytes > IOSurfaceGetAllocSize(dst1) || src1Bytes > IOSurfaceGetAllocSize(src1)) goto cleanup;
+
+    _Float16 *dst0F16 = (_Float16 *)dst0Base;
+    _Float16 *dst1F16 = (_Float16 *)dst1Base;
+    const _Float16 *src0F16 = (const _Float16 *)src0Base;
+    const _Float16 *src1F16 = (const _Float16 *)src1Base;
+
+    for (int c = 0; c < channels; c++) {
+        size_t dst0Idx = (size_t)(dst0_ch_off + c) * dst0SpatialSz + (size_t)dst0_spatial_index;
+        size_t src0Idx = (size_t)(src0_ch_off + c) * src0SpatialSz + (size_t)src0_spatial_index;
+        size_t dst1Idx = (size_t)(dst1_ch_off + c) * dst1SpatialSz + (size_t)dst1_spatial_index;
+        size_t src1Idx = (size_t)(src1_ch_off + c) * src1SpatialSz + (size_t)src1_spatial_index;
+        dst0F16[dst0Idx] = src0F16[src0Idx];
+        dst1F16[dst1Idx] = src1F16[src1Idx];
+    }
+
+    ok = true;
+
+cleanup:
+    if (lockedSrc1) IOSurfaceUnlock(src1, kIOSurfaceLockReadOnly, NULL);
+    if (lockedSrc0) IOSurfaceUnlock(src0, kIOSurfaceLockReadOnly, NULL);
+    if (lockedDst1) IOSurfaceUnlock(dst1, 0, NULL);
+    if (lockedDst0) IOSurfaceUnlock(dst0, 0, NULL);
+    return ok;
+}
+
 bool ane_interop_io_write_fp16_spatial_slice(IOSurfaceRef surface,
                                              int ch_off,
                                              int spatial_index,

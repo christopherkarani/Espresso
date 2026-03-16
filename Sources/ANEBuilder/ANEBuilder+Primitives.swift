@@ -178,6 +178,21 @@ extension ANEGraph {
         )
     }
 
+    public mutating func reduceMean(
+        _ name: String,
+        input: Int,
+        axis: Int,
+        keepDims: Bool
+    ) throws -> Int {
+        try reduction(
+            .reduceMean,
+            name: name,
+            input: input,
+            axis: axis,
+            keepDims: keepDims
+        )
+    }
+
     public mutating func reduceMax(
         _ name: String,
         input: Int,
@@ -205,7 +220,8 @@ extension ANEGraph {
                 name: name,
                 dtype: inputNode.dtype,
                 shape: shape,
-                inputs: [input]
+                inputs: [input],
+                attrs: .intTensor(shape.dimensions)
             )
         )
     }

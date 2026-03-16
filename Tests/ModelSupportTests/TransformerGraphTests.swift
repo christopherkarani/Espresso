@@ -22,7 +22,7 @@ import ANEPasses
     #expect(graph.nodes.contains { $0.name == "layer0_attn_proj_bias" })
     #expect(graph.nodes.contains { $0.name == "layer0_ffn_up_bias" })
     #expect(graph.nodes.contains { $0.name == "layer0_ffn_down_bias" })
-    #expect(allWeightOffsets(in: graph).allSatisfy { $0 == 128 })
+    #expect(allWeightOffsets(in: graph).allSatisfy { $0 == 64 })
     #expect(!ANEOptimizationPipeline.validate(graph).contains { $0.severity == .error })
 }
 
@@ -40,7 +40,7 @@ import ANEPasses
     #expect(graph.nodes.contains { $0.name == "layer0_ffn_gate_act_sigmoid" && $0.op == .sigmoid })
     #expect(graph.nodes.contains { $0.name == "layer0_ffn_gated" && $0.op == .mul })
     #expect(!graph.nodes.contains { $0.name.contains("bias") })
-    #expect(allWeightOffsets(in: graph).allSatisfy { $0 == 128 })
+    #expect(allWeightOffsets(in: graph).allSatisfy { $0 == 64 })
     #expect(!ANEOptimizationPipeline.validate(graph).contains { $0.severity == .error })
 }
 

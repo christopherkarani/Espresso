@@ -282,6 +282,62 @@ public enum SurfaceIO {
         guard ok else { throw .interopCallFailed }
     }
 
+    public static func copyTwoFP16SpatialSlices(
+        dst0: IOSurfaceRef,
+        dst0ChannelOffset: Int,
+        dst0SpatialIndex: Int,
+        dst0Spatial: Int,
+        src0: IOSurfaceRef,
+        src0ChannelOffset: Int,
+        src0SpatialIndex: Int,
+        src0Spatial: Int,
+        dst1: IOSurfaceRef,
+        dst1ChannelOffset: Int,
+        dst1SpatialIndex: Int,
+        dst1Spatial: Int,
+        src1: IOSurfaceRef,
+        src1ChannelOffset: Int,
+        src1SpatialIndex: Int,
+        src1Spatial: Int,
+        channels: Int
+    ) throws(SurfaceIOError) {
+        let dst0Off32 = try checkedNonNegativeInt32(dst0ChannelOffset)
+        let src0Off32 = try checkedNonNegativeInt32(src0ChannelOffset)
+        let dst0SpatialIndex32 = try checkedNonNegativeInt32(dst0SpatialIndex)
+        let src0SpatialIndex32 = try checkedNonNegativeInt32(src0SpatialIndex)
+        let dst0Spatial32 = try checkedNonNegativeInt32(dst0Spatial)
+        let src0Spatial32 = try checkedNonNegativeInt32(src0Spatial)
+        let dst1Off32 = try checkedNonNegativeInt32(dst1ChannelOffset)
+        let src1Off32 = try checkedNonNegativeInt32(src1ChannelOffset)
+        let dst1SpatialIndex32 = try checkedNonNegativeInt32(dst1SpatialIndex)
+        let src1SpatialIndex32 = try checkedNonNegativeInt32(src1SpatialIndex)
+        let dst1Spatial32 = try checkedNonNegativeInt32(dst1Spatial)
+        let src1Spatial32 = try checkedNonNegativeInt32(src1Spatial)
+        let channels32 = try checkedNonNegativeInt32(channels)
+        if channels == 0 { return }
+
+        let ok = ane_interop_io_copy_two_fp16_spatial_slices(
+            dst0,
+            dst0Off32,
+            dst0SpatialIndex32,
+            dst0Spatial32,
+            src0,
+            src0Off32,
+            src0SpatialIndex32,
+            src0Spatial32,
+            dst1,
+            dst1Off32,
+            dst1SpatialIndex32,
+            dst1Spatial32,
+            src1,
+            src1Off32,
+            src1SpatialIndex32,
+            src1Spatial32,
+            channels32
+        )
+        guard ok else { throw .interopCallFailed }
+    }
+
     public static func writeFP16SpatialSlice(
         to surface: IOSurfaceRef,
         channelOffset: Int,
