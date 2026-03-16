@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "Package.swift"
+      - "Sources/**"
+      - "Tests/**"
+      - ".github/workflows/ci.yml"
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: "Build & Test (Xcode ${{ matrix.xcode }})"
+    runs-on: macos-15
+    strategy:
+      fail-fast: true
+      matrix:
+        xcode:
+          - "16.2"
+          - "16.3"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode ${{ matrix.xcode }}
+        run: |
+          XCODE_PATH=$(find /Applications -maxdepth 1 -name "Xcode_${{ matrix.xcode }}*.app" | head -1)
+          if [ -n "$XCODE_PATH" ]; then
+            sudo xcode-select -s "$XCODE_PATH"
+          else
+            echo "Xcode ${{ matrix.xcode }} not found, using default"
+          fi
+          xcodebuild -version
+          swift --version
+
+      - name: Restore SPM cache
+        uses: actions/cache@v4
+        with:
+          path: .build
+          key: spm-${{ runner.os }}-${{ matrix.xcode }}-${{ hashFiles('Package.swift', 'Package.resolved') }}
+          restore-keys: |
+            spm-${{ runner.os }}-${{ matrix.xcode }}-
+            spm-${{ runner.os }}-
+
+      - name: Build (release)
+        run: swift build -c release
+
+      - name: Test (unit — no ANE required)
+        run: |
+          swift test \
+            --filter "ANETypesTests|MILGeneratorTests|CPUOpsTests|ANEGraphIRTests|ANECodegenTests|ANEPassesTests|ANEBuilderTests|ModelSupportTests|DeltaCompilationTests|LoRAAdapterTests|MigrationParityTests|EspressoGenerateTests"
+
+  lint:
+    name: Swift Package Lint
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve dependencies
+        run: swift package resolve
+      - name: Show dependency graph
+        run: swift package show-dependencies

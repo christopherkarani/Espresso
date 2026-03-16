@@ -7,7 +7,8 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/christopherkarani/Espresso/actions/workflows/phase8-matrix.yml"><img src="https://github.com/christopherkarani/Espresso/actions/workflows/phase8-matrix.yml/badge.svg" alt="Build"></a>
+  <a href="https://github.com/christopherkarani/Espresso/actions/workflows/ci.yml"><img src="https://github.com/christopherkarani/Espresso/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/christopherkarani/Espresso/actions/workflows/phase8-matrix.yml"><img src="https://github.com/christopherkarani/Espresso/actions/workflows/phase8-matrix.yml/badge.svg" alt="ANE Matrix"></a>
   <a href="https://swift.org"><img src="https://img.shields.io/badge/Swift-6.2-orange.svg" alt="Swift 6.2"></a>
   <a href="https://github.com/christopherkarani/Espresso/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"></a>
   <img src="https://img.shields.io/badge/macOS-15+-lightgrey.svg" alt="macOS 15+">
