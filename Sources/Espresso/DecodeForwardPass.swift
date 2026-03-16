@@ -688,6 +688,7 @@ public extension ForwardPass {
         metalAttention: MetalAttentionKernel,
         decodeState: inout DecodeState,
         dim: Int = ModelConfig.dim,
+        readFinalOutputIntoXCur: Bool = true,
         timings: inout HybridDecodeTimingBreakdown
     ) throws(ANEError) {
         precondition(kernels.count > 0)
@@ -822,23 +823,25 @@ public extension ForwardPass {
             }
         }
 
-        let finalHandles = surfaceHandles[kernels.count - 1]
-        t0 = RuntimeClock.now()
-        do {
-            try xCur.withUnsafeMutableBufferPointer { out in
-                try SurfaceIO.readFP16SpatialSlice(
-                    from: finalHandles.ffnOut,
-                    channelOffset: 0,
-                    spatialIndex: 0,
-                    spatial: laneSpatial,
-                    into: out,
-                    channels: dim
-                )
+        if readFinalOutputIntoXCur {
+            let finalHandles = surfaceHandles[kernels.count - 1]
+            t0 = RuntimeClock.now()
+            do {
+                try xCur.withUnsafeMutableBufferPointer { out in
+                    try SurfaceIO.readFP16SpatialSlice(
+                        from: finalHandles.ffnOut,
+                        channelOffset: 0,
+                        spatialIndex: 0,
+                        spatial: laneSpatial,
+                        into: out,
+                        channels: dim
+                    )
+                }
+            } catch {
+                throw .invalidArguments("hybrid final decode lane unpack failed: \(error)")
             }
-        } catch {
-            throw .invalidArguments("hybrid final decode lane unpack failed: \(error)")
+            timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
         }
-        timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
 
         try decodeState.commitTokenStep(expectedIndex: tokenIndex)
     }

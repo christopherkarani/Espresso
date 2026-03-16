@@ -11,6 +11,7 @@ import ANERuntime
 import ANETypes
 import CPUOps
 import Espresso
+import MILGenerator
 import ModelSupport
 
 public struct GenerationResult: Sendable {
@@ -184,6 +185,18 @@ public struct RealModelInferenceEngine: ~Copyable {
         }
     }
 
+    private struct CompiledClassifier: ~Copyable {
+        let kernel: ANEKernel
+        let inputSurface: IOSurfaceRef
+        let outputSurface: IOSurfaceRef
+
+        init(kernel: consuming ANEKernel, inputSurface: IOSurfaceRef, outputSurface: IOSurfaceRef) {
+            self.kernel = kernel
+            self.inputSurface = inputSurface
+            self.outputSurface = outputSurface
+        }
+    }
+
     private static let gpt2EOSToken: UInt16 = 50_256
 
     private let config: MultiModelConfig
@@ -199,6 +212,9 @@ public struct RealModelInferenceEngine: ~Copyable {
     private var compiledHybridSurfaceHandles: [HybridDecodeSurfaceHandles]
     private var compiledHybridHead: LayerStorage<CompiledHead>
     private var compiledHybridHeadSpatial: Int
+    private var compiledHybridGreedyNorm: LayerStorage<CompiledHead>
+    private var compiledHybridGreedyClassifier: LayerStorage<CompiledClassifier>
+    private var compiledHybridGreedySpatial: Int
     private var hybridMetalAttention: MetalAttentionKernel?
     private let classifierBlockMaxNorms: [Float]
     private var classifierLogitsScratch: [Float]
@@ -230,6 +246,9 @@ public struct RealModelInferenceEngine: ~Copyable {
         self.compiledHybridSurfaceHandles = []
         self.compiledHybridHead = Self.emptyStorage(CompiledHead.self)
         self.compiledHybridHeadSpatial = 0
+        self.compiledHybridGreedyNorm = Self.emptyStorage(CompiledHead.self)
+        self.compiledHybridGreedyClassifier = Self.emptyStorage(CompiledClassifier.self)
+        self.compiledHybridGreedySpatial = 0
         self.hybridMetalAttention = nil
         self.classifierBlockMaxNorms = classifierBlockMaxNorms
         self.classifierLogitsScratch = [Float](
@@ -1006,6 +1025,44 @@ public struct RealModelInferenceEngine: ~Copyable {
             didCompile = true
         }
 
+        if compiledHybridGreedyNorm.count != 1 ||
+            compiledHybridGreedyClassifier.count != 1 ||
+            compiledHybridGreedySpatial != hybridHeadSpatial {
+            compiledHybridGreedyNorm = try LayerStorage<CompiledHead>(count: 1, throwingInitializer: { _ in
+                try Self.compileHead(
+                    config: config,
+                    weightDirURL: weightDirURL,
+                    assets: gpt2Assets,
+                    spatial: hybridHeadSpatial,
+                    inputDType: .fp16,
+                    outputDType: .fp16
+                )
+            })
+            compiledHybridGreedyClassifier = try LayerStorage<CompiledClassifier>(count: 1, throwingInitializer: { _ in
+                try Self.compileClassifier(
+                    config: config,
+                    assets: gpt2Assets,
+                    spatial: hybridHeadSpatial
+                )
+            })
+            compiledHybridGreedySpatial = hybridHeadSpatial
+            try compiledHybridGreedyClassifier[0].kernel.rebindInput(
+                at: 0,
+                to: compiledHybridGreedyNorm[0].outputSurface
+            )
+            didCompile = true
+        }
+
+        if compiledHybridGreedyNorm.count == 1,
+           compiledHybridGreedyClassifier.count == 1,
+           let finalSurface = compiledHybridSurfaceHandles.last?.ffnOut {
+            try compiledHybridGreedyNorm[0].kernel.rebindInput(at: 0, to: finalSurface)
+            try compiledHybridGreedyClassifier[0].kernel.rebindInput(
+                at: 0,
+                to: compiledHybridGreedyNorm[0].outputSurface
+            )
+        }
+
         return didCompile
     }
 
@@ -1046,6 +1103,10 @@ public struct RealModelInferenceEngine: ~Copyable {
             throw RealModelInferenceError.runtimeFailure("Hybrid decode state initialization failed: \(error)")
         }
         var timings = HybridDecodeTimingBreakdown()
+        let useANEGreedyHead =
+            temperature == 0 &&
+            compiledHybridGreedyNorm.count == 1 &&
+            compiledHybridGreedyClassifier.count == 1
 
         for (position, token) in promptTokens.enumerated() {
             try writeIncrementalEmbedding(token: token, position: position, into: xCur)
@@ -1063,6 +1124,7 @@ public struct RealModelInferenceEngine: ~Copyable {
                     metalAttention: metalAttention,
                     decodeState: &decodeState,
                     dim: config.dModel,
+                    readFinalOutputIntoXCur: !useANEGreedyHead,
                     timings: &timings
                 )
             } catch {
@@ -1116,35 +1178,60 @@ public struct RealModelInferenceEngine: ~Copyable {
         let headSpatial = compiledHybridHeadSpatial
 
         while generatedTokens.count < effectiveMaxTokens {
-            do {
-                try xCur.withUnsafeBufferPointer { buffer in
-                    try Self.writeFP32SpatialSlice(
-                        to: compiledHybridHead[0].inputSurface,
+            let nextToken: UInt16
+            if useANEGreedyHead {
+                do {
+                    try compiledHybridGreedyNorm[0].kernel.eval()
+                    try compiledHybridGreedyClassifier[0].kernel.eval()
+                    let argmax = try SurfaceIO.argmaxFP16SpatialSlice(
+                        from: compiledHybridGreedyClassifier[0].outputSurface,
+                        channelOffset: 0,
                         spatialIndex: 0,
                         spatial: headSpatial,
-                        data: buffer,
-                        channels: config.dModel
+                        channels: config.vocab
                     )
+                    guard let token = UInt16(exactly: argmax.index) else {
+                        throw RealModelInferenceError.runtimeFailure(
+                            "Greedy ANE classifier selected out-of-range token \(argmax.index)"
+                        )
+                    }
+                    nextToken = token
+                } catch let error as RealModelInferenceError {
+                    throw error
+                } catch {
+                    throw RealModelInferenceError.runtimeFailure("Hybrid greedy ANE head evaluation failed: \(error)")
                 }
-                try compiledHybridHead[0].kernel.eval()
-                try normalized.withUnsafeMutableBufferPointer { buffer in
-                    try Self.readFP32SpatialSlice(
-                        from: compiledHybridHead[0].outputSurface,
-                        spatialIndex: 0,
-                        spatial: headSpatial,
-                        into: buffer,
-                        channels: config.dModel
-                    )
+            } else {
+                do {
+                    try xCur.withUnsafeBufferPointer { buffer in
+                        try Self.writeFP32SpatialSlice(
+                            to: compiledHybridHead[0].inputSurface,
+                            spatialIndex: 0,
+                            spatial: headSpatial,
+                            data: buffer,
+                            channels: config.dModel
+                        )
+                    }
+                    try compiledHybridHead[0].kernel.eval()
+                    try normalized.withUnsafeMutableBufferPointer { buffer in
+                        try Self.readFP32SpatialSlice(
+                            from: compiledHybridHead[0].outputSurface,
+                            spatialIndex: 0,
+                            spatial: headSpatial,
+                            into: buffer,
+                            channels: config.dModel
+                        )
+                    }
+                } catch {
+                    throw RealModelInferenceError.runtimeFailure("Hybrid step head evaluation failed: \(error)")
                 }
-            } catch {
-                throw RealModelInferenceError.runtimeFailure("Hybrid step head evaluation failed: \(error)")
-            }
 
-            let nextToken = selectTokenFromNormalizedHidden(
-                normalized,
-                temperature: temperature,
-                using: &rng
-            )
+                nextToken = selectTokenFromNormalizedHidden(
+                    normalized,
+                    temperature: temperature,
+                    using: &rng
+                )
+            }
             let emissionNow = DispatchTime.now().uptimeNanoseconds
             let tokenLatencyMs = Self.milliseconds(from: emissionNow - emissionStart)
 
@@ -1186,6 +1273,7 @@ public struct RealModelInferenceEngine: ~Copyable {
                     metalAttention: metalAttention,
                     decodeState: &decodeState,
                     dim: config.dModel,
+                    readFinalOutputIntoXCur: !useANEGreedyHead,
                     timings: &timings
                 )
             } catch {
@@ -1534,13 +1622,21 @@ public struct RealModelInferenceEngine: ~Copyable {
         config: MultiModelConfig,
         weightDirURL: URL,
         assets: GPT2TopLevelAssets,
-        spatial: Int
+        spatial: Int,
+        inputDType: ANEDType = .fp32,
+        outputDType: ANEDType = .fp32
     ) throws -> CompiledHead {
-        var graph = buildGPT2HeadGraph(config: config, assets: assets, spatial: spatial)
+        var graph = buildGPT2HeadGraph(
+            config: config,
+            assets: assets,
+            spatial: spatial,
+            inputDType: inputDType,
+            outputDType: outputDType
+        )
         ANEOptimizationPipeline.optimize(&graph)
         let mil = rewriteMILWeightPaths(ANECodegen.emit(graph), rootDir: weightDirURL)
-        let inputBytes = try ANEShape(channels: config.dModel, spatial: spatial).byteSize(for: .fp32)
-        let outputBytes = try ANEShape(channels: config.dModel, spatial: spatial).byteSize(for: .fp32)
+        let inputBytes = try ANEShape(channels: config.dModel, spatial: spatial).byteSize(for: inputDType)
+        let outputBytes = try ANEShape(channels: config.dModel, spatial: spatial).byteSize(for: outputDType)
         let kernel: ANEKernel
         do {
             kernel = try ANEKernel(
@@ -1565,6 +1661,38 @@ public struct RealModelInferenceEngine: ~Copyable {
             throw RealModelInferenceError.runtimeFailure("Final norm surfaces unavailable: \(error)")
         }
         return CompiledHead(kernel: kernel, inputSurface: inputSurface, outputSurface: outputSurface)
+    }
+
+    private static func compileClassifier(
+        config: MultiModelConfig,
+        assets: GPT2TopLevelAssets,
+        spatial: Int
+    ) throws -> CompiledClassifier {
+        let generator = GenerationClassifierGenerator(vocabSize: config.vocab, laneSpatial: spatial)
+        let classifierBlob = WeightBlob.build(from: assets.lmHead, rows: config.vocab, cols: config.dModel)
+        let kernel: ANEKernel
+        do {
+            kernel = try ANEKernel(
+                milText: generator.milText,
+                weights: [
+                    (path: "@model_path/weights/classifier.bin", data: classifierBlob),
+                ],
+                inputSizes: generator.inputByteSizes,
+                outputSizes: generator.outputByteSizes
+            )
+        } catch {
+            throw RealModelInferenceError.runtimeFailure("Hybrid classifier compilation failed: \(error)")
+        }
+
+        let inputSurface: IOSurfaceRef
+        let outputSurface: IOSurfaceRef
+        do {
+            inputSurface = try kernel.inputSurface(at: 0)
+            outputSurface = try kernel.outputSurface(at: 0)
+        } catch {
+            throw RealModelInferenceError.runtimeFailure("Hybrid classifier surfaces unavailable: \(error)")
+        }
+        return CompiledClassifier(kernel: kernel, inputSurface: inputSurface, outputSurface: outputSurface)
     }
 
     private static func buildGPT2AttentionBlockGraph(
@@ -1690,15 +1818,17 @@ public struct RealModelInferenceEngine: ~Copyable {
     private static func buildGPT2HeadGraph(
         config: MultiModelConfig,
         assets: GPT2TopLevelAssets,
-        spatial: Int
+        spatial: Int,
+        inputDType: ANEDType = .fp32,
+        outputDType: ANEDType = .fp32
     ) -> ANEGraph {
         var graph = ANEGraph()
         let input = try! graph.input(
             "x",
-            dtype: .fp32,
+            dtype: inputDType,
             shape: try! ANEShape(channels: config.dModel, spatial: spatial)
         )
-        let x16 = try! graph.cast("final_ln_x16", input: input, to: .fp16)
+        let x16 = inputDType == .fp16 ? input : try! graph.cast("final_ln_x16", input: input, to: .fp16)
         let norm = try! graph.layerNorm128(
             "final_ln",
             input: x16,
@@ -1708,8 +1838,8 @@ public struct RealModelInferenceEngine: ~Copyable {
             gammaPath: assets.finalNormGammaPath,
             betaPath: assets.finalNormBetaPath
         )
-        let hidden = try! graph.cast("hidden", input: norm, to: .fp32)
-        _ = try! graph.output(hidden, name: "hidden")
+        let output = outputDType == .fp16 ? norm : try! graph.cast("hidden", input: norm, to: .fp32)
+        _ = try! graph.output(output, name: "hidden")
         return graph
     }
 
