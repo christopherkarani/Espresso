@@ -99,6 +99,7 @@ public enum RealModelInferenceError: Error, Sendable, Equatable, LocalizedError 
 
 public struct RealModelInferenceEngine: ~Copyable {
     private static let minimumANEIOSurfaceBytes = 49_152
+    private static let classifierArgmaxBlockSize = 4_000
 
     struct TopLevelWeightPaths: Sendable, Equatable {
         let tokenEmbedding: String
@@ -186,6 +187,8 @@ public struct RealModelInferenceEngine: ~Copyable {
     private var compiledLayers: LayerStorage<CompiledLayer>
     private var firstLayerInputSurface: IOSurfaceRef?
     private var compiledHead: LayerStorage<CompiledHead>
+    private let classifierBlockMaxNorms: [Float]
+    private var classifierLogitsScratch: [Float]
 
     private init(
         config: MultiModelConfig,
@@ -193,6 +196,14 @@ public struct RealModelInferenceEngine: ~Copyable {
         tokenizer: LoadedTokenizer,
         gpt2Assets: GPT2TopLevelAssets
     ) {
+        let classifierBlockMaxNorms = gpt2Assets.lmHead.withUnsafeBufferPointer { weightBuffer in
+            Self.precomputeClassifierBlockMaxNorms(
+                classifier: weightBuffer.baseAddress!,
+                vocabSize: config.vocab,
+                dim: config.dModel,
+                blockSize: Self.classifierArgmaxBlockSize
+            )
+        }
         self.config = config
         self.weightDirURL = weightDirURL
         self.tokenizer = tokenizer
@@ -201,6 +212,11 @@ public struct RealModelInferenceEngine: ~Copyable {
         self.compiledLayers = Self.emptyStorage(CompiledLayer.self)
         self.firstLayerInputSurface = nil
         self.compiledHead = Self.emptyStorage(CompiledHead.self)
+        self.classifierBlockMaxNorms = classifierBlockMaxNorms
+        self.classifierLogitsScratch = [Float](
+            repeating: 0,
+            count: min(Self.classifierArgmaxBlockSize, config.vocab)
+        )
     }
 
     public static func build(
@@ -360,8 +376,11 @@ public struct RealModelInferenceEngine: ~Copyable {
                 spatial: activeBucket,
                 spatialIndex: sequenceLength - 1
             )
-            let logits = projectLogits(lastHidden)
-            let nextToken = sampleToken(from: logits, temperature: temperature, using: &rng)
+            let nextToken = selectTokenFromNormalizedHidden(
+                lastHidden,
+                temperature: temperature,
+                using: &rng
+            )
 
             if !firstTokenRecorded {
                 firstTokenLatencyMs = Self.milliseconds(from: DispatchTime.now().uptimeNanoseconds - generationStart)
@@ -1320,6 +1339,47 @@ public struct RealModelInferenceEngine: ~Copyable {
         return UInt16(max(0, scaled.count - 1))
     }
 
+    private mutating func selectTokenFromNormalizedHidden<R: RandomNumberGenerator>(
+        _ hidden: [Float],
+        temperature: Float,
+        using rng: inout R
+    ) -> UInt16 {
+        if temperature <= 0 {
+            let index = exactClassifierArgmax(hidden)
+            return UInt16(index)
+        }
+        let logits = projectLogits(hidden)
+        return sampleToken(from: logits, temperature: temperature, using: &rng)
+    }
+
+    private mutating func exactClassifierArgmax(_ hidden: [Float]) -> Int {
+        precondition(hidden.count == config.dModel)
+        let blockSize = Self.classifierArgmaxBlockSize
+        return hidden.withUnsafeBufferPointer { hiddenBuffer in
+            gpt2Assets.lmHead.withUnsafeBufferPointer { weightBuffer in
+                classifierBlockMaxNorms.withUnsafeBufferPointer { normsBuffer in
+                    classifierLogitsScratch.withUnsafeMutableBufferPointer { scratchBuffer in
+                        guard let hiddenBase = hiddenBuffer.baseAddress,
+                              let weightBase = weightBuffer.baseAddress,
+                              let normsBase = normsBuffer.baseAddress,
+                              let scratchBase = scratchBuffer.baseAddress else {
+                            return 0
+                        }
+                        return Self.partitionedArgmax(
+                            classifier: weightBase,
+                            input: hiddenBase,
+                            logitsScratch: scratchBase,
+                            blockMaxNorms: normsBase,
+                            vocabSize: config.vocab,
+                            dim: config.dModel,
+                            blockSize: blockSize
+                        )
+                    }
+                }
+            }
+        }
+    }
+
     private func projectLogits(_ hidden: [Float]) -> [Float] {
         precondition(hidden.count == config.dModel)
         var logits = [Float](repeating: 0, count: config.vocab)
@@ -1346,6 +1406,106 @@ public struct RealModelInferenceEngine: ~Copyable {
             }
         }
         return logits
+    }
+
+    private static func precomputeClassifierBlockMaxNorms(
+        classifier: UnsafePointer<Float>,
+        vocabSize: Int,
+        dim: Int,
+        blockSize: Int
+    ) -> [Float] {
+        precondition(vocabSize > 0)
+        precondition(dim > 0)
+        precondition(blockSize > 0)
+
+        let numBlocks = (vocabSize + blockSize - 1) / blockSize
+        var blockMaxNorms = [Float](repeating: 0, count: numBlocks)
+
+        var blockIndex = 0
+        var blockStart = 0
+        while blockStart < vocabSize {
+            let blockEnd = min(blockStart + blockSize, vocabSize)
+            var blockMax: Float = 0
+
+            for rowIndex in blockStart..<blockEnd {
+                let rowBase = rowIndex * dim
+                var sumOfSquares: Float = 0
+                vDSP_svesq(classifier.advanced(by: rowBase), 1, &sumOfSquares, vDSP_Length(dim))
+                let rowNorm = sqrtf(sumOfSquares)
+                if rowNorm > blockMax {
+                    blockMax = rowNorm
+                }
+            }
+
+            blockMaxNorms[blockIndex] = blockMax
+            blockIndex += 1
+            blockStart = blockEnd
+        }
+
+        return blockMaxNorms
+    }
+
+    private static func partitionedArgmax(
+        classifier: UnsafePointer<Float>,
+        input: UnsafePointer<Float>,
+        logitsScratch: UnsafeMutablePointer<Float>,
+        blockMaxNorms: UnsafePointer<Float>,
+        vocabSize: Int,
+        dim: Int,
+        blockSize: Int
+    ) -> Int {
+        var inputNormSquared: Float = 0
+        vDSP_svesq(input, 1, &inputNormSquared, vDSP_Length(dim))
+        let inputNorm = sqrtf(inputNormSquared)
+
+        var bestIndex = 0
+        var bestValue: Float = -.infinity
+        var blockIndex = 0
+        var blockStart = 0
+
+        while blockStart < vocabSize {
+            let blockEnd = min(blockStart + blockSize, vocabSize)
+            let blockCount = blockEnd - blockStart
+
+            if blockIndex > 0, bestValue > -.infinity {
+                let upperBound = blockMaxNorms[blockIndex] * inputNorm
+                if upperBound < bestValue {
+                    blockIndex += 1
+                    blockStart = blockEnd
+                    continue
+                }
+            }
+
+            cblas_sgemm(
+                CblasRowMajor,
+                CblasNoTrans,
+                CblasNoTrans,
+                Int32(blockCount),
+                1,
+                Int32(dim),
+                1.0,
+                classifier.advanced(by: blockStart * dim),
+                Int32(dim),
+                input,
+                1,
+                0.0,
+                logitsScratch,
+                1
+            )
+
+            var blockMaxValue: Float = 0
+            var blockMaxIndex: vDSP_Length = 0
+            vDSP_maxvi(logitsScratch, 1, &blockMaxValue, &blockMaxIndex, vDSP_Length(blockCount))
+            if blockMaxValue > bestValue {
+                bestValue = blockMaxValue
+                bestIndex = blockStart + Int(blockMaxIndex)
+            }
+
+            blockIndex += 1
+            blockStart = blockEnd
+        }
+
+        return bestIndex
     }
 
     private static func extractSpatialSlice(

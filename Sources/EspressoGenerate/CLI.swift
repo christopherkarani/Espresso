@@ -923,11 +923,16 @@ private func runEspressoBenchmark(invocation: ResolvedInvocation) throws -> Back
     }
 }
 
+private struct CoreMLRunOutput {
+    let metrics: BackendRunMetrics
+    let sequenceLength: Int
+}
+
 private func runCoreMLGeneration(
     invocation: ResolvedInvocation,
     defaults: DemoDefaults,
     promptTokens: [UInt16]
-) throws -> BackendRunMetrics {
+) throws -> CoreMLRunOutput {
     let sequenceLength = invocation.coreMLSequenceLength ?? nextPowerOfTwo(
         min(invocation.config.maxSeq, promptTokens.count + max(invocation.maxTokens, 1))
     )
@@ -955,18 +960,21 @@ private func runCoreMLGeneration(
     let tokenizer = try loadTokenizer(config: invocation.config, tokenizerDir: invocation.tokenizerDir)
     let generatedTokens = try result.generatedTokens.map(validateUInt16Token)
     let text = tokenizer.decode((promptTokens + generatedTokens).map(Int.init))
-    return BackendRunMetrics(
-        backend: "coreml",
-        text: text,
-        generatedTokens: generatedTokens,
-        promptTokens: promptTokens,
-        compileTimeMs: result.compileTimeMs,
-        firstTokenLatencyMs: result.firstTokenLatencyMs,
-        tokensPerSecond: result.tokensPerSecond,
-        medianTokenMs: result.medianTokenMs,
-        p95TokenMs: result.p95TokenMs,
-        totalTimeMs: result.totalTimeMs,
-        tokenLatenciesMs: result.tokenLatenciesMs
+    return CoreMLRunOutput(
+        metrics: BackendRunMetrics(
+            backend: "coreml",
+            text: text,
+            generatedTokens: generatedTokens,
+            promptTokens: promptTokens,
+            compileTimeMs: result.compileTimeMs,
+            firstTokenLatencyMs: result.firstTokenLatencyMs,
+            tokensPerSecond: result.tokensPerSecond,
+            medianTokenMs: result.medianTokenMs,
+            p95TokenMs: result.p95TokenMs,
+            totalTimeMs: result.totalTimeMs,
+            tokenLatenciesMs: result.tokenLatenciesMs
+        ),
+        sequenceLength: result.seqLen
     )
 }
 
@@ -1688,17 +1696,14 @@ private func runCompareOrBench(
     let espressoMeasured = try maybeMeasurePower(enabled: powerEnabled) {
         try runEspressoBenchmark(invocation: invocation)
     }
-    let coreMLSequenceLength = invocation.coreMLSequenceLength ?? nextPowerOfTwo(
-        min(invocation.config.maxSeq, espressoMeasured.result.promptTokens.count + max(invocation.maxTokens, 1))
-    )
     let coreMLMeasured = try maybeMeasurePower(enabled: powerEnabled) {
         try runCoreMLGeneration(invocation: invocation, defaults: defaults, promptTokens: espressoMeasured.result.promptTokens)
     }
     return compareReport(
         invocation: invocation,
         espresso: espressoMeasured.result,
-        coreML: coreMLMeasured.result,
-        coreMLSequenceLength: coreMLSequenceLength,
+        coreML: coreMLMeasured.result.metrics,
+        coreMLSequenceLength: coreMLMeasured.result.sequenceLength,
         espressoPower: espressoMeasured.power,
         coreMLPower: coreMLMeasured.power,
         outputDirectory: nil

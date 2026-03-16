@@ -33,6 +33,35 @@ import Testing
     #expect(!shouldUseDefaultGPT2Demo(explicit))
 }
 
+@Test func test_demoDefaultsTreatReferenceRunnerAsOptional() throws {
+    let fileManager = FileManager.default
+    let root = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+    let scripts = root.appendingPathComponent("scripts", isDirectory: true)
+    try fileManager.createDirectory(at: scripts, withIntermediateDirectories: true)
+    try Data().write(to: scripts.appendingPathComponent("bootstrap_gpt2_demo.py"))
+    try Data().write(to: scripts.appendingPathComponent("export_gpt2_coreml.py"))
+
+    let defaults = DemoDefaults(
+        repoRoot: root,
+        workingDirectory: root,
+        stateRoot: root,
+        cacheRoot: root,
+        reportsRoot: root,
+        hfCacheRoot: root,
+        weightsDir: root,
+        tokenizerDir: root,
+        coreMLDir: root,
+        toolsVenvDir: root,
+        scriptsDir: scripts,
+        legacyArtifactsRoot: nil
+    )
+
+    #expect(defaults.bootstrapScriptAvailable)
+    #expect(defaults.exportScriptAvailable)
+    #expect(defaults.scriptsAvailable)
+    #expect(!defaults.referenceScriptAvailable)
+}
+
 @Test func test_implicitPromptDefaultsDemoAndCompareToHelloForManagedDemo() {
     let options = Options()
 
