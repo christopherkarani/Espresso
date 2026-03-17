@@ -1,4 +1,5 @@
 import Accelerate
+import ANETypes
 import CoreML
 import Foundation
 import ModelSupport
@@ -92,7 +93,7 @@ struct CoreMLComparisonResult: Decodable, Sendable {
 
 enum CoreMLStreamEvent: Sendable {
     case compile(compileTimeMs: Double, computeUnits: String, seqLen: Int)
-    case token(token: UInt16, tokenIndex: Int, elapsedMs: Double, tokenLatencyMs: Double, tokensPerSecond: Double)
+    case token(token: TokenID, tokenIndex: Int, elapsedMs: Double, tokenLatencyMs: Double, tokensPerSecond: Double)
     case completed(CoreMLComparisonResult)
 }
 
@@ -147,7 +148,7 @@ private struct NativeGPT2TopLevelWeights {
 }
 
 private struct NativeGPT2CoreMLRunResult {
-    let generatedTokens: [UInt16]
+    let generatedTokens: [TokenID]
     let firstTokenLatencyMs: Double
     let tokensPerSecond: Double
     let tokenLatenciesMs: [Double]
@@ -187,7 +188,7 @@ private struct NativeGPT2CoreMLReferenceRunner {
     private let finalNormBeta: [Float]
     private let lmHead: [Float]
 
-    private var currentTokens: [UInt16]
+    private var currentTokens: [TokenID]
     private var stepHidden: [Float]
     private var stepNorm: [Float]
     private var stepLogits: [Float]
@@ -281,7 +282,7 @@ private struct NativeGPT2CoreMLReferenceRunner {
     }
 
     mutating func benchmark(
-        promptTokens: [UInt16],
+        promptTokens: [TokenID],
         maxTokens: Int,
         temperature: Float,
         warmup: Int,
@@ -342,7 +343,7 @@ private struct NativeGPT2CoreMLReferenceRunner {
     }
 
     private mutating func runOnce(
-        promptTokens: [UInt16],
+        promptTokens: [TokenID],
         maxTokens: Int,
         temperature: Float,
         seed: Int,
@@ -350,7 +351,7 @@ private struct NativeGPT2CoreMLReferenceRunner {
     ) throws -> NativeGPT2CoreMLRunResult {
         try reset()
 
-        var generatedTokens: [UInt16] = []
+        var generatedTokens: [TokenID] = []
         generatedTokens.reserveCapacity(maxTokens)
         var tokenLatenciesMs: [Double] = []
         tokenLatenciesMs.reserveCapacity(maxTokens)
@@ -425,7 +426,7 @@ private struct NativeGPT2CoreMLReferenceRunner {
         try zeroInputArray()
     }
 
-    private mutating func prefill(promptTokens: [UInt16]) throws -> [Float] {
+    private mutating func prefill(promptTokens: [TokenID]) throws -> [Float] {
         guard !promptTokens.isEmpty else {
             throw CLIError.runtime("Cannot compare Core ML without prompt tokens.")
         }
@@ -436,7 +437,7 @@ private struct NativeGPT2CoreMLReferenceRunner {
         return try runPrediction(sequenceLength: promptTokens.count)
     }
 
-    private mutating func decode(nextToken: UInt16) throws -> [Float] {
+    private mutating func decode(nextToken: TokenID) throws -> [Float] {
         guard currentTokens.count < maxSequenceTokens else {
             throw CLIError.runtime("Core ML decode overflow at sequence length \(maxSequenceTokens)")
         }
@@ -566,7 +567,7 @@ private struct NativeGPT2CoreMLReferenceRunner {
         }
     }
 
-    private func writeToken(_ token: UInt16, at position: Int) throws {
+    private func writeToken(_ token: TokenID, at position: Int) throws {
         guard Int(token) < vocabSize else {
             throw CLIError.runtime("Token \(token) exceeds Core ML vocab size \(vocabSize)")
         }
@@ -674,9 +675,9 @@ private func sampleNativeToken<R: RandomNumberGenerator>(
     from logits: [Float],
     temperature: Float,
     using rng: inout R
-) -> UInt16 {
+) -> TokenID {
     if temperature <= 0 {
-        return UInt16(logits.enumerated().max(by: { $0.element < $1.element })?.offset ?? 0)
+        return TokenID(logits.enumerated().max(by: { $0.element < $1.element })?.offset ?? 0)
     }
 
     let maxLogit = logits.max() ?? 0
@@ -688,17 +689,17 @@ private func sampleNativeToken<R: RandomNumberGenerator>(
         total += value
     }
     if !total.isFinite || total <= 0 {
-        return UInt16(logits.enumerated().max(by: { $0.element < $1.element })?.offset ?? 0)
+        return TokenID(logits.enumerated().max(by: { $0.element < $1.element })?.offset ?? 0)
     }
 
     var threshold = Double.random(in: 0..<total, using: &rng)
     for index in scaled.indices {
         threshold -= scaled[index]
         if threshold <= 0 {
-            return UInt16(index)
+            return TokenID(index)
         }
     }
-    return UInt16(max(0, scaled.count - 1))
+    return TokenID(max(0, scaled.count - 1))
 }
 
 private func nativePercentile(_ values: [Double], percentile: Double) -> Double {
@@ -934,7 +935,7 @@ func runGPT2CoreMLReference(
     defaults: DemoDefaults,
     coreMLModelPath: String,
     weightsDir: String,
-    promptTokens: [UInt16],
+    promptTokens: [TokenID],
     sequenceLength: Int,
     maxTokens: Int,
     temperature: Float,
@@ -1010,7 +1011,7 @@ func runGPT2CoreMLReferenceStreaming(
     defaults: DemoDefaults,
     coreMLModelPath: String,
     weightsDir: String,
-    promptTokens: [UInt16],
+    promptTokens: [TokenID],
     sequenceLength: Int,
     maxTokens: Int,
     temperature: Float,
@@ -1068,13 +1069,13 @@ func runGPT2CoreMLReferenceStreaming(
                               let tokenLatencyMs = raw.tokenLatencyMs,
                               let tokensPerSecond = raw.tokensPerSecond,
                               token >= 0,
-                              token <= Int(UInt16.max)
+                              token <= Int(TokenID.max)
                         else {
                             return
                         }
                         onEvent(
                             .token(
-                                token: UInt16(token),
+                                token: TokenID(token),
                                 tokenIndex: tokenIndex,
                                 elapsedMs: elapsedMs,
                                 tokenLatencyMs: tokenLatencyMs,

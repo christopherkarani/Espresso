@@ -28,7 +28,7 @@ private struct Options {
     var compareCoreML: Bool = false
     var coreMLModelPath: String? = nil
     var generationModelPath: String? = nil
-    var promptToken: UInt16 = 0
+    var promptToken: TokenID = 0
     var shareWeights: Bool = false
 
     static func parse(_ argv: [String]) -> Options {
@@ -115,7 +115,7 @@ private struct Options {
                 options.generationModelPath = argv[idx]
             case "--prompt-token":
                 idx += 1
-                guard idx < argv.count, let promptToken = UInt16(argv[idx]) else {
+                guard idx < argv.count, let promptToken = TokenID(argv[idx]) else {
                     fatal("Expected --prompt-token UINT16")
                 }
                 options.promptToken = promptToken
@@ -278,7 +278,7 @@ private func median(_ values: [Double]) -> Double {
 
 private func benchmarkDirectSelectionHarness<Model>(
     harness: inout DirectTokenSelectionGenerationHarness<Model>,
-    promptTokens: [UInt16],
+    promptTokens: [TokenID],
     maxNewTokens: Int,
     warmup: Int,
     iterations: Int
@@ -321,7 +321,7 @@ where Model: DirectTokenSelectingLanguageModel & GenerationPerformanceTrackable,
 
 private func benchmarkExactTwoTokenHarness<Model>(
     harness: inout ExactTwoTokenGenerationHarness<Model>,
-    promptTokens: [UInt16],
+    promptTokens: [TokenID],
     maxNewTokens: Int,
     warmup: Int,
     iterations: Int
@@ -473,7 +473,7 @@ private func comparePayload(options: Options) throws -> [String: Any] {
     printStderr("Resetting compile budget")
     try? CompileBudget.setCount(0)
 
-    let prompt: [UInt16] = [options.promptToken]
+    let prompt: [TokenID] = [options.promptToken]
     let weights = try loadRecurrentGenerationWeights(input: plan.input, layerCount: options.layerCount)
 
     printStderr("Starting control model init\(options.shareWeights ? " (retained read-only weights)" : "")")

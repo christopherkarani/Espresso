@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+import ANETypes
 import ModelSupport
 import RealModelInference
 
@@ -313,8 +314,8 @@ struct ResolvedInvocation {
 struct BackendRunMetrics: Sendable {
     let backend: String
     let text: String
-    let generatedTokens: [UInt16]
-    let promptTokens: [UInt16]
+    let generatedTokens: [TokenID]
+    let promptTokens: [TokenID]
     let compileTimeMs: Double
     let firstTokenLatencyMs: Double
     let tokensPerSecond: Double
@@ -948,7 +949,7 @@ private struct CoreMLRunOutput {
 private func runCoreMLGeneration(
     invocation: ResolvedInvocation,
     defaults: DemoDefaults,
-    promptTokens: [UInt16]
+    promptTokens: [TokenID]
 ) throws -> CoreMLRunOutput {
     let sequenceLength = invocation.coreMLSequenceLength ?? nextPowerOfTwo(
         min(invocation.config.maxSeq, promptTokens.count + max(invocation.maxTokens, 1))
@@ -975,7 +976,7 @@ private func runCoreMLGeneration(
         allowBootstrap: invocation.allowBootstrap
     )
     let tokenizer = try loadTokenizer(config: invocation.config, tokenizerDir: invocation.tokenizerDir)
-    let generatedTokens = try result.generatedTokens.map(validateUInt16Token)
+    let generatedTokens = try result.generatedTokens.map(validateToken)
     let text = tokenizer.decode((promptTokens + generatedTokens).map(Int.init))
     return CoreMLRunOutput(
         metrics: BackendRunMetrics(
@@ -995,11 +996,11 @@ private func runCoreMLGeneration(
     )
 }
 
-private func validateUInt16Token(_ raw: Int) throws -> UInt16 {
-    guard raw >= 0, raw <= Int(UInt16.max) else {
+private func validateToken(_ raw: Int) throws -> TokenID {
+    guard raw >= 0, raw <= Int(TokenID.max) else {
         throw CLIError.runtime("Received invalid token id: \(raw)")
     }
-    return UInt16(raw)
+    return TokenID(raw)
 }
 
 func resolvePowerEnabled(
@@ -1430,8 +1431,8 @@ private func runLiveCompare(invocation: ResolvedInvocation, defaults: DemoDefaul
 
     let coreMLMetricsBox = LockedValueBox<BackendRunMetrics>()
     let espressoMetricsBox = LockedValueBox<BackendRunMetrics>()
-    let coreMLTokensBox = LockedValueBox<[UInt16]>()
-    let espressoTokensBox = LockedValueBox<[UInt16]>()
+    let coreMLTokensBox = LockedValueBox<[TokenID]>()
+    let espressoTokensBox = LockedValueBox<[TokenID]>()
     let errorBox = LockedValueBox<Error>()
     let renderStopBox = LockedValueBox<Bool>()
     renderStopBox.set(false)
@@ -1460,7 +1461,7 @@ private func runLiveCompare(invocation: ResolvedInvocation, defaults: DemoDefaul
                 snapshot.events.append("[Core ML] loading baseline")
                 trimEvents(&snapshot.events)
             }
-            var generated: [UInt16] = []
+            var generated: [TokenID] = []
             let result = try runGPT2CoreMLReferenceStreaming(
                 defaults: defaults,
                 coreMLModelPath: coreMLModelPath,
@@ -1516,7 +1517,7 @@ private func runLiveCompare(invocation: ResolvedInvocation, defaults: DemoDefaul
                     trimEvents(&snapshot.events)
                 }
             }
-            let generatedTokens = try result.generatedTokens.map(validateUInt16Token)
+            let generatedTokens = try result.generatedTokens.map(validateToken)
             coreMLTokensBox.set(generatedTokens)
             coreMLMetricsBox.set(
                 BackendRunMetrics(
@@ -1636,11 +1637,11 @@ private func runLiveCompare(invocation: ResolvedInvocation, defaults: DemoDefaul
     return report
 }
 
-private func decodeToken(_ token: UInt16, tokenizer: CLITokenizer) -> String {
+private func decodeToken(_ token: TokenID, tokenizer: CLITokenizer) -> String {
     tokenizer.decode([Int(token)]).replacingOccurrences(of: "\n", with: "\\n")
 }
 
-private func updateMatchCounts(snapshot: inout LiveCompareSnapshot, espressoTokens: [UInt16]?, coreMLTokens: [UInt16]) {
+private func updateMatchCounts(snapshot: inout LiveCompareSnapshot, espressoTokens: [TokenID]?, coreMLTokens: [TokenID]) {
     guard let espressoTokens else {
         snapshot.matchCount = 0
         snapshot.totalComparedTokens = 0
@@ -1665,7 +1666,7 @@ private func millisecondsSince(_ started: UInt64) -> Double {
     Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000.0
 }
 
-private func encodePromptTokens(_ prompt: String, config: MultiModelConfig, tokenizerDir: String) throws -> [UInt16] {
+private func encodePromptTokens(_ prompt: String, config: MultiModelConfig, tokenizerDir: String) throws -> [TokenID] {
     let tokenizer = try loadTokenizer(config: config, tokenizerDir: tokenizerDir)
     let decoded = tokenizer.decode // silence unused? no
     _ = decoded
@@ -1676,11 +1677,11 @@ private func encodePromptTokens(_ prompt: String, config: MultiModelConfig, toke
             vocabURL: tokenizerDirURL.appendingPathComponent("vocab.json"),
             mergesURL: tokenizerDirURL.appendingPathComponent("merges.txt")
         )
-        return try tokenizer.encode(prompt).map(validateUInt16Token)
+        return try tokenizer.encode(prompt).map(validateToken)
     case .llama:
         let tokenizerDirURL = URL(fileURLWithPath: tokenizerDir, isDirectory: true)
         let tokenizer = try SentencePieceTokenizer(modelURL: tokenizerDirURL.appendingPathComponent("tokenizer.bin"))
-        return try tokenizer.encode(prompt).map(validateUInt16Token)
+        return try tokenizer.encode(prompt).map(validateToken)
     }
 }
 

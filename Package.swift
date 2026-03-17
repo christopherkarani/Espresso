@@ -229,7 +229,7 @@ let package = Package(
         ),
         .executableTarget(
             name: "EspressoGenerate",
-            dependencies: ["RealModelInference", "ModelSupport"],
+            dependencies: ["RealModelInference", "ModelSupport", "ANETypes"],
             path: "Sources/EspressoGenerate",
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),

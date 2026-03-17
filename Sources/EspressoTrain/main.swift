@@ -28,7 +28,7 @@ enum EspressoTrainMain {
         var offlineAcceptanceJSONPath: String?
         var offlineRecurrentCheckpointPath: String?
         var offlineFutureSidecarPath: String?
-        var promptToken: UInt16?
+        var promptToken: TokenID?
         var gateMaxNewTokens: Int = 8
         var textRoots: [String] = []
         var textExtensions: Set<String> = ["swift", "md", "txt", "py", "sh", "m", "h", "c"]
@@ -91,7 +91,7 @@ enum EspressoTrainMain {
             case "--offline-future-sidecar":
                 if i + 1 < argv.count { a.offlineFutureSidecarPath = argv[i + 1]; i += 1 }
             case "--prompt-token":
-                if i + 1 < argv.count, let token = UInt16(argv[i + 1]) { a.promptToken = token; i += 1 }
+                if i + 1 < argv.count, let token = TokenID(argv[i + 1]) { a.promptToken = token; i += 1 }
             case "--gate-max-new-tokens":
                 if i + 1 < argv.count { a.gateMaxNewTokens = Int(argv[i + 1]) ?? a.gateMaxNewTokens; i += 1 }
             case "--text-root":
@@ -456,6 +456,9 @@ enum EspressoTrainMain {
         let bwdScratch = BackwardScratch(dim: dim, hidden: hidden, seqLen: seqLen)
         let rmsWorkspace = RMSNorm.Workspace(seqLen: seqLen)
         let crossEntropyWorkspace = CrossEntropy.Workspace(vocabSize: vocab, seqLen: seqLen)
+        // Token ID conversion buffers: dataset is on-disk UInt16; CPUOps expect TokenID (UInt32).
+        var inputTokenIDs = [TokenID](repeating: 0, count: seqLen)
+        var targetTokenIDs = [TokenID](repeating: 0, count: seqLen)
 
         var totalCompileMs: Double = 0
         var totalTrainMs: Double = 0
@@ -572,20 +575,26 @@ enum EspressoTrainMain {
                 var t0 = MachTime.now()
 
                 let pos = Sampler.samplePosition(maxPos: maxPos)
-                let inputTokens = dataset[pos]
-                let targetTokens = dataset[pos + 1]
+                let inputTokensRaw = dataset[pos]
+                let targetTokensRaw = dataset[pos + 1]
+                for i in 0..<seqLen {
+                    inputTokenIDs[i] = TokenID(inputTokensRaw[i])
+                    targetTokenIDs[i] = TokenID(targetTokensRaw[i])
+                }
 
                 // Embedding lookup -> xCur.
                 xCur.withUnsafeMutablePointer { xPtr in
                     embed.withUnsafePointer { ePtr in
-                        Embedding.lookup(
-                            output: xPtr,
-                            embedding: ePtr,
-                            tokens: inputTokens,
-                            vocabSize: vocab,
-                            dim: dim,
-                            seqLen: seqLen
-                        )
+                        inputTokenIDs.withUnsafeBufferPointer { tokensBuf in
+                            Embedding.lookup(
+                                output: xPtr,
+                                embedding: ePtr,
+                                tokens: tokensBuf.baseAddress!,
+                                vocabSize: vocab,
+                                dim: dim,
+                                seqLen: seqLen
+                            )
+                        }
                     }
                 }
                 stepTimings.tElem += MachTime.ms(MachTime.now() - t0)
@@ -649,14 +658,16 @@ enum EspressoTrainMain {
                 t0 = MachTime.now()
                 let loss = dlogits.withUnsafeMutablePointer { dlogitsPtr in
                     logits.withUnsafePointer { logitsPtr in
-                        CrossEntropy.lossAndGradient(
-                            dlogits: dlogitsPtr,
-                            logits: logitsPtr,
-                            targets: targetTokens,
-                            vocabSize: vocab,
-                            seqLen: seqLen,
-                            workspace: crossEntropyWorkspace
-                        )
+                        targetTokenIDs.withUnsafeBufferPointer { targetsBuf in
+                            CrossEntropy.lossAndGradient(
+                                dlogits: dlogitsPtr,
+                                logits: logitsPtr,
+                                targets: targetsBuf.baseAddress!,
+                                vocabSize: vocab,
+                                seqLen: seqLen,
+                                workspace: crossEntropyWorkspace
+                            )
+                        }
                     }
                 }
                 lastLoss = loss
@@ -745,14 +756,16 @@ enum EspressoTrainMain {
                 accumulator.barrier()
                 gembed.withUnsafeMutablePointer { gPtr in
                     dy.withUnsafePointer { dyPtr in
-                        Embedding.backward(
-                            dEmbedding: gPtr,
-                            dx: dyPtr,
-                            tokens: inputTokens,
-                            vocabSize: vocab,
-                            dim: dim,
-                            seqLen: seqLen
-                        )
+                        inputTokenIDs.withUnsafeBufferPointer { tokensBuf in
+                            Embedding.backward(
+                                dEmbedding: gPtr,
+                                dx: dyPtr,
+                                tokens: tokensBuf.baseAddress!,
+                                vocabSize: vocab,
+                                dim: dim,
+                                seqLen: seqLen
+                            )
+                        }
                     }
                 }
 
