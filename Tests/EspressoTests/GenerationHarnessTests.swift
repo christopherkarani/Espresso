@@ -61,7 +61,7 @@ private func makeGenerationTestRowTensor(_ rows: [[Float]]) -> TensorBuffer {
 }
 
 private struct FakeVerifyResponse: Equatable {
-    let sequenceTokens: [UInt16]
+    let sequenceTokens: [TokenID]
     let startIndex: Int
     let logits: [[Float]]
 }
@@ -73,15 +73,15 @@ private struct FakeGenerationModel: AutoregressiveLanguageModel {
     var verifyResponses: [FakeVerifyResponse]
 
     private(set) var resetCount: Int = 0
-    private(set) var prefillCalls: [[UInt16]] = []
-    private(set) var decodeCalls: [UInt16] = []
-    private(set) var verifyCalls: [(sequenceTokens: [UInt16], startIndex: Int)] = []
+    private(set) var prefillCalls: [[TokenID]] = []
+    private(set) var decodeCalls: [TokenID] = []
+    private(set) var verifyCalls: [(sequenceTokens: [TokenID], startIndex: Int)] = []
 
     mutating func reset() throws(GenerationError) {
         resetCount += 1
     }
 
-    mutating func prefill(promptTokens: [UInt16]) throws(GenerationError) -> [Float] {
+    mutating func prefill(promptTokens: [TokenID]) throws(GenerationError) -> [Float] {
         prefillCalls.append(promptTokens)
         guard !prefillLogitsQueue.isEmpty else {
             throw .invalidArguments("missing fake prefill logits")
@@ -89,7 +89,7 @@ private struct FakeGenerationModel: AutoregressiveLanguageModel {
         return prefillLogitsQueue.removeFirst()
     }
 
-    mutating func decode(nextToken: UInt16) throws(GenerationError) -> [Float] {
+    mutating func decode(nextToken: TokenID) throws(GenerationError) -> [Float] {
         decodeCalls.append(nextToken)
         guard !decodeLogitsQueue.isEmpty else {
             throw .invalidArguments("missing fake decode logits")
@@ -97,7 +97,7 @@ private struct FakeGenerationModel: AutoregressiveLanguageModel {
         return decodeLogitsQueue.removeFirst()
     }
 
-    mutating func verify(sequenceTokens: [UInt16], startIndex: Int) throws(GenerationError) -> [[Float]] {
+    mutating func verify(sequenceTokens: [TokenID], startIndex: Int) throws(GenerationError) -> [[Float]] {
         verifyCalls.append((sequenceTokens, startIndex))
         guard !verifyResponses.isEmpty else {
             throw .invalidArguments("missing fake verify response")
@@ -111,45 +111,45 @@ private struct FakeGenerationModel: AutoregressiveLanguageModel {
 
 private struct FakeFastSelectionModel: DirectTokenSelectingLanguageModel {
     let vocabSize: Int
-    let selectedPrefillToken: UInt16
-    let selectedDecodeTokens: [UInt16]
+    let selectedPrefillToken: TokenID
+    let selectedDecodeTokens: [TokenID]
 
     private(set) var resetCount: Int = 0
-    private(set) var prefillCalls: [[UInt16]] = []
-    private(set) var decodeCalls: [UInt16] = []
-    private(set) var prefillSelectedCalls: [[UInt16]] = []
-    private(set) var decodeSelectedCalls: [UInt16] = []
+    private(set) var prefillCalls: [[TokenID]] = []
+    private(set) var decodeCalls: [TokenID] = []
+    private(set) var prefillSelectedCalls: [[TokenID]] = []
+    private(set) var decodeSelectedCalls: [TokenID] = []
 
     mutating func reset() throws(GenerationError) {
         resetCount += 1
     }
 
-    mutating func prefill(promptTokens: [UInt16]) throws(GenerationError) -> [Float] {
+    mutating func prefill(promptTokens: [TokenID]) throws(GenerationError) -> [Float] {
         prefillCalls.append(promptTokens)
         return [0, 1, 0, 0].map(Float.init)
     }
 
-    mutating func decode(nextToken: UInt16) throws(GenerationError) -> [Float] {
+    mutating func decode(nextToken: TokenID) throws(GenerationError) -> [Float] {
         decodeCalls.append(nextToken)
         return [1, 0, 0, 0].map(Float.init)
     }
 
-    mutating func verify(sequenceTokens: [UInt16], startIndex: Int) throws(GenerationError) -> [[Float]] {
+    mutating func verify(sequenceTokens: [TokenID], startIndex: Int) throws(GenerationError) -> [[Float]] {
         []
     }
 
     mutating func prefillSelectedToken(
-        promptTokens: [UInt16],
+        promptTokens: [TokenID],
         strategy: TokenSelectionStrategy
-    ) throws(GenerationError) -> UInt16 {
+    ) throws(GenerationError) -> TokenID {
         prefillSelectedCalls.append(promptTokens)
         return selectedPrefillToken
     }
 
     mutating func decodeSelectedToken(
-        nextToken: UInt16,
+        nextToken: TokenID,
         strategy: TokenSelectionStrategy
-    ) throws(GenerationError) -> UInt16 {
+    ) throws(GenerationError) -> TokenID {
         decodeSelectedCalls.append(nextToken)
         let idx = decodeSelectedCalls.count - 1
         return selectedDecodeTokens[idx]
@@ -157,59 +157,59 @@ private struct FakeFastSelectionModel: DirectTokenSelectingLanguageModel {
 }
 
 private struct FakeTwoTokenDraftModel: TwoTokenDraftingLanguageModel {
-    var selectedPrefillToken: UInt16
-    var proposalQueue: [[UInt16]]
+    var selectedPrefillToken: TokenID
+    var proposalQueue: [[TokenID]]
 
     private(set) var resetCount: Int = 0
-    private(set) var prefillSelectedCalls: [[UInt16]] = []
-    private(set) var commitCalls: [[UInt16]] = []
+    private(set) var prefillSelectedCalls: [[TokenID]] = []
+    private(set) var commitCalls: [[TokenID]] = []
 
     mutating func reset() throws(GenerationError) {
         resetCount += 1
     }
 
     mutating func prefillSelectedToken(
-        promptTokens: [UInt16],
+        promptTokens: [TokenID],
         strategy: TokenSelectionStrategy
-    ) throws(GenerationError) -> UInt16 {
+    ) throws(GenerationError) -> TokenID {
         prefillSelectedCalls.append(promptTokens)
         return selectedPrefillToken
     }
 
-    mutating func proposeTwoTokens(strategy: TokenSelectionStrategy) throws(GenerationError) -> [UInt16] {
+    mutating func proposeTwoTokens(strategy: TokenSelectionStrategy) throws(GenerationError) -> [TokenID] {
         guard !proposalQueue.isEmpty else {
             throw .invalidArguments("missing fake two-token proposal")
         }
         return proposalQueue.removeFirst()
     }
 
-    mutating func commit(tokens: [UInt16]) throws(GenerationError) {
+    mutating func commit(tokens: [TokenID]) throws(GenerationError) {
         commitCalls.append(tokens)
     }
 }
 
 private struct FakeTwoTokenVerifierModel: TwoTokenBranchVerifyingLanguageModel {
-    var selectedPrefillToken: UInt16
-    var verificationQueue: [(proposed: [UInt16], result: TwoTokenBranchCommitResult)]
+    var selectedPrefillToken: TokenID
+    var verificationQueue: [(proposed: [TokenID], result: TwoTokenBranchCommitResult)]
 
     private(set) var resetCount: Int = 0
-    private(set) var prefillSelectedCalls: [[UInt16]] = []
-    private(set) var verifyCalls: [[UInt16]] = []
+    private(set) var prefillSelectedCalls: [[TokenID]] = []
+    private(set) var verifyCalls: [[TokenID]] = []
 
     mutating func reset() throws(GenerationError) {
         resetCount += 1
     }
 
     mutating func prefillSelectedToken(
-        promptTokens: [UInt16],
+        promptTokens: [TokenID],
         strategy: TokenSelectionStrategy
-    ) throws(GenerationError) -> UInt16 {
+    ) throws(GenerationError) -> TokenID {
         prefillSelectedCalls.append(promptTokens)
         return selectedPrefillToken
     }
 
     mutating func verifyAndCommit(
-        proposedTokens: [UInt16],
+        proposedTokens: [TokenID],
         strategy: TokenSelectionStrategy
     ) throws(GenerationError) -> TwoTokenBranchCommitResult {
         verifyCalls.append(proposedTokens)
@@ -223,14 +223,14 @@ private struct FakeTwoTokenVerifierModel: TwoTokenBranchVerifyingLanguageModel {
 }
 
 private struct FakeExactTwoTokenPassResponse: Equatable {
-    let currentToken: UInt16
+    let currentToken: TokenID
     let remainingTokenBudget: Int
     let result: ExactTwoTokenPassResult
 }
 
 private struct FakeExactTwoTokenModel: ExactTwoTokenGeneratingLanguageModel {
     let vocabSize: Int
-    var selectedPrefillToken: UInt16
+    var selectedPrefillToken: TokenID
     var passQueue: [FakeExactTwoTokenPassResponse]
 
     var performanceSnapshot: GenerationPerformanceSnapshot {
@@ -238,23 +238,23 @@ private struct FakeExactTwoTokenModel: ExactTwoTokenGeneratingLanguageModel {
     }
 
     private(set) var resetCount: Int = 0
-    private(set) var prefillSelectedCalls: [[UInt16]] = []
-    private(set) var passCalls: [(currentToken: UInt16, remainingTokenBudget: Int)] = []
+    private(set) var prefillSelectedCalls: [[TokenID]] = []
+    private(set) var passCalls: [(currentToken: TokenID, remainingTokenBudget: Int)] = []
 
     mutating func reset() throws(GenerationError) {
         resetCount += 1
     }
 
     mutating func prefillSelectedToken(
-        promptTokens: [UInt16],
+        promptTokens: [TokenID],
         strategy: TokenSelectionStrategy
-    ) throws(GenerationError) -> UInt16 {
+    ) throws(GenerationError) -> TokenID {
         prefillSelectedCalls.append(promptTokens)
         return selectedPrefillToken
     }
 
     mutating func performExactTwoTokenPass(
-        currentToken: UInt16,
+        currentToken: TokenID,
         remainingTokenBudget: Int,
         strategy: TokenSelectionStrategy
     ) throws(GenerationError) -> ExactTwoTokenPassResult {

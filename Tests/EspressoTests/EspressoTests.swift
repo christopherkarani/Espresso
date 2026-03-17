@@ -1606,7 +1606,7 @@ final class EspressoTests: XCTestCase {
             return nanos / 1_000_000.0
         }
 
-        let tokens = [UInt16](repeating: 0, count: seqLen + 1)
+        let tokens = [TokenID](repeating: 0, count: seqLen + 1)
         let nSteps = 100
 
         var stepTimes: [Double] = []

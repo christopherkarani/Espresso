@@ -289,7 +289,7 @@ private func requireTripletLayerCount(_ layerCount: Int) throws {
     }
 }
 
-private func repeatedPromptSeed(_ promptTokens: [UInt16], streamCount: Int) throws -> [UInt16] {
+private func repeatedPromptSeed(_ promptTokens: [UInt32], streamCount: Int) throws -> [UInt32] {
     guard let seed = promptTokens.first else {
         throw GenerationError.invalidArguments("promptTokens must not be empty")
     }
@@ -331,7 +331,7 @@ private struct CoreMLGenerationBenchmarkModel: ~Copyable, AutoregressiveLanguage
     private let verifyLogits: TensorBuffer
     private let stepRMSWorkspace: RMSNorm.Workspace
     private let verifyRMSWorkspace: RMSNorm.Workspace
-    private var currentTokens: [UInt16]
+    private var currentTokens: [UInt32]
     private(set) var compileTimeMs: Double
     private var trunkLatencyMs: Double
     private var logitsLatencyMs: Double
@@ -435,7 +435,7 @@ private struct CoreMLGenerationBenchmarkModel: ~Copyable, AutoregressiveLanguage
         zeroInputArray()
     }
 
-    mutating func prefill(promptTokens: [UInt16]) throws(GenerationError) -> [Float] {
+    mutating func prefill(promptTokens: [UInt32]) throws(GenerationError) -> [Float] {
         guard !promptTokens.isEmpty else {
             throw .invalidArguments("promptTokens must not be empty")
         }
@@ -451,7 +451,7 @@ private struct CoreMLGenerationBenchmarkModel: ~Copyable, AutoregressiveLanguage
         return try projectCurrentLogits(sequenceIndex: promptTokens.count - 1)
     }
 
-    mutating func decode(nextToken: UInt16) throws(GenerationError) -> [Float] {
+    mutating func decode(nextToken: UInt32) throws(GenerationError) -> [Float] {
         guard currentTokens.count < maxSequenceTokens else {
             throw .invalidArguments("decode overflow at maxSequenceTokens \(maxSequenceTokens)")
         }
@@ -463,7 +463,7 @@ private struct CoreMLGenerationBenchmarkModel: ~Copyable, AutoregressiveLanguage
     }
 
     mutating func verify(
-        sequenceTokens: [UInt16],
+        sequenceTokens: [UInt32],
         startIndex: Int
     ) throws(GenerationError) -> [[Float]] {
         guard !sequenceTokens.isEmpty else {
@@ -529,7 +529,7 @@ private struct CoreMLGenerationBenchmarkModel: ~Copyable, AutoregressiveLanguage
         }
     }
 
-    private func writeToken(_ token: UInt16, at position: Int) throws(GenerationError) {
+    private func writeToken(_ token: UInt32, at position: Int) throws(GenerationError) {
         guard Int(token) < vocabSize else {
             throw .invalidArguments("token \(token) exceeds vocab size \(vocabSize)")
         }
@@ -749,7 +749,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
     func test_speculative_upper_bound_reports_metrics_on_hardware() throws {
         try requireGenerationHardware()
 
-        let prompt: [UInt16] = [0]
+        let prompt: [UInt32] = [0]
         let warmup = 3
         let iterations = 20
         let maxNewTokens = 8
@@ -796,7 +796,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
     func test_recurrent_exact_two_token_upper_bound_reports_pass_breakdown_on_hardware() throws {
         try requireGenerationHardware()
 
-        let prompt: [UInt16] = [0]
+        let prompt: [UInt32] = [0]
         let warmup = 3
         let iterations = 20
         let maxNewTokens = 8
@@ -997,7 +997,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
             layerCount: 1,
             vocabSize: ModelConfig.vocab
         )
-        let expectedTokens: [UInt16] = [105, 110, 116, 32]
+        let expectedTokens: [UInt32] = [105, 110, 116, 32]
 
         let cpuTeacher = try CPURecurrentGenerationModel(
             weights: recurrentWeights,
@@ -1064,7 +1064,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
     func test_recurrent_exact_two_token_branch_state_promotion_reports_pass_breakdown_on_hardware() throws {
         try requireGenerationHardware()
 
-        let prompt: [UInt16] = [0]
+        let prompt: [UInt32] = [0]
         let warmup = 3
         let iterations = 20
         let maxNewTokens = 8
@@ -1136,7 +1136,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
     func test_recurrent_generation_reports_compile_and_runtime_breakdown_on_hardware() throws {
         try requireGenerationHardware()
 
-        let prompt: [UInt16] = [0]
+        let prompt: [UInt32] = [0]
         let warmup = 3
         let iterations = 20
         let maxNewTokens = 8
@@ -1174,7 +1174,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
     func test_recurrent_generation_6layer_and_coreml_generation_baseline_if_gate_passes() throws {
         try requireGenerationHardware()
 
-        let prompt: [UInt16] = [0]
+        let prompt: [UInt32] = [0]
         let warmup = 3
         let iterations = 20
         let maxNewTokens = 8
@@ -1232,7 +1232,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
     func test_recurrent_generation_ane_classifier_head_reports_comparison_on_hardware() throws {
         try requireGenerationHardware()
 
-        let prompt: [UInt16] = [0]
+        let prompt: [UInt32] = [0]
         let warmup = 3
         let iterations = 20
         let maxNewTokens = 8
@@ -1282,7 +1282,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
     func test_recurrent_generation_fused_head_direct_surface_argmax_reports_reduced_readback_on_hardware() throws {
         try requireGenerationHardware()
 
-        let prompt: [UInt16] = [0]
+        let prompt: [UInt32] = [0]
         let warmup = 3
         let iterations = 20
         let maxNewTokens = 8
@@ -1353,7 +1353,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
     func test_recurrent_generation_fused_pair_direct_select_reports_comparison_on_hardware() throws {
         try requireGenerationHardware()
 
-        let prompt: [UInt16] = [0]
+        let prompt: [UInt32] = [0]
         let warmup = 3
         let iterations = 20
         let maxNewTokens = 8
@@ -1428,7 +1428,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
     func test_recurrent_generation_fused_pair_direct_select_trunk_lane_spatial_sweep_on_hardware() throws {
         try requireGenerationHardware()
 
-        let prompt: [UInt16] = [0]
+        let prompt: [UInt32] = [0]
         let warmup = 3
         let iterations = 20
         let maxNewTokens = 8
@@ -1501,7 +1501,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
     func test_recurrent_generation_fused_triplet_direct_select_reports_comparison_on_hardware() throws {
         try requireGenerationHardware()
 
-        let prompt: [UInt16] = [0]
+        let prompt: [UInt32] = [0]
         let warmup = 3
         let iterations = 20
         let maxNewTokens = 8
@@ -1576,7 +1576,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
     func test_recurrent_generation_fused_triplet_direct_select_vs_autoregressive_materialized_on_hardware() throws {
         try requireGenerationHardware()
 
-        let prompt: [UInt16] = [0]
+        let prompt: [UInt32] = [0]
         let maxNewTokens = 8
         let weights = makeEchoRecurrentGenerationWeights(layerCount: 6)
 
@@ -1623,7 +1623,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
     func test_recurrent_generation_fused_triplet_direct_select_output_head_lane_sweep_on_hardware() throws {
         try requireGenerationHardware()
 
-        let prompt: [UInt16] = [0]
+        let prompt: [UInt32] = [0]
         let warmup = 3
         let iterations = 20
         let maxNewTokens = 8
@@ -1727,7 +1727,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
     func test_recurrent_generation_concurrent_multistream_scaling_reports_matched_ane_and_coreml_baselines_on_hardware() throws {
         try requireGenerationHardware()
 
-        let prompt: [UInt16] = [0]
+        let prompt: [UInt32] = [0]
         let warmup = 3
         let iterations = 20
         let maxNewTokens = 8
@@ -1816,7 +1816,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
     func test_batched_multistream_scaling_reports_aggregate_throughput_on_hardware() throws {
         try requireGenerationHardware()
 
-        let prompt: [UInt16] = [0]
+        let prompt: [UInt32] = [0]
         let warmup = 3
         let iterations = 20
         let maxNewTokens = 8
@@ -1872,7 +1872,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
 
     private func benchmarkBatchedRecurrentGeneration(
         layerCount: Int,
-        promptTokens: [UInt16],
+        promptTokens: [UInt32],
         maxNewTokens: Int,
         warmup: Int,
         iterations: Int,
@@ -2028,7 +2028,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
     }
 
     private func batchedTokenStep(
-        tokens: inout [UInt16],
+        tokens: inout [UInt32],
         streamCount: Int,
         embedding: borrowing TensorBuffer,
         dim: Int,
@@ -2062,7 +2062,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
     }
 
     private func batchedTokenStepWithEval(
-        tokens: inout [UInt16],
+        tokens: inout [UInt32],
         streamCount: Int,
         embedding: borrowing TensorBuffer,
         dim: Int,
@@ -2113,7 +2113,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
             channels: vocabSize, streamCount: streamCount, nBlocks: 32
         )
         for streamIdx in 0..<streamCount {
-            tokens[streamIdx] = UInt16(argmaxResults[streamIdx].index)
+            tokens[streamIdx] = UInt32(argmaxResults[streamIdx].index)
         }
     }
 
@@ -2537,7 +2537,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
     func test_batched_multistream_high_lane_sweep_on_hardware() throws {
         try requireGenerationHardware()
 
-        let prompt: [UInt16] = [0]
+        let prompt: [UInt32] = [0]
         let warmup = 10
         let iterations = 50
         let maxNewTokens = 8
@@ -2563,7 +2563,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
     /// Zero-copy step: no state copies, no xfer copy, no head copy.
     /// Requires surfaces to be pre-rebound so inputs alias outputs.
     private func batchedTokenStepZeroCopy(
-        tokens: inout [UInt16],
+        tokens: inout [UInt32],
         streamCount: Int,
         embedding: borrowing TensorBuffer,
         dim: Int,
@@ -2597,7 +2597,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
             channels: vocabSize, streamCount: streamCount, nBlocks: 32
         )
         for streamIdx in 0..<streamCount {
-            tokens[streamIdx] = UInt16(argmaxResults[streamIdx].index)
+            tokens[streamIdx] = UInt32(argmaxResults[streamIdx].index)
         }
     }
 
@@ -2605,7 +2605,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
     /// Returns results as a ConcurrentGenerationScalingReport for comparison with batched/concurrent.
     private func benchmarkPipelinedGeneration(
         layerCount: Int,
-        promptTokens: [UInt16],
+        promptTokens: [UInt32],
         maxNewTokens: Int,
         warmup: Int,
         iterations: Int,
@@ -2682,7 +2682,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         let compileTimeMs = machMilliseconds(GenerationClock.now() - compileStart)
         let aneQueue = DispatchQueue(label: "com.espresso.concurrent.ane.pipeline", qos: .userInteractive)
 
-        func embWrite(_ tokens: [UInt16], to surface: IOSurfaceRef) throws {
+        func embWrite(_ tokens: [UInt32], to surface: IOSurfaceRef) throws {
             try weights.embedding.withUnsafePointer { embPtr in
                 try tokens.withUnsafeBufferPointer { tokenBuf in
                     try SurfaceIO.writeEmbeddingBatchFP16(
@@ -2693,11 +2693,11 @@ final class GenerationHarnessHardwareTests: XCTestCase {
             }
         }
 
-        func argmax(from surface: IOSurfaceRef, into tokens: inout [UInt16]) throws {
+        func argmax(from surface: IOSurfaceRef, into tokens: inout [UInt32]) throws {
             let r = try SurfaceIO.argmaxBatchFP16SpatialParallel(
                 from: surface, channelOffset: 0, spatial: streamCount,
                 channels: vocabSize, streamCount: streamCount, nBlocks: 32)
-            for i in 0..<streamCount { tokens[i] = UInt16(r[i].index) }
+            for i in 0..<streamCount { tokens[i] = UInt32(r[i].index) }
         }
 
         func evalAll(_ tr: inout LayerStorage<RWKVStyleFusedThreeLayerSession>, head: borrowing FactoredGenerationRMSNormClassifierKernelSet) throws {
@@ -2840,7 +2840,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
 
         let t0xIn = tripletSessions[0].handles.xIn
         let vocabSize = weights.vocabSize
-        var tokens = Array(repeating: UInt16(0), count: streamCount)
+        var tokens = Array(repeating: UInt32(0), count: streamCount)
 
         // Warmup
         for _ in 0..<5 {
@@ -2892,7 +2892,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                 channels: vocabSize, streamCount: streamCount, nBlocks: 8
             )
             argmaxUs.append(machMilliseconds(GenerationClock.now() - s) * 1000)
-            for i in 0..<streamCount { tokens[i] = UInt16(argmaxResults[i].index) }
+            for i in 0..<streamCount { tokens[i] = UInt32(argmaxResults[i].index) }
         }
 
         func median(_ arr: [Double]) -> Double {
@@ -3101,7 +3101,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         let t0xIn = tripletSessions[0].handles.xIn
         let vocabSize = weights.vocabSize
 
-        var tokens = Array(repeating: UInt16(0), count: streamCount)
+        var tokens = Array(repeating: UInt32(0), count: streamCount)
 
         // Warmup
         for _ in 0..<5 {
@@ -3213,7 +3213,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
             // Expansion weights for CPU-side argmax (zeroed = synthetic)
             let expWeights = TensorBuffer(count: vocabSize * (bneck / groups), zeroed: true)
 
-            var tokens = Array(repeating: UInt16(0), count: streamCount)
+            var tokens = Array(repeating: UInt32(0), count: streamCount)
 
             // === BASELINE: ANE factored head + surface argmax ===
             // Warmup
@@ -3234,7 +3234,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                     from: factoredOut, channelOffset: 0, spatial: laneSpatial,
                     channels: vocabSize, streamCount: streamCount, nBlocks: 8
                 )
-                for i in 0..<streamCount { tokens[i] = UInt16(r[i].index) }
+                for i in 0..<streamCount { tokens[i] = UInt32(r[i].index) }
             }
 
             var baselineUs: [Double] = []
@@ -3257,11 +3257,11 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                     channels: vocabSize, streamCount: streamCount, nBlocks: 8
                 )
                 baselineUs.append(machMilliseconds(GenerationClock.now() - s) * 1000)
-                for i in 0..<streamCount { tokens[i] = UInt16(r[i].index) }
+                for i in 0..<streamCount { tokens[i] = UInt32(r[i].index) }
             }
 
             // === PROJECTION: ANE proj head + CPU fused expansion argmax ===
-            tokens = Array(repeating: UInt16(0), count: streamCount)
+            tokens = Array(repeating: UInt32(0), count: streamCount)
             // Warmup
             for _ in 0..<5 {
                 try weights.embedding.withUnsafePointer { embPtr in
@@ -3284,7 +3284,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                         vocabSize: vocabSize, streamCount: streamCount, nBlocks: 8
                     )
                 }
-                for i in 0..<streamCount { tokens[i] = UInt16(r[i].index) }
+                for i in 0..<streamCount { tokens[i] = UInt32(r[i].index) }
             }
 
             var projUs: [Double] = []
@@ -3311,7 +3311,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                     )
                 }
                 projUs.append(machMilliseconds(GenerationClock.now() - s) * 1000)
-                for i in 0..<streamCount { tokens[i] = UInt16(r[i].index) }
+                for i in 0..<streamCount { tokens[i] = UInt32(r[i].index) }
             }
 
             func median(_ a: [Double]) -> Double { let s = a.sorted(); return s[s.count / 2] }
@@ -3491,7 +3491,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         }
 
         // === BASELINE warmup + timing ===
-        var tokens = Array(repeating: UInt16(0), count: streamCount)
+        var tokens = Array(repeating: UInt32(0), count: streamCount)
         let vocabSize = weights.vocabSize
 
         for _ in 0..<10 {
@@ -3520,7 +3520,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         }
 
         // === FUSED warmup + timing ===
-        tokens = Array(repeating: UInt16(0), count: streamCount)
+        tokens = Array(repeating: UInt32(0), count: streamCount)
         for _ in 0..<10 {
             try weights.embedding.withUnsafePointer { embPtr in
                 try tokens.withUnsafeBufferPointer { tokenBuf in
@@ -3537,7 +3537,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                 from: fusedLogitsOut, channelOffset: 0, spatial: laneSpatial,
                 channels: vocabSize, streamCount: streamCount, nBlocks: 8
             )
-            for i in 0..<streamCount { tokens[i] = UInt16(results[i].index) }
+            for i in 0..<streamCount { tokens[i] = UInt32(results[i].index) }
         }
 
         var fusedStepUs: [Double] = []
@@ -3559,7 +3559,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                 channels: vocabSize, streamCount: streamCount, nBlocks: 8
             )
             fusedStepUs.append(machMilliseconds(GenerationClock.now() - s) * 1000)
-            for i in 0..<streamCount { tokens[i] = UInt16(results[i].index) }
+            for i in 0..<streamCount { tokens[i] = UInt32(results[i].index) }
         }
 
         func median(_ arr: [Double]) -> Double {
@@ -3610,7 +3610,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
             classifierExpansion: TensorBuffer(count: weights.vocabSize * 128, zeroed: true),
             vocabSize: weights.vocabSize, bottleneck: 128, laneSpatial: laneSpatial
         )
-        var baselineTokens = Array(repeating: UInt16(0), count: streamCount)
+        var baselineTokens = Array(repeating: UInt32(0), count: streamCount)
         for tIdx in 0..<tripletCount { try baselineSessions[tIdx].reset() }
         for _ in 0..<maxNewTokens {
             try batchedTokenStepWithEval(
@@ -3678,7 +3678,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         try SurfaceIO.copyFP16(dst: t1sOut1, dstChannelOffset: 0, src: zl1, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
         try SurfaceIO.copyFP16(dst: t1sOut2, dstChannelOffset: 0, src: zl1, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
 
-        var zcTokens = Array(repeating: UInt16(0), count: streamCount)
+        var zcTokens = Array(repeating: UInt32(0), count: streamCount)
         let zcXIn = zcSessions[0].handles.xIn
         let zcHeadOut = try zcHead.rmsNormClassifier.outputSurface(at: 0)
         for _ in 0..<maxNewTokens {
@@ -3712,7 +3712,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         let iterations = 20
         let maxNewTokens = 8
         let streamCounts = [32, 64, 128, 256, 512]
-        let prompt: [UInt16] = [0]
+        let prompt: [UInt32] = [0]
 
         for streamCount in streamCounts {
             let laneSpatial: Int
@@ -4532,7 +4532,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         let headOut = head.outputSurface
         let vocabSize = weights.vocabSize
 
-        var tokens = Array(repeating: UInt16(0), count: streamCount)
+        var tokens = Array(repeating: UInt32(0), count: streamCount)
 
         // Warmup
         for _ in 0..<5 {
@@ -4614,7 +4614,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                 from: headOut, channelOffset: 0, spatial: laneSpatial,
                 channels: vocabSize, streamCount: streamCount
             )
-            for i in 0..<streamCount { tokens[i] = UInt16(argmaxResults[i].index) }
+            for i in 0..<streamCount { tokens[i] = UInt32(argmaxResults[i].index) }
             t2 = GenerationClock.now(); argmaxUs.append(machMicroseconds(t2 - t))
         }
 
@@ -5313,7 +5313,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         let headOut = try factoredHead.rmsNormClassifier.outputSurface(at: 0)
         let vocabSize = weights.vocabSize
 
-        var tokens = Array(repeating: UInt16(0), count: streamCount)
+        var tokens = Array(repeating: UInt32(0), count: streamCount)
 
         // Warmup
         for _ in 0..<3 {
@@ -5386,7 +5386,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                 from: headOut, channelOffset: 0, spatial: laneSpatial,
                 channels: vocabSize, streamCount: streamCount, nBlocks: 8
             )
-            for i in 0..<streamCount { tokens[i] = UInt16(argmaxResults[i].index) }
+            for i in 0..<streamCount { tokens[i] = UInt32(argmaxResults[i].index) }
             t2 = GenerationClock.now(); argmaxUs.append(machMicroseconds(t2 - t))
         }
 
@@ -5467,7 +5467,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         let headOut = try factoredHead.rmsNormClassifier.outputSurface(at: 0)
         let vocabSize = weights.vocabSize
 
-        var tokens = Array(repeating: UInt16(0), count: streamCount)
+        var tokens = Array(repeating: UInt32(0), count: streamCount)
 
         // Warmup
         for _ in 0..<3 {
@@ -5540,7 +5540,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                 from: headOut, channelOffset: 0, spatial: laneSpatial,
                 channels: vocabSize, streamCount: streamCount, nBlocks: 8
             )
-            for i in 0..<streamCount { tokens[i] = UInt16(argmaxResults[i].index) }
+            for i in 0..<streamCount { tokens[i] = UInt32(argmaxResults[i].index) }
             t2 = GenerationClock.now(); argmaxUs.append(machMicroseconds(t2 - t))
         }
 
@@ -5812,7 +5812,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
 
     private func benchmarkConcurrentRecurrentEchoGeneration(
         layerCount: Int,
-        promptTokens: [UInt16],
+        promptTokens: [UInt32],
         maxNewTokens: Int,
         warmup: Int,
         iterations: Int,
@@ -5998,7 +5998,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
 
     private func benchmarkConcurrentCoreMLGeneration(
         modelPath: String,
-        promptTokens: [UInt16],
+        promptTokens: [UInt32],
         maxNewTokens: Int,
         warmup: Int,
         iterations: Int,
@@ -6149,7 +6149,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
 
     private func benchmarkDirectEchoGeneration(
         layerCount: Int,
-        promptTokens: [UInt16],
+        promptTokens: [UInt32],
         maxNewTokens: Int,
         warmup: Int,
         iterations: Int,
@@ -6176,7 +6176,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         fullLayers: Int,
         draftLayers: Int,
         candidateCount: Int,
-        promptTokens: [UInt16],
+        promptTokens: [UInt32],
         maxNewTokens: Int,
         warmup: Int,
         iterations: Int
@@ -6219,7 +6219,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
 
     private func benchmarkRecurrentEchoGeneration(
         layerCount: Int,
-        promptTokens: [UInt16],
+        promptTokens: [UInt32],
         maxNewTokens: Int,
         warmup: Int,
         iterations: Int,
@@ -6262,7 +6262,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
 
     private func benchmarkRecurrentExactTwoTokenUpperBoundGeneration(
         layerCount: Int,
-        promptTokens: [UInt16],
+        promptTokens: [UInt32],
         maxNewTokens: Int,
         warmup: Int,
         iterations: Int,
@@ -6293,7 +6293,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
 
     private func benchmarkRecurrentExactTwoTokenBranchStatePromotionGeneration(
         layerCount: Int,
-        promptTokens: [UInt16],
+        promptTokens: [UInt32],
         maxNewTokens: Int,
         warmup: Int,
         iterations: Int,
@@ -6369,7 +6369,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
 
     private func benchmarkExactTwoTokenHarness<Model>(
         harness: inout ExactTwoTokenGenerationHarness<Model>,
-        promptTokens: [UInt16],
+        promptTokens: [UInt32],
         maxNewTokens: Int,
         warmup: Int,
         iterations: Int
@@ -6424,7 +6424,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
 
     private func benchmarkCoreMLGeneration(
         modelPath: String,
-        promptTokens: [UInt16],
+        promptTokens: [UInt32],
         maxNewTokens: Int,
         warmup: Int,
         iterations: Int
@@ -6447,7 +6447,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
 
     private func benchmarkAutoregressiveHarness<Model>(
         harness: inout AutoregressiveGenerationHarness<Model>,
-        promptTokens: [UInt16],
+        promptTokens: [UInt32],
         maxNewTokens: Int,
         warmup: Int,
         iterations: Int
@@ -6487,7 +6487,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
 
     private func benchmarkDirectSelectionHarness<Model>(
         harness: inout DirectTokenSelectionGenerationHarness<Model>,
-        promptTokens: [UInt16],
+        promptTokens: [UInt32],
         maxNewTokens: Int,
         warmup: Int,
         iterations: Int
@@ -6618,11 +6618,11 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         let headOutB = try headB.rmsNormClassifier.outputSurface(at: 0)
         let t0xInB = tripletsB[0].handles.xIn
 
-        var tokensA = Array(repeating: UInt16(0), count: streamCount)
-        var tokensB = Array(repeating: UInt16(0), count: streamCount)
+        var tokensA = Array(repeating: UInt32(0), count: streamCount)
+        var tokensB = Array(repeating: UInt32(0), count: streamCount)
 
         // Helper closures
-        func embWrite(_ tokens: [UInt16], to surface: IOSurfaceRef) throws {
+        func embWrite(_ tokens: [UInt32], to surface: IOSurfaceRef) throws {
             try weights.embedding.withUnsafePointer { embPtr in
                 try tokens.withUnsafeBufferPointer { tokenBuf in
                     try SurfaceIO.writeEmbeddingBatchFP16(
@@ -6641,12 +6641,12 @@ final class GenerationHarnessHardwareTests: XCTestCase {
             try head.rmsNormClassifier.eval()
         }
 
-        func argmax(from surface: IOSurfaceRef, into tokens: inout [UInt16]) throws {
+        func argmax(from surface: IOSurfaceRef, into tokens: inout [UInt32]) throws {
             let r = try SurfaceIO.argmaxBatchFP16SpatialParallel(
                 from: surface, channelOffset: 0, spatial: streamCount,
                 channels: vocabSize, streamCount: streamCount, nBlocks: 32
             )
-            for i in 0..<streamCount { tokens[i] = UInt16(r[i].index) }
+            for i in 0..<streamCount { tokens[i] = UInt32(r[i].index) }
         }
 
         // === BASELINE: sequential single-pipeline ===
@@ -6672,8 +6672,8 @@ final class GenerationHarnessHardwareTests: XCTestCase {
 
         // === DOUBLE-BUFFERED: overlap CPU work with ANE eval ===
         print("\n=== Double-buffered pipeline (2x1024 streams) ===")
-        tokensA = Array(repeating: UInt16(0), count: streamCount)
-        tokensB = Array(repeating: UInt16(0), count: streamCount)
+        tokensA = Array(repeating: UInt32(0), count: streamCount)
+        tokensB = Array(repeating: UInt32(0), count: streamCount)
 
         // Prime both pipelines
         try embWrite(tokensA, to: t0xInA)
@@ -6778,8 +6778,8 @@ final class GenerationHarnessHardwareTests: XCTestCase {
 
         // === TRUE OVERLAP: pipeline the CPU work during ANE eval ===
         print("\n=== Pipelined double-buffer (CPU argmax overlaps ANE eval) ===")
-        tokensA = Array(repeating: UInt16(0), count: streamCount)
-        tokensB = Array(repeating: UInt16(0), count: streamCount)
+        tokensA = Array(repeating: UInt32(0), count: streamCount)
+        tokensB = Array(repeating: UInt32(0), count: streamCount)
 
         // Prime
         try embWrite(tokensA, to: t0xInA)
@@ -6902,10 +6902,10 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         let headOutB = try headB.rmsNormClassifier.outputSurface(at: 0)
         let t0xInB = trB[0].handles.xIn
 
-        var tokensA = Array(repeating: UInt16(0), count: streamCount)
-        var tokensB = Array(repeating: UInt16(0), count: streamCount)
+        var tokensA = Array(repeating: UInt32(0), count: streamCount)
+        var tokensB = Array(repeating: UInt32(0), count: streamCount)
 
-        func embWrite(_ tokens: [UInt16], to surface: IOSurfaceRef) throws {
+        func embWrite(_ tokens: [UInt32], to surface: IOSurfaceRef) throws {
             try weights.embedding.withUnsafePointer { embPtr in
                 try tokens.withUnsafeBufferPointer { tokenBuf in
                     try SurfaceIO.writeEmbeddingBatchFP16(
@@ -6916,11 +6916,11 @@ final class GenerationHarnessHardwareTests: XCTestCase {
             }
         }
 
-        func argmax(from surface: IOSurfaceRef, into tokens: inout [UInt16]) throws {
+        func argmax(from surface: IOSurfaceRef, into tokens: inout [UInt32]) throws {
             let r = try SurfaceIO.argmaxBatchFP16SpatialParallel(
                 from: surface, channelOffset: 0, spatial: streamCount,
                 channels: vocabSize, streamCount: streamCount, nBlocks: 32)
-            for i in 0..<streamCount { tokens[i] = UInt16(r[i].index) }
+            for i in 0..<streamCount { tokens[i] = UInt32(r[i].index) }
         }
 
         // Prime
@@ -7047,10 +7047,10 @@ final class GenerationHarnessHardwareTests: XCTestCase {
             let headOutB = try headB.rmsNormClassifier.outputSurface(at: 0)
             let t0xInB = trB[0].handles.xIn
 
-            var tokensA = Array(repeating: UInt16(0), count: streamCount)
-            var tokensB = Array(repeating: UInt16(0), count: streamCount)
+            var tokensA = Array(repeating: UInt32(0), count: streamCount)
+            var tokensB = Array(repeating: UInt32(0), count: streamCount)
 
-            func embWrite(_ tokens: [UInt16], to surface: IOSurfaceRef) throws {
+            func embWrite(_ tokens: [UInt32], to surface: IOSurfaceRef) throws {
                 try weights.embedding.withUnsafePointer { embPtr in
                     try tokens.withUnsafeBufferPointer { tokenBuf in
                         try SurfaceIO.writeEmbeddingBatchFP16(
@@ -7061,11 +7061,11 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                 }
             }
 
-            func argmax(from surface: IOSurfaceRef, into tokens: inout [UInt16]) throws {
+            func argmax(from surface: IOSurfaceRef, into tokens: inout [UInt32]) throws {
                 let r = try SurfaceIO.argmaxBatchFP16SpatialParallel(
                     from: surface, channelOffset: 0, spatial: streamCount,
                     channels: testVocab, streamCount: streamCount, nBlocks: 32)
-                for i in 0..<streamCount { tokens[i] = UInt16(r[i].index) }
+                for i in 0..<streamCount { tokens[i] = UInt32(r[i].index) }
             }
 
             func evalAll(_ tr: inout LayerStorage<RWKVStyleFusedThreeLayerSession>, head: borrowing FactoredGenerationRMSNormClassifierKernelSet) throws {
@@ -7224,10 +7224,10 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         let headOutB = try headB.rmsNormClassifier.outputSurface(at: 0)
         let t0xInB = trB[0].handles.xIn
 
-        var tokensA = Array(repeating: UInt16(0), count: streamCount)
-        var tokensB = Array(repeating: UInt16(0), count: streamCount)
+        var tokensA = Array(repeating: UInt32(0), count: streamCount)
+        var tokensB = Array(repeating: UInt32(0), count: streamCount)
 
-        func embWrite(_ tokens: [UInt16], to surface: IOSurfaceRef) throws {
+        func embWrite(_ tokens: [UInt32], to surface: IOSurfaceRef) throws {
             try weights.embedding.withUnsafePointer { embPtr in
                 try tokens.withUnsafeBufferPointer { tokenBuf in
                     try SurfaceIO.writeEmbeddingBatchFP16(
@@ -7239,7 +7239,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         }
 
         // CPU sharded expansion [bneck→fullVocab] + fused argmax
-        func cpuExpandArgmax(from surface: IOSurfaceRef, into tokens: inout [UInt16]) {
+        func cpuExpandArgmax(from surface: IOSurfaceRef, into tokens: inout [UInt32]) {
             // Read [bneck, spatial] fp16 surface → transpose to [spatial, bneck] fp32
             IOSurfaceLock(surface, [.readOnly], nil)
             let base = IOSurfaceGetBaseAddress(surface).assumingMemoryBound(to: Float16.self)
@@ -7273,10 +7273,10 @@ final class GenerationHarnessHardwareTests: XCTestCase {
             // Merge across shards
             for sp in 0..<streamCount {
                 var gBest: Float = -.infinity
-                var gIdx: UInt16 = 0
+                var gIdx: UInt32 = 0
                 for shard in 0..<nShards {
                     let v = shardBestVals[shard * streamCount + sp]
-                    if v > gBest { gBest = v; gIdx = UInt16(shardBestIdxs[shard * streamCount + sp]) }
+                    if v > gBest { gBest = v; gIdx = UInt32(shardBestIdxs[shard * streamCount + sp]) }
                 }
                 tokens[sp] = gIdx
             }
@@ -7434,10 +7434,10 @@ final class GenerationHarnessHardwareTests: XCTestCase {
             let headOutB = try headB.rmsNormClassifier.outputSurface(at: 0)
             let t0xInB = trB[0].handles.xIn
 
-            var tokensA = Array(repeating: UInt16(0), count: streamCount)
-            var tokensB = Array(repeating: UInt16(0), count: streamCount)
+            var tokensA = Array(repeating: UInt32(0), count: streamCount)
+            var tokensB = Array(repeating: UInt32(0), count: streamCount)
 
-            func embWrite(_ tokens: [UInt16], to surface: IOSurfaceRef) throws {
+            func embWrite(_ tokens: [UInt32], to surface: IOSurfaceRef) throws {
                 try weights.embedding.withUnsafePointer { embPtr in
                     try tokens.withUnsafeBufferPointer { tokenBuf in
                         try SurfaceIO.writeEmbeddingBatchFP16(
@@ -7448,12 +7448,12 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                 }
             }
 
-            func argmax(from surface: IOSurfaceRef, into tokens: inout [UInt16]) throws {
+            func argmax(from surface: IOSurfaceRef, into tokens: inout [UInt32]) throws {
                 let nBlocks = min(32, streamCount / 8)
                 let r = try SurfaceIO.argmaxBatchFP16SpatialParallel(
                     from: surface, channelOffset: 0, spatial: streamCount,
                     channels: fullVocab, streamCount: streamCount, nBlocks: max(1, nBlocks))
-                for i in 0..<streamCount { tokens[i] = UInt16(r[i].index) }
+                for i in 0..<streamCount { tokens[i] = UInt32(r[i].index) }
             }
 
             func evalAll(_ tr: inout LayerStorage<RWKVStyleFusedThreeLayerSession>, head: borrowing FactoredGenerationRMSNormClassifierKernelSet) throws {
@@ -7559,7 +7559,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         defer { wF16.deallocate() }
         for i in 0..<(vocab * bneck) { wF16[i] = Float16(wF32[i]) }
 
-        var tokens = Array(repeating: UInt16(0), count: spatial)
+        var tokens = Array(repeating: UInt32(0), count: spatial)
 
         // --- Method 1: CPU BLAS chunked (128) ---
         let projBuf = UnsafeMutablePointer<Float>.allocate(capacity: spatial * bneck)
@@ -7589,7 +7589,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                 for i in 0..<count {
                     var maxVal: Float = -.infinity; var maxIdx: vDSP_Length = 0
                     vDSP_maxvi(logitsChunk + i * vocab, 1, &maxVal, &maxIdx, vDSP_Length(vocab))
-                    tokens[start + i] = UInt16(maxIdx)
+                    tokens[start + i] = UInt32(maxIdx)
                 }
             }
         }
@@ -7622,7 +7622,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
             for sp in 0..<spatial {
                 var maxVal: Float = -.infinity; var maxIdx: vDSP_Length = 0
                 vDSP_maxvi(logitsFull + sp * vocab, 1, &maxVal, &maxIdx, vDSP_Length(vocab))
-                tokens[sp] = UInt16(maxIdx)
+                tokens[sp] = UInt32(maxIdx)
             }
         }
 
@@ -7639,7 +7639,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         let partialBuf = UnsafeMutablePointer<Float>.allocate(capacity: spatial * vChunk)
         defer { partialBuf.deallocate() }
         var bestVals = [Float](repeating: 0, count: spatial)
-        var bestIdxs = [UInt16](repeating: 0, count: spatial)
+        var bestIdxs = [UInt32](repeating: 0, count: spatial)
 
         func cpuVocabChunked() {
             IOSurfaceLock(projSurf, [.readOnly], nil)
@@ -7669,7 +7669,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                     vDSP_maxvi(partialBuf + sp * vCount, 1, &maxVal, &maxIdx, vDSP_Length(vCount))
                     if maxVal > bestVals[sp] {
                         bestVals[sp] = maxVal
-                        bestIdxs[sp] = UInt16(vStart + Int(maxIdx))
+                        bestIdxs[sp] = UInt32(vStart + Int(maxIdx))
                     }
                 }
             }
@@ -7716,7 +7716,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                     vDSP_maxvi(partialSmall + sp * vCount, 1, &maxVal, &maxIdx, vDSP_Length(vCount))
                     if maxVal > bestVals[sp] {
                         bestVals[sp] = maxVal
-                        bestIdxs[sp] = UInt16(vStart + Int(maxIdx))
+                        bestIdxs[sp] = UInt32(vStart + Int(maxIdx))
                     }
                 }
             }
@@ -7788,12 +7788,12 @@ final class GenerationHarnessHardwareTests: XCTestCase {
             // Merge: find global best across shards (14 comparisons per lane)
             for sp in 0..<spatial {
                 var gBest: Float = -.infinity
-                var gIdx: UInt16 = 0
+                var gIdx: UInt32 = 0
                 for shard in 0..<nShards {
                     let v = shardBestVals[shard * spatial + sp]
                     if v > gBest {
                         gBest = v
-                        gIdx = UInt16(shardBestIdxs[shard * spatial + sp])
+                        gIdx = UInt32(shardBestIdxs[shard * spatial + sp])
                     }
                 }
                 tokens[sp] = gIdx
@@ -7869,10 +7869,10 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                 let headOutB = try headB.rmsNormClassifier.outputSurface(at: 0)
                 let t0xInB = trB[0].handles.xIn
 
-                var tokensA = Array(repeating: UInt16(0), count: streamCount)
-                var tokensB = Array(repeating: UInt16(0), count: streamCount)
+                var tokensA = Array(repeating: UInt32(0), count: streamCount)
+                var tokensB = Array(repeating: UInt32(0), count: streamCount)
 
-                func embWrite(_ tokens: [UInt16], to surface: IOSurfaceRef) throws {
+                func embWrite(_ tokens: [UInt32], to surface: IOSurfaceRef) throws {
                     try weights.embedding.withUnsafePointer { embPtr in
                         try tokens.withUnsafeBufferPointer { tokenBuf in
                             try SurfaceIO.writeEmbeddingBatchFP16(
@@ -7883,11 +7883,11 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                     }
                 }
 
-                func argmax(from surface: IOSurfaceRef, into tokens: inout [UInt16]) throws {
+                func argmax(from surface: IOSurfaceRef, into tokens: inout [UInt32]) throws {
                     let r = try SurfaceIO.argmaxBatchFP16SpatialParallel(
                         from: surface, channelOffset: 0, spatial: streamCount,
                         channels: vocabSize, streamCount: streamCount, nBlocks: 32)
-                    for i in 0..<streamCount { tokens[i] = UInt16(r[i].index) }
+                    for i in 0..<streamCount { tokens[i] = UInt32(r[i].index) }
                 }
 
                 // Prime
@@ -8020,13 +8020,13 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         let headOutC = try headC.rmsNormClassifier.outputSurface(at: 0)
         let t0xInC = trC[0].handles.xIn
 
-        var tokensA = Array(repeating: UInt16(0), count: streamCount)
-        var tokensB = Array(repeating: UInt16(0), count: streamCount)
-        var tokensC = Array(repeating: UInt16(0), count: streamCount)
+        var tokensA = Array(repeating: UInt32(0), count: streamCount)
+        var tokensB = Array(repeating: UInt32(0), count: streamCount)
+        var tokensC = Array(repeating: UInt32(0), count: streamCount)
 
         let aneQueue = DispatchQueue(label: "ane.eval.triple", qos: .userInteractive)
 
-        func embWrite(_ tokens: [UInt16], to surface: IOSurfaceRef) throws {
+        func embWrite(_ tokens: [UInt32], to surface: IOSurfaceRef) throws {
             try weights.embedding.withUnsafePointer { embPtr in
                 try tokens.withUnsafeBufferPointer { tokenBuf in
                     try SurfaceIO.writeEmbeddingBatchFP16(
@@ -8038,12 +8038,12 @@ final class GenerationHarnessHardwareTests: XCTestCase {
             }
         }
 
-        func argmax(from surface: IOSurfaceRef, into tokens: inout [UInt16]) throws {
+        func argmax(from surface: IOSurfaceRef, into tokens: inout [UInt32]) throws {
             let r = try SurfaceIO.argmaxBatchFP16SpatialParallel(
                 from: surface, channelOffset: 0, spatial: streamCount,
                 channels: vocabSize, streamCount: streamCount, nBlocks: 32
             )
-            for i in 0..<streamCount { tokens[i] = UInt16(r[i].index) }
+            for i in 0..<streamCount { tokens[i] = UInt32(r[i].index) }
         }
 
         // Prime all pipelines
@@ -8209,11 +8209,11 @@ final class GenerationHarnessHardwareTests: XCTestCase {
             let headOutB = try headB.rmsNormClassifier.outputSurface(at: 0)
             let t0xInB = tripletsB[0].handles.xIn
 
-            var tokensA = Array(repeating: UInt16(0), count: streamCount)
-            var tokensB = Array(repeating: UInt16(0), count: streamCount)
+            var tokensA = Array(repeating: UInt32(0), count: streamCount)
+            var tokensB = Array(repeating: UInt32(0), count: streamCount)
             let aneQueue = DispatchQueue(label: "ane.eval.\(streamCount)", qos: .userInteractive)
 
-            func embWrite(_ tokens: [UInt16], to surface: IOSurfaceRef) throws {
+            func embWrite(_ tokens: [UInt32], to surface: IOSurfaceRef) throws {
                 try weights.embedding.withUnsafePointer { embPtr in
                     try tokens.withUnsafeBufferPointer { tokenBuf in
                         try SurfaceIO.writeEmbeddingBatchFP16(
@@ -8225,12 +8225,12 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                 }
             }
 
-            func argmax(from surface: IOSurfaceRef, into tokens: inout [UInt16]) throws {
+            func argmax(from surface: IOSurfaceRef, into tokens: inout [UInt32]) throws {
                 let r = try SurfaceIO.argmaxBatchFP16SpatialParallel(
                     from: surface, channelOffset: 0, spatial: streamCount,
                     channels: vocabSize, streamCount: streamCount, nBlocks: 32
                 )
-                for i in 0..<streamCount { tokens[i] = UInt16(r[i].index) }
+                for i in 0..<streamCount { tokens[i] = UInt32(r[i].index) }
             }
 
             // Prime
@@ -8357,7 +8357,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                 let headOut = try factoredHead.rmsNormClassifier.outputSurface(at: 0)
                 let t0xIn = tripletSessions[0].handles.xIn
                 let vocabSize = weights.vocabSize
-                var tokens = Array(repeating: UInt16(0), count: streamCount)
+                var tokens = Array(repeating: UInt32(0), count: streamCount)
 
                 // Warmup
                 for _ in 0..<5 {
@@ -8377,7 +8377,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                         from: headOut, channelOffset: 0, spatial: streamCount,
                         channels: vocabSize, streamCount: streamCount, nBlocks: 32
                     )
-                    for i in 0..<streamCount { tokens[i] = UInt16(r[i].index) }
+                    for i in 0..<streamCount { tokens[i] = UInt32(r[i].index) }
                 }
 
                 // Timed
@@ -8407,7 +8407,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                     evalUs.append(machMilliseconds(s1 - s0) * 1000)
                     argmaxUs.append(machMilliseconds(s2 - s1) * 1000)
                     stepUs.append(machMilliseconds(s2 - s0) * 1000)
-                    for i in 0..<streamCount { tokens[i] = UInt16(r[i].index) }
+                    for i in 0..<streamCount { tokens[i] = UInt32(r[i].index) }
                 }
                 func median(_ a: [Double]) -> Double { let s = a.sorted(); return s[s.count / 2] }
                 let med = median(stepUs)
@@ -8475,7 +8475,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
 
         print("=== nBlocks sweep at 512 streams, g=\(groups) ===")
         for nBlocks in [4, 8, 16, 32] {
-            var tokens = Array(repeating: UInt16(0), count: streamCount)
+            var tokens = Array(repeating: UInt32(0), count: streamCount)
             // Warmup
             for _ in 0..<5 {
                 try weights.embedding.withUnsafePointer { embPtr in
@@ -8494,7 +8494,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                     from: headOut, channelOffset: 0, spatial: laneSpatial,
                     channels: vocabSize, streamCount: streamCount, nBlocks: nBlocks
                 )
-                for i in 0..<streamCount { tokens[i] = UInt16(r[i].index) }
+                for i in 0..<streamCount { tokens[i] = UInt32(r[i].index) }
             }
             // Timed
             var stepUs: [Double] = []
@@ -8517,7 +8517,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                     channels: vocabSize, streamCount: streamCount, nBlocks: nBlocks
                 )
                 stepUs.append(machMilliseconds(GenerationClock.now() - s) * 1000)
-                for i in 0..<streamCount { tokens[i] = UInt16(r[i].index) }
+                for i in 0..<streamCount { tokens[i] = UInt32(r[i].index) }
             }
             func median(_ a: [Double]) -> Double { let s = a.sorted(); return s[s.count / 2] }
             let med = median(stepUs)
@@ -8593,7 +8593,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
             let headOut = try factoredHead.rmsNormClassifier.outputSurface(at: 0)
             let t0xIn = tripletSessions[0].handles.xIn
             let vocabSize = weights.vocabSize
-            var tokens = Array(repeating: UInt16(0), count: 1024)
+            var tokens = Array(repeating: UInt32(0), count: 1024)
 
             for nBlocks in [4, 8, 16, 32] {
                 // Warmup
@@ -8614,7 +8614,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                         from: headOut, channelOffset: 0, spatial: 1024,
                         channels: vocabSize, streamCount: 1024, nBlocks: nBlocks
                     )
-                    for i in 0..<1024 { tokens[i] = UInt16(r[i].index) }
+                    for i in 0..<1024 { tokens[i] = UInt32(r[i].index) }
                 }
                 // Timed
                 var stepUs: [Double] = []
@@ -8637,7 +8637,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                         channels: vocabSize, streamCount: 1024, nBlocks: nBlocks
                     )
                     stepUs.append(machMilliseconds(GenerationClock.now() - s) * 1000)
-                    for i in 0..<1024 { tokens[i] = UInt16(r[i].index) }
+                    for i in 0..<1024 { tokens[i] = UInt32(r[i].index) }
                 }
                 func median(_ a: [Double]) -> Double { let s = a.sorted(); return s[s.count / 2] }
                 let med = median(stepUs)
@@ -8731,11 +8731,11 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                 b: wF32, ldb: Int32(bneck), beta: 0.0,
                 c: logitsBuf, ldc: Int32(vocab))
 
-            var cpuRefTokens = [UInt16](repeating: 0, count: spatial)
+            var cpuRefTokens = [UInt32](repeating: 0, count: spatial)
             for sp in 0..<spatial {
                 var maxVal: Float = -.infinity; var maxIdx: vDSP_Length = 0
                 vDSP_maxvi(logitsBuf + sp * vocab, 1, &maxVal, &maxIdx, vDSP_Length(vocab))
-                cpuRefTokens[sp] = UInt16(maxIdx)
+                cpuRefTokens[sp] = UInt32(maxIdx)
             }
 
             // --- Method 1: Custom Metal shader (compile-time BNECK) ---
@@ -8743,7 +8743,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                 wExpand: wBuf, bottleneck: bneck, vocabSize: vocab, spatial: spatial)
             for _ in 0..<3 { _ = try metalExpander.run(projectedSurface: projSurf) }
             var t1: [Double] = []
-            var metalTokens: [UInt16] = []
+            var metalTokens: [UInt32] = []
             for _ in 0..<reps {
                 let s = mach_absolute_time()
                 let result = try metalExpander.run(projectedSurface: projSurf)
@@ -8812,7 +8812,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
             }
 
             var t2: [Double] = []
-            var mpsTokens = [UInt16](repeating: 0, count: spatial)
+            var mpsTokens = [UInt32](repeating: 0, count: spatial)
             for rep in 0..<reps {
                 let s = mach_absolute_time()
                 let cb = cmdQueue.makeCommandBuffer()!
@@ -8822,10 +8822,10 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                 let outPtr = outBufMetal.contents().assumingMemoryBound(to: Float16.self)
                 for sp in 0..<spatial {
                     var best: Float16 = -Float16.infinity
-                    var bestIdx: UInt16 = 0
+                    var bestIdx: UInt32 = 0
                     let row = outPtr + sp * vocab
                     for v in 0..<vocab {
-                        if row[v] > best { best = row[v]; bestIdx = UInt16(v) }
+                        if row[v] > best { best = row[v]; bestIdx = UInt32(v) }
                     }
                     mpsTokens[sp] = bestIdx
                 }
@@ -8884,7 +8884,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                 wExpand: wBuf, bottleneck: bneck, vocabSize: vocab, spatial: spatial)
             for _ in 0..<3 { _ = try mpsExpander.run(projectedSurface: projSurf) }
             var t5: [Double] = []
-            var mpsGpuTokens: [UInt16] = []
+            var mpsGpuTokens: [UInt32] = []
             for _ in 0..<reps {
                 let s = mach_absolute_time()
                 let result = try mpsExpander.run(projectedSurface: projSurf)
@@ -8972,10 +8972,10 @@ final class GenerationHarnessHardwareTests: XCTestCase {
             let metalB = try MPSExpansionArgmax(
                 wExpand: wBuf, bottleneck: bneck, vocabSize: vocabSize, spatial: streamCount)
 
-            var tokensA = Array(repeating: UInt16(0), count: streamCount)
-            var tokensB = Array(repeating: UInt16(0), count: streamCount)
+            var tokensA = Array(repeating: UInt32(0), count: streamCount)
+            var tokensB = Array(repeating: UInt32(0), count: streamCount)
 
-            func embWrite(_ tokens: [UInt16], to surface: IOSurfaceRef) throws {
+            func embWrite(_ tokens: [UInt32], to surface: IOSurfaceRef) throws {
                 try weights.embedding.withUnsafePointer { embPtr in
                     try tokens.withUnsafeBufferPointer { tokenBuf in
                         try SurfaceIO.writeEmbeddingBatchFP16(
@@ -9026,7 +9026,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                   "total=\(String(format: "%.1f", med(trip0Us) + med(trip1Us) + med(headUs))) µs")
 
             // Re-prime pipelines for pipelined benchmark
-            tokensA = Array(repeating: UInt16(0), count: streamCount)
+            tokensA = Array(repeating: UInt32(0), count: streamCount)
             try embWrite(tokensA, to: t0xInA)
             try trA[0].kernels.step.eval(); try trA[1].kernels.step.eval()
             try projHeadA.rmsNormProjection.eval()
@@ -9034,7 +9034,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                 let rePrime = try metalA.run(projectedSurface: projOutA)
                 for i in 0..<streamCount { tokensA[i] = rePrime[i] }
             }
-            tokensB = Array(repeating: UInt16(0), count: streamCount)
+            tokensB = Array(repeating: UInt32(0), count: streamCount)
             try embWrite(tokensB, to: t0xInB)
 
             var pipeUs: [Double] = []
@@ -9136,14 +9136,14 @@ final class GenerationHarnessHardwareTests: XCTestCase {
             let trunkOutB = trB[1].handles.xOut
 
             // Prime GPU head path
-            tokensA = Array(repeating: UInt16(0), count: streamCount)
+            tokensA = Array(repeating: UInt32(0), count: streamCount)
             try embWrite(tokensA, to: t0xInA)
             try trA[0].kernels.step.eval(); try trA[1].kernels.step.eval()
             do {
                 let r = try gpuHeadA.run(trunkSurface: trunkOutA)
                 for i in 0..<streamCount { tokensA[i] = r[i] }
             }
-            tokensB = Array(repeating: UInt16(0), count: streamCount)
+            tokensB = Array(repeating: UInt32(0), count: streamCount)
             try embWrite(tokensB, to: t0xInB)
 
             var gpuPipeUs: [Double] = []
@@ -9306,10 +9306,10 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                 wProject: UnsafeBufferPointer(start: projWFp16, count: dim * bneck),
                 wExpand: wBuf, dim: dim, bottleneck: bneck, vocabSize: vocabSize, spatial: streamCount)
 
-            var tokensA = Array(repeating: UInt16(0), count: streamCount)
-            var tokensB = Array(repeating: UInt16(0), count: streamCount)
+            var tokensA = Array(repeating: UInt32(0), count: streamCount)
+            var tokensB = Array(repeating: UInt32(0), count: streamCount)
 
-            func embWrite(_ tokens: [UInt16], to surface: IOSurfaceRef) throws {
+            func embWrite(_ tokens: [UInt32], to surface: IOSurfaceRef) throws {
                 try weights.embedding.withUnsafePointer { embPtr in
                     try tokens.withUnsafeBufferPointer { tokenBuf in
                         try SurfaceIO.writeEmbeddingBatchFP16(
@@ -9341,11 +9341,11 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                   "total=\(String(format: "%.1f", med(trip0Us) + med(trip1Us))) µs")
 
             // Prime GPU head path
-            tokensA = Array(repeating: UInt16(0), count: streamCount)
+            tokensA = Array(repeating: UInt32(0), count: streamCount)
             try embWrite(tokensA, to: t0xInA)
             try trA[0].kernels.step.eval(); try trA[1].kernels.step.eval()
             do { let r = try gpuHeadA.run(trunkSurface: trunkOutA); for i in 0..<streamCount { tokensA[i] = r[i] } }
-            tokensB = Array(repeating: UInt16(0), count: streamCount)
+            tokensB = Array(repeating: UInt32(0), count: streamCount)
             try embWrite(tokensB, to: t0xInB)
 
             // Pipelined benchmark
@@ -9763,7 +9763,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
 
             // CPU embed for initial priming
             func cpuEmbWrite(_ surface: IOSurfaceRef) throws {
-                let tokens = Array(repeating: UInt16(0), count: streamCount)
+                let tokens = Array(repeating: UInt32(0), count: streamCount)
                 try weights.embedding.withUnsafePointer { embPtr in
                     try tokens.withUnsafeBufferPointer { tokenBuf in
                         try SurfaceIO.writeEmbeddingBatchFP16(
@@ -9835,8 +9835,8 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                 wProject: UnsafeBufferPointer(start: projWFp16, count: dim * bneck),
                 wExpand: wBuf, dim: dim, bottleneck: bneck, vocabSize: vocabSize, spatial: streamCount)
 
-            var tokensA = Array(repeating: UInt16(0), count: streamCount)
-            var tokensB = Array(repeating: UInt16(0), count: streamCount)
+            var tokensA = Array(repeating: UInt32(0), count: streamCount)
+            var tokensB = Array(repeating: UInt32(0), count: streamCount)
 
             try cpuEmbWrite(t0xInA)
             try cpuEmbWrite(t0xInB)
@@ -9965,7 +9965,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         }
 
         func cpuEmbWrite(_ surface: IOSurfaceRef) throws {
-            let tokens = Array(repeating: UInt16(0), count: streamCount)
+            let tokens = Array(repeating: UInt32(0), count: streamCount)
             try weights.embedding.withUnsafePointer { embPtr in
                 try tokens.withUnsafeBufferPointer { tokenBuf in
                     try SurfaceIO.writeEmbeddingBatchFP16(

@@ -45,6 +45,63 @@ public enum RoPE {
         }
     }
 
+    /// Single-token RoPE for decode step. Applies rotation at the given
+    /// `position` to Q (`nHeads` heads) and K (`nKVHeads` heads).
+    /// Row-major layout: `h * headDim + i`.  Mutates q and k IN PLACE.
+    public static func applyDecodeStep(
+        q: UnsafeMutablePointer<Float>,
+        k: UnsafeMutablePointer<Float>,
+        nHeads: Int,
+        nKVHeads: Int,
+        headDim: Int,
+        position: Int,
+        theta: Float = 10_000.0
+    ) {
+        precondition(nHeads > 0)
+        precondition(nKVHeads > 0)
+        precondition(headDim > 0)
+        precondition(headDim % 2 == 0)
+        precondition(position >= 0)
+
+        let halfDim = headDim / 2
+        var freqs = [Float](repeating: 0, count: halfDim)
+        for idx in 0..<halfDim {
+            freqs[idx] = 1.0 / powf(theta, Float(2 * idx) / Float(headDim))
+        }
+
+        // Rotate Q heads
+        for h in 0..<nHeads {
+            for idx in 0..<halfDim {
+                let i = idx * 2
+                let angle = Float(position) * freqs[idx]
+                let cosv = cosf(angle)
+                let sinv = sinf(angle)
+
+                let off = h * headDim + i
+                let q0 = q[off]
+                let q1 = q[off + 1]
+                q[off] = q0 * cosv - q1 * sinv
+                q[off + 1] = q0 * sinv + q1 * cosv
+            }
+        }
+
+        // Rotate K heads (may be fewer due to GQA)
+        for h in 0..<nKVHeads {
+            for idx in 0..<halfDim {
+                let i = idx * 2
+                let angle = Float(position) * freqs[idx]
+                let cosv = cosf(angle)
+                let sinv = sinf(angle)
+
+                let off = h * headDim + i
+                let k0 = k[off]
+                let k1 = k[off + 1]
+                k[off] = k0 * cosv - k1 * sinv
+                k[off + 1] = k0 * sinv + k1 * cosv
+            }
+        }
+    }
+
     /// Transposed rotation backward. Mutates dq and dk IN PLACE.
     public static func backward(
         dq: UnsafeMutablePointer<Float>,

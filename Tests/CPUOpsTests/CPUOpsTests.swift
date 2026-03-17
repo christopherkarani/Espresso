@@ -1,3 +1,4 @@
+import ANETypes
 import XCTest
 @testable import CPUOps
 
@@ -56,7 +57,7 @@ private func relativeError(_ a: Float, _ b: Float, floor: Float = 1e-6) -> Float
 
 private func crossEntropyReference(
     logits: [Float],
-    targets: [UInt16],
+    targets: [UInt32],
     vocabSize: Int,
     seqLen: Int
 ) -> (loss: Float, dlogits: [Float]) {
@@ -503,7 +504,7 @@ final class CPUOpsTests: XCTestCase {
         let vocabSize = 100
         let seqLen = 4
         let logits = [Float](repeating: 0.0, count: vocabSize * seqLen)
-        let targets: [UInt16] = [0, 1, 2, 3]
+        let targets: [UInt32] = [0, 1, 2, 3]
         var dlogits = [Float](repeating: 0.0, count: vocabSize * seqLen)
 
         let loss = logits.withUnsafeBufferPointer { logitsPtr in
@@ -529,7 +530,7 @@ final class CPUOpsTests: XCTestCase {
         let seqLen = 5
         var rng = SplitMix64(seed: 777)
         let logits = (0..<(vocabSize * seqLen)).map { _ in randomFloat(&rng, min: -4.0, max: 4.0) }
-        let targets = (0..<seqLen).map { _ in UInt16(randomInt(&rng, upperBound: vocabSize)) }
+        let targets = (0..<seqLen).map { _ in UInt32(randomInt(&rng, upperBound: vocabSize)) }
         var dlogits = [Float](repeating: 0, count: vocabSize * seqLen)
 
         let loss = logits.withUnsafeBufferPointer { logitsPtr in
@@ -564,7 +565,7 @@ final class CPUOpsTests: XCTestCase {
         let seqLen = 8
         var rng = SplitMix64(seed: 42)
         let logits = (0..<(vocabSize * seqLen)).map { _ in randomFloat(&rng, min: -4.0, max: 4.0) }
-        let targets = (0..<seqLen).map { _ in UInt16(randomInt(&rng, upperBound: vocabSize)) }
+        let targets = (0..<seqLen).map { _ in UInt32(randomInt(&rng, upperBound: vocabSize)) }
         var dlogits = [Float](repeating: 0.0, count: vocabSize * seqLen)
 
         logits.withUnsafeBufferPointer { logitsPtr in
@@ -595,7 +596,7 @@ final class CPUOpsTests: XCTestCase {
         let seqLen = 6
         var rng = SplitMix64(seed: 1701)
         let logits = (0..<(vocabSize * seqLen)).map { _ in randomFloat(&rng, min: -6.0, max: 6.0) }
-        let targets = (0..<seqLen).map { _ in UInt16(randomInt(&rng, upperBound: vocabSize)) }
+        let targets = (0..<seqLen).map { _ in UInt32(randomInt(&rng, upperBound: vocabSize)) }
 
         var gradsDefault = [Float](repeating: 0, count: vocabSize * seqLen)
         var gradsWorkspace = [Float](repeating: 0, count: vocabSize * seqLen)
@@ -776,7 +777,7 @@ final class CPUOpsTests: XCTestCase {
         let dim = 4
         let seqLen = 3
         let vocab = 5
-        let tokens: [UInt16] = [3, 1, 0]
+        let tokens: [UInt32] = [3, 1, 0]
         var embedding = [Float](repeating: 0, count: vocab * dim)
 
         for tok in 0..<vocab {
@@ -815,7 +816,7 @@ final class CPUOpsTests: XCTestCase {
         let dim = 4
         let seqLen = 3
         let vocab = 5
-        let tokens: [UInt16] = [2, 2, 1]
+        let tokens: [UInt32] = [2, 2, 1]
         var dx = [Float](repeating: 0, count: dim * seqLen)
         for d in 0..<dim {
             for t in 0..<seqLen {

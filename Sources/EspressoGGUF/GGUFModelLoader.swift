@@ -44,7 +44,7 @@ public enum GGUFModelLoader {
         switch erConfig.architectureName.lowercased() {
         case "gpt2":
             arch = .gpt2
-        case "llama", "llama2", "llama3", "mistral", "qwen2":
+        case "llama", "llama2", "llama3", "mistral", "qwen2", "qwen3":
             arch = .llama
         default:
             throw GGUFModelLoaderError.unsupportedArchitecture(erConfig.architectureName)

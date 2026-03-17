@@ -9,6 +9,7 @@ public struct MultiModelConfig: Sendable, Equatable {
     public let vocab: Int
     public let maxSeq: Int
     public let normEps: Float
+    public let ropeTheta: Float
     public let architecture: Architecture
 
     public enum Architecture: Sendable, Equatable {
@@ -27,6 +28,7 @@ public struct MultiModelConfig: Sendable, Equatable {
         vocab: Int,
         maxSeq: Int,
         normEps: Float,
+        ropeTheta: Float = 10_000.0,
         architecture: Architecture
     ) {
         self.name = name
@@ -39,6 +41,7 @@ public struct MultiModelConfig: Sendable, Equatable {
         self.vocab = vocab
         self.maxSeq = maxSeq
         self.normEps = normEps
+        self.ropeTheta = ropeTheta
         self.architecture = architecture
     }
 }

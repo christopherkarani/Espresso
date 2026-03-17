@@ -14,7 +14,7 @@ private struct StagedHeadBenchmarkSample {
     let compileTimeMs: Double
     let medianTrunkMsPerToken: Double
     let medianLogitsMsPerToken: Double
-    let generatedTokens: [UInt16]
+    let generatedTokens: [UInt32]
 }
 
 private func fillStagedHeadBuffer(_ buffer: borrowing TensorBuffer, value: Float) {
@@ -69,7 +69,7 @@ final class GenerationStagedHeadHardwareTests: XCTestCase {
     func test_recurrent_generation_cpu_exact_staged_head_reports_hardware_comparison() throws {
         try requireStagedHeadHardware()
 
-        let prompt: [UInt16] = [0]
+        let prompt: [UInt32] = [0]
         let warmup = 3
         let iterations = 20
         let maxNewTokens = 8
@@ -109,7 +109,7 @@ final class GenerationStagedHeadHardwareTests: XCTestCase {
     func test_recurrent_generation_cpu_exact_clustered_head_reports_hardware_comparison() throws {
         try requireStagedHeadHardware()
 
-        let prompt: [UInt16] = [0]
+        let prompt: [UInt32] = [0]
         let warmup = 3
         let iterations = 20
         let maxNewTokens = 8
@@ -146,7 +146,7 @@ final class GenerationStagedHeadHardwareTests: XCTestCase {
 
     private func benchmarkRecurrentEchoGeneration(
         layerCount: Int,
-        promptTokens: [UInt16],
+        promptTokens: [TokenID],
         maxNewTokens: Int,
         warmup: Int,
         iterations: Int,
@@ -166,7 +166,7 @@ final class GenerationStagedHeadHardwareTests: XCTestCase {
         var throughput: [Double] = []
         var trunkLatencies: [Double] = []
         var logitsLatencies: [Double] = []
-        var generatedTokens: [UInt16] = []
+        var generatedTokens: [UInt32] = []
         tokenLatencies.reserveCapacity(iterations)
         throughput.reserveCapacity(iterations)
         trunkLatencies.reserveCapacity(iterations)

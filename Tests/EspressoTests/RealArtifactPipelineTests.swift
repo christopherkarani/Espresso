@@ -244,11 +244,11 @@ final class RealArtifactPipelineTests: XCTestCase {
 
     private struct StubExactModel: DirectTokenSelectingLanguageModel {
         let vocabSize: Int = 32_000
-        private let sequence: [UInt16]
+        private let sequence: [TokenID]
         private var prefillWasCalled = false
         private var nextIndex = 0
 
-        init(sequence: [UInt16]) {
+        init(sequence: [TokenID]) {
             self.sequence = sequence
         }
 
@@ -257,22 +257,22 @@ final class RealArtifactPipelineTests: XCTestCase {
             nextIndex = 0
         }
 
-        mutating func prefill(promptTokens: [UInt16]) throws(GenerationError) -> [Float] {
+        mutating func prefill(promptTokens: [TokenID]) throws(GenerationError) -> [Float] {
             throw .runtimeFailure("unused in stub")
         }
 
-        mutating func decode(nextToken: UInt16) throws(GenerationError) -> [Float] {
+        mutating func decode(nextToken: TokenID) throws(GenerationError) -> [Float] {
             throw .runtimeFailure("unused in stub")
         }
 
-        mutating func verify(sequenceTokens: [UInt16], startIndex: Int) throws(GenerationError) -> [[Float]] {
+        mutating func verify(sequenceTokens: [TokenID], startIndex: Int) throws(GenerationError) -> [[Float]] {
             throw .runtimeFailure("unused in stub")
         }
 
         mutating func prefillSelectedToken(
-            promptTokens: [UInt16],
+            promptTokens: [TokenID],
             strategy: TokenSelectionStrategy
-        ) throws(GenerationError) -> UInt16 {
+        ) throws(GenerationError) -> TokenID {
             precondition(!promptTokens.isEmpty)
             prefillWasCalled = true
             nextIndex = 1
@@ -280,9 +280,9 @@ final class RealArtifactPipelineTests: XCTestCase {
         }
 
         mutating func decodeSelectedToken(
-            nextToken: UInt16,
+            nextToken: TokenID,
             strategy: TokenSelectionStrategy
-        ) throws(GenerationError) -> UInt16 {
+        ) throws(GenerationError) -> TokenID {
             precondition(prefillWasCalled)
             precondition(nextIndex < sequence.count)
             let expectedCommitted = sequence[nextIndex - 1]
@@ -295,12 +295,12 @@ final class RealArtifactPipelineTests: XCTestCase {
 
     private struct StubFutureProposingModel: FutureTokenProposingLanguageModel {
         let vocabSize: Int = 32_000
-        private let sequence: [UInt16]
-        private let futureProposals: [UInt16]
+        private let sequence: [TokenID]
+        private let futureProposals: [TokenID]
         private var nextIndex = 0
         private var proposalIndex = 0
 
-        init(sequence: [UInt16], futureProposals: [UInt16]) {
+        init(sequence: [TokenID], futureProposals: [TokenID]) {
             self.sequence = sequence
             self.futureProposals = futureProposals
         }
@@ -310,22 +310,22 @@ final class RealArtifactPipelineTests: XCTestCase {
             proposalIndex = 0
         }
 
-        mutating func prefill(promptTokens: [UInt16]) throws(GenerationError) -> [Float] {
+        mutating func prefill(promptTokens: [TokenID]) throws(GenerationError) -> [Float] {
             throw .runtimeFailure("unused in stub")
         }
 
-        mutating func decode(nextToken: UInt16) throws(GenerationError) -> [Float] {
+        mutating func decode(nextToken: TokenID) throws(GenerationError) -> [Float] {
             throw .runtimeFailure("unused in stub")
         }
 
-        mutating func verify(sequenceTokens: [UInt16], startIndex: Int) throws(GenerationError) -> [[Float]] {
+        mutating func verify(sequenceTokens: [TokenID], startIndex: Int) throws(GenerationError) -> [[Float]] {
             throw .runtimeFailure("unused in stub")
         }
 
         mutating func prefillSelectedToken(
-            promptTokens: [UInt16],
+            promptTokens: [TokenID],
             strategy: TokenSelectionStrategy
-        ) throws(GenerationError) -> UInt16 {
+        ) throws(GenerationError) -> TokenID {
             precondition(!promptTokens.isEmpty)
             nextIndex = 1
             proposalIndex = 0
@@ -333,9 +333,9 @@ final class RealArtifactPipelineTests: XCTestCase {
         }
 
         mutating func decodeSelectedToken(
-            nextToken: UInt16,
+            nextToken: TokenID,
             strategy: TokenSelectionStrategy
-        ) throws(GenerationError) -> UInt16 {
+        ) throws(GenerationError) -> TokenID {
             precondition(nextIndex < sequence.count)
             let expectedCommitted = sequence[nextIndex - 1]
             XCTAssertEqual(nextToken, expectedCommitted)
@@ -346,7 +346,7 @@ final class RealArtifactPipelineTests: XCTestCase {
 
         mutating func proposeFutureToken(
             strategy: TokenSelectionStrategy
-        ) throws(GenerationError) -> UInt16 {
+        ) throws(GenerationError) -> TokenID {
             precondition(proposalIndex < futureProposals.count)
             let proposal = futureProposals[proposalIndex]
             proposalIndex += 1

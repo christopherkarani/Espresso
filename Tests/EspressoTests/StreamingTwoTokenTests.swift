@@ -65,7 +65,7 @@ final class StreamingTwoTokenTests: XCTestCase {
             trunkBackend: .identityZeroTrunk
         )
 
-        let startToken: UInt16 = 42
+        let startToken: TokenID = 42
 
         // Sequential: two individual decodes
         let tok1_seq = try modelA.decodeSelectedToken(nextToken: startToken, strategy: .argmax)

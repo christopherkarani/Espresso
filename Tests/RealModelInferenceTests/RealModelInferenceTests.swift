@@ -66,6 +66,10 @@ import ModelSupport
         )
     }
 
+    // Llama is now supported. With a weight dir that lacks llama-specific files,
+    // the build should fail on missing layer weights (rms_att.bin etc) or succeed
+    // if the GPT-2 dir happens to have compatible top-level files.
+    // With a completely empty weight dir, it should fail on missing token embedding.
     let llamaTokenizerDir = try makeSentencePieceTokenizerDirectory()
     let llamaConfig = MultiModelConfig(
         name: "tiny-llama",
@@ -80,10 +84,11 @@ import ModelSupport
         normEps: 1e-5,
         architecture: .llama
     )
-    try expectRealModelInferenceError(containing: "rope") {
+    let emptyLlamaDir = try makeTempDirectory()
+    try expectRealModelInferenceError(containing: "token embedding") {
         _ = try RealModelInferenceEngine.build(
             config: llamaConfig,
-            weightDir: validWeightDir.path,
+            weightDir: emptyLlamaDir.path,
             tokenizerDir: llamaTokenizerDir.deletingLastPathComponent().path
         )
     }
@@ -341,7 +346,7 @@ import ModelSupport
     }
 
     let config = ModelRegistry.gpt2_124m
-    let tokens: [UInt16] = [15496, 11]
+    let tokens: [UInt32] = [15496, 11]
     let packedInput = try RealModelInferenceEngine.composeEmbeddingInputForTesting(
         config: config,
         weightDir: weightsDir,

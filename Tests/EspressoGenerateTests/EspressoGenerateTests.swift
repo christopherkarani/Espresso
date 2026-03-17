@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+import ANETypes
 @testable import EspressoGenerate
 
 @Test func test_optionsParseSubcommandsAndFlags() throws {
@@ -168,7 +169,7 @@ import Testing
         return BackendRunMetrics(
             backend: "espresso",
             text: "Hello \(callCount)",
-            generatedTokens: [UInt16(callCount)],
+            generatedTokens: [UInt32(callCount)],
             promptTokens: [0],
             compileTimeMs: compileTimeMs,
             firstTokenLatencyMs: Double(100 + callCount),

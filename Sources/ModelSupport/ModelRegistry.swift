@@ -55,8 +55,7 @@ public enum ModelRegistry {
         architecture: .llama
     )
 
-    /// Llama 3.2 1B — GQA (nKVHead=8), SwiGLU, RMSNorm.
-    /// Weights should be pre-processed offline: GQA heads expanded, RoPE rotations baked into Wq/Wk.
+    /// Llama 3.2 1B — GQA (nKVHead=8), SwiGLU, RMSNorm, RoPE theta=500000.
     public static let llama3_2_1b = MultiModelConfig(
         name: "llama3_2_1b",
         nLayer: 16,
@@ -68,11 +67,11 @@ public enum ModelRegistry {
         vocab: 128_256,
         maxSeq: 2_048,
         normEps: 1e-5,
+        ropeTheta: 500_000.0,
         architecture: .llama
     )
 
-    /// Llama 3.2 3B — GQA (nKVHead=8), SwiGLU, RMSNorm.
-    /// Weights should be pre-processed offline: GQA heads expanded, RoPE rotations baked into Wq/Wk.
+    /// Llama 3.2 3B — GQA (nKVHead=8), SwiGLU, RMSNorm, RoPE theta=500000.
     public static let llama3_2_3b = MultiModelConfig(
         name: "llama3_2_3b",
         nLayer: 28,
@@ -84,6 +83,7 @@ public enum ModelRegistry {
         vocab: 128_256,
         maxSeq: 2_048,
         normEps: 1e-5,
+        ropeTheta: 500_000.0,
         architecture: .llama
     )
 

@@ -186,6 +186,150 @@ public struct TransformerLayerGraphBuilder {
         _ = try! graph.output(output, name: "out")
         return graph
     }
+
+    /// Pre-RoPE graph: RMSNorm -> Wq, Wk, Wv projections.
+    /// Outputs: k, q, v (alphabetical order).
+    public static func preRoPEForwardLayer(
+        layer: Int,
+        config: MultiModelConfig,
+        paths: LayerWeightPaths,
+        spatial: Int
+    ) -> ANEGraph {
+        precondition(config.architecture == .llama, "preRoPEForwardLayer only supports llama architecture")
+        precondition(config.dModel == config.nHead * config.headDim, "dModel must equal nHead * headDim")
+        precondition(
+            isSupportedMaskBucket(spatial: spatial, maxSeq: config.maxSeq),
+            "spatial must be a power-of-two mask bucket within model context"
+        )
+
+        var graph = ANEGraph()
+        let input = try! graph.input(
+            "x",
+            dtype: .fp16,
+            shape: try! ANEShape(channels: config.dModel, spatial: spatial)
+        )
+        let prefix = "layer\(layer)"
+
+        let norm = try! graph.rmsNorm128(
+            "\(prefix)_rms1",
+            input: input,
+            dim: config.dModel,
+            spatial: spatial,
+            eps: config.normEps,
+            weightPath: paths.rmsAtt
+        )
+        let q = try! graph.linear128(
+            "\(prefix)_q",
+            input: norm,
+            inDim: config.dModel,
+            outDim: config.dModel,
+            spatial: spatial,
+            weightPath: paths.wq
+        )
+        let k = try! graph.linear128(
+            "\(prefix)_k",
+            input: norm,
+            inDim: config.dModel,
+            outDim: config.dModel,
+            spatial: spatial,
+            weightPath: paths.wk
+        )
+        let v = try! graph.linear128(
+            "\(prefix)_v",
+            input: norm,
+            inDim: config.dModel,
+            outDim: config.dModel,
+            spatial: spatial,
+            weightPath: paths.wv
+        )
+
+        // Outputs in alphabetical order: k, q, v
+        _ = try! graph.output(k, name: "k")
+        _ = try! graph.output(q, name: "q")
+        _ = try! graph.output(v, name: "v")
+        return graph
+    }
+
+    /// Post-RoPE graph: causalAttention(Q,K,V) -> Wo -> residual -> RMSNorm -> SwiGLU FFN -> residual.
+    /// Inputs: k_rotated, q_rotated, v, x_residual (alphabetical order).
+    public static func postRoPEForwardLayer(
+        layer: Int,
+        config: MultiModelConfig,
+        paths: LayerWeightPaths,
+        spatial: Int
+    ) -> ANEGraph {
+        precondition(config.architecture == .llama, "postRoPEForwardLayer only supports llama architecture")
+        precondition(config.dModel == config.nHead * config.headDim, "dModel must equal nHead * headDim")
+        precondition(
+            isSupportedMaskBucket(spatial: spatial, maxSeq: config.maxSeq),
+            "spatial must be a power-of-two mask bucket within model context"
+        )
+
+        var graph = ANEGraph()
+        let prefix = "layer\(layer)"
+
+        let kRotated = try! graph.input(
+            "k_rotated",
+            dtype: .fp16,
+            shape: try! ANEShape(channels: config.dModel, spatial: spatial)
+        )
+        let qRotated = try! graph.input(
+            "q_rotated",
+            dtype: .fp16,
+            shape: try! ANEShape(channels: config.dModel, spatial: spatial)
+        )
+        let v = try! graph.input(
+            "v",
+            dtype: .fp16,
+            shape: try! ANEShape(channels: config.dModel, spatial: spatial)
+        )
+        let xResidual = try! graph.input(
+            "x_residual",
+            dtype: .fp16,
+            shape: try! ANEShape(channels: config.dModel, spatial: spatial)
+        )
+
+        let attn = try! graph.causalAttention128(
+            "\(prefix)_attn",
+            q: qRotated,
+            k: kRotated,
+            v: v,
+            nHeads: config.nHead,
+            headDim: config.headDim,
+            spatial: spatial,
+            maskPath: paths.causalMaskPath(spatial: spatial)
+        )
+        let projected = try! graph.linear128(
+            "\(prefix)_attn_proj",
+            input: attn,
+            inDim: config.dModel,
+            outDim: config.dModel,
+            spatial: spatial,
+            weightPath: paths.wo
+        )
+        let residual1 = try! graph.add("\(prefix)_res1_out", x: xResidual, y: projected)
+        let norm2 = try! graph.rmsNorm128(
+            "\(prefix)_rms2",
+            input: residual1,
+            dim: config.dModel,
+            spatial: spatial,
+            eps: config.normEps,
+            weightPath: paths.rmsFfn
+        )
+        let ffn = try! graph.swigluFFN128(
+            "\(prefix)_ffn",
+            input: norm2,
+            inDim: config.dModel,
+            hiddenDim: config.hiddenDim,
+            spatial: spatial,
+            w1Path: paths.w1,
+            w3Path: paths.w3!,
+            w2Path: paths.w2
+        )
+        let output = try! graph.add("\(prefix)_res2_out", x: residual1, y: ffn)
+        _ = try! graph.output(output, name: "out")
+        return graph
+    }
 }
 
 private extension ANEGraph {

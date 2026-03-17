@@ -299,7 +299,9 @@ public struct HybridDecodeSurfaceHandles {
     public let maxSeq: Int
     public let laneSpatial: Int
 
-    public init(kernels: borrowing HybridDecodeKernelSet, logicalMaxSeq: Int? = nil) throws(ANEError) {
+    public let dim: Int
+
+    public init(kernels: borrowing HybridDecodeKernelSet, logicalMaxSeq: Int? = nil, dim: Int = ModelConfig.dim) throws(ANEError) {
         let qkvIn = try kernels.decodeQKVOnly.inputSurface(at: 0)
         let kOut = try kernels.decodeQKVOnly.outputSurface(at: 0)
         let qOut = try kernels.decodeQKVOnly.outputSurface(at: 1)
@@ -314,6 +316,7 @@ public struct HybridDecodeSurfaceHandles {
             try kernels.decodeFFN.rebindInput(at: 0, to: projectionOut)
         }
 
+        self.dim = dim
         self.qkvIn = qkvIn
         self.kOut = kOut
         self.qOut = qOut
@@ -326,18 +329,18 @@ public struct HybridDecodeSurfaceHandles {
         self.maxSeq = logicalMaxSeq ?? kernels.maxSeq
         self.laneSpatial = kernels.laneSpatial
 
-        guard let kCacheFull = ane_interop_create_surface(ModelConfig.dim * self.maxSeq * 2),
-              let vCacheFull = ane_interop_create_surface(ModelConfig.dim * self.maxSeq * 2),
-              let zeroLane = ane_interop_create_surface(ModelConfig.dim * kernels.laneSpatial * 2) else {
+        guard let kCacheFull = ane_interop_create_surface(dim * self.maxSeq * 2),
+              let vCacheFull = ane_interop_create_surface(dim * self.maxSeq * 2),
+              let zeroLane = ane_interop_create_surface(dim * kernels.laneSpatial * 2) else {
             throw .surfaceAllocationFailed
         }
         self.kCacheFull = kCacheFull
         self.vCacheFull = vCacheFull
         self.zeroLane = zeroLane
 
-        let zeroLaneValues = Array(repeating: Float(0), count: ModelConfig.dim * kernels.laneSpatial)
+        let zeroLaneValues = Array(repeating: Float(0), count: dim * kernels.laneSpatial)
         zeroLaneValues.withUnsafeBufferPointer { src in
-            SurfaceIO.writeFP16(to: zeroLane, data: src, channels: ModelConfig.dim, spatial: kernels.laneSpatial)
+            SurfaceIO.writeFP16(to: zeroLane, data: src, channels: dim, spatial: kernels.laneSpatial)
         }
     }
 }
@@ -692,6 +695,9 @@ public extension ForwardPass {
         metalAttention: MetalAttentionKernel,
         decodeState: inout DecodeState,
         dim: Int = ModelConfig.dim,
+        nHeads: Int = ModelConfig.heads,
+        headDim: Int = ModelConfig.headDim,
+        postQKVHook: ((IOSurfaceRef, IOSurfaceRef, Int, Int) throws(ANEError) -> Void)? = nil,
         readFinalOutputIntoXCur: Bool = true,
         timings: inout HybridDecodeTimingBreakdown
     ) throws(ANEError) {
@@ -726,6 +732,9 @@ public extension ForwardPass {
             metalAttention: metalAttention,
             decodeState: &decodeState,
             dim: dim,
+            nHeads: nHeads,
+            headDim: headDim,
+            postQKVHook: postQKVHook,
             timings: &timings
         )
 
@@ -756,6 +765,9 @@ public extension ForwardPass {
         metalAttention: MetalAttentionKernel,
         decodeState: inout DecodeState,
         dim: Int = ModelConfig.dim,
+        nHeads: Int = ModelConfig.heads,
+        headDim: Int = ModelConfig.headDim,
+        postQKVHook: ((IOSurfaceRef, IOSurfaceRef, Int, Int) throws(ANEError) -> Void)? = nil,
         timings: inout HybridDecodeTimingBreakdown
     ) throws(ANEError) {
         precondition(kernels.count > 0)
@@ -783,6 +795,13 @@ public extension ForwardPass {
                 throw .invalidArguments("decodeQKVOnly eval failed at layer \(layerIndex), token \(tokenIndex): \(error)")
             }
             timings.tAneQKV += RuntimeClock.ms(RuntimeClock.now() - t0)
+
+            // Optional post-QKV hook (e.g. RoPE for llama models)
+            if let hook = postQKVHook {
+                t0 = RuntimeClock.now()
+                try hook(handles.qOut, handles.kOut, laneSpatial, tokenIndex)
+                timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
+            }
 
             t0 = RuntimeClock.now()
             do {
@@ -813,8 +832,8 @@ public extension ForwardPass {
             let metalShape: MetalDecodeAttentionShape
             do {
                 metalShape = try MetalDecodeAttentionShape(
-                    heads: ModelConfig.heads,
-                    headDim: ModelConfig.headDim,
+                    heads: nHeads,
+                    headDim: headDim,
                     visibleTokens: visibleTokens,
                     cacheStride: maxSeq,
                     laneStride: laneSpatial
