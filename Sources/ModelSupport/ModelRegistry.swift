@@ -68,6 +68,7 @@ public enum ModelRegistry {
         maxSeq: 2_048,
         normEps: 1e-5,
         ropeTheta: 500_000.0,
+        eosToken: 128_001,
         architecture: .llama
     )
 
@@ -84,6 +85,7 @@ public enum ModelRegistry {
         maxSeq: 2_048,
         normEps: 1e-5,
         ropeTheta: 500_000.0,
+        eosToken: 128_001,
         architecture: .llama
     )
 

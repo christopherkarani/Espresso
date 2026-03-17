@@ -1541,42 +1541,44 @@ public struct RealModelInferenceEngine: ~Copyable {
             didCompile = true
         }
 
-        if compiledHybridGreedyNorm.count != 1 ||
-            compiledHybridGreedyClassifier.count != 1 ||
-            compiledHybridGreedySpatial != hybridHeadSpatial {
-            compiledHybridGreedyNorm = try LayerStorage<CompiledHead>(count: 1, throwingInitializer: { _ in
-                try Self.compileHead(
-                    config: config,
-                    weightDirURL: weightDirURL,
-                    assets: gpt2Assets,
-                    spatial: hybridHeadSpatial,
-                    inputDType: .fp16,
-                    outputDType: .fp16
+        if classifierStrategy == .ane {
+            if compiledHybridGreedyNorm.count != 1 ||
+                compiledHybridGreedyClassifier.count != 1 ||
+                compiledHybridGreedySpatial != hybridHeadSpatial {
+                compiledHybridGreedyNorm = try LayerStorage<CompiledHead>(count: 1, throwingInitializer: { _ in
+                    try Self.compileHead(
+                        config: config,
+                        weightDirURL: weightDirURL,
+                        assets: gpt2Assets,
+                        spatial: hybridHeadSpatial,
+                        inputDType: .fp16,
+                        outputDType: .fp16
+                    )
+                })
+                compiledHybridGreedyClassifier = try LayerStorage<CompiledClassifier>(count: 1, throwingInitializer: { _ in
+                    try Self.compileClassifier(
+                        config: config,
+                        assets: gpt2Assets,
+                        spatial: hybridHeadSpatial
+                    )
+                })
+                compiledHybridGreedySpatial = hybridHeadSpatial
+                try compiledHybridGreedyClassifier[0].kernel.rebindInput(
+                    at: 0,
+                    to: compiledHybridGreedyNorm[0].outputSurface
                 )
-            })
-            compiledHybridGreedyClassifier = try LayerStorage<CompiledClassifier>(count: 1, throwingInitializer: { _ in
-                try Self.compileClassifier(
-                    config: config,
-                    assets: gpt2Assets,
-                    spatial: hybridHeadSpatial
-                )
-            })
-            compiledHybridGreedySpatial = hybridHeadSpatial
-            try compiledHybridGreedyClassifier[0].kernel.rebindInput(
-                at: 0,
-                to: compiledHybridGreedyNorm[0].outputSurface
-            )
-            didCompile = true
-        }
+                didCompile = true
+            }
 
-        if compiledHybridGreedyNorm.count == 1,
-           compiledHybridGreedyClassifier.count == 1,
-           let finalSurface = compiledHybridSurfaceHandles.last?.ffnOut {
-            try compiledHybridGreedyNorm[0].kernel.rebindInput(at: 0, to: finalSurface)
-            try compiledHybridGreedyClassifier[0].kernel.rebindInput(
-                at: 0,
-                to: compiledHybridGreedyNorm[0].outputSurface
-            )
+            if compiledHybridGreedyNorm.count == 1,
+               compiledHybridGreedyClassifier.count == 1,
+               let finalSurface = compiledHybridSurfaceHandles.last?.ffnOut {
+                try compiledHybridGreedyNorm[0].kernel.rebindInput(at: 0, to: finalSurface)
+                try compiledHybridGreedyClassifier[0].kernel.rebindInput(
+                    at: 0,
+                    to: compiledHybridGreedyNorm[0].outputSurface
+                )
+            }
         }
 
         return didCompile
@@ -1738,6 +1740,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         var timings = HybridDecodeTimingBreakdown()
         let useANEGreedyHead =
             temperature == 0 &&
+            classifierStrategy == .ane &&
             compiledHybridGreedyNorm.count == 1 &&
             compiledHybridGreedyClassifier.count == 1
 
@@ -2326,7 +2329,6 @@ public struct RealModelInferenceEngine: ~Copyable {
             let kBuf = UnsafeMutableBufferPointer<Float>.allocate(capacity: kBufSize)
             defer { kBuf.deallocate() }
 
-            let readOK: Bool
             do {
                 try SurfaceIO.readFP16SpatialSlice(
                     from: qSurf, channelOffset: 0, spatialIndex: 0, spatial: laneSp,
@@ -2336,12 +2338,8 @@ public struct RealModelInferenceEngine: ~Copyable {
                     from: kSurf, channelOffset: 0, spatialIndex: 0, spatial: laneSp,
                     into: kBuf, channels: kBufSize
                 )
-                readOK = true
             } catch {
-                readOK = false
-            }
-            guard readOK else {
-                throw .invalidArguments("RoPE hook surface read failed")
+                throw .invalidArguments("RoPE hook surface read failed: \(error)")
             }
 
             RoPE.applyDecodeStep(
@@ -2350,7 +2348,6 @@ public struct RealModelInferenceEngine: ~Copyable {
                 position: tokenIndex, theta: theta
             )
 
-            let writeOK: Bool
             do {
                 try SurfaceIO.writeFP16SpatialSlice(
                     to: qSurf, channelOffset: 0, spatialIndex: 0, spatial: laneSp,
@@ -2360,12 +2357,8 @@ public struct RealModelInferenceEngine: ~Copyable {
                     to: kSurf, channelOffset: 0, spatialIndex: 0, spatial: laneSp,
                     data: UnsafeBufferPointer(kBuf), channels: kBufSize
                 )
-                writeOK = true
             } catch {
-                writeOK = false
-            }
-            guard writeOK else {
-                throw .invalidArguments("RoPE hook surface write failed")
+                throw .invalidArguments("RoPE hook surface write failed: \(error)")
             }
         }
 
@@ -2524,7 +2517,10 @@ public struct RealModelInferenceEngine: ~Copyable {
                 firstTokenRecorded = true
             }
 
-            // Llama EOS varies by model — use vocab-1 as a safe sentinel or check config
+            if let eosToken = config.eosToken, nextToken == eosToken {
+                generatedTokens.append(nextToken)
+                break
+            }
             generatedTokens.append(nextToken)
             allTokens.append(nextToken)
             let elapsedMs = Self.milliseconds(from: emissionNow - generationStart)
