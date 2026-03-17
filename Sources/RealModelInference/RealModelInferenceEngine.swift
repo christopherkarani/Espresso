@@ -125,6 +125,21 @@ public struct RealModelInferenceEngine: ~Copyable {
         let finalNormBetaData: Data
     }
 
+    private struct LlamaTopLevelAssets {
+        let tokenEmbedding: [Float]
+        let finalNormGamma: [Float]
+        let lmHead: [Float]
+        let lmHeadFP16: [UInt16]
+        let finalNormGammaPath: String
+        let finalNormGammaCompilePath: String
+        let finalNormGammaData: Data
+    }
+
+    private enum TopLevelAssets {
+        case gpt2(GPT2TopLevelAssets)
+        case llama(LlamaTopLevelAssets)
+    }
+
     struct AttentionTestingOutputs {
         let hidden: [Float]
         let kCache: [Float]
@@ -518,7 +533,22 @@ public struct RealModelInferenceEngine: ~Copyable {
     private let config: MultiModelConfig
     private let weightDirURL: URL
     private let tokenizer: LoadedTokenizer
-    private let gpt2Assets: GPT2TopLevelAssets
+    private let assets: TopLevelAssets
+
+    private var gpt2Assets: GPT2TopLevelAssets {
+        guard case let .gpt2(a) = assets else {
+            preconditionFailure("Attempted to access GPT-2 assets on a non-GPT-2 model")
+        }
+        return a
+    }
+
+    private var llamaAssets: LlamaTopLevelAssets {
+        guard case let .llama(a) = assets else {
+            preconditionFailure("Attempted to access Llama assets on a non-Llama model")
+        }
+        return a
+    }
+
     private var compiledBucket: Int
     private var compiledLayers: LayerStorage<CompiledLayer>
     private var firstLayerInputSurface: IOSurfaceRef?
@@ -536,14 +566,20 @@ public struct RealModelInferenceEngine: ~Copyable {
     private var speculativeRuntimeCacheOrder: [SpeculativeRuntimeKey]
     private let classifierBlockMaxNorms: [Float]
     private var classifierLogitsScratch: [Float]
+    private let classifierStrategy: ClassifierStrategy
 
     private init(
         config: MultiModelConfig,
         weightDirURL: URL,
         tokenizer: LoadedTokenizer,
-        gpt2Assets: GPT2TopLevelAssets
+        assets: TopLevelAssets
     ) {
-        let classifierBlockMaxNorms = gpt2Assets.lmHead.withUnsafeBufferPointer { weightBuffer in
+        let lmHead: [Float]
+        switch assets {
+        case let .gpt2(a): lmHead = a.lmHead
+        case let .llama(a): lmHead = a.lmHead
+        }
+        let classifierBlockMaxNorms = lmHead.withUnsafeBufferPointer { weightBuffer in
             Self.precomputeClassifierBlockMaxNorms(
                 classifier: weightBuffer.baseAddress!,
                 vocabSize: config.vocab,
@@ -554,7 +590,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         self.config = config
         self.weightDirURL = weightDirURL
         self.tokenizer = tokenizer
-        self.gpt2Assets = gpt2Assets
+        self.assets = assets
         self.compiledBucket = 0
         self.compiledLayers = Self.emptyStorage(CompiledLayer.self)
         self.firstLayerInputSurface = nil
@@ -575,6 +611,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             repeating: 0,
             count: min(Self.classifierArgmaxBlockSize, config.vocab)
         )
+        self.classifierStrategy = ClassifierStrategy.select(for: config)
     }
 
     public static func build(
@@ -590,54 +627,75 @@ public struct RealModelInferenceEngine: ~Copyable {
         try validateDirectory(tokenizerDirURL)
         try validateMetadataIfPresent(config: config, weightDirURL: weightDirURL)
 
-        guard config.architecture == .gpt2 else {
-            throw RealModelInferenceError.unsupportedArchitecture(
-                "Architecture \(architectureName(config.architecture)) is not supported yet: llama-family models require RoPE in the ANE graph."
-            )
-        }
-
         let tokenizer = try loadTokenizer(config: config, tokenizerDirURL: tokenizerDirURL)
 
-        let topLevelPaths = try resolveTopLevelWeightPaths(config: config, weightDir: weightDir)
-        let tokenEmbedding = try loadWeightTable(
-            at: topLevelPaths.tokenEmbedding,
-            expectedCount: config.vocab * config.dModel
-        )
-        let positionEmbedding = try loadWeightTable(
-            at: topLevelPaths.positionEmbedding,
-            expectedCount: config.maxSeq * config.dModel
-        )
-        let finalNormGamma = try loadWeightTable(
-            at: topLevelPaths.finalNormGamma,
-            expectedCount: config.dModel
-        )
-        let finalNormBeta = try loadWeightTable(
-            at: topLevelPaths.finalNormBeta,
-            expectedCount: config.dModel
-        )
-        let lmHead = try loadWeightTable(
-            at: topLevelPaths.lmHead,
-            expectedCount: config.vocab * config.dModel
-        )
-
-        let assets = GPT2TopLevelAssets(
-            tokenEmbedding: tokenEmbedding,
-            positionEmbedding: positionEmbedding,
-            finalNormGamma: finalNormGamma,
-            finalNormBeta: finalNormBeta,
-            lmHead: lmHead,
-            finalNormGammaPath: topLevelPaths.finalNormGamma,
-            finalNormBetaPath: topLevelPaths.finalNormBeta,
-            finalNormGammaCompilePath: compileBlobPath(actualPath: topLevelPaths.finalNormGamma, rootDir: weightDirURL),
-            finalNormBetaCompilePath: compileBlobPath(actualPath: topLevelPaths.finalNormBeta, rootDir: weightDirURL),
-            finalNormGammaData: WeightBlob.build(from: finalNormGamma, rows: 1, cols: finalNormGamma.count),
-            finalNormBetaData: WeightBlob.build(from: finalNormBeta, rows: 1, cols: finalNormBeta.count)
-        )
+        let topLevelAssets: TopLevelAssets
+        switch config.architecture {
+        case .gpt2:
+            let topLevelPaths = try resolveTopLevelWeightPaths(config: config, weightDir: weightDir)
+            let tokenEmbedding = try loadWeightTable(
+                at: topLevelPaths.tokenEmbedding,
+                expectedCount: config.vocab * config.dModel
+            )
+            let positionEmbedding = try loadWeightTable(
+                at: topLevelPaths.positionEmbedding,
+                expectedCount: config.maxSeq * config.dModel
+            )
+            let finalNormGamma = try loadWeightTable(
+                at: topLevelPaths.finalNormGamma,
+                expectedCount: config.dModel
+            )
+            let finalNormBeta = try loadWeightTable(
+                at: topLevelPaths.finalNormBeta,
+                expectedCount: config.dModel
+            )
+            let lmHead = try loadWeightTable(
+                at: topLevelPaths.lmHead,
+                expectedCount: config.vocab * config.dModel
+            )
+            topLevelAssets = .gpt2(GPT2TopLevelAssets(
+                tokenEmbedding: tokenEmbedding,
+                positionEmbedding: positionEmbedding,
+                finalNormGamma: finalNormGamma,
+                finalNormBeta: finalNormBeta,
+                lmHead: lmHead,
+                finalNormGammaPath: topLevelPaths.finalNormGamma,
+                finalNormBetaPath: topLevelPaths.finalNormBeta,
+                finalNormGammaCompilePath: compileBlobPath(actualPath: topLevelPaths.finalNormGamma, rootDir: weightDirURL),
+                finalNormBetaCompilePath: compileBlobPath(actualPath: topLevelPaths.finalNormBeta, rootDir: weightDirURL),
+                finalNormGammaData: WeightBlob.build(from: finalNormGamma, rows: 1, cols: finalNormGamma.count),
+                finalNormBetaData: WeightBlob.build(from: finalNormBeta, rows: 1, cols: finalNormBeta.count)
+            ))
+        case .llama:
+            let topLevelPaths = try resolveLlamaTopLevelWeightPaths(config: config, weightDir: weightDir)
+            let tokenEmbedding = try loadWeightTable(
+                at: topLevelPaths.tokenEmbedding,
+                expectedCount: config.vocab * config.dModel
+            )
+            let finalNormGamma = try loadWeightTable(
+                at: topLevelPaths.finalNormGamma,
+                expectedCount: config.dModel
+            )
+            let lmHead = try loadWeightTable(
+                at: topLevelPaths.lmHead,
+                expectedCount: config.vocab * config.dModel
+            )
+            let lmHeadFP16 = lmHead.map { Float16($0).bitPattern }
+            topLevelAssets = .llama(LlamaTopLevelAssets(
+                tokenEmbedding: tokenEmbedding,
+                finalNormGamma: finalNormGamma,
+                lmHead: lmHead,
+                lmHeadFP16: lmHeadFP16,
+                finalNormGammaPath: topLevelPaths.finalNormGamma,
+                finalNormGammaCompilePath: compileBlobPath(actualPath: topLevelPaths.finalNormGamma, rootDir: weightDirURL),
+                finalNormGammaData: WeightBlob.build(from: finalNormGamma, rows: 1, cols: finalNormGamma.count)
+            ))
+        }
         return RealModelInferenceEngine(
             config: config,
             weightDirURL: weightDirURL,
             tokenizer: tokenizer,
-            gpt2Assets: assets
+            assets: topLevelAssets
         )
     }
 
@@ -681,6 +739,26 @@ public struct RealModelInferenceEngine: ~Copyable {
             channels: config.dModel,
             maxSeq: config.maxSeq
         )
+
+        // Llama always uses hybrid decode (RoPE requires CPU step between ANE QKV and Metal attention)
+        if config.architecture == .llama {
+            let compileStart = DispatchTime.now().uptimeNanoseconds
+            let compileDidRun = try ensureHybridCompiledLlama(bucket: bucket)
+            guard let metalAttention = hybridMetalAttention else {
+                throw RealModelInferenceError.runtimeFailure("Hybrid Metal attention unavailable for llama")
+            }
+            let compileEnd = DispatchTime.now().uptimeNanoseconds
+            let compileTimeMs = compileDidRun ? Self.milliseconds(from: compileEnd - compileStart) : 0
+            return try generateIncrementalHybridLlama(
+                promptTokens: promptTokens,
+                effectiveMaxTokens: effectiveMaxTokens,
+                temperature: temperature,
+                compileTimeMs: compileTimeMs,
+                maxSeq: bucket,
+                metalAttention: metalAttention,
+                onStep: onStep
+            )
+        }
 
         let compileStart = DispatchTime.now().uptimeNanoseconds
         var compileDidRun = false
@@ -941,10 +1019,57 @@ public struct RealModelInferenceEngine: ~Copyable {
                 )
             )
         case .llama:
-            throw RealModelInferenceError.unsupportedArchitecture(
-                "Architecture llama is not supported yet: llama-family models require RoPE in the ANE graph."
+            return TopLevelWeightPaths(
+                tokenEmbedding: try requiredFile(
+                    root: root,
+                    candidates: ["embeddings/token.bin", "embeddings/token_embeddings.bin"],
+                    label: "token embedding"
+                ),
+                positionEmbedding: "",
+                finalNormGamma: try requiredFile(
+                    root: root,
+                    candidates: ["rms_final.bin", "final_norm_gamma.bin"],
+                    label: "final norm gamma"
+                ),
+                finalNormBeta: "",
+                lmHead: try requiredFile(
+                    root: root,
+                    candidates: ["lm_head.bin", "classifier.bin"],
+                    label: "lm head"
+                )
             )
         }
+    }
+
+    struct LlamaTopLevelWeightPaths: Sendable, Equatable {
+        let tokenEmbedding: String
+        let finalNormGamma: String
+        let lmHead: String
+    }
+
+    static func resolveLlamaTopLevelWeightPaths(
+        config: MultiModelConfig,
+        weightDir: String
+    ) throws -> LlamaTopLevelWeightPaths {
+        let root = URL(fileURLWithPath: weightDir, isDirectory: true)
+        try validateDirectory(root)
+        return LlamaTopLevelWeightPaths(
+            tokenEmbedding: try requiredFile(
+                root: root,
+                candidates: ["embeddings/token.bin", "embeddings/token_embeddings.bin"],
+                label: "token embedding"
+            ),
+            finalNormGamma: try requiredFile(
+                root: root,
+                candidates: ["rms_final.bin", "final_norm_gamma.bin"],
+                label: "final norm gamma"
+            ),
+            lmHead: try requiredFile(
+                root: root,
+                candidates: ["lm_head.bin", "classifier.bin"],
+                label: "lm head"
+            )
+        )
     }
 
     static func compileAndEvalSingleLayerForTesting(
@@ -1452,6 +1577,123 @@ public struct RealModelInferenceEngine: ~Copyable {
                 at: 0,
                 to: compiledHybridGreedyNorm[0].outputSurface
             )
+        }
+
+        return didCompile
+    }
+
+    private mutating func ensureHybridCompiledLlama(bucket: Int) throws -> Bool {
+        var didCompile = false
+
+        if compiledHybridBucket < bucket {
+            let newLayers = try Self.compileHybridLayers(
+                config: config,
+                weightDirURL: weightDirURL,
+                maxSeq: bucket
+            )
+            var newSurfaceHandles: [HybridDecodeSurfaceHandles] = []
+            newSurfaceHandles.reserveCapacity(newLayers.count)
+            for layerIndex in 0..<newLayers.count {
+                do {
+                    newSurfaceHandles.append(
+                        try HybridDecodeSurfaceHandles(
+                            kernels: newLayers[layerIndex],
+                            logicalMaxSeq: bucket,
+                            dim: config.dModel
+                        )
+                    )
+                } catch {
+                    throw RealModelInferenceError.runtimeFailure(
+                        "Llama hybrid decode surfaces unavailable for layer \(layerIndex): \(error)"
+                    )
+                }
+            }
+            if newLayers.count > 1 {
+                for layerIndex in 1..<newLayers.count {
+                    do {
+                        try newLayers[layerIndex].decodeQKVOnly.rebindInput(
+                            at: 0,
+                            to: newSurfaceHandles[layerIndex - 1].ffnOut
+                        )
+                    } catch {
+                        throw RealModelInferenceError.runtimeFailure(
+                            "Llama hybrid decode chaining unavailable for layer \(layerIndex): \(error)"
+                        )
+                    }
+                }
+            }
+
+            compiledHybridLayers = newLayers
+            compiledHybridSurfaceHandles = newSurfaceHandles
+            compiledHybridBucket = bucket
+            didCompile = true
+        }
+
+        if hybridMetalAttention == nil {
+            do {
+                hybridMetalAttention = try MetalAttentionKernel()
+            } catch {
+                throw RealModelInferenceError.runtimeFailure("Llama hybrid Metal attention initialization failed: \(error)")
+            }
+            didCompile = true
+        }
+
+        let hybridHeadSpatial = Self.incrementalHeadSpatial(channels: config.dModel)
+
+        // Compile RMSNorm head (no beta) for llama
+        if compiledHybridHead.count != 1 || compiledHybridHeadSpatial != hybridHeadSpatial {
+            compiledHybridHead = try LayerStorage<CompiledHead>(count: 1, throwingInitializer: { _ in
+                try Self.compileLlamaHead(
+                    config: config,
+                    weightDirURL: weightDirURL,
+                    assets: llamaAssets,
+                    spatial: hybridHeadSpatial
+                )
+            })
+            compiledHybridHeadSpatial = hybridHeadSpatial
+            try Self.zeroSurface(compiledHybridHead[0].inputSurface)
+            didCompile = true
+        }
+
+        // Compile greedy norm + classifier for llama (ANE path only)
+        if classifierStrategy == .ane {
+            if compiledHybridGreedyNorm.count != 1 ||
+                compiledHybridGreedyClassifier.count != 1 ||
+                compiledHybridGreedySpatial != hybridHeadSpatial {
+                compiledHybridGreedyNorm = try LayerStorage<CompiledHead>(count: 1, throwingInitializer: { _ in
+                    try Self.compileLlamaHead(
+                        config: config,
+                        weightDirURL: weightDirURL,
+                        assets: llamaAssets,
+                        spatial: hybridHeadSpatial,
+                        inputDType: .fp16,
+                        outputDType: .fp16
+                    )
+                })
+                compiledHybridGreedyClassifier = try LayerStorage<CompiledClassifier>(count: 1, throwingInitializer: { _ in
+                    try Self.compileLlamaClassifier(
+                        config: config,
+                        assets: llamaAssets,
+                        spatial: hybridHeadSpatial
+                    )
+                })
+                compiledHybridGreedySpatial = hybridHeadSpatial
+                try compiledHybridGreedyClassifier[0].kernel.rebindInput(
+                    at: 0,
+                    to: compiledHybridGreedyNorm[0].outputSurface
+                )
+                didCompile = true
+            }
+
+            if compiledHybridGreedyNorm.count == 1,
+               compiledHybridGreedyClassifier.count == 1,
+               let finalSurface = compiledHybridSurfaceHandles.last?.ffnOut {
+                try compiledHybridGreedyNorm[0].kernel.rebindInput(at: 0, to: finalSurface)
+                try compiledHybridGreedyClassifier[0].kernel.rebindInput(
+                    at: 0,
+                    to: compiledHybridGreedyNorm[0].outputSurface
+                )
+            }
         }
 
         return didCompile
@@ -2013,6 +2255,335 @@ public struct RealModelInferenceEngine: ~Copyable {
         }
     }
 
+    private func writeIncrementalEmbeddingLlama(
+        token: UInt16,
+        into buffer: borrowing TensorBuffer
+    ) throws {
+        let tokenBase = Int(token) * config.dModel
+        buffer.withUnsafeMutableBufferPointer { dst in
+            for channel in 0..<config.dModel {
+                dst[channel] = llamaAssets.tokenEmbedding[tokenBase + channel]
+            }
+        }
+    }
+
+    private mutating func generateIncrementalHybridLlama(
+        promptTokens: [UInt16],
+        effectiveMaxTokens: Int,
+        temperature: Float,
+        compileTimeMs: Double,
+        maxSeq: Int,
+        metalAttention: MetalAttentionKernel,
+        onStep: ((GenerationStep) -> Void)?
+    ) throws -> GenerationResult {
+        guard compiledHybridLayers.count == config.nLayer,
+              compiledHybridSurfaceHandles.count == config.nLayer,
+              compiledHybridHead.count == 1,
+              compiledHybridHeadSpatial > 0 else {
+            throw RealModelInferenceError.runtimeFailure("Llama hybrid decode state is unavailable")
+        }
+
+        ForwardPass.initializeHybridDecodeCaches(
+            surfaceHandles: compiledHybridSurfaceHandles,
+            dim: config.dModel
+        )
+
+        let xCur = TensorBuffer(count: config.dModel, zeroed: true)
+        var decodeState: DecodeState
+        do {
+            decodeState = try DecodeState(maxSeq: maxSeq)
+        } catch {
+            throw RealModelInferenceError.runtimeFailure("Llama hybrid decode state initialization failed: \(error)")
+        }
+        var timings = HybridDecodeTimingBreakdown()
+        let useANEGreedyHead =
+            temperature == 0 &&
+            classifierStrategy == .ane &&
+            compiledHybridGreedyNorm.count == 1 &&
+            compiledHybridGreedyClassifier.count == 1
+
+        let useCPUTiledGreedyHead =
+            temperature == 0 &&
+            classifierStrategy == .cpuTiled
+
+        // Build the RoPE hook closure that rotates Q and K between ANE QKV eval and Metal attention
+        let nHeads = config.nHead
+        let nKVHeads = config.nKVHead
+        let headDim = config.headDim
+        let dim = config.dModel
+        let theta = config.ropeTheta
+
+        let qBufSize = nHeads * headDim
+        let kBufSize = nKVHeads * headDim
+        func applyRoPEHook(
+            qSurf: IOSurfaceRef, kSurf: IOSurfaceRef,
+            laneSp: Int, tokenIndex: Int,
+            qBufSize: Int, kBufSize: Int,
+            dim: Int, nHeads: Int, nKVHeads: Int, headDim: Int, theta: Float
+        ) throws(ANEError) {
+            let qBuf = UnsafeMutableBufferPointer<Float>.allocate(capacity: qBufSize)
+            defer { qBuf.deallocate() }
+            let kBuf = UnsafeMutableBufferPointer<Float>.allocate(capacity: kBufSize)
+            defer { kBuf.deallocate() }
+
+            let readOK: Bool
+            do {
+                try SurfaceIO.readFP16SpatialSlice(
+                    from: qSurf, channelOffset: 0, spatialIndex: 0, spatial: laneSp,
+                    into: qBuf, channels: dim
+                )
+                try SurfaceIO.readFP16SpatialSlice(
+                    from: kSurf, channelOffset: 0, spatialIndex: 0, spatial: laneSp,
+                    into: kBuf, channels: kBufSize
+                )
+                readOK = true
+            } catch {
+                readOK = false
+            }
+            guard readOK else {
+                throw .invalidArguments("RoPE hook surface read failed")
+            }
+
+            RoPE.applyDecodeStep(
+                q: qBuf.baseAddress!, k: kBuf.baseAddress!,
+                nHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
+                position: tokenIndex, theta: theta
+            )
+
+            let writeOK: Bool
+            do {
+                try SurfaceIO.writeFP16SpatialSlice(
+                    to: qSurf, channelOffset: 0, spatialIndex: 0, spatial: laneSp,
+                    data: UnsafeBufferPointer(qBuf), channels: dim
+                )
+                try SurfaceIO.writeFP16SpatialSlice(
+                    to: kSurf, channelOffset: 0, spatialIndex: 0, spatial: laneSp,
+                    data: UnsafeBufferPointer(kBuf), channels: kBufSize
+                )
+                writeOK = true
+            } catch {
+                writeOK = false
+            }
+            guard writeOK else {
+                throw .invalidArguments("RoPE hook surface write failed")
+            }
+        }
+
+        let ropeHook: (IOSurfaceRef, IOSurfaceRef, Int, Int) throws(ANEError) -> Void = { qSurf, kSurf, laneSp, tokenIndex in
+            try applyRoPEHook(
+                qSurf: qSurf, kSurf: kSurf,
+                laneSp: laneSp, tokenIndex: tokenIndex,
+                qBufSize: qBufSize, kBufSize: kBufSize,
+                dim: dim, nHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim, theta: theta
+            )
+        }
+
+        // Prefill: process prompt tokens
+        for (position, token) in promptTokens.enumerated() {
+            try writeIncrementalEmbeddingLlama(token: token, into: xCur)
+            do {
+                try ForwardPass.runHybridDecodeTimed(
+                    xCur: xCur,
+                    kernels: compiledHybridLayers,
+                    surfaceHandles: compiledHybridSurfaceHandles,
+                    metalAttention: metalAttention,
+                    decodeState: &decodeState,
+                    dim: dim,
+                    nHeads: nHeads,
+                    headDim: headDim,
+                    postQKVHook: ropeHook,
+                    readFinalOutputIntoXCur: !useANEGreedyHead && !useCPUTiledGreedyHead,
+                    timings: &timings
+                )
+            } catch {
+                throw RealModelInferenceError.runtimeFailure(
+                    "Llama hybrid prefill failed at prompt position \(position): \(error)"
+                )
+            }
+        }
+
+        var allTokens = promptTokens
+        var generatedTokens: [UInt16] = []
+        generatedTokens.reserveCapacity(effectiveMaxTokens)
+
+        let generationStart = DispatchTime.now().uptimeNanoseconds
+        var emissionStart = generationStart
+        var firstTokenLatencyMs = 0.0
+        var firstTokenRecorded = false
+        var rng = SystemRandomNumberGenerator()
+        var normalized = [Float](repeating: 0, count: config.dModel)
+        let headSpatial = compiledHybridHeadSpatial
+
+        while generatedTokens.count < effectiveMaxTokens {
+            let nextToken: UInt16
+            if useANEGreedyHead {
+                do {
+                    try compiledHybridGreedyNorm[0].kernel.eval()
+                    try compiledHybridGreedyClassifier[0].kernel.eval()
+                    let argmax = try SurfaceIO.argmaxFP16SpatialSliceWithHint(
+                        from: compiledHybridGreedyClassifier[0].outputSurface,
+                        channelOffset: 0,
+                        spatialIndex: 0,
+                        spatial: headSpatial,
+                        channels: config.vocab,
+                        hintSurface: compiledHybridGreedyClassifier[0].maxValueSurface,
+                        hintSpatialIndex: 0,
+                        hintSpatial: headSpatial
+                    )
+                    guard let token = UInt16(exactly: argmax.index) else {
+                        throw RealModelInferenceError.runtimeFailure(
+                            "Llama greedy ANE classifier selected out-of-range token \(argmax.index)"
+                        )
+                    }
+                    nextToken = token
+                } catch let error as RealModelInferenceError {
+                    throw error
+                } catch {
+                    throw RealModelInferenceError.runtimeFailure("Llama hybrid greedy ANE head evaluation failed: \(error)")
+                }
+            } else if useCPUTiledGreedyHead {
+                guard let lastFFNOut = compiledHybridSurfaceHandles.last?.ffnOut else {
+                    throw RealModelInferenceError.runtimeFailure("Llama CPU tiled head: last layer FFN output surface unavailable")
+                }
+                let laneSpatial = compiledHybridSurfaceHandles.last!.laneSpatial
+
+                // 1. Read hidden state from last layer's FFN output surface
+                var hidden = [Float](repeating: 0, count: config.dModel)
+                do {
+                    try hidden.withUnsafeMutableBufferPointer { buf in
+                        try SurfaceIO.readFP16SpatialSlice(
+                            from: lastFFNOut,
+                            channelOffset: 0,
+                            spatialIndex: 0,
+                            spatial: laneSpatial,
+                            into: buf,
+                            channels: config.dModel
+                        )
+                    }
+                } catch {
+                    throw RealModelInferenceError.runtimeFailure("Llama CPU tiled head: surface read failed: \(error)")
+                }
+
+                // 2. Apply final RMSNorm on CPU
+                let gamma = llamaAssets.finalNormGamma
+                var sumSq: Float = 0
+                vDSP_dotpr(hidden, 1, hidden, 1, &sumSq, vDSP_Length(config.dModel))
+                let invRms = 1.0 / sqrtf(sumSq / Float(config.dModel) + config.normEps)
+                vDSP_vsmul(hidden, 1, [invRms], &normalized, 1, vDSP_Length(config.dModel))
+                vDSP_vmul(normalized, 1, gamma, 1, &normalized, 1, vDSP_Length(config.dModel))
+
+                // 3. Tiled matmul argmax using pre-converted FP16 weights
+                let lmHeadFP16 = llamaAssets.lmHeadFP16
+                let bestIndex = lmHeadFP16.withUnsafeBufferPointer { wPtr in
+                    normalized.withUnsafeBufferPointer { iPtr in
+                        FP16TiledClassifier.tiledMatvecArgmax(
+                            weights: wPtr.baseAddress!,
+                            input: iPtr.baseAddress!,
+                            vocabSize: config.vocab,
+                            dim: config.dModel
+                        )
+                    }
+                }
+                nextToken = UInt16(bestIndex)
+            } else {
+                do {
+                    try xCur.withUnsafeBufferPointer { buffer in
+                        try Self.writeFP32SpatialSlice(
+                            to: compiledHybridHead[0].inputSurface,
+                            spatialIndex: 0,
+                            spatial: headSpatial,
+                            data: buffer,
+                            channels: config.dModel
+                        )
+                    }
+                    try compiledHybridHead[0].kernel.eval()
+                    try normalized.withUnsafeMutableBufferPointer { buffer in
+                        try Self.readFP32SpatialSlice(
+                            from: compiledHybridHead[0].outputSurface,
+                            spatialIndex: 0,
+                            spatial: headSpatial,
+                            into: buffer,
+                            channels: config.dModel
+                        )
+                    }
+                } catch {
+                    throw RealModelInferenceError.runtimeFailure("Llama hybrid step head evaluation failed: \(error)")
+                }
+
+                nextToken = selectTokenFromNormalizedHidden(
+                    normalized,
+                    temperature: temperature,
+                    using: &rng
+                )
+            }
+            let emissionNow = DispatchTime.now().uptimeNanoseconds
+            let tokenLatencyMs = Self.milliseconds(from: emissionNow - emissionStart)
+
+            if !firstTokenRecorded {
+                firstTokenLatencyMs = Self.milliseconds(from: emissionNow - generationStart)
+                firstTokenRecorded = true
+            }
+
+            // Llama EOS varies by model — use vocab-1 as a safe sentinel or check config
+            generatedTokens.append(nextToken)
+            allTokens.append(nextToken)
+            let elapsedMs = Self.milliseconds(from: emissionNow - generationStart)
+            let tokensPerSecond = Double(generatedTokens.count) / max(elapsedMs / 1_000, 1e-9)
+            onStep?(
+                GenerationStep(
+                    token: nextToken,
+                    generatedTokens: generatedTokens,
+                    text: tokenizer.decode(allTokens.map(Int.init)),
+                    tokenLatencyMs: tokenLatencyMs,
+                    elapsedMs: elapsedMs,
+                    firstTokenLatencyMs: firstTokenLatencyMs,
+                    tokensPerSecond: tokensPerSecond
+                )
+            )
+
+            if generatedTokens.count >= effectiveMaxTokens || allTokens.count >= config.maxSeq {
+                break
+            }
+
+            try writeIncrementalEmbeddingLlama(token: nextToken, into: xCur)
+            do {
+                try ForwardPass.runHybridDecodeTimed(
+                    xCur: xCur,
+                    kernels: compiledHybridLayers,
+                    surfaceHandles: compiledHybridSurfaceHandles,
+                    metalAttention: metalAttention,
+                    decodeState: &decodeState,
+                    dim: dim,
+                    nHeads: nHeads,
+                    headDim: headDim,
+                    postQKVHook: ropeHook,
+                    readFinalOutputIntoXCur: !useANEGreedyHead && !useCPUTiledGreedyHead,
+                    timings: &timings
+                )
+            } catch {
+                throw RealModelInferenceError.runtimeFailure(
+                    "Llama hybrid decode failed at generated token \(generatedTokens.count - 1): \(error)"
+                )
+            }
+            emissionStart = emissionNow
+        }
+
+        let generationEnd = DispatchTime.now().uptimeNanoseconds
+        let generationTimeMs = Self.milliseconds(from: generationEnd - generationStart)
+        let tokensPerSecond = generatedTokens.isEmpty
+            ? 0
+            : Double(generatedTokens.count) / max(generationTimeMs / 1_000, 1e-9)
+
+        return GenerationResult(
+            text: tokenizer.decode(allTokens.map(Int.init)),
+            tokens: generatedTokens,
+            promptTokens: promptTokens,
+            tokensPerSecond: tokensPerSecond,
+            compileTimeMs: compileTimeMs,
+            firstTokenLatencyMs: firstTokenLatencyMs
+        )
+    }
+
     private static func compileHybridLayers(
         config: MultiModelConfig,
         weightDirURL: URL,
@@ -2023,7 +2594,10 @@ public struct RealModelInferenceEngine: ~Copyable {
         return try LayerStorage<HybridDecodeKernelSet>(count: layerRange.count, throwingInitializer: { localLayerIndex in
             let layerIndex = layerRange.lowerBound + localLayerIndex
             let paths = LayerWeightPaths.forLayer(layerIndex, config: config, blobDir: weightDirURL.path)
-            let weights = try loadHybridLayerWeights(config: config, paths: paths)
+            let weights: LayerWeights = switch config.architecture {
+            case .gpt2: try loadHybridLayerWeights(config: config, paths: paths)
+            case .llama: try loadHybridLayerWeightsLlama(config: config, paths: paths)
+            }
             do {
                 return try HybridDecodeKernelSet(weights: weights, maxSeq: maxSeq)
             } catch {
@@ -2089,6 +2663,34 @@ public struct RealModelInferenceEngine: ~Copyable {
         }
         try loadTensor(weights.b1, from: b1Path, expectedCount: config.hiddenDim)
         try loadTensor(weights.b2, from: b2Path, expectedCount: config.dModel)
+
+        return weights
+    }
+
+    private static func loadHybridLayerWeightsLlama(
+        config: MultiModelConfig,
+        paths: LayerWeightPaths
+    ) throws -> LayerWeights {
+        let weights = LayerWeights(
+            architecture: .rmsNormSwiGLU,
+            dim: config.dModel,
+            hiddenDim: config.hiddenDim
+        )
+
+        let kvDim = config.nKVHead * config.headDim
+        try loadTensor(weights.rmsAtt, from: paths.rmsAtt, expectedCount: config.dModel)
+        try loadTensor(weights.Wq, from: paths.wq, expectedCount: config.dModel * config.dModel)
+        try loadTensor(weights.Wk, from: paths.wk, expectedCount: config.dModel * kvDim)
+        try loadTensor(weights.Wv, from: paths.wv, expectedCount: config.dModel * kvDim)
+        try loadTensor(weights.Wo, from: paths.wo, expectedCount: config.dModel * config.dModel)
+        try loadTensor(weights.rmsFfn, from: paths.rmsFfn, expectedCount: config.dModel)
+        try loadTensor(weights.W1, from: paths.w1, expectedCount: config.hiddenDim * config.dModel)
+        try loadTensor(weights.W2, from: paths.w2, expectedCount: config.dModel * config.hiddenDim)
+        guard let w3Path = paths.w3 else {
+            let layerDirectory = URL(fileURLWithPath: paths.wq).deletingLastPathComponent()
+            throw RealModelInferenceError.runtimeFailure("Missing llama W3 (gate) weight for \(layerDirectory.path)")
+        }
+        try loadTensor(weights.W3, from: w3Path, expectedCount: config.hiddenDim * config.dModel)
 
         return weights
     }
@@ -2241,7 +2843,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             _ = diskFfnBeta
         case .llama:
             throw RealModelInferenceError.unsupportedArchitecture(
-                "Architecture llama is not supported yet: llama-family models require RoPE in the ANE graph."
+                "Llama full-sequence path is not supported; use the hybrid decode path instead."
             )
         }
 
@@ -2277,7 +2879,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             try addPath(actualPath: diskPaths.b2, into: &values)
         case .llama:
             throw RealModelInferenceError.unsupportedArchitecture(
-                "Architecture llama is not supported yet: llama-family models require RoPE in the ANE graph."
+                "Llama full-sequence path is not supported; use the hybrid decode path instead."
             )
         }
         return values
@@ -2365,6 +2967,116 @@ public struct RealModelInferenceEngine: ~Copyable {
             outputSurface: outputSurface,
             maxValueSurface: maxValueSurface
         )
+    }
+
+    private static func compileLlamaHead(
+        config: MultiModelConfig,
+        weightDirURL: URL,
+        assets: LlamaTopLevelAssets,
+        spatial: Int,
+        inputDType: ANEDType = .fp32,
+        outputDType: ANEDType = .fp32
+    ) throws -> CompiledHead {
+        var graph = buildLlamaHeadGraph(
+            config: config,
+            assets: assets,
+            spatial: spatial,
+            inputDType: inputDType,
+            outputDType: outputDType
+        )
+        ANEOptimizationPipeline.optimize(&graph)
+        let mil = rewriteMILWeightPaths(ANECodegen.emit(graph), rootDir: weightDirURL)
+        let inputBytes = try ANEShape(channels: config.dModel, spatial: spatial).byteSize(for: inputDType)
+        let outputBytes = try ANEShape(channels: config.dModel, spatial: spatial).byteSize(for: outputDType)
+        let kernel: ANEKernel
+        do {
+            kernel = try ANEKernel(
+                milText: mil,
+                weights: [
+                    (path: assets.finalNormGammaCompilePath, data: assets.finalNormGammaData),
+                ],
+                inputBytes: inputBytes,
+                outputBytes: outputBytes
+            )
+        } catch {
+            throw RealModelInferenceError.runtimeFailure("Llama final RMSNorm compilation failed: \(error)")
+        }
+
+        let inputSurface: IOSurfaceRef
+        let outputSurface: IOSurfaceRef
+        do {
+            inputSurface = try kernel.inputSurface(at: 0)
+            outputSurface = try kernel.outputSurface(at: 0)
+        } catch {
+            throw RealModelInferenceError.runtimeFailure("Llama final RMSNorm surfaces unavailable: \(error)")
+        }
+        return CompiledHead(kernel: kernel, inputSurface: inputSurface, outputSurface: outputSurface)
+    }
+
+    private static func compileLlamaClassifier(
+        config: MultiModelConfig,
+        assets: LlamaTopLevelAssets,
+        spatial: Int
+    ) throws -> CompiledClassifier {
+        let generator = GenerationClassifierWithMaxGenerator(vocabSize: config.vocab, laneSpatial: spatial)
+        let classifierBlob = WeightBlob.build(from: assets.lmHead, rows: config.vocab, cols: config.dModel)
+        let kernel: ANEKernel
+        do {
+            kernel = try ANEKernel(
+                milText: generator.milText,
+                weights: [
+                    (path: "@model_path/weights/classifier.bin", data: classifierBlob),
+                ],
+                inputSizes: generator.inputByteSizes,
+                outputSizes: generator.outputByteSizes
+            )
+        } catch {
+            throw RealModelInferenceError.runtimeFailure("Llama classifier compilation failed: \(error)")
+        }
+
+        let inputSurface: IOSurfaceRef
+        let outputSurface: IOSurfaceRef
+        let maxValueSurface: IOSurfaceRef
+        do {
+            inputSurface = try kernel.inputSurface(at: 0)
+            outputSurface = try kernel.outputSurface(at: 0)
+            maxValueSurface = try kernel.outputSurface(at: 1)
+        } catch {
+            throw RealModelInferenceError.runtimeFailure("Llama classifier surfaces unavailable: \(error)")
+        }
+        return CompiledClassifier(
+            kernel: kernel,
+            inputSurface: inputSurface,
+            outputSurface: outputSurface,
+            maxValueSurface: maxValueSurface
+        )
+    }
+
+    private static func buildLlamaHeadGraph(
+        config: MultiModelConfig,
+        assets: LlamaTopLevelAssets,
+        spatial: Int,
+        inputDType: ANEDType = .fp32,
+        outputDType: ANEDType = .fp32
+    ) -> ANEGraph {
+        var graph = ANEGraph()
+        let input = try! graph.input(
+            "x",
+            dtype: inputDType,
+            shape: try! ANEShape(channels: config.dModel, spatial: spatial)
+        )
+        let x16 = inputDType == .fp16 ? input : try! graph.cast("final_rms_x16", input: input, to: .fp16)
+        let norm = try! graph.rmsNorm128(
+            "final_rms",
+            input: x16,
+            dim: config.dModel,
+            spatial: spatial,
+            eps: config.normEps,
+            weightPath: assets.finalNormGammaPath
+        )
+        let output = outputDType == .fp16 ? norm : try! graph.cast("hidden", input: norm, to: .fp32)
+        _ = try! graph.output(output, name: "hidden")
+        return graph
     }
 
     private static func buildGPT2AttentionBlockGraph(
@@ -2550,8 +3262,9 @@ public struct RealModelInferenceEngine: ~Copyable {
                 throw RealModelInferenceError.runtimeFailure("Failed to load GPT-2 tokenizer: \(error)")
             }
         case .llama:
-            let candidates = ["tokenizer.model", "tokenizer.bin"]
-            for candidate in candidates {
+            // Try SentencePiece first (Llama, Mistral)
+            let spCandidates = ["tokenizer.model", "tokenizer.bin"]
+            for candidate in spCandidates {
                 let url = tokenizerDirURL.appendingPathComponent(candidate)
                 if FileManager.default.fileExists(atPath: url.path) {
                     do {
@@ -2561,8 +3274,19 @@ public struct RealModelInferenceEngine: ~Copyable {
                     }
                 }
             }
+            // Fallback to GPT-2 BPE (Qwen uses BPE with llama-family architecture)
+            let vocabURL = tokenizerDirURL.appendingPathComponent("vocab.json")
+            let mergesURL = tokenizerDirURL.appendingPathComponent("merges.txt")
+            if FileManager.default.fileExists(atPath: vocabURL.path),
+               FileManager.default.fileExists(atPath: mergesURL.path) {
+                do {
+                    return .gpt2(try GPT2BPETokenizer(vocabURL: vocabURL, mergesURL: mergesURL))
+                } catch {
+                    throw RealModelInferenceError.runtimeFailure("Failed to load GPT-2 BPE tokenizer: \(error)")
+                }
+            }
             throw RealModelInferenceError.missingPath(
-                tokenizerDirURL.appendingPathComponent("tokenizer.model").path
+                "No tokenizer found in \(tokenizerDirURL.path) — tried tokenizer.model, tokenizer.bin, vocab.json+merges.txt"
             )
         }
     }
@@ -3391,6 +4115,31 @@ private extension ANEGraph {
             blobPath: betaPath
         )
         return try add("\(prefix)_out", x: scaled, y: beta)
+    }
+
+    mutating func rmsNorm128(
+        _ prefix: String,
+        input: Int,
+        dim: Int,
+        spatial: Int,
+        eps: Float,
+        weightPath: String
+    ) throws -> Int {
+        let sq = try mul("\(prefix)_sq", x: input, y: input)
+        let ss = try reduceSum("\(prefix)_ss", input: sq, axis: 1, keepDims: true)
+        let invd = try constScalar("\(prefix)_invd", 1.0 / Float(dim))
+        let ms = try mul("\(prefix)_ms", x: ss, y: invd)
+        let epsNode = try constScalar("\(prefix)_eps", eps)
+        let varEps = try add("\(prefix)_var_eps", x: ms, y: epsNode)
+        let nhalf = try constScalar("\(prefix)_nhalf", -0.5)
+        let invStd = try pow("\(prefix)_inv_std", base: varEps, exp: nhalf)
+        let normalized = try mul("\(prefix)_normalized", x: input, y: invStd)
+        let weight = try constWeight128(
+            "\(prefix)_weight",
+            shape: try ANEShape(channels: dim, spatial: 1),
+            blobPath: weightPath
+        )
+        return try mul("\(prefix)_out", x: normalized, y: weight)
     }
 
     mutating func gelu128(
