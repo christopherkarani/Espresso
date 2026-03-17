@@ -56,6 +56,42 @@ import Espresso
     #expect(ClassifierStrategy.select(for: config) == .cpuTiled)
 }
 
+@Test func exactThresholdSelectsANE() {
+    // 250_000 * 64 == 16_000_000 == limit → should be .ane
+    let config = MultiModelConfig(
+        name: "boundary-test",
+        nLayer: 1,
+        nHead: 1,
+        nKVHead: 1,
+        dModel: 64,
+        headDim: 64,
+        hiddenDim: 128,
+        vocab: 250_000,
+        maxSeq: 32,
+        normEps: 1e-5,
+        architecture: .llama
+    )
+    #expect(ClassifierStrategy.select(for: config) == .ane)
+}
+
+@Test func oneOverThresholdSelectsCPU() {
+    // 250_001 * 64 == 16_000_064 > 16_000_000 → should be .cpuTiled
+    let config = MultiModelConfig(
+        name: "boundary-plus-one",
+        nLayer: 1,
+        nHead: 1,
+        nKVHead: 1,
+        dModel: 64,
+        headDim: 64,
+        hiddenDim: 128,
+        vocab: 250_001,
+        maxSeq: 32,
+        normEps: 1e-5,
+        architecture: .llama
+    )
+    #expect(ClassifierStrategy.select(for: config) == .cpuTiled)
+}
+
 @Test func cpuTiledArgmaxCorrectness() {
     let vocabSize = 16
     let dim = 8

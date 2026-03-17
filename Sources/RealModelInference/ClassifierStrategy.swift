@@ -1,4 +1,3 @@
-import Espresso
 import ModelSupport
 
 /// Selects between ANE and CPU-tiled classifier based on the model's
