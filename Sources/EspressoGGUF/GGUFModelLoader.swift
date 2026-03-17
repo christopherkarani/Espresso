@@ -50,6 +50,9 @@ public enum GGUFModelLoader {
             throw GGUFModelLoaderError.unsupportedArchitecture(erConfig.architectureName)
         }
 
+        let ropeTheta = ggufLoader.modelConfig.float(forKey: "\(erConfig.architectureName).rope.freq_base")
+            ?? 10_000.0
+
         let config = MultiModelConfig(
             name: erConfig.architectureName,
             nLayer: erConfig.blockCount,
@@ -63,6 +66,7 @@ public enum GGUFModelLoader {
                 ?? 0,
             maxSeq: erConfig.contextLength,
             normEps: erConfig.rmsNormEpsilon,
+            ropeTheta: ropeTheta,
             architecture: arch
         )
 
