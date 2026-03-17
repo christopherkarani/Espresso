@@ -1,10 +1,12 @@
+import ANETypes
+
 public enum Embedding {
     /// Channel-first lookup: output[d*seq + t] = embedding[tok*dim + d].
     /// `vocabSize` is used to validate token ids before indexing.
     public static func lookup(
         output: UnsafeMutablePointer<Float>,
         embedding: UnsafePointer<Float>,
-        tokens: UnsafePointer<UInt16>,
+        tokens: UnsafePointer<TokenID>,
         vocabSize: Int,
         dim: Int,
         seqLen: Int
@@ -28,7 +30,7 @@ public enum Embedding {
     public static func backward(
         dEmbedding: UnsafeMutablePointer<Float>,
         dx: UnsafePointer<Float>,
-        tokens: UnsafePointer<UInt16>,
+        tokens: UnsafePointer<TokenID>,
         vocabSize: Int,
         dim: Int,
         seqLen: Int
