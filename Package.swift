@@ -241,7 +241,7 @@ let package = Package(
         ),
         .testTarget(
             name: "RealModelInferenceTests",
-            dependencies: ["RealModelInference", "ModelSupport", "ANEGraphIR"],
+            dependencies: ["RealModelInference", "ModelSupport", "ANEGraphIR", "Espresso"],
             path: "Tests/RealModelInferenceTests",
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
@@ -259,6 +259,12 @@ let package = Package(
             name: "EspressoGGUFTests",
             dependencies: ["EspressoGGUF", "ModelSupport", "ANETypes"],
             path: "Tests/EspressoGGUFTests",
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .executableTarget(
+            name: "EspressoGGUFRunner",
+            dependencies: ["EspressoGGUF", "RealModelInference", "ModelSupport"],
+            path: "Sources/EspressoGGUFRunner",
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
     ]
