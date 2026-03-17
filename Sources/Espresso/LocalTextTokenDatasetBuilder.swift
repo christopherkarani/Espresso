@@ -86,7 +86,10 @@ public enum LocalTextTokenDatasetBuilder {
     ) throws(LocalTextTokenDatasetBuilderError) {
         var data = Data(capacity: tokens.count * MemoryLayout<UInt16>.stride)
         for token in tokens {
-            var narrow = UInt16(token).littleEndian
+            guard let narrowValue = UInt16(exactly: token) else {
+                preconditionFailure("Token \(token) exceeds UInt16 on-disk format capacity")
+            }
+            var narrow = narrowValue.littleEndian
             withUnsafeBytes(of: &narrow) { bytes in
                 data.append(bytes.bindMemory(to: UInt8.self))
             }
