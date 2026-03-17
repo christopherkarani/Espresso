@@ -1,4 +1,5 @@
 import Accelerate
+import ANETypes
 
 public enum CrossEntropy {
     public struct Workspace: ~Copyable {
@@ -23,7 +24,7 @@ public enum CrossEntropy {
     public static func lossAndGradient(
         dlogits: UnsafeMutablePointer<Float>,
         logits: UnsafePointer<Float>,
-        targets: UnsafePointer<UInt16>,
+        targets: UnsafePointer<TokenID>,
         vocabSize: Int,
         seqLen: Int
     ) -> Float {
@@ -43,7 +44,7 @@ public enum CrossEntropy {
     public static func lossAndGradient(
         dlogits: UnsafeMutablePointer<Float>,
         logits: UnsafePointer<Float>,
-        targets: UnsafePointer<UInt16>,
+        targets: UnsafePointer<TokenID>,
         vocabSize: Int,
         seqLen: Int,
         workspace: borrowing Workspace
