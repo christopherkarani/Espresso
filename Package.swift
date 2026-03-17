@@ -1,9 +1,9 @@
-// swift-tools-version: 6.0
+// swift-tools-version: 6.2
 import PackageDescription
 
 let package = Package(
     name: "Espresso",
-    platforms: [.macOS(.v15)],
+    platforms: [.macOS(.v26)],
     products: [
         .executable(name: "espresso-train", targets: ["EspressoTrain"]),
         .executable(name: "espresso-bench", targets: ["EspressoBench"]),
@@ -12,6 +12,9 @@ let package = Package(
         .library(name: "Espresso", targets: ["Espresso"]),
         .library(name: "ModelSupport", targets: ["ModelSupport"]),
         .library(name: "RealModelInference", targets: ["RealModelInference"]),
+    ],
+    dependencies: [
+        .package(path: "../Edgerunner"),
     ],
     targets: [
         .target(
@@ -240,6 +243,22 @@ let package = Package(
             name: "RealModelInferenceTests",
             dependencies: ["RealModelInference", "ModelSupport", "ANEGraphIR"],
             path: "Tests/RealModelInferenceTests",
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .target(
+            name: "EspressoGGUF",
+            dependencies: [
+                "RealModelInference", "ModelSupport", "ANETypes",
+                .product(name: "EdgeRunner", package: "Edgerunner"),
+                .product(name: "EspressoEdgeRunner", package: "Edgerunner"),
+            ],
+            path: "Sources/EspressoGGUF",
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
+            name: "EspressoGGUFTests",
+            dependencies: ["EspressoGGUF", "ModelSupport", "ANETypes"],
+            path: "Tests/EspressoGGUFTests",
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
     ]
