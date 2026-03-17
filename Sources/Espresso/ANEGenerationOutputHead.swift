@@ -172,7 +172,7 @@ enum ANEGenerationOutputHeadIO {
         from surface: IOSurfaceRef,
         vocabSize: Int,
         laneSpatial: Int
-    ) throws(GenerationError) -> UInt16 {
+    ) throws(GenerationError) -> TokenID {
         do {
             let result = try SurfaceIO.argmaxFP16SpatialSlice(
                 from: surface,
@@ -181,9 +181,9 @@ enum ANEGenerationOutputHeadIO {
                 spatial: laneSpatial,
                 channels: vocabSize
             )
-            guard let token = UInt16(exactly: result.index) else {
+            guard let token = TokenID(exactly: result.index) else {
                 throw GenerationError.invalidArguments(
-                    "selected token index \(result.index) exceeds UInt16 range"
+                    "selected token index \(result.index) exceeds TokenID range"
                 )
             }
             return token
@@ -199,7 +199,7 @@ enum ANEGenerationOutputHeadIO {
         vocabSize: Int,
         laneSpatial: Int,
         hintSurface: IOSurfaceRef
-    ) throws(GenerationError) -> UInt16 {
+    ) throws(GenerationError) -> TokenID {
         do {
             let result = try SurfaceIO.argmaxFP16SpatialSliceWithHint(
                 from: surface,
@@ -211,9 +211,9 @@ enum ANEGenerationOutputHeadIO {
                 hintSpatialIndex: 0,
                 hintSpatial: laneSpatial
             )
-            guard let token = UInt16(exactly: result.index) else {
+            guard let token = TokenID(exactly: result.index) else {
                 throw GenerationError.invalidArguments(
-                    "selected token index \(result.index) exceeds UInt16 range"
+                    "selected token index \(result.index) exceeds TokenID range"
                 )
             }
             return token
@@ -229,14 +229,14 @@ enum ANEGenerationOutputHeadIO {
         vocabSize: Int,
         laneSpatial: Int,
         hintSurface: IOSurfaceRef
-    ) throws(GenerationError) -> (UInt16, UInt16) {
+    ) throws(GenerationError) -> (TokenID, TokenID) {
         guard laneSpatial >= 2 else {
             throw .invalidArguments("ANE output-head pair argmax requires laneSpatial >= 2")
         }
 
-        func convert(_ result: SurfaceIO.FP16ArgmaxResult) throws(GenerationError) -> UInt16 {
-            guard let token = UInt16(exactly: result.index) else {
-                throw .invalidArguments("selected token index \(result.index) exceeds UInt16 range")
+        func convert(_ result: SurfaceIO.FP16ArgmaxResult) throws(GenerationError) -> TokenID {
+            guard let token = TokenID(exactly: result.index) else {
+                throw .invalidArguments("selected token index \(result.index) exceeds TokenID range")
             }
             return token
         }
@@ -274,14 +274,14 @@ enum ANEGenerationOutputHeadIO {
         from surface: IOSurfaceRef,
         vocabSize: Int,
         laneSpatial: Int
-    ) throws(GenerationError) -> (UInt16, UInt16) {
+    ) throws(GenerationError) -> (TokenID, TokenID) {
         guard laneSpatial >= 2 else {
             throw .invalidArguments("ANE output-head pair argmax requires laneSpatial >= 2")
         }
 
-        func convert(_ result: SurfaceIO.FP16ArgmaxResult) throws(GenerationError) -> UInt16 {
-            guard let token = UInt16(exactly: result.index) else {
-                throw .invalidArguments("selected token index \(result.index) exceeds UInt16 range")
+        func convert(_ result: SurfaceIO.FP16ArgmaxResult) throws(GenerationError) -> TokenID {
+            guard let token = TokenID(exactly: result.index) else {
+                throw .invalidArguments("selected token index \(result.index) exceeds TokenID range")
             }
             return token
         }
@@ -370,7 +370,7 @@ final class ANEGenerationClassifierHead {
 
     func selectArgmax(
         normalizedInput: borrowing TensorBuffer
-    ) throws(GenerationError) -> UInt16 {
+    ) throws(GenerationError) -> TokenID {
         precondition(normalizedInput.count == ModelConfig.dim)
 
         try ANEGenerationOutputHeadIO.writeSingleToken(
@@ -395,7 +395,7 @@ final class ANEGenerationClassifierHead {
     func selectArgmaxPair(
         normalizedInputA: borrowing TensorBuffer,
         normalizedInputB: borrowing TensorBuffer
-    ) throws(GenerationError) -> (UInt16, UInt16) {
+    ) throws(GenerationError) -> (TokenID, TokenID) {
         try ANEGenerationOutputHeadIO.writeTokenPair(
             normalizedInputA,
             normalizedInputB,
@@ -482,7 +482,7 @@ final class ANEGenerationRMSNormClassifierHead {
 
     func selectArgmax(
         rawInput: borrowing TensorBuffer
-    ) throws(GenerationError) -> UInt16 {
+    ) throws(GenerationError) -> TokenID {
         precondition(rawInput.count == ModelConfig.dim)
 
         try ANEGenerationOutputHeadIO.writeSingleToken(
@@ -508,7 +508,7 @@ final class ANEGenerationRMSNormClassifierHead {
     func selectArgmaxPair(
         rawInputA: borrowing TensorBuffer,
         rawInputB: borrowing TensorBuffer
-    ) throws(GenerationError) -> (UInt16, UInt16) {
+    ) throws(GenerationError) -> (TokenID, TokenID) {
         try ANEGenerationOutputHeadIO.writeTokenPair(
             rawInputA,
             rawInputB,

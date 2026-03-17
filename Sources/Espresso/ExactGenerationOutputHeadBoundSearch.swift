@@ -291,7 +291,7 @@ final class CPUStagedExactGenerationOutputHead {
 
     func selectArgmax(
         normalizedInput: borrowing TensorBuffer
-    ) throws(GenerationError) -> UInt16 {
+    ) throws(GenerationError) -> TokenID {
         precondition(normalizedInput.count == ModelConfig.dim)
 
         let normalizedVector = normalizedInput.withUnsafeBufferPointer { Array($0) }
@@ -303,8 +303,8 @@ final class CPUStagedExactGenerationOutputHead {
         }
         self.lastEvaluatedShardCount = result.evaluatedShardOffsets.count
 
-        guard let token = UInt16(exactly: result.token) else {
-            throw .invalidArguments("selected token index \(result.token) exceeds UInt16 range")
+        guard let token = TokenID(exactly: result.token) else {
+            throw .invalidArguments("selected token index \(result.token) exceeds TokenID range")
         }
         return token
     }

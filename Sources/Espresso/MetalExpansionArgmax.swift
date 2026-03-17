@@ -153,7 +153,7 @@ public final class MPSExpansionArgmax {
     }
 
     /// Run MPS matmul + GPU argmax on projected ANE output surface.
-    public func run(projectedSurface: IOSurfaceRef) throws(MetalExpansionArgmaxError) -> [UInt16] {
+    public func run(projectedSurface: IOSurfaceRef) throws(MetalExpansionArgmaxError) -> [TokenID] {
         let length = try requiredFP16SurfaceBytes(channels: bottleneck, spatial: spatial)
 
         // Copy IOSurface data into Metal buffer
@@ -219,7 +219,7 @@ public final class MPSExpansionArgmax {
         }
 
         let ptr = outputBuffer.contents().assumingMemoryBound(to: UInt16.self)
-        return Array(UnsafeBufferPointer(start: ptr, count: spatial))
+        return UnsafeBufferPointer(start: ptr, count: spatial).map { TokenID($0) }
     }
 
     // MARK: - GPU Argmax Shader
@@ -424,7 +424,7 @@ public final class GPUFullHeadArgmax {
     }
 
     /// Run full GPU head pipeline on trunk output surface.
-    public func run(trunkSurface: IOSurfaceRef) throws(MetalExpansionArgmaxError) -> [UInt16] {
+    public func run(trunkSurface: IOSurfaceRef) throws(MetalExpansionArgmaxError) -> [TokenID] {
         let trunkBytes = try requiredFP16SurfaceBytes(channels: dim, spatial: spatial)
 
         // 1. Copy trunk output to GPU buffer
@@ -501,7 +501,7 @@ public final class GPUFullHeadArgmax {
         }
 
         let ptr = outputBuffer.contents().assumingMemoryBound(to: UInt16.self)
-        return Array(UnsafeBufferPointer(start: ptr, count: spatial))
+        return UnsafeBufferPointer(start: ptr, count: spatial).map { TokenID($0) }
     }
 
     // MARK: - RMSNorm Shader
@@ -703,7 +703,7 @@ public final class GPUPipelinedHead {
     public func runAndEmbed(
         trunkSurface: IOSurfaceRef,
         embedSurface: IOSurfaceRef
-    ) throws(MetalExpansionArgmaxError) -> [UInt16] {
+    ) throws(MetalExpansionArgmaxError) -> [TokenID] {
         let trunkBytes = try requiredFP16SurfaceBytes(channels: dim, spatial: spatial)
 
         // 1. Copy trunk output to GPU buffer (lock/unlock immediately)
@@ -801,7 +801,7 @@ public final class GPUPipelinedHead {
         IOSurfaceUnlock(embedSurface, [], nil)
 
         let ptr = outputBuffer.contents().assumingMemoryBound(to: UInt16.self)
-        return Array(UnsafeBufferPointer(start: ptr, count: spatial))
+        return UnsafeBufferPointer(start: ptr, count: spatial).map { TokenID($0) }
     }
 
     /// Pre-bind IOSurfaces for zero-copy access. Returns opaque binding tokens.
@@ -846,7 +846,7 @@ public final class GPUPipelinedHead {
     /// IOSurface lock/unlock in the critical path.
     public func runPreBound(
         _ binding: PreBoundSurfaces
-    ) throws(MetalExpansionArgmaxError) -> [UInt16] {
+    ) throws(MetalExpansionArgmaxError) -> [TokenID] {
         guard let cb = commandQueue.makeCommandBuffer() else { throw .commandBufferUnavailable }
 
         // 1. Blit trunk surface → trunkBuffer (GPU copy, avoids CPU memcpy)
@@ -922,7 +922,7 @@ public final class GPUPipelinedHead {
         }
 
         let ptr = outputBuffer.contents().assumingMemoryBound(to: UInt16.self)
-        return Array(UnsafeBufferPointer(start: ptr, count: spatial))
+        return UnsafeBufferPointer(start: ptr, count: spatial).map { TokenID($0) }
     }
 
     // MARK: - Embed Write Shader
@@ -1039,7 +1039,7 @@ public final class FusedExpansionArgmax {
     }
 
     /// Run fused matmul+argmax on projected ANE output surface.
-    public func run(projectedSurface: IOSurfaceRef) throws(MetalExpansionArgmaxError) -> [UInt16] {
+    public func run(projectedSurface: IOSurfaceRef) throws(MetalExpansionArgmaxError) -> [TokenID] {
         let length = try requiredFP16SurfaceBytes(channels: bottleneck, spatial: spatial)
 
         let status = IOSurfaceLock(projectedSurface, [.readOnly], nil)
@@ -1082,7 +1082,7 @@ public final class FusedExpansionArgmax {
         }
 
         let ptr = outputBuffer.contents().assumingMemoryBound(to: UInt16.self)
-        return Array(UnsafeBufferPointer(start: ptr, count: spatial))
+        return UnsafeBufferPointer(start: ptr, count: spatial).map { TokenID($0) }
     }
 
     // MARK: - Fused Shader
@@ -1279,7 +1279,7 @@ public final class MetalExpansionArgmax {
 
     /// Run expansion+argmax on projected ANE output surface.
     /// Returns token IDs as a copied array.
-    public func run(projectedSurface: IOSurfaceRef) throws(MetalExpansionArgmaxError) -> [UInt16] {
+    public func run(projectedSurface: IOSurfaceRef) throws(MetalExpansionArgmaxError) -> [TokenID] {
         let length = try requiredFP16SurfaceBytes(channels: bottleneck, spatial: spatial)
 
         let status = IOSurfaceLock(projectedSurface, [.readOnly], nil)
@@ -1337,12 +1337,12 @@ public final class MetalExpansionArgmax {
         }
 
         let ptr = outputBuffer.contents().assumingMemoryBound(to: UInt16.self)
-        return Array(UnsafeBufferPointer(start: ptr, count: spatial))
+        return UnsafeBufferPointer(start: ptr, count: spatial).map { TokenID($0) }
     }
 
     /// Run expansion+argmax from pre-allocated inputBuffer (caller must fill it first).
     /// Avoids IOSurface lock and per-call buffer creation overhead.
-    public func runPreBound() throws(MetalExpansionArgmaxError) -> [UInt16] {
+    public func runPreBound() throws(MetalExpansionArgmaxError) -> [TokenID] {
         guard let commandBuffer = commandQueue.makeCommandBuffer() else {
             throw .commandBufferUnavailable
         }
@@ -1375,7 +1375,7 @@ public final class MetalExpansionArgmax {
         }
 
         let ptr = outputBuffer.contents().assumingMemoryBound(to: UInt16.self)
-        return Array(UnsafeBufferPointer(start: ptr, count: spatial))
+        return UnsafeBufferPointer(start: ptr, count: spatial).map { TokenID($0) }
     }
 
     // MARK: - Metal Shader
