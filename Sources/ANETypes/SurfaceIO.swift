@@ -480,7 +480,7 @@ public enum SurfaceIO {
         embeddingTable: UnsafePointer<Float>,
         vocabSize: Int,
         dim: Int,
-        tokenIDs: UnsafePointer<UInt16>,
+        tokenIDs: UnsafePointer<TokenID>,
         streamCount: Int
     ) throws(SurfaceIOError) {
         let chOff32 = try checkedNonNegativeInt32(channelOffset)
@@ -491,8 +491,17 @@ public enum SurfaceIO {
         guard spatial > 0, vocabSize > 0, dim > 0, streamCount > 0, streamCount <= spatial else {
             throw .argumentOutOfRange
         }
+        // Narrow TokenID (UInt32) to UInt16 for the C interop function which takes uint16_t*.
+        let narrowed = UnsafeMutableBufferPointer<UInt16>.allocate(capacity: streamCount)
+        defer { narrowed.deallocate() }
+        for i in 0..<streamCount {
+            guard let narrow = UInt16(exactly: tokenIDs[i]) else {
+                throw .argumentOutOfRange  // Token ID exceeds UInt16 for ANE embedding
+            }
+            narrowed[i] = narrow
+        }
         let ok = ane_interop_io_write_embedding_batch_fp16(
-            surface, chOff32, spatial32, embeddingTable, vocab32, dim32, tokenIDs, count32
+            surface, chOff32, spatial32, embeddingTable, vocab32, dim32, narrowed.baseAddress!, count32
         )
         guard ok else { throw .interopCallFailed }
     }
