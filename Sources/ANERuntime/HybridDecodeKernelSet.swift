@@ -141,20 +141,22 @@ public struct HybridDecodeKernelSet: ~Copyable {
         laneSpatial: Int
     ) -> CompileSpec {
         let dim = weights.dim
+        let kvDim = weights.kvDim
         let generator = DecodeQKVOnlyGenerator(
             dim: dim,
+            kvDim: kvDim,
             laneSpatial: laneSpatial,
             architecture: weights.architecture
         )
 
         let rms1Blob = buildBlob(from: weights.rmsAtt, rows: 1, cols: dim)
         let wqBlob = buildBlob(from: weights.Wq, rows: dim, cols: dim)
-        let wkBlob = buildBlob(from: weights.Wk, rows: dim, cols: dim)
-        let wvBlob = buildBlob(from: weights.Wv, rows: dim, cols: dim)
+        let wkBlob = buildBlob(from: weights.Wk, rows: kvDim, cols: dim)
+        let wvBlob = buildBlob(from: weights.Wv, rows: kvDim, cols: dim)
         let rms1BetaBlob = buildBlob(from: weights.attentionNormBeta, rows: 1, cols: dim)
         let bqBlob = buildBlob(from: weights.bq, rows: 1, cols: dim)
-        let bkBlob = buildBlob(from: weights.bk, rows: 1, cols: dim)
-        let bvBlob = buildBlob(from: weights.bv, rows: 1, cols: dim)
+        let bkBlob = buildBlob(from: weights.bk, rows: 1, cols: kvDim)
+        let bvBlob = buildBlob(from: weights.bv, rows: 1, cols: kvDim)
 
         let qkvWeights: [(path: String, data: Data)]
         switch weights.architecture {

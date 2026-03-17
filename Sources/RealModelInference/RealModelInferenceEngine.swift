@@ -1601,7 +1601,8 @@ public struct RealModelInferenceEngine: ~Copyable {
                         try HybridDecodeSurfaceHandles(
                             kernels: newLayers[layerIndex],
                             logicalMaxSeq: bucket,
-                            dim: config.dModel
+                            dim: config.dModel,
+                            kvDim: config.nKVHead * config.headDim
                         )
                     )
                 } catch {
@@ -2288,7 +2289,8 @@ public struct RealModelInferenceEngine: ~Copyable {
 
         ForwardPass.initializeHybridDecodeCaches(
             surfaceHandles: compiledHybridSurfaceHandles,
-            dim: config.dModel
+            dim: config.dModel,
+            kvDim: config.nKVHead * config.headDim
         )
 
         let xCur = TensorBuffer(count: config.dModel, zeroed: true)
@@ -2383,6 +2385,7 @@ public struct RealModelInferenceEngine: ~Copyable {
                     decodeState: &decodeState,
                     dim: dim,
                     nHeads: nHeads,
+                    nKVHeads: nKVHeads,
                     headDim: headDim,
                     postQKVHook: ropeHook,
                     readFinalOutputIntoXCur: !useANEGreedyHead && !useCPUTiledGreedyHead,
@@ -2551,6 +2554,7 @@ public struct RealModelInferenceEngine: ~Copyable {
                     decodeState: &decodeState,
                     dim: dim,
                     nHeads: nHeads,
+                    nKVHeads: nKVHeads,
                     headDim: headDim,
                     postQKVHook: ropeHook,
                     readFinalOutputIntoXCur: !useANEGreedyHead && !useCPUTiledGreedyHead,
@@ -2667,13 +2671,14 @@ public struct RealModelInferenceEngine: ~Copyable {
         config: MultiModelConfig,
         paths: LayerWeightPaths
     ) throws -> LayerWeights {
+        let kvDim = config.nKVHead * config.headDim
         let weights = LayerWeights(
             architecture: .rmsNormSwiGLU,
             dim: config.dModel,
-            hiddenDim: config.hiddenDim
+            hiddenDim: config.hiddenDim,
+            kvDim: kvDim
         )
 
-        let kvDim = config.nKVHead * config.headDim
         try loadTensor(weights.rmsAtt, from: paths.rmsAtt, expectedCount: config.dModel)
         try loadTensor(weights.Wq, from: paths.wq, expectedCount: config.dModel * config.dModel)
         try loadTensor(weights.Wk, from: paths.wk, expectedCount: config.dModel * kvDim)

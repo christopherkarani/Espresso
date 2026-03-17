@@ -283,6 +283,8 @@ public struct HybridDecodeTimingBreakdown: Sendable {
 
 /// Decode surfaces for the split hybrid path:
 /// ANE QKV-only -> Metal attention/projection -> ANE FFN.
+///
+/// Supports GQA: K/V caches use `kvDim` (nKVHeads * headDim) which may differ from `dim`.
 public struct HybridDecodeSurfaceHandles {
     public let qkvIn: IOSurfaceRef
     public let qOut: IOSurfaceRef
@@ -300,8 +302,10 @@ public struct HybridDecodeSurfaceHandles {
     public let laneSpatial: Int
 
     public let dim: Int
+    public let kvDim: Int
 
-    public init(kernels: borrowing HybridDecodeKernelSet, logicalMaxSeq: Int? = nil, dim: Int = ModelConfig.dim) throws(ANEError) {
+    public init(kernels: borrowing HybridDecodeKernelSet, logicalMaxSeq: Int? = nil, dim: Int = ModelConfig.dim, kvDim: Int? = nil) throws(ANEError) {
+        let resolvedKVDim = kvDim ?? dim
         let qkvIn = try kernels.decodeQKVOnly.inputSurface(at: 0)
         let kOut = try kernels.decodeQKVOnly.outputSurface(at: 0)
         let qOut = try kernels.decodeQKVOnly.outputSurface(at: 1)
@@ -317,6 +321,7 @@ public struct HybridDecodeSurfaceHandles {
         }
 
         self.dim = dim
+        self.kvDim = resolvedKVDim
         self.qkvIn = qkvIn
         self.kOut = kOut
         self.qOut = qOut
@@ -329,8 +334,8 @@ public struct HybridDecodeSurfaceHandles {
         self.maxSeq = logicalMaxSeq ?? kernels.maxSeq
         self.laneSpatial = kernels.laneSpatial
 
-        guard let kCacheFull = ane_interop_create_surface(dim * self.maxSeq * 2),
-              let vCacheFull = ane_interop_create_surface(dim * self.maxSeq * 2),
+        guard let kCacheFull = ane_interop_create_surface(resolvedKVDim * self.maxSeq * 2),
+              let vCacheFull = ane_interop_create_surface(resolvedKVDim * self.maxSeq * 2),
               let zeroLane = ane_interop_create_surface(dim * kernels.laneSpatial * 2) else {
             throw .surfaceAllocationFailed
         }
@@ -638,21 +643,23 @@ public extension ForwardPass {
 
     public static func initializeHybridDecodeCaches(
         surfaceHandles: [HybridDecodeSurfaceHandles],
-        dim: Int = ModelConfig.dim
+        dim: Int = ModelConfig.dim,
+        kvDim: Int? = nil
     ) {
         precondition(dim > 0)
         guard let first = surfaceHandles.first else { return }
+        let resolvedKVDim = kvDim ?? first.kvDim
         let maxSeq = first.maxSeq
         precondition(maxSeq > 0)
 
-        let zeroCache = Array(repeating: Float(0), count: dim * maxSeq)
+        let zeroKVCache = Array(repeating: Float(0), count: resolvedKVDim * maxSeq)
         let zeroContext = Array(repeating: Float(0), count: dim * first.laneSpatial)
         for handles in surfaceHandles {
             precondition(handles.maxSeq == maxSeq)
             precondition(handles.laneSpatial == first.laneSpatial)
-            zeroCache.withUnsafeBufferPointer { src in
-                SurfaceIO.writeFP16(to: handles.kCacheFull, data: src, channels: dim, spatial: maxSeq)
-                SurfaceIO.writeFP16(to: handles.vCacheFull, data: src, channels: dim, spatial: maxSeq)
+            zeroKVCache.withUnsafeBufferPointer { src in
+                SurfaceIO.writeFP16(to: handles.kCacheFull, data: src, channels: resolvedKVDim, spatial: maxSeq)
+                SurfaceIO.writeFP16(to: handles.vCacheFull, data: src, channels: resolvedKVDim, spatial: maxSeq)
             }
             do {
                 try SurfaceIO.copyFP16(
@@ -696,6 +703,7 @@ public extension ForwardPass {
         decodeState: inout DecodeState,
         dim: Int = ModelConfig.dim,
         nHeads: Int = ModelConfig.heads,
+        nKVHeads: Int? = nil,
         headDim: Int = ModelConfig.headDim,
         postQKVHook: ((IOSurfaceRef, IOSurfaceRef, Int, Int) throws(ANEError) -> Void)? = nil,
         readFinalOutputIntoXCur: Bool = true,
@@ -733,6 +741,7 @@ public extension ForwardPass {
             decodeState: &decodeState,
             dim: dim,
             nHeads: nHeads,
+            nKVHeads: nKVHeads,
             headDim: headDim,
             postQKVHook: postQKVHook,
             timings: &timings
@@ -766,6 +775,7 @@ public extension ForwardPass {
         decodeState: inout DecodeState,
         dim: Int = ModelConfig.dim,
         nHeads: Int = ModelConfig.heads,
+        nKVHeads: Int? = nil,
         headDim: Int = ModelConfig.headDim,
         postQKVHook: ((IOSurfaceRef, IOSurfaceRef, Int, Int) throws(ANEError) -> Void)? = nil,
         timings: inout HybridDecodeTimingBreakdown
@@ -773,6 +783,9 @@ public extension ForwardPass {
         precondition(kernels.count > 0)
         precondition(surfaceHandles.count == kernels.count)
         precondition(dim > 0)
+
+        let resolvedKVHeads = nKVHeads ?? nHeads
+        let kvDim = resolvedKVHeads * headDim
 
         let maxSeq = decodeState.maxSeq
         for handles in surfaceHandles {
@@ -822,7 +835,7 @@ public extension ForwardPass {
                     src1ChannelOffset: 0,
                     src1SpatialIndex: 0,
                     src1Spatial: laneSpatial,
-                    channels: dim
+                    channels: kvDim
                 )
             } catch {
                 throw .invalidArguments("hybrid KV cache update failed: \(error)")
@@ -833,6 +846,7 @@ public extension ForwardPass {
             do {
                 metalShape = try MetalDecodeAttentionShape(
                     heads: nHeads,
+                    kvHeads: resolvedKVHeads,
                     headDim: headDim,
                     visibleTokens: visibleTokens,
                     cacheStride: maxSeq,

@@ -53,6 +53,7 @@ public struct MetalAttentionBenchmarkResult: Sendable, Equatable {
 
 public struct MetalDecodeAttentionShape: Sendable, Equatable {
     public let heads: Int
+    public let kvHeads: Int
     public let headDim: Int
     public let visibleTokens: Int
     public let cacheStride: Int
@@ -60,13 +61,21 @@ public struct MetalDecodeAttentionShape: Sendable, Equatable {
 
     public init(
         heads: Int,
+        kvHeads: Int? = nil,
         headDim: Int,
         visibleTokens: Int,
         cacheStride: Int,
         laneStride: Int
     ) throws(MetalAttentionError) {
+        let resolvedKVHeads = kvHeads ?? heads
         guard heads > 0 else {
             throw .invalidShape("heads must be > 0")
+        }
+        guard resolvedKVHeads > 0 else {
+            throw .invalidShape("kvHeads must be > 0")
+        }
+        guard heads % resolvedKVHeads == 0 else {
+            throw .invalidShape("heads must be divisible by kvHeads")
         }
         guard headDim > 0 else {
             throw .invalidShape("headDim must be > 0")
@@ -81,6 +90,7 @@ public struct MetalDecodeAttentionShape: Sendable, Equatable {
             throw .invalidShape("laneStride must be > 0")
         }
         self.heads = heads
+        self.kvHeads = resolvedKVHeads
         self.headDim = headDim
         self.visibleTokens = visibleTokens
         self.cacheStride = cacheStride
@@ -215,7 +225,7 @@ public final class MetalAttentionKernel {
         var visibleTokens: UInt32
         var cacheStride: UInt32
         var laneStride: UInt32
-        var pad0: UInt32 = 0
+        var kvHeads: UInt32
         var scale: Float
         var pad1: Float = 0
     }
@@ -382,6 +392,7 @@ public final class MetalAttentionKernel {
         projection: HybridOutputProjectionWeights
     ) throws(MetalAttentionError) {
         let dim = shape.heads * shape.headDim
+        let kvDim = shape.kvHeads * shape.headDim
         guard projection.rowMajorWeights.count == dim * dim else {
             throw .invalidInputCount(
                 "output projection count \(projection.rowMajorWeights.count) != expected \(dim * dim)"
@@ -394,10 +405,10 @@ public final class MetalAttentionKernel {
         }
 
         let laneElementCount = dim * shape.laneStride
-        let cacheElementCount = dim * shape.cacheStride
+        let kvCacheElementCount = kvDim * shape.cacheStride
         let qBinding = try SurfaceBinding(surface: qSurface, elementCount: laneElementCount, device: device)
-        let kBinding = try SurfaceBinding(surface: kCacheSurface, elementCount: cacheElementCount, device: device)
-        let vBinding = try SurfaceBinding(surface: vCacheSurface, elementCount: cacheElementCount, device: device)
+        let kBinding = try SurfaceBinding(surface: kCacheSurface, elementCount: kvCacheElementCount, device: device)
+        let vBinding = try SurfaceBinding(surface: vCacheSurface, elementCount: kvCacheElementCount, device: device)
         let residualBinding = try SurfaceBinding(surface: residualSurface, elementCount: laneElementCount, device: device)
         let outputBinding = try SurfaceBinding(surface: outputSurface, elementCount: laneElementCount, device: device)
         let scratch = try decodeScratch(for: shape, dim: dim)
@@ -422,11 +433,12 @@ public final class MetalAttentionKernel {
         shape: MetalDecodeAttentionShape
     ) throws(MetalAttentionError) -> [Float] {
         let dim = shape.heads * shape.headDim
+        let kvDim = shape.kvHeads * shape.headDim
         let laneElementCount = dim * shape.laneStride
-        let cacheElementCount = dim * shape.cacheStride
+        let kvCacheElementCount = kvDim * shape.cacheStride
         let qBinding = try SurfaceBinding(surface: qSurface, elementCount: laneElementCount, device: device)
-        let kBinding = try SurfaceBinding(surface: kCacheSurface, elementCount: cacheElementCount, device: device)
-        let vBinding = try SurfaceBinding(surface: vCacheSurface, elementCount: cacheElementCount, device: device)
+        let kBinding = try SurfaceBinding(surface: kCacheSurface, elementCount: kvCacheElementCount, device: device)
+        let vBinding = try SurfaceBinding(surface: vCacheSurface, elementCount: kvCacheElementCount, device: device)
         let scratch = try decodeScratch(for: shape, dim: dim)
         try encodeDecodeContextAndWait(
             qBinding: qBinding,
@@ -449,11 +461,12 @@ public final class MetalAttentionKernel {
         shape: MetalDecodeAttentionShape
     ) throws(MetalAttentionError) {
         let dim = shape.heads * shape.headDim
+        let kvDim = shape.kvHeads * shape.headDim
         let laneElementCount = dim * shape.laneStride
-        let cacheElementCount = dim * shape.cacheStride
+        let kvCacheElementCount = kvDim * shape.cacheStride
         let qBinding = try SurfaceBinding(surface: qSurface, elementCount: laneElementCount, device: device)
-        let kBinding = try SurfaceBinding(surface: kCacheSurface, elementCount: cacheElementCount, device: device)
-        let vBinding = try SurfaceBinding(surface: vCacheSurface, elementCount: cacheElementCount, device: device)
+        let kBinding = try SurfaceBinding(surface: kCacheSurface, elementCount: kvCacheElementCount, device: device)
+        let vBinding = try SurfaceBinding(surface: vCacheSurface, elementCount: kvCacheElementCount, device: device)
         let contextBinding = try SurfaceBinding(
             surface: contextSurface,
             byteCount: laneElementCount * MemoryLayout<Float>.stride,
@@ -672,6 +685,7 @@ public final class MetalAttentionKernel {
             visibleTokens: UInt32(shape.visibleTokens),
             cacheStride: UInt32(shape.cacheStride),
             laneStride: UInt32(shape.laneStride),
+            kvHeads: UInt32(shape.kvHeads),
             scale: 1.0 / sqrt(Float(shape.headDim))
         )
         let softmaxParams = AttentionParams(
@@ -788,6 +802,7 @@ public final class MetalAttentionKernel {
             visibleTokens: UInt32(shape.visibleTokens),
             cacheStride: UInt32(shape.cacheStride),
             laneStride: UInt32(shape.laneStride),
+            kvHeads: UInt32(shape.kvHeads),
             scale: 1.0 / sqrt(Float(shape.headDim))
         )
         let softmaxParams = AttentionParams(
@@ -916,7 +931,7 @@ public final class MetalAttentionKernel {
         uint visibleTokens;
         uint cacheStride;
         uint laneStride;
-        uint pad0;
+        uint kvHeads;
         float scale;
         float pad1;
     };
@@ -1012,12 +1027,13 @@ public final class MetalAttentionKernel {
             return;
         }
 
+        uint kvHead = head / (params.heads / params.kvHeads);
         float dot = 0.0f;
-        uint headOffset = head * params.headDim;
+        uint qHeadOffset = head * params.headDim;
+        uint kHeadOffset = kvHead * params.headDim;
         for (uint dim = 0; dim < params.headDim; ++dim) {
-            uint channel = headOffset + dim;
-            uint qIndex = channel * params.laneStride;
-            uint kIndex = channel * params.cacheStride + token;
+            uint qIndex = (qHeadOffset + dim) * params.laneStride;
+            uint kIndex = (kHeadOffset + dim) * params.cacheStride + token;
             dot += float(q[qIndex]) * float(kCache[kIndex]);
         }
 
@@ -1037,14 +1053,16 @@ public final class MetalAttentionKernel {
             return;
         }
 
-        uint channel = head * params.headDim + dim;
+        uint kvHead = head / (params.heads / params.kvHeads);
+        uint vChannel = kvHead * params.headDim + dim;
         float accum = 0.0f;
         uint weightBase = head * params.visibleTokens;
-        uint valueBase = channel * params.cacheStride;
+        uint valueBase = vChannel * params.cacheStride;
         for (uint token = 0; token < params.visibleTokens; ++token) {
             accum += weights[weightBase + token] * float(vCache[valueBase + token]);
         }
-        context[channel] = accum;
+        uint outChannel = head * params.headDim + dim;
+        context[outChannel] = accum;
     }
 
     kernel void decode_attention_output_strided(
@@ -1060,14 +1078,16 @@ public final class MetalAttentionKernel {
             return;
         }
 
-        uint channel = head * params.headDim + dim;
+        uint kvHead = head / (params.heads / params.kvHeads);
+        uint vChannel = kvHead * params.headDim + dim;
         float accum = 0.0f;
         uint weightBase = head * params.visibleTokens;
-        uint valueBase = channel * params.cacheStride;
+        uint valueBase = vChannel * params.cacheStride;
         for (uint token = 0; token < params.visibleTokens; ++token) {
             accum += weights[weightBase + token] * float(vCache[valueBase + token]);
         }
-        context[channel * params.laneStride] = accum;
+        uint outChannel = head * params.headDim + dim;
+        context[outChannel * params.laneStride] = accum;
     }
 
     kernel void decode_output_projection(

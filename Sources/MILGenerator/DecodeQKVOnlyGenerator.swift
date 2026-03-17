@@ -8,26 +8,31 @@ import ANEGraphIR
 /// This isolates the ANE work needed before Metal-owned attention:
 /// RMSNorm(x) -> Wq/Wk/Wv, with no cache reads, mask input, or output projection.
 ///
+/// Supports GQA: K/V projections use `kvDim` (nKVHeads * headDim) which may differ from `dim`.
+///
 /// Input:
 /// - `x`: `[1, dim, 1, laneSpatial]`
 ///
-/// Outputs:
+/// Outputs (alphabetical by MIL name):
+/// - `kNew`: `[1, kvDim, 1, laneSpatial]`
 /// - `qOut`: `[1, dim, 1, laneSpatial]`
-/// - `kNew`: `[1, dim, 1, laneSpatial]`
-/// - `vNew`: `[1, dim, 1, laneSpatial]`
+/// - `vNew`: `[1, kvDim, 1, laneSpatial]`
 public struct DecodeQKVOnlyGenerator: MILProgramGenerator {
     public let dim: Int
+    public let kvDim: Int
     public let laneSpatial: Int
     public let architecture: LayerWeightsArchitecture
 
     public init(
         dim: Int = ModelConfig.dim,
+        kvDim: Int? = nil,
         laneSpatial: Int = 32,
         architecture: LayerWeightsArchitecture = .rmsNormSwiGLU
     ) {
         precondition(dim > 0)
         precondition(laneSpatial > 0)
         self.dim = dim
+        self.kvDim = kvDim ?? dim
         self.laneSpatial = laneSpatial
         self.architecture = architecture
     }
@@ -38,11 +43,12 @@ public struct DecodeQKVOnlyGenerator: MILProgramGenerator {
         [dim * laneSpatial * 2]
     }
 
+    /// Output byte sizes in alphabetical order of MIL output names: kNew, qOut, vNew.
     public var outputByteSizes: [Int] {
         [
+            kvDim * laneSpatial * 2,
             dim * laneSpatial * 2,
-            dim * laneSpatial * 2,
-            dim * laneSpatial * 2,
+            kvDim * laneSpatial * 2,
         ]
     }
 
@@ -86,7 +92,7 @@ public struct DecodeQKVOnlyGenerator: MILProgramGenerator {
                 "k",
                 input: normalized,
                 inDim: dim,
-                outDim: dim,
+                outDim: kvDim,
                 spatial: laneSpatial,
                 weightPath: "@model_path/weights/wk.bin",
                 biasPath: architecture == .gpt2 ? "@model_path/weights/bk.bin" : nil
@@ -95,7 +101,7 @@ public struct DecodeQKVOnlyGenerator: MILProgramGenerator {
                 "v",
                 input: normalized,
                 inDim: dim,
-                outDim: dim,
+                outDim: kvDim,
                 spatial: laneSpatial,
                 weightPath: "@model_path/weights/wv.bin",
                 biasPath: architecture == .gpt2 ? "@model_path/weights/bv.bin" : nil
