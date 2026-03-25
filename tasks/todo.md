@@ -1,3 +1,24 @@
+# Stories Stateful Core ML Exactness + ANE 2026-03-26
+
+- [ ] Establish native Stories source identity.
+- [ ] Discover the canonical native `stories110M.bin` checkpoint path (`STORIES_MODEL_PATH`, repo asset path, or explicit local path) and stop exporter work if it is unavailable.
+- [ ] Add env-gated identity coverage that compares the native Stories checkpoint against the cached HF `Xenova/llama2.c-stories110M` snapshot for tensor equality and tokenizer behavior on the fixed prompt suite.
+- [ ] Decide the exporter source of truth from measured evidence: keep HF input only if identity is proven exact; otherwise make the exporter consume the native Stories checkpoint directly.
+- [ ] Add a fixed Stories prompt suite for Core ML parity and benchmark runs.
+- [ ] Add CPU exactness coverage across Espresso native runtime, source Torch wrapper, and exported Core ML on `cpu_only`.
+- [ ] Restore and harden the stateful Core ML runner contract with explicit stateless/stateful detection plus public `MLState` execution.
+- [ ] Extend compare/report payloads with Core ML stateful/load/compute-plan diagnostics.
+- [ ] Investigate exporter/state lowering correctness if CPU parity fails, using first-mismatch token/tensor evidence rather than guesswork.
+- [ ] Require CPU exactness on the full fixed prompt suite before any ANE optimization work.
+- [ ] Probe `cpu_and_neural_engine` compute-plan generation and stateful prediction directly on the exact package.
+- [ ] Investigate Core ML `-14` failures one factor at a time and revert any failed exporter/runtime experiment commit immediately.
+- [ ] Benchmark the exact kept path against the current Stories warm baseline, `cpu_only`, and `cpu_and_neural_engine`.
+- [ ] Keep only production-ready changes that preserve exactness and measured throughput gates; revert regressions.
+
+## Review
+
+- Pending.
+
 # Qwen ANE Serving Execution Spec Review 2026-03-20
 
 - [x] Compare the canonical execution spec against the local implementation plan and current workspace layout.

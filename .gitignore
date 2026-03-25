@@ -78,6 +78,9 @@ scripts/internal/**
 !scripts/benchmark-prompts.txt
 !scripts/setup_autoresearch_lane.sh
 !scripts/generate-benchmark-dashboard.sh
+!scripts/stories_model_identity.py
+!scripts/tests/
+!scripts/tests/test_stories_model_identity.py
 !scripts/README.md
 tasks/
 AGENTS.md

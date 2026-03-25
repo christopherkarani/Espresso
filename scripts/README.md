@@ -12,6 +12,7 @@ Tracked scripts are intentionally limited to:
 - `run_autoresearch_suite.sh`
 - `judge_suite_results.sh`
 - `run_anemll_coreml_benchmark.py`
+- `stories_model_identity.py`
 - `benchmark-prompts.txt`
 - `setup_autoresearch_lane.sh`
 
