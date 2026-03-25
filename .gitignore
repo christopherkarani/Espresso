@@ -81,10 +81,12 @@ scripts/internal/**
 !scripts/stories_model_identity.py
 !scripts/espresso_llama_weights.py
 !scripts/export_llama_coreml.py
+!scripts/run_stories_coreml_parity.py
 !scripts/stories_prompt_suite.txt
 !scripts/tests/
 !scripts/tests/test_stories_model_identity.py
 !scripts/tests/test_espresso_llama_weights.py
+!scripts/tests/test_run_stories_coreml_parity.py
 !scripts/README.md
 tasks/
 AGENTS.md
