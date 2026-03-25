@@ -68,6 +68,32 @@ final class HybridDecodeForwardPassTests: XCTestCase {
         )
     }
 
+    func test_hybrid_decode_attention_window_defaults_off() {
+        XCTAssertNil(DecodeRuntimeOptions.hybridAttentionWindow(env: [:]))
+        XCTAssertNil(DecodeRuntimeOptions.hybridAttentionWindow(env: ["ESPRESSO_HYBRID_ATTENTION_WINDOW": "0"]))
+        XCTAssertNil(DecodeRuntimeOptions.hybridAttentionWindow(env: ["ESPRESSO_HYBRID_ATTENTION_WINDOW": "bogus"]))
+        XCTAssertEqual(
+            DecodeRuntimeOptions.hybridAttentionWindow(
+                env: ["ESPRESSO_HYBRID_ATTENTION_WINDOW": "64"]
+            ),
+            64
+        )
+    }
+
+    func test_resolved_hybrid_attention_range_uses_suffix_window() {
+        let fullContext = ForwardPass.resolvedHybridAttentionRange(tokenIndex: 0, attentionWindow: nil)
+        XCTAssertEqual(fullContext.tokenBase, 0)
+        XCTAssertEqual(fullContext.visibleTokens, 1)
+
+        let withinWindow = ForwardPass.resolvedHybridAttentionRange(tokenIndex: 3, attentionWindow: 8)
+        XCTAssertEqual(withinWindow.tokenBase, 0)
+        XCTAssertEqual(withinWindow.visibleTokens, 4)
+
+        let suffixWindow = ForwardPass.resolvedHybridAttentionRange(tokenIndex: 7, attentionWindow: 4)
+        XCTAssertEqual(suffixWindow.tokenBase, 4)
+        XCTAssertEqual(suffixWindow.visibleTokens, 4)
+    }
+
     func test_cpu_decode_context_matches_grouped_contiguous_reference() {
         let qOut: [Float] = [1, 2, 3, 4]
         let kCache: [Float] = [
@@ -188,6 +214,31 @@ final class HybridDecodeForwardPassTests: XCTestCase {
         )
 
         XCTAssertNotEqual(groupedInterleaved, moduloInterleaved)
+    }
+
+    func test_cpu_decode_context_can_read_suffix_window() {
+        let context = ForwardPass.cpuDecodeContext(
+            qOut: [1],
+            kCache: [0, 1, 2, 3],
+            vCache: [10, 20, 30, 40],
+            heads: 1,
+            kvHeads: 1,
+            headDim: 1,
+            visibleTokens: 2,
+            tokenBase: 2,
+            cacheStride: 4,
+            useModuloKVHeadMapping: false,
+            useVDimMajorInterleave: false
+        )
+
+        let scale: Float = 1
+        let logits: [Float] = [2 * scale, 3 * scale]
+        let weights = softmaxWeightedContext(
+            logitsByHead: [logits],
+            values: [[30, 40]]
+        )
+        XCTAssertEqual(context.count, 1)
+        XCTAssertEqual(context[0], weights[0], accuracy: 1e-5)
     }
 
     func test_hybrid_decode_single_step_runs_on_hardware() throws {

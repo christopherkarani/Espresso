@@ -689,7 +689,8 @@ final class MetalAttentionKernelTests: XCTestCase {
                 for headOffset in 0..<shape.headDim {
                     let qChannel = head * shape.headDim + headOffset
                     let kvChannel = kvHead * shape.headDim + headOffset
-                    dot += qLane[qChannel] * kCache[kvChannel * shape.cacheStride + token]
+                    let cacheToken = shape.tokenBase + token
+                    dot += qLane[qChannel] * kCache[kvChannel * shape.cacheStride + cacheToken]
                 }
                 logits[token] = dot * scale
             }
@@ -708,7 +709,8 @@ final class MetalAttentionKernelTests: XCTestCase {
                 let kvChannel = kvHead * shape.headDim + headOffset
                 var accum: Float = 0
                 for token in 0..<shape.visibleTokens {
-                    accum += (weights[token] / denom) * vCache[kvChannel * shape.cacheStride + token]
+                    let cacheToken = shape.tokenBase + token
+                    accum += (weights[token] / denom) * vCache[kvChannel * shape.cacheStride + cacheToken]
                 }
                 context[channel] = accum
             }
@@ -735,7 +737,8 @@ final class MetalAttentionKernelTests: XCTestCase {
                 for headOffset in 0..<shape.headDim {
                     let qChannel = head * shape.headDim + headOffset
                     let kvChannel = kvHead * shape.headDim + headOffset
-                    dot += qLane[qChannel] * kCache[kvChannel * shape.cacheStride + token]
+                    let cacheToken = shape.tokenBase + token
+                    dot += qLane[qChannel] * kCache[kvChannel * shape.cacheStride + cacheToken]
                 }
                 logits[token] = dot * scale
             }
@@ -754,7 +757,8 @@ final class MetalAttentionKernelTests: XCTestCase {
                 let kvChannel = kvHead * shape.headDim + headOffset
                 var accum: Float = 0
                 for token in 0..<shape.visibleTokens {
-                    accum += (weights[token] / denom) * vCache[kvChannel * shape.cacheStride + token]
+                    let cacheToken = shape.tokenBase + token
+                    accum += (weights[token] / denom) * vCache[kvChannel * shape.cacheStride + cacheToken]
                 }
                 context[channel] = accum
             }
@@ -789,5 +793,18 @@ final class MetalAttentionKernelTests: XCTestCase {
             visibleTokens: 10, cacheStride: 256, laneStride: 32
         )
         XCTAssertEqual(shape.kvHeads, 12)
+    }
+
+    func test_decode_shape_rejects_token_window_overflow() {
+        XCTAssertThrowsError(
+            try MetalDecodeAttentionShape(
+                heads: 8,
+                headDim: 16,
+                visibleTokens: 5,
+                tokenBase: 4,
+                cacheStride: 8,
+                laneStride: 32
+            )
+        )
     }
 }

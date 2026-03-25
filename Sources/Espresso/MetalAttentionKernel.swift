@@ -56,6 +56,7 @@ public struct MetalDecodeAttentionShape: Sendable, Equatable {
     public let kvHeads: Int
     public let headDim: Int
     public let visibleTokens: Int
+    public let tokenBase: Int
     public let cacheStride: Int
     public let laneStride: Int
 
@@ -64,6 +65,7 @@ public struct MetalDecodeAttentionShape: Sendable, Equatable {
         kvHeads: Int? = nil,
         headDim: Int,
         visibleTokens: Int,
+        tokenBase: Int = 0,
         cacheStride: Int,
         laneStride: Int
     ) throws(MetalAttentionError) {
@@ -83,8 +85,14 @@ public struct MetalDecodeAttentionShape: Sendable, Equatable {
         guard visibleTokens > 0 else {
             throw .invalidShape("visibleTokens must be > 0")
         }
+        guard tokenBase >= 0 else {
+            throw .invalidShape("tokenBase must be >= 0")
+        }
         guard cacheStride >= visibleTokens else {
             throw .invalidShape("cacheStride must be >= visibleTokens")
+        }
+        guard tokenBase + visibleTokens <= cacheStride else {
+            throw .invalidShape("tokenBase + visibleTokens must be <= cacheStride")
         }
         guard laneStride > 0 else {
             throw .invalidShape("laneStride must be > 0")
@@ -93,6 +101,7 @@ public struct MetalDecodeAttentionShape: Sendable, Equatable {
         self.kvHeads = resolvedKVHeads
         self.headDim = headDim
         self.visibleTokens = visibleTokens
+        self.tokenBase = tokenBase
         self.cacheStride = cacheStride
         self.laneStride = laneStride
     }
@@ -270,6 +279,8 @@ public final class MetalAttentionKernel {
         var cacheStride: UInt32
         var laneStride: UInt32
         var kvHeads: UInt32
+        var tokenBase: UInt32
+        var pad0: UInt32 = 0
         var scale: Float
         var pad1: Float = 0
     }
@@ -846,6 +857,7 @@ public final class MetalAttentionKernel {
             cacheStride: UInt32(shape.cacheStride),
             laneStride: UInt32(shape.laneStride),
             kvHeads: UInt32(shape.kvHeads),
+            tokenBase: UInt32(shape.tokenBase),
             scale: 1.0 / sqrt(Float(shape.headDim))
         )
 
@@ -1010,6 +1022,7 @@ public final class MetalAttentionKernel {
             cacheStride: UInt32(shape.cacheStride),
             laneStride: UInt32(shape.laneStride),
             kvHeads: UInt32(shape.kvHeads),
+            tokenBase: UInt32(shape.tokenBase),
             scale: 1.0 / sqrt(Float(shape.headDim))
         )
         guard let sdpaEncoder = commandBuffer.makeComputeCommandEncoder() else {
@@ -1288,6 +1301,7 @@ public final class MetalAttentionKernel {
             cacheStride: UInt32(shape.cacheStride),
             laneStride: UInt32(shape.laneStride),
             kvHeads: UInt32(shape.kvHeads),
+            tokenBase: UInt32(shape.tokenBase),
             scale: 1.0 / sqrt(Float(shape.headDim))
         )
         let softmaxParams = AttentionParams(
@@ -1405,6 +1419,7 @@ public final class MetalAttentionKernel {
             cacheStride: UInt32(shape.cacheStride),
             laneStride: UInt32(shape.laneStride),
             kvHeads: UInt32(shape.kvHeads),
+            tokenBase: UInt32(shape.tokenBase),
             scale: 1.0 / sqrt(Float(shape.headDim))
         )
         let softmaxParams = AttentionParams(
@@ -1536,6 +1551,8 @@ public final class MetalAttentionKernel {
         uint cacheStride;
         uint laneStride;
         uint kvHeads;
+        uint tokenBase;
+        uint pad0;
         float scale;
         float pad1;
     };
@@ -1636,8 +1653,9 @@ public final class MetalAttentionKernel {
         uint qHeadOffset = head * params.headDim;
         uint kHeadOffset = kvHead * params.headDim;
         for (uint dim = 0; dim < params.headDim; ++dim) {
+            uint cacheToken = params.tokenBase + token;
             uint qIndex = (qHeadOffset + dim) * params.laneStride;
-            uint kIndex = (kHeadOffset + dim) * params.cacheStride + token;
+            uint kIndex = (kHeadOffset + dim) * params.cacheStride + cacheToken;
             dot += float(q[qIndex]) * float(kCache[kIndex]);
         }
 
@@ -1663,7 +1681,8 @@ public final class MetalAttentionKernel {
         uint weightBase = head * params.visibleTokens;
         uint valueBase = vChannel * params.cacheStride;
         for (uint token = 0; token < params.visibleTokens; ++token) {
-            accum += weights[weightBase + token] * float(vCache[valueBase + token]);
+            uint cacheToken = params.tokenBase + token;
+            accum += weights[weightBase + token] * float(vCache[valueBase + cacheToken]);
         }
         uint outChannel = head * params.headDim + dim;
         context[outChannel] = accum;
@@ -1688,7 +1707,8 @@ public final class MetalAttentionKernel {
         uint weightBase = head * params.visibleTokens;
         uint valueBase = vChannel * params.cacheStride;
         for (uint token = 0; token < params.visibleTokens; ++token) {
-            accum += weights[weightBase + token] * float(vCache[valueBase + token]);
+            uint cacheToken = params.tokenBase + token;
+            accum += weights[weightBase + token] * float(vCache[valueBase + cacheToken]);
         }
         uint outChannel = head * params.headDim + dim;
         context[outChannel * params.laneStride] = accum;
@@ -1821,9 +1841,10 @@ public final class MetalAttentionKernel {
         // Step 1: Compute Q*K^T scores (cooperative across threads in threadgroup)
         for (uint token = tid; token < params.visibleTokens; token += tgSize) {
             float dot = 0.0f;
+            uint cacheToken = params.tokenBase + token;
             for (uint d = 0; d < params.headDim; ++d) {
                 uint qIndex = (qHeadOffset + d) * params.laneStride;
-                uint kIndex = (kHeadOffset + d) * params.cacheStride + token;
+                uint kIndex = (kHeadOffset + d) * params.cacheStride + cacheToken;
                 dot += float(q[qIndex]) * float(kCache[kIndex]);
             }
             scores[token] = dot * params.scale;
@@ -1856,7 +1877,8 @@ public final class MetalAttentionKernel {
             uint valueBase = vChannel * params.cacheStride;
             float accum = 0.0f;
             for (uint t = 0; t < params.visibleTokens; ++t) {
-                accum += scores[t] * float(vCache[valueBase + t]);
+                uint cacheToken = params.tokenBase + t;
+                accum += scores[t] * float(vCache[valueBase + cacheToken]);
             }
             uint outChannel = head * params.headDim + d;
             context[outChannel * params.laneStride] = accum;

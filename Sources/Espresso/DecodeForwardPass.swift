@@ -175,6 +175,22 @@ enum DecodeRuntimeOptions {
     }
 
     @inline(__always)
+    static func hybridAttentionWindow(env: [String: String]) -> Int? {
+        guard let rawValue = env["ESPRESSO_HYBRID_ATTENTION_WINDOW"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              let parsed = Int(rawValue),
+              parsed > 0 else {
+            return nil
+        }
+        return parsed
+    }
+
+    @inline(__always)
+    static var hybridAttentionWindow: Int? {
+        hybridAttentionWindow(env: ProcessInfo.processInfo.environment)
+    }
+
+    @inline(__always)
     static func cpuDecodeAttentionVDimMajor(env: [String: String]) -> Bool {
         env["ESPRESSO_CPU_DECODE_ATTENTION_V_DIM_MAJOR"] == "1"
     }
@@ -672,6 +688,7 @@ public extension ForwardPass {
         kvHeads: Int,
         headDim: Int,
         visibleTokens: Int,
+        tokenBase: Int = 0,
         cacheStride: Int,
         useModuloKVHeadMapping: Bool,
         useVDimMajorInterleave: Bool
@@ -680,7 +697,9 @@ public extension ForwardPass {
         precondition(kvHeads > 0)
         precondition(headDim > 0)
         precondition(visibleTokens > 0)
+        precondition(tokenBase >= 0)
         precondition(cacheStride >= visibleTokens)
+        precondition(tokenBase + visibleTokens <= cacheStride)
         precondition(qOut.count == heads * headDim)
         precondition(kCache.count == kvHeads * headDim * cacheStride)
         precondition(vCache.count == kvHeads * headDim * cacheStride)
@@ -702,9 +721,10 @@ public extension ForwardPass {
 
             var maxScore = -Float.infinity
             for token in 0..<visibleTokens {
+                let cacheToken = tokenBase + token
                 var dot: Float = 0
                 for dimIndex in 0..<headDim {
-                    dot += qOut[qBase + dimIndex] * kCache[(kBase + dimIndex) * cacheStride + token]
+                    dot += qOut[qBase + dimIndex] * kCache[(kBase + dimIndex) * cacheStride + cacheToken]
                 }
                 let score = dot * scale
                 scores[token] = score
@@ -725,7 +745,8 @@ public extension ForwardPass {
                     ? (dimIndex * kvHeads + kvHead)
                     : (kBase + dimIndex)
                 for token in 0..<visibleTokens {
-                    value += (weights[token] * invWeightSum) * vCache[vChannel * cacheStride + token]
+                    let cacheToken = tokenBase + token
+                    value += (weights[token] * invWeightSum) * vCache[vChannel * cacheStride + cacheToken]
                 }
                 context[qBase + dimIndex] = value
             }
@@ -740,6 +761,7 @@ public extension ForwardPass {
         kvHeads: Int,
         headDim: Int,
         visibleTokens: Int,
+        tokenBase: Int,
         cacheStride: Int
     ) throws(ANEError) {
         let qDim = heads * headDim
@@ -786,6 +808,7 @@ public extension ForwardPass {
                 kvHeads: kvHeads,
                 headDim: headDim,
                 visibleTokens: visibleTokens,
+                tokenBase: tokenBase,
                 cacheStride: cacheStride,
                 useModuloKVHeadMapping: MetalAttentionKernel.resolvedKVHeadMappingMode() == .moduloInterleaved,
                 useVDimMajorInterleave: DecodeRuntimeOptions.cpuDecodeAttentionVDimMajor
@@ -804,6 +827,22 @@ public extension ForwardPass {
         } catch {
             throw .invalidArguments("CPU decode attention helper failed: \(error)")
         }
+    }
+
+    internal static func resolvedHybridAttentionRange(
+        tokenIndex: Int,
+        attentionWindow: Int?
+    ) -> (tokenBase: Int, visibleTokens: Int) {
+        precondition(tokenIndex >= 0)
+        let fullVisibleTokens = tokenIndex + 1
+        guard let attentionWindow else {
+            return (tokenBase: 0, visibleTokens: fullVisibleTokens)
+        }
+        let clampedVisibleTokens = min(fullVisibleTokens, attentionWindow)
+        return (
+            tokenBase: fullVisibleTokens - clampedVisibleTokens,
+            visibleTokens: clampedVisibleTokens
+        )
     }
 
     private static func updateHybridKVCacheSlices(
@@ -1103,7 +1142,11 @@ public extension ForwardPass {
         }
 
         let tokenIndex = try decodeState.beginTokenStep()
-        let visibleTokens = tokenIndex + 1
+        let attentionRange = resolvedHybridAttentionRange(
+            tokenIndex: tokenIndex,
+            attentionWindow: DecodeRuntimeOptions.hybridAttentionWindow
+        )
+        let visibleTokens = attentionRange.visibleTokens
         let laneSpatial = surfaceHandles[0].laneSpatial
         let useMetalFusedSDPA = DecodeRuntimeOptions.useMetalFusedSDPA
         let useCPUDecodeAttention = preferCPUDecodeAttention || DecodeRuntimeOptions.useCPUDecodeAttention
@@ -1117,6 +1160,7 @@ public extension ForwardPass {
                 kvHeads: resolvedKVHeads,
                 headDim: headDim,
                 visibleTokens: visibleTokens,
+                tokenBase: attentionRange.tokenBase,
                 cacheStride: maxSeq,
                 laneStride: laneSpatial
             )
@@ -1426,6 +1470,7 @@ public extension ForwardPass {
                             kvHeads: resolvedKVHeads,
                             headDim: headDim,
                             visibleTokens: visibleTokens,
+                            tokenBase: attentionRange.tokenBase,
                             cacheStride: maxSeq
                         )
                     } else if useMetalFusedSDPA {
