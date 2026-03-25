@@ -1011,3 +1011,18 @@ Both 0.6B and 1.7B pass all correctness checks with the narrowed `.automatic` po
 - `swift test --filter hybridDonorDeltaDefaultsOffForStoriesButAllowsOverrides`
 - `swift test --filter HybridDecodeForwardPassTests`
 - `swift test --filter MetalAttentionKernelTests`
+
+# Next Rollout 2026-03-26
+
+- [x] Attempt production persisted decode sessions for Stories/LLaMA generate calls and keep only if they clear exactness and throughput gates.
+- [x] Add exact continuation benchmarks and regression tests for turn-2/turn-3 generation.
+- [ ] Implement stateful Core ML export/loader on the clean post-revert baseline.
+- [ ] Attempt cross-device scheduling only if it can be shipped production-ready, not as a prototype.
+
+## Review
+
+- Corrected implementation order from the user-proposed list to the repo-realistic order: persisted decode sessions -> stateful Core ML -> cross-device scheduling.
+- Persisted decode sessions were implemented, benchmarked, and reverted on March 26, 2026 because they failed both keep gates:
+- Throughput failed: the continued Stories run with `--session --session-prime-tokens 16 --max-tokens 16 --prompt 'Hello'` measured `36.14 tok/s`, while prompt replay on the equivalent decoded prefix measured `71.62 tok/s`.
+- Correctness failed: `ANE_HARDWARE_TESTS=1 swift test --filter test_llamaSessionContinuationMatchesPromptReplay` failed after repeated ANE compile retries with `runtimeFailure("Session CPU exact head read failed: ANE kernel evaluation failed")`.
+- The persisted-session benchmark/helper surface was also reverted, so the active branch is back on the known-good generator/runtime path before the stateful Core ML work starts.

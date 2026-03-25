@@ -177,6 +177,73 @@ import ModelSupport
     try? fileManager.removeItem(at: root)
 }
 
+@Test func test_resolveCoreMLReferenceModelContractDetectsStatelessInput() throws {
+    let contract = try resolveCoreMLReferenceModelContract(
+        inputSpecs: [
+            CoreMLReferenceArraySpec(name: "input_ids", shape: [1, 64], dataType: .int32),
+        ],
+        outputFeatureNames: ["hidden_states"],
+        stateSpecs: [],
+        requestedSequenceLength: 32
+    )
+
+    #expect(
+        contract == .stateless(
+            StatelessCoreMLReferenceContract(
+                tokenInput: CoreMLReferenceArraySpec(name: "input_ids", shape: [1, 64], dataType: .int32),
+                outputFeatureName: "hidden_states",
+                maxSequenceTokens: 64
+            )
+        )
+    )
+}
+
+@Test func test_resolveCoreMLReferenceModelContractDetectsStatefulInputsAndCapacity() throws {
+    let contract = try resolveCoreMLReferenceModelContract(
+        inputSpecs: [
+            CoreMLReferenceArraySpec(name: "cache_position", shape: [1], dataType: .int32),
+            CoreMLReferenceArraySpec(name: "input_ids", shape: [1, 1], dataType: .int32),
+        ],
+        outputFeatureNames: ["hidden_states"],
+        stateSpecs: [
+            CoreMLReferenceArraySpec(name: "key_cache_0", shape: [1, 4, 128, 16], dataType: .float16),
+            CoreMLReferenceArraySpec(name: "value_cache_0", shape: [1, 4, 128, 16], dataType: .float16),
+        ],
+        requestedSequenceLength: 96
+    )
+
+    #expect(
+        contract == .stateful(
+            StatefulCoreMLReferenceContract(
+                tokenInput: CoreMLReferenceArraySpec(name: "input_ids", shape: [1, 1], dataType: .int32),
+                cachePositionInput: CoreMLReferenceArraySpec(name: "cache_position", shape: [1], dataType: .int32),
+                outputFeatureName: "hidden_states",
+                maxSequenceTokens: 128
+            )
+        )
+    )
+}
+
+@Test func test_resolveCoreMLReferenceModelContractRejectsMismatchedStateCapacities() throws {
+    do {
+        _ = try resolveCoreMLReferenceModelContract(
+            inputSpecs: [
+                CoreMLReferenceArraySpec(name: "cache_position", shape: [1], dataType: .int32),
+                CoreMLReferenceArraySpec(name: "input_ids", shape: [1, 1], dataType: .int32),
+            ],
+            outputFeatureNames: ["hidden_states"],
+            stateSpecs: [
+                CoreMLReferenceArraySpec(name: "key_cache_0", shape: [1, 4, 128, 16], dataType: .float16),
+                CoreMLReferenceArraySpec(name: "value_cache_0", shape: [1, 4, 64, 16], dataType: .float16),
+            ],
+            requestedSequenceLength: 32
+        )
+        Issue.record("Expected mismatched state capacities to be rejected.")
+    } catch let error as CLIError {
+        #expect(error.localizedDescription.contains("KV cache capacity"))
+    }
+}
+
 @Test func test_resolveCoreMLModelPathRejectsLlamaWithoutExplicitModel() throws {
     let fileManager = FileManager.default
     let root = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
