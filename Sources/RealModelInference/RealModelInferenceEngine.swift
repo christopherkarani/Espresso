@@ -132,6 +132,22 @@ public struct RealModelInferenceEngine: ~Copyable {
         return true
     }
 
+    static func supportsHybridDonorDelta(
+        config: MultiModelConfig,
+        environment: [String: String]
+    ) -> Bool {
+        if environment["ESPRESSO_DISABLE_HYBRID_DONOR_DELTA"] == "1" {
+            return false
+        }
+        if environment["ESPRESSO_ENABLE_HYBRID_DONOR_DELTA"] == "1" {
+            return true
+        }
+        if config.architecture == .llama, config.name == "stories110m" {
+            return false
+        }
+        return true
+    }
+
     static func resolveClassifierStrategy(
         config: MultiModelConfig,
         hasExactFloat32LMHead: Bool,
@@ -5410,6 +5426,10 @@ public struct RealModelInferenceEngine: ~Copyable {
         maxSeq: Int
     ) throws -> LayerStorage<HybridDecodeKernelSet> {
         let layerRange = sourceLayerRange ?? (0..<config.nLayer)
+        let useDonorDelta = supportsHybridDonorDelta(
+            config: config,
+            environment: ProcessInfo.processInfo.environment
+        )
         var donorHexIDs: HybridDecodeKernelSet.DonorHexIDs? = nil
         return try LayerStorage<HybridDecodeKernelSet>(count: layerRange.count, throwingInitializer: { localLayerIndex in
             let layerIndex = layerRange.lowerBound + localLayerIndex
@@ -5422,9 +5442,11 @@ public struct RealModelInferenceEngine: ~Copyable {
                 let kernels = try HybridDecodeKernelSet(
                     weights: weights,
                     maxSeq: maxSeq,
-                    donorHexIDs: donorHexIDs
+                    donorHexIDs: useDonorDelta ? donorHexIDs : nil
                 )
-                donorHexIDs = kernels.donorHexIDs
+                if useDonorDelta {
+                    donorHexIDs = kernels.donorHexIDs
+                }
                 return kernels
             } catch {
                 throw RealModelInferenceError.runtimeFailure(

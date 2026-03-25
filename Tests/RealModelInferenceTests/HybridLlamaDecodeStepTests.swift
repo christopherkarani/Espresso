@@ -206,6 +206,42 @@ import ModelSupport
     )
 }
 
+@Test func test_hybridDonorDeltaDefaultsOffForStoriesButAllowsOverrides() {
+    let gpt2Config = ModelRegistry.gpt2_124m
+    let storiesConfig = ModelRegistry.stories110m
+    let otherLlamaConfig = ModelRegistry.tinyLlama_1_1b
+    #expect(
+        RealModelInferenceEngine.supportsHybridDonorDelta(
+            config: gpt2Config,
+            environment: [:]
+        ) == true
+    )
+    #expect(
+        RealModelInferenceEngine.supportsHybridDonorDelta(
+            config: otherLlamaConfig,
+            environment: [:]
+        ) == true
+    )
+    #expect(
+        RealModelInferenceEngine.supportsHybridDonorDelta(
+            config: storiesConfig,
+            environment: [:]
+        ) == false
+    )
+    #expect(
+        RealModelInferenceEngine.supportsHybridDonorDelta(
+            config: storiesConfig,
+            environment: ["ESPRESSO_ENABLE_HYBRID_DONOR_DELTA": "1"]
+        ) == true
+    )
+    #expect(
+        RealModelInferenceEngine.supportsHybridDonorDelta(
+            config: gpt2Config,
+            environment: ["ESPRESSO_DISABLE_HYBRID_DONOR_DELTA": "1"]
+        ) == false
+    )
+}
+
 @Test func test_forceExactHeadBackendOverrideParsesKnownValues() {
     #expect(
         RealModelInferenceEngine.forcedExactHeadBackend(
