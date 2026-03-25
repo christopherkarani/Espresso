@@ -26,11 +26,6 @@ public struct HybridOutputProjectionWeights: Sendable {
 
 /// Owns the split decode path for ANE QKV-only + Metal attention + ANE FFN.
 public struct HybridDecodeKernelSet: ~Copyable {
-    private enum FusedPostAttentionFailureCache {
-        static let lock = NSLock()
-        nonisolated(unsafe) static var failedKeys: Set<String> = []
-    }
-
     package struct DonorHexIDs {
         package let decodeQKVOnly: String
         package let decodeProjection: String
@@ -90,38 +85,6 @@ public struct HybridDecodeKernelSet: ~Copyable {
             }
             return result
         }
-    }
-
-    internal static func fusedPostAttentionFailureCacheKey(
-        architecture: LayerWeightsArchitecture,
-        dim: Int,
-        qDim: Int,
-        hiddenDim: Int,
-        laneSpatial: Int
-    ) -> String {
-        let architectureKey: String = switch architecture {
-        case .gpt2: "gpt2"
-        case .rmsNormSwiGLU: "llama"
-        }
-        return "\(architectureKey):\(dim):\(qDim):\(hiddenDim):\(laneSpatial)"
-    }
-
-    internal static func shouldAttemptFusedPostAttention(forKey key: String) -> Bool {
-        FusedPostAttentionFailureCache.lock.lock()
-        defer { FusedPostAttentionFailureCache.lock.unlock() }
-        return !FusedPostAttentionFailureCache.failedKeys.contains(key)
-    }
-
-    internal static func markFusedPostAttentionFailure(forKey key: String) {
-        FusedPostAttentionFailureCache.lock.lock()
-        defer { FusedPostAttentionFailureCache.lock.unlock() }
-        FusedPostAttentionFailureCache.failedKeys.insert(key)
-    }
-
-    internal static func resetFusedPostAttentionFailureCache() {
-        FusedPostAttentionFailureCache.lock.lock()
-        defer { FusedPostAttentionFailureCache.lock.unlock() }
-        FusedPostAttentionFailureCache.failedKeys.removeAll()
     }
 
     private init(
@@ -300,14 +263,7 @@ public struct HybridDecodeKernelSet: ~Copyable {
             weights.architecture == .rmsNormSwiGLU ||
             ProcessInfo.processInfo.environment["ESPRESSO_ENABLE_HYBRID_FUSED_POST_ATTENTION"] == "1"
         )
-        let fusionCacheKey = fusedPostAttentionFailureCacheKey(
-            architecture: weights.architecture,
-            dim: weights.dim,
-            qDim: weights.qDim,
-            hiddenDim: weights.hiddenDim,
-            laneSpatial: laneSpatial
-        )
-        if fusionEnabled && shouldAttemptFusedPostAttention(forKey: fusionCacheKey) {
+        if fusionEnabled {
             do {
                 return CompiledPostAttention(
                     decodeProjection: try compileDecodeProjectionFFN(
@@ -323,7 +279,6 @@ public struct HybridDecodeKernelSet: ~Copyable {
                     usesFusedPostAttention: true
                 )
             } catch {
-                markFusedPostAttentionFailure(forKey: fusionCacheKey)
             }
         }
 

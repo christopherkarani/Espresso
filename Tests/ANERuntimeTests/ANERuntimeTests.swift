@@ -377,38 +377,6 @@ private func decodePassthroughProbeMIL(dim: Int, laneSpatial: Int, maxSeq: Int, 
     return lines.joined(separator: "\n")
 }
 
-final class HybridDecodeKernelSetCacheTests: XCTestCase {
-    override func tearDown() {
-        HybridDecodeKernelSet.resetFusedPostAttentionFailureCache()
-        super.tearDown()
-    }
-
-    func test_fusedPostAttentionFailureCacheSkipsOnlyMatchingGraphShape() {
-        let llamaKey = HybridDecodeKernelSet.fusedPostAttentionFailureCacheKey(
-            architecture: .rmsNormSwiGLU,
-            dim: 768,
-            qDim: 768,
-            hiddenDim: 2048,
-            laneSpatial: 32
-        )
-        let differentLaneKey = HybridDecodeKernelSet.fusedPostAttentionFailureCacheKey(
-            architecture: .rmsNormSwiGLU,
-            dim: 768,
-            qDim: 768,
-            hiddenDim: 2048,
-            laneSpatial: 64
-        )
-
-        XCTAssertTrue(HybridDecodeKernelSet.shouldAttemptFusedPostAttention(forKey: llamaKey))
-        XCTAssertTrue(HybridDecodeKernelSet.shouldAttemptFusedPostAttention(forKey: differentLaneKey))
-
-        HybridDecodeKernelSet.markFusedPostAttentionFailure(forKey: llamaKey)
-
-        XCTAssertFalse(HybridDecodeKernelSet.shouldAttemptFusedPostAttention(forKey: llamaKey))
-        XCTAssertTrue(HybridDecodeKernelSet.shouldAttemptFusedPostAttention(forKey: differentLaneKey))
-    }
-}
-
 final class ANERuntimeTests: XCTestCase {
     func test_ane_error_conforms_to_sendable_and_error() {
         func requireErrorAndSendable<T: Error & Sendable>(_: T.Type) {}
