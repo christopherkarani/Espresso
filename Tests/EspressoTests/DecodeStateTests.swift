@@ -101,14 +101,4 @@ final class DecodeStateTests: XCTestCase {
     func test_decode_runtime_options_force_full_window_sync_enabled_by_one() {
         XCTAssertTrue(DecodeRuntimeOptions.forceFullWindowSync(env: ["ESPRESSO_DECODE_FORCE_FULL_WINDOW_SYNC": "1"]))
     }
-
-    func test_decode_runtime_options_force_cpu_hybrid_kv_scatter_defaults_off() {
-        XCTAssertFalse(DecodeRuntimeOptions.forceCPUHybridKVScatter(env: [:]))
-        XCTAssertFalse(DecodeRuntimeOptions.forceCPUHybridKVScatter(env: ["ESPRESSO_FORCE_CPU_HYBRID_KV_SCATTER": "0"]))
-        XCTAssertFalse(DecodeRuntimeOptions.forceCPUHybridKVScatter(env: ["ESPRESSO_FORCE_CPU_HYBRID_KV_SCATTER": "true"]))
-    }
-
-    func test_decode_runtime_options_force_cpu_hybrid_kv_scatter_enabled_by_one() {
-        XCTAssertTrue(DecodeRuntimeOptions.forceCPUHybridKVScatter(env: ["ESPRESSO_FORCE_CPU_HYBRID_KV_SCATTER": "1"]))
-    }
 }

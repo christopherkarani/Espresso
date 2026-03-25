@@ -165,16 +165,6 @@ enum DecodeRuntimeOptions {
     }
 
     @inline(__always)
-    static func forceCPUHybridKVScatter(env: [String: String]) -> Bool {
-        env["ESPRESSO_FORCE_CPU_HYBRID_KV_SCATTER"] == "1"
-    }
-
-    @inline(__always)
-    static var forceCPUHybridKVScatter: Bool {
-        forceCPUHybridKVScatter(env: ProcessInfo.processInfo.environment)
-    }
-
-    @inline(__always)
     static func useCPUDecodeAttention(env: [String: String]) -> Bool {
         env["ESPRESSO_USE_CPU_DECODE_ATTENTION"] == "1"
     }
@@ -1198,23 +1188,25 @@ public extension ForwardPass {
 
                 if let ropeConfig = metalRoPEConfig {
                     // Phase 5: Metal RoPE + KV scatter + SDPA in one command buffer
-                    if DecodeRuntimeOptions.forceCPUHybridKVScatter {
-                        t0 = RuntimeClock.now()
-                        do {
-                            try updateHybridKVCacheSlices(
-                                handles: handles,
-                                tokenIndex: tokenIndex,
-                                maxSeq: maxSeq,
-                                laneSpatial: laneSpatial,
-                                kvDim: kvDim,
-                                kvHeads: resolvedKVHeads,
-                                headDim: headDim
-                            )
-                        } catch {
-                            throw .invalidArguments("hybrid KV cache update failed: \(error)")
-                        }
-                        timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
+                    // CPU KV cache scatter still needed (Metal scatter writes to kCache which
+                    // is the same surface as kCacheFull here), but RoPE moves to Metal.
+                    t0 = RuntimeClock.now()
+                    do {
+                        // CPU KV cache scatter (still needed — Metal scatter requires locked surfaces
+                        // for kOut/vOut which aren't in the cached bindings)
+                        try updateHybridKVCacheSlices(
+                            handles: handles,
+                            tokenIndex: tokenIndex,
+                            maxSeq: maxSeq,
+                            laneSpatial: laneSpatial,
+                            kvDim: kvDim,
+                            kvHeads: resolvedKVHeads,
+                            headDim: headDim
+                        )
+                    } catch {
+                        throw .invalidArguments("hybrid KV cache update failed: \(error)")
                     }
+                    timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
 
                     // Submit Metal RoPE + SDPA (non-blocking)
                     do {
