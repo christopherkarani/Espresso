@@ -417,6 +417,12 @@ struct BackendRunMetrics: Sendable {
     let compileBreakdown: [String: ANECompileLabelStatsSnapshot]?
     let exactHeadBackend: String?
     let cachedBindingsEnabled: Bool?
+    let isStateful: Bool?
+    let loadSucceeded: Bool?
+    let computePlanSucceeded: Bool?
+    let errorDomain: String?
+    let errorCode: Int?
+    let errorMessage: String?
 
     init(
         backend: String,
@@ -434,7 +440,13 @@ struct BackendRunMetrics: Sendable {
         compileFailureCount: Int = 0,
         compileBreakdown: [String: ANECompileLabelStatsSnapshot]? = nil,
         exactHeadBackend: String? = nil,
-        cachedBindingsEnabled: Bool? = nil
+        cachedBindingsEnabled: Bool? = nil,
+        isStateful: Bool? = nil,
+        loadSucceeded: Bool? = nil,
+        computePlanSucceeded: Bool? = nil,
+        errorDomain: String? = nil,
+        errorCode: Int? = nil,
+        errorMessage: String? = nil
     ) {
         self.backend = backend
         self.text = text
@@ -452,6 +464,12 @@ struct BackendRunMetrics: Sendable {
         self.compileBreakdown = compileBreakdown
         self.exactHeadBackend = exactHeadBackend
         self.cachedBindingsEnabled = cachedBindingsEnabled
+        self.isStateful = isStateful
+        self.loadSucceeded = loadSucceeded
+        self.computePlanSucceeded = computePlanSucceeded
+        self.errorDomain = errorDomain
+        self.errorCode = errorCode
+        self.errorMessage = errorMessage
     }
 }
 
@@ -1110,6 +1128,12 @@ func aggregateBenchmarkRuns(
     var compileBreakdown: [String: ANECompileLabelStatsSnapshot]?
     var exactHeadBackend: String?
     var cachedBindingsEnabled: Bool?
+    var isStateful: Bool?
+    var loadSucceeded: Bool?
+    var computePlanSucceeded: Bool?
+    var errorDomain: String?
+    var errorCode: Int?
+    var errorMessage: String?
 
     for iteration in 0..<totalIterations {
         let metrics = try run()
@@ -1121,6 +1145,12 @@ func aggregateBenchmarkRuns(
         }
         exactHeadBackend = exactHeadBackend ?? metrics.exactHeadBackend
         cachedBindingsEnabled = cachedBindingsEnabled ?? metrics.cachedBindingsEnabled
+        isStateful = isStateful ?? metrics.isStateful
+        loadSucceeded = loadSucceeded ?? metrics.loadSucceeded
+        computePlanSucceeded = computePlanSucceeded ?? metrics.computePlanSucceeded
+        errorDomain = errorDomain ?? metrics.errorDomain
+        errorCode = errorCode ?? metrics.errorCode
+        errorMessage = errorMessage ?? metrics.errorMessage
         if iteration >= warmup {
             lastMeasured = metrics
             aggregatedLatencySamples.append(contentsOf: metrics.tokenLatenciesMs)
@@ -1147,7 +1177,13 @@ func aggregateBenchmarkRuns(
         compileFailureCount: compileFailureCount != 0 ? compileFailureCount : lastMeasured.compileFailureCount,
         compileBreakdown: compileBreakdown ?? lastMeasured.compileBreakdown,
         exactHeadBackend: exactHeadBackend ?? lastMeasured.exactHeadBackend,
-        cachedBindingsEnabled: cachedBindingsEnabled ?? lastMeasured.cachedBindingsEnabled
+        cachedBindingsEnabled: cachedBindingsEnabled ?? lastMeasured.cachedBindingsEnabled,
+        isStateful: isStateful ?? lastMeasured.isStateful,
+        loadSucceeded: loadSucceeded ?? lastMeasured.loadSucceeded,
+        computePlanSucceeded: computePlanSucceeded ?? lastMeasured.computePlanSucceeded,
+        errorDomain: errorDomain ?? lastMeasured.errorDomain,
+        errorCode: errorCode ?? lastMeasured.errorCode,
+        errorMessage: errorMessage ?? lastMeasured.errorMessage
     )
 }
 
@@ -1206,7 +1242,13 @@ private func runCoreMLGeneration(
             medianTokenMs: result.medianTokenMs,
             p95TokenMs: result.p95TokenMs,
             totalTimeMs: result.totalTimeMs,
-            tokenLatenciesMs: result.tokenLatenciesMs
+            tokenLatenciesMs: result.tokenLatenciesMs,
+            isStateful: result.isStateful,
+            loadSucceeded: result.loadSucceeded,
+            computePlanSucceeded: result.computePlanSucceeded,
+            errorDomain: result.errorDomain,
+            errorCode: result.errorCode,
+            errorMessage: result.errorMessage
         ),
         sequenceLength: result.seqLen
     )
@@ -1486,6 +1528,12 @@ private func backendPayload(_ backend: BackendRunMetrics) -> [String: Any] {
         } ?? NSNull(),
         "exact_head_backend": backend.exactHeadBackend ?? NSNull(),
         "cached_bindings_enabled": backend.cachedBindingsEnabled ?? NSNull(),
+        "is_stateful": backend.isStateful ?? NSNull(),
+        "load_succeeded": backend.loadSucceeded ?? NSNull(),
+        "compute_plan_succeeded": backend.computePlanSucceeded ?? NSNull(),
+        "error_domain": backend.errorDomain ?? NSNull(),
+        "error_code": backend.errorCode ?? NSNull(),
+        "error_message": backend.errorMessage ?? NSNull(),
     ]
 }
 
