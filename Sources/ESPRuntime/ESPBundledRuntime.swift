@@ -48,24 +48,57 @@ public enum ESPRuntimeRunner {
         temperature: Float = 0
     ) throws -> GenerationResult {
         let selection = try resolve(bundle: bundle)
-        switch selection.backend {
-        case .anePrivate:
-            var engine = try RealModelInferenceEngine.build(
-                config: bundle.config,
-                weightDir: bundle.archive.weightsURL.path,
-                tokenizerDir: bundle.archive.tokenizerURL.path
-            )
-            return try engine.generate(prompt: prompt, maxTokens: maxTokens, temperature: temperature)
-        case .cpuSafe:
-            return try withTemporaryEnvironment(["ESPRESSO_USE_CPU_EXACT_DECODE": "1"]) {
+        return try withTemporaryEnvironment(environmentOverrides(for: selection)) {
+            switch selection.backend {
+            case .anePrivate:
                 var engine = try RealModelInferenceEngine.build(
                     config: bundle.config,
                     weightDir: bundle.archive.weightsURL.path,
                     tokenizerDir: bundle.archive.tokenizerURL.path
                 )
                 return try engine.generate(prompt: prompt, maxTokens: maxTokens, temperature: temperature)
+            case .cpuSafe:
+                return try withTemporaryEnvironment(["ESPRESSO_USE_CPU_EXACT_DECODE": "1"]) {
+                    var engine = try RealModelInferenceEngine.build(
+                        config: bundle.config,
+                        weightDir: bundle.archive.weightsURL.path,
+                        tokenizerDir: bundle.archive.tokenizerURL.path
+                    )
+                    return try engine.generate(prompt: prompt, maxTokens: maxTokens, temperature: temperature)
+                }
             }
         }
+    }
+
+    private static func environmentOverrides(for selection: ESPRuntimeSelection) -> [String: String] {
+        var overrides: [String: String] = [:]
+        if let outputHead = selection.outputHead,
+           outputHead.kind == .factored,
+           outputHead.behaviorClass != .approximate {
+            overrides["ESPRESSO_BUNDLE_OUTPUT_HEAD_KIND"] = outputHead.kind.rawValue
+            if let bottleneck = outputHead.bottleneck {
+                overrides["ESPRESSO_BUNDLE_OUTPUT_HEAD_BOTTLENECK"] = String(bottleneck)
+            }
+            if let groups = outputHead.groups {
+                overrides["ESPRESSO_BUNDLE_OUTPUT_HEAD_GROUPS"] = String(groups)
+            }
+            if let projectionRef = outputHead.projectionRef {
+                overrides["ESPRESSO_BUNDLE_OUTPUT_HEAD_PROJECTION_REF"] = projectionRef
+            }
+            if let expansionRef = outputHead.expansionRef {
+                overrides["ESPRESSO_BUNDLE_OUTPUT_HEAD_EXPANSION_REF"] = expansionRef
+            }
+        }
+        if let draft = selection.draft,
+           draft.behaviorClass != .approximate {
+            overrides["ESPRESSO_BUNDLE_DRAFT_KIND"] = draft.kind.rawValue
+            overrides["ESPRESSO_BUNDLE_DRAFT_HORIZON"] = String(draft.horizon)
+            overrides["ESPRESSO_BUNDLE_DRAFT_VERIFIER"] = draft.verifier
+            overrides["ESPRESSO_BUNDLE_DRAFT_ROLLBACK"] = draft.rollback
+            overrides["ESPRESSO_BUNDLE_DRAFT_ARTIFACT_REF"] = draft.artifactRef
+            overrides["ESPRESSO_BUNDLE_DRAFT_ACCEPTANCE_METRIC"] = draft.acceptanceMetric
+        }
+        return overrides
     }
 }
 

@@ -296,11 +296,19 @@ public struct RealModelInferenceEngine: ~Copyable {
     }
 
     private struct LlamaTopLevelAssets {
+        struct FactoredOutputHead: Sendable, Equatable {
+            let projection: [Float]
+            let expansion: [Float]
+            let bottleneck: Int
+            let groups: Int
+        }
+
         let tokenEmbedding: [Float]
         let finalNormGamma: [Float]
         let lmHead: [Float]
         let lmHeadFP16: [UInt16]?
         let lmHeadHasExactFloat32Sidecar: Bool
+        let factoredOutputHead: FactoredOutputHead?
         let finalNormGammaPath: String
         let finalNormGammaCompilePath: String
         let finalNormGammaData: Data
@@ -479,13 +487,13 @@ public struct RealModelInferenceEngine: ~Copyable {
         let kernel: ANEKernel
         let inputSurface: IOSurfaceRef
         let outputSurface: IOSurfaceRef
-        let maxValueSurface: IOSurfaceRef
+        let maxValueSurface: IOSurfaceRef?
 
         init(
             kernel: consuming ANEKernel,
             inputSurface: IOSurfaceRef,
             outputSurface: IOSurfaceRef,
-            maxValueSurface: IOSurfaceRef
+            maxValueSurface: IOSurfaceRef?
         ) {
             self.kernel = kernel
             self.inputSurface = inputSurface
@@ -1463,7 +1471,8 @@ public struct RealModelInferenceEngine: ~Copyable {
     private static func loadLlamaTopLevelAssets(
         config: MultiModelConfig,
         topLevelPaths: LlamaTopLevelWeightPaths,
-        weightDirURL: URL
+        weightDirURL: URL,
+        environment: [String: String] = ProcessInfo.processInfo.environment
     ) throws -> LlamaTopLevelAssets {
         let tokenEmbedding = try loadWeightTablePreferringFloat32Sidecar(
             at: topLevelPaths.tokenEmbedding,
@@ -1481,15 +1490,76 @@ public struct RealModelInferenceEngine: ~Copyable {
             at: topLevelPaths.lmHead,
             expectedCount: config.vocab * config.dModel
         )
+        let factoredOutputHead = try loadLlamaFactoredOutputHead(
+            config: config,
+            weightDirURL: weightDirURL,
+            environment: environment
+        )
         return LlamaTopLevelAssets(
             tokenEmbedding: tokenEmbedding,
             finalNormGamma: finalNormGamma,
             lmHead: lmHead,
             lmHeadFP16: lmHeadFP16,
             lmHeadHasExactFloat32Sidecar: lmHeadFP16 == nil,
+            factoredOutputHead: factoredOutputHead,
             finalNormGammaPath: topLevelPaths.finalNormGamma,
             finalNormGammaCompilePath: compileBlobPath(actualPath: topLevelPaths.finalNormGamma, rootDir: weightDirURL),
             finalNormGammaData: WeightBlob.build(from: finalNormGamma, rows: 1, cols: finalNormGamma.count)
+        )
+    }
+
+    private static func loadLlamaFactoredOutputHead(
+        config: MultiModelConfig,
+        weightDirURL: URL,
+        environment: [String: String]
+    ) throws -> LlamaTopLevelAssets.FactoredOutputHead? {
+        guard config.architecture == .llama,
+              environment["ESPRESSO_BUNDLE_OUTPUT_HEAD_KIND"] == "factored" else {
+            return nil
+        }
+
+        guard let bottleneckRaw = environment["ESPRESSO_BUNDLE_OUTPUT_HEAD_BOTTLENECK"],
+              let bottleneck = Int(bottleneckRaw),
+              bottleneck > 0 else {
+            throw RealModelInferenceError.invalidConfig(
+                "Factored output head requires ESPRESSO_BUNDLE_OUTPUT_HEAD_BOTTLENECK > 0"
+            )
+        }
+        guard let groupsRaw = environment["ESPRESSO_BUNDLE_OUTPUT_HEAD_GROUPS"],
+              let groups = Int(groupsRaw),
+              groups > 0 else {
+            throw RealModelInferenceError.invalidConfig(
+                "Factored output head requires ESPRESSO_BUNDLE_OUTPUT_HEAD_GROUPS > 0"
+            )
+        }
+
+        let projectionPath = try resolveBundleWeightReference(
+            environment["ESPRESSO_BUNDLE_OUTPUT_HEAD_PROJECTION_REF"] ?? "cls_proj.bin",
+            weightDirURL: weightDirURL
+        )
+        let expansionPath = try resolveBundleWeightReference(
+            environment["ESPRESSO_BUNDLE_OUTPUT_HEAD_EXPANSION_REF"] ?? "cls_expand.bin",
+            weightDirURL: weightDirURL
+        )
+
+        let projectionCompactCount = bottleneck * (config.dModel / groups)
+        let projectionDenseCount = bottleneck * config.dModel
+        let expansionCompactCount = config.vocab * (bottleneck / groups)
+        let expansionDenseCount = config.vocab * bottleneck
+        let projection = try loadWeightTable(
+            at: projectionPath,
+            allowedCounts: [projectionCompactCount, projectionDenseCount]
+        )
+        let expansion = try loadWeightTable(
+            at: expansionPath,
+            allowedCounts: [expansionCompactCount, expansionDenseCount]
+        )
+
+        return LlamaTopLevelAssets.FactoredOutputHead(
+            projection: projection,
+            expansion: expansion,
+            bottleneck: bottleneck,
+            groups: groups
         )
     }
 
@@ -3952,6 +4022,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         }
 
         let hybridHeadSpatial = Self.incrementalHeadSpatial(channels: config.dModel)
+        let useFactoredGreedyHead = llamaAssets.factoredOutputHead != nil
 
         // Compile RMSNorm head (no beta) for llama
         if compiledHybridHead.count != 1 || compiledHybridHeadSpatial != hybridHeadSpatial {
@@ -3969,41 +4040,70 @@ public struct RealModelInferenceEngine: ~Copyable {
         }
 
         if classifierStrategy.usesANEClassifier {
-            if compiledHybridGreedyNorm.count != 1 || compiledHybridGreedySpatial != hybridHeadSpatial {
-                compiledHybridGreedyNorm = try LayerStorage<CompiledHead>(count: 1, throwingInitializer: { _ in
-                    try Self.compileLlamaHead(
-                        config: config,
-                        weightDirURL: weightDirURL,
-                        assets: llamaAssets,
-                        spatial: hybridHeadSpatial,
-                        inputDType: .fp16,
-                        outputDType: .fp16
-                    )
-                })
-                compiledHybridGreedySpatial = hybridHeadSpatial
-                didCompile = true
-            }
+            if useFactoredGreedyHead {
+                if compiledHybridGreedyNorm.count != 0 {
+                    compiledHybridGreedyNorm = Self.emptyStorage(CompiledHead.self)
+                    didCompile = true
+                }
+                if compiledHybridGreedyClassifier.count != 1 {
+                    do {
+                        compiledHybridGreedyClassifier = try LayerStorage<CompiledClassifier>(count: 1, throwingInitializer: { _ in
+                            try Self.compileLlamaFactoredClassifier(
+                                config: config,
+                                assets: llamaAssets,
+                                spatial: hybridHeadSpatial
+                            )
+                        })
+                    } catch {
+                        fputs(
+                            "[RealModelInference] Llama factored classifier compile failed; falling back to dense ANE classifier: \(error)\n",
+                            stderr
+                        )
+                        compiledHybridGreedyClassifier = Self.emptyStorage(CompiledClassifier.self)
+                    }
+                    didCompile = true
+                }
+                if compiledHybridGreedyClassifier.count == 1,
+                   let finalSurface = compiledHybridSurfaceHandles.last?.ffnOut {
+                    try compiledHybridGreedyClassifier[0].kernel.rebindInput(at: 0, to: finalSurface)
+                }
+            } else {
+                if compiledHybridGreedyNorm.count != 1 || compiledHybridGreedySpatial != hybridHeadSpatial {
+                    compiledHybridGreedyNorm = try LayerStorage<CompiledHead>(count: 1, throwingInitializer: { _ in
+                        try Self.compileLlamaHead(
+                            config: config,
+                            weightDirURL: weightDirURL,
+                            assets: llamaAssets,
+                            spatial: hybridHeadSpatial,
+                            inputDType: .fp16,
+                            outputDType: .fp16
+                        )
+                    })
+                    compiledHybridGreedySpatial = hybridHeadSpatial
+                    didCompile = true
+                }
 
-            if compiledHybridGreedyClassifier.count != 1 {
-                compiledHybridGreedyClassifier = try LayerStorage<CompiledClassifier>(count: 1, throwingInitializer: { _ in
-                    try Self.compileLlamaClassifier(
-                        config: config,
-                        assets: llamaAssets,
-                        spatial: hybridHeadSpatial
+                if compiledHybridGreedyClassifier.count != 1 {
+                    compiledHybridGreedyClassifier = try LayerStorage<CompiledClassifier>(count: 1, throwingInitializer: { _ in
+                        try Self.compileLlamaClassifier(
+                            config: config,
+                            assets: llamaAssets,
+                            spatial: hybridHeadSpatial
+                        )
+                    })
+                    try compiledHybridGreedyClassifier[0].kernel.rebindInput(
+                        at: 0,
+                        to: compiledHybridGreedyNorm[0].outputSurface
                     )
-                })
-                try compiledHybridGreedyClassifier[0].kernel.rebindInput(
-                    at: 0,
-                    to: compiledHybridGreedyNorm[0].outputSurface
-                )
-                didCompile = true
-            }
+                    didCompile = true
+                }
 
-            if compiledHybridGreedyClassifier.count == 1 {
-                try compiledHybridGreedyClassifier[0].kernel.rebindInput(
-                    at: 0,
-                    to: compiledHybridGreedyNorm[0].outputSurface
-                )
+                if compiledHybridGreedyClassifier.count == 1 {
+                    try compiledHybridGreedyClassifier[0].kernel.rebindInput(
+                        at: 0,
+                        to: compiledHybridGreedyNorm[0].outputSurface
+                    )
+                }
             }
         }
 
@@ -4092,11 +4192,15 @@ public struct RealModelInferenceEngine: ~Copyable {
             throw RealModelInferenceError.runtimeFailure("Hybrid decode state initialization failed: \(error)")
         }
         var timings = HybridDecodeTimingBreakdown()
+        let usingFactoredGreedyHead = llamaAssets.factoredOutputHead != nil
         let useANEGreedyHead =
             temperature == 0 &&
             classifierStrategy.usesANEClassifier &&
-            compiledHybridGreedyNorm.count == 1 &&
-            compiledHybridGreedyClassifier.count == 1
+            compiledHybridGreedyClassifier.count == 1 &&
+            (
+                (usingFactoredGreedyHead && compiledHybridGreedyNorm.count == 0) ||
+                (!usingFactoredGreedyHead && compiledHybridGreedyNorm.count == 1)
+            )
 
         for (position, token) in promptTokens.enumerated() {
             try writeIncrementalEmbedding(token: token, position: position, into: xCur)
@@ -4180,15 +4284,10 @@ public struct RealModelInferenceEngine: ~Copyable {
                 do {
                     try compiledHybridGreedyNorm[0].kernel.eval()
                     try compiledHybridGreedyClassifier[0].kernel.eval()
-                    let argmax = try SurfaceIO.argmaxFP16SpatialSliceWithHint(
-                        from: compiledHybridGreedyClassifier[0].outputSurface,
-                        channelOffset: 0,
-                        spatialIndex: 0,
-                        spatial: headSpatial,
-                        channels: config.vocab,
-                        hintSurface: compiledHybridGreedyClassifier[0].maxValueSurface,
-                        hintSpatialIndex: 0,
-                        hintSpatial: headSpatial
+                    let argmax = try Self.greedyArgmax(
+                        classifier: compiledHybridGreedyClassifier[0],
+                        headSpatial: headSpatial,
+                        vocab: config.vocab
                     )
                     guard let token = TokenID(exactly: argmax.index) else {
                         throw RealModelInferenceError.runtimeFailure(
@@ -4724,11 +4823,15 @@ public struct RealModelInferenceEngine: ~Copyable {
             throw RealModelInferenceError.runtimeFailure("Llama hybrid decode state initialization failed: \(error)")
         }
         var timings = HybridDecodeTimingBreakdown()
+        let usingFactoredGreedyHead = llamaAssets.factoredOutputHead != nil
         let useANEGreedyHead =
             temperature == 0 &&
             classifierStrategy.usesANEClassifier &&
-            compiledHybridGreedyNorm.count == 1 &&
-            compiledHybridGreedyClassifier.count == 1
+            compiledHybridGreedyClassifier.count == 1 &&
+            (
+                (usingFactoredGreedyHead && compiledHybridGreedyNorm.count == 0) ||
+                (!usingFactoredGreedyHead && compiledHybridGreedyNorm.count == 1)
+            )
 
         let useCPUExactGreedyHead =
             temperature == 0 &&
@@ -5003,17 +5106,16 @@ public struct RealModelInferenceEngine: ~Copyable {
             let nextToken: TokenID
             if useANEGreedyHead {
                 do {
-                    try compiledHybridGreedyNorm[0].kernel.eval()
-                    try compiledHybridGreedyClassifier[0].kernel.eval()
-                    let argmax = try SurfaceIO.argmaxFP16SpatialSliceWithHint(
-                        from: compiledHybridGreedyClassifier[0].outputSurface,
-                        channelOffset: 0,
-                        spatialIndex: 0,
-                        spatial: headSpatial,
-                        channels: config.vocab,
-                        hintSurface: compiledHybridGreedyClassifier[0].maxValueSurface,
-                        hintSpatialIndex: 0,
-                        hintSpatial: headSpatial
+                    if usingFactoredGreedyHead {
+                        try compiledHybridGreedyClassifier[0].kernel.eval()
+                    } else {
+                        try compiledHybridGreedyNorm[0].kernel.eval()
+                        try compiledHybridGreedyClassifier[0].kernel.eval()
+                    }
+                    let argmax = try Self.greedyArgmax(
+                        classifier: compiledHybridGreedyClassifier[0],
+                        headSpatial: headSpatial,
+                        vocab: config.vocab
                     )
                     guard let token = TokenID(exactly: argmax.index) else {
                         throw RealModelInferenceError.runtimeFailure(
@@ -5021,8 +5123,6 @@ public struct RealModelInferenceEngine: ~Copyable {
                         )
                     }
                     nextToken = token
-                } catch let error as RealModelInferenceError {
-                    throw error
                 } catch {
                     throw RealModelInferenceError.runtimeFailure("Llama hybrid greedy ANE head evaluation failed: \(error)")
                 }
@@ -5140,7 +5240,9 @@ public struct RealModelInferenceEngine: ~Copyable {
             tokensPerSecond: tokensPerSecond,
             compileTimeMs: compileTimeMs,
             firstTokenLatencyMs: firstTokenLatencyMs,
-            exactHeadBackend: classifierStrategy.exactHeadBackendLabel,
+            exactHeadBackend: usingFactoredGreedyHead && useANEGreedyHead
+                ? "ane_factored_classifier"
+                : classifierStrategy.exactHeadBackendLabel,
             cachedBindingsEnabled: cachedBindings != nil
         )
     }
@@ -6185,6 +6287,76 @@ public struct RealModelInferenceEngine: ~Copyable {
         )
     }
 
+    private static func compileLlamaFactoredClassifier(
+        config: MultiModelConfig,
+        assets: LlamaTopLevelAssets,
+        spatial: Int
+    ) throws -> CompiledClassifier {
+        guard let factoredOutputHead = assets.factoredOutputHead else {
+            throw RealModelInferenceError.runtimeFailure("Factored llama classifier requested without factorized head weights")
+        }
+        guard config.dModel == ModelConfig.dim else {
+            throw RealModelInferenceError.runtimeFailure(
+                "Factored llama classifier currently requires dModel \(ModelConfig.dim), got \(config.dModel)"
+            )
+        }
+
+        let projColsPerGroup = config.dModel / factoredOutputHead.groups
+        let expColsPerGroup = factoredOutputHead.bottleneck / factoredOutputHead.groups
+        let generator = FactoredGenerationRMSNormClassifierGenerator(
+            vocabSize: config.vocab,
+            bottleneck: factoredOutputHead.bottleneck,
+            laneSpatial: spatial,
+            groups: factoredOutputHead.groups
+        )
+        let rmsBlob = assets.finalNormGamma.withUnsafeBufferPointer { ptr in
+            WeightBlob.build(from: ptr, rows: 1, cols: config.dModel)
+        }
+        let projBlob = buildGroupedWeightBlob(
+            from: factoredOutputHead.projection,
+            rows: factoredOutputHead.bottleneck,
+            colsPerGroup: projColsPerGroup,
+            groups: factoredOutputHead.groups
+        )
+        let expBlob = buildGroupedWeightBlob(
+            from: factoredOutputHead.expansion,
+            rows: config.vocab,
+            colsPerGroup: expColsPerGroup,
+            groups: factoredOutputHead.groups
+        )
+        let kernel: ANEKernel
+        do {
+            kernel = try ANEKernel(
+                milText: generator.milText,
+                weights: [
+                    (path: "@model_path/weights/rms_final.bin", data: rmsBlob),
+                    (path: "@model_path/weights/cls_proj.bin", data: projBlob),
+                    (path: "@model_path/weights/cls_expand.bin", data: expBlob),
+                ],
+                inputSizes: generator.inputByteSizes,
+                outputSizes: generator.outputByteSizes
+            )
+        } catch {
+            throw RealModelInferenceError.runtimeFailure("Llama factored classifier compilation failed: \(error)")
+        }
+
+        let inputSurface: IOSurfaceRef
+        let outputSurface: IOSurfaceRef
+        do {
+            inputSurface = try kernel.inputSurface(at: 0)
+            outputSurface = try kernel.outputSurface(at: 0)
+        } catch {
+            throw RealModelInferenceError.runtimeFailure("Llama factored classifier surfaces unavailable: \(error)")
+        }
+
+        return CompiledClassifier(
+            kernel: kernel,
+            inputSurface: inputSurface,
+            outputSurface: outputSurface,
+            maxValueSurface: nil
+        )
+    }
+
     private static func buildLlamaHeadGraph(
         config: MultiModelConfig,
         assets: LlamaTopLevelAssets,
@@ -6567,6 +6739,22 @@ public struct RealModelInferenceEngine: ~Copyable {
         return values
     }
 
+    static func loadWeightTable(at path: String, allowedCounts: [Int]) throws -> [Float] {
+        let values: [Float]
+        do {
+            values = try BlobWeightLoader.load(from: path)
+        } catch {
+            throw RealModelInferenceError.runtimeFailure("Failed to load weight blob \(path): \(error)")
+        }
+        guard allowedCounts.contains(values.count) else {
+            let expected = allowedCounts.map(String.init).joined(separator: " or ")
+            throw RealModelInferenceError.runtimeFailure(
+                "Unexpected weight count for \(path): expected \(expected), got \(values.count)"
+            )
+        }
+        return values
+    }
+
     static func loadRawFP16WeightTableIfNoExactFloat32Sidecar(
         at path: String,
         expectedCount: Int
@@ -6698,9 +6886,58 @@ public struct RealModelInferenceEngine: ~Copyable {
         }
     }
 
+    private static func buildGroupedWeightBlob(
+        from weights: [Float],
+        rows: Int,
+        colsPerGroup: Int,
+        groups: Int
+    ) -> Data {
+        let compactCount = rows * colsPerGroup
+        let repacked: [Float] = weights.withUnsafeBufferPointer { buffer in
+            if groups == 1 || buffer.count == compactCount {
+                return Array(buffer)
+            }
+
+            let denseCols = colsPerGroup * groups
+            precondition(rows.isMultiple(of: groups))
+            precondition(buffer.count == rows * denseCols)
+
+            let rowsPerGroup = rows / groups
+            var compact = [Float](repeating: 0, count: compactCount)
+            for row in 0..<rows {
+                let group = row / rowsPerGroup
+                let srcStart = row * denseCols + group * colsPerGroup
+                let dstStart = row * colsPerGroup
+                for col in 0..<colsPerGroup {
+                    compact[dstStart + col] = buffer[srcStart + col]
+                }
+            }
+            return compact
+        }
+        return WeightBlob.build(from: repacked, rows: rows, cols: colsPerGroup)
+    }
+
     private static func fileExists(at path: String?) -> Bool {
         guard let path else { return false }
         return FileManager.default.fileExists(atPath: path)
+    }
+
+    private static func resolveBundleWeightReference(
+        _ reference: String,
+        weightDirURL: URL
+    ) throws -> String {
+        let normalized = reference.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else {
+            throw RealModelInferenceError.invalidConfig("Bundle output-head reference must not be empty")
+        }
+        let relative = normalized.hasPrefix("weights/")
+            ? String(normalized.dropFirst("weights/".count))
+            : normalized
+        let resolved = weightDirURL.appendingPathComponent(relative).standardizedFileURL.path
+        guard FileManager.default.fileExists(atPath: resolved) else {
+            throw RealModelInferenceError.missingPath(resolved)
+        }
+        return resolved
     }
 
     private static func compileBlobPath(actualPath: String, rootDir: URL) -> String {
@@ -7204,15 +7441,10 @@ public struct RealModelInferenceEngine: ~Copyable {
         do {
             try norm.kernel.eval()
             try classifier.kernel.eval()
-            let argmax = try SurfaceIO.argmaxFP16SpatialSliceWithHint(
-                from: classifier.outputSurface,
-                channelOffset: 0,
-                spatialIndex: 0,
-                spatial: headSpatial,
-                channels: vocab,
-                hintSurface: classifier.maxValueSurface,
-                hintSpatialIndex: 0,
-                hintSpatial: headSpatial
+            let argmax = try greedyArgmax(
+                classifier: classifier,
+                headSpatial: headSpatial,
+                vocab: vocab
             )
             guard let token = TokenID(exactly: argmax.index) else {
                 throw RealModelInferenceError.runtimeFailure(
@@ -7225,6 +7457,32 @@ public struct RealModelInferenceEngine: ~Copyable {
         } catch {
             throw RealModelInferenceError.runtimeFailure("Hybrid greedy ANE head evaluation failed: \(error)")
         }
+    }
+
+    private static func greedyArgmax(
+        classifier: borrowing CompiledClassifier,
+        headSpatial: Int,
+        vocab: Int
+    ) throws -> SurfaceIO.FP16ArgmaxResult {
+        if let maxValueSurface = classifier.maxValueSurface {
+            return try SurfaceIO.argmaxFP16SpatialSliceWithHint(
+                from: classifier.outputSurface,
+                channelOffset: 0,
+                spatialIndex: 0,
+                spatial: headSpatial,
+                channels: vocab,
+                hintSurface: maxValueSurface,
+                hintSpatialIndex: 0,
+                hintSpatial: headSpatial
+            )
+        }
+        return try SurfaceIO.argmaxFP16SpatialSlice(
+            from: classifier.outputSurface,
+            channelOffset: 0,
+            spatialIndex: 0,
+            spatial: headSpatial,
+            channels: vocab
+        )
     }
 
     private static func zeroSurface(_ surface: IOSurfaceRef) throws {
