@@ -44,3 +44,6 @@
 
 ## 2026-03-26
 - When a baseline shifts materially, rerun previously rejected runtime knobs under the new baseline before treating the old verdict as permanent; donor-delta removal changed the sign of some Stories experiments even though the code in those knobs did not change.
+
+## 2026-03-26
+- When a stateful Core ML LLM package is exact on `cpu_only` but `cpu_and_neural_engine` fails with Core ML `-14`, bisect the recurrent layer count before changing math; on this Apple runtime the failure boundary appeared at 3 stateful layers, so further exporter tweaks inside the same single-package stateful format are low-probability.

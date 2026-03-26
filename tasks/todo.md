@@ -39,6 +39,21 @@
 - `python3 -m unittest scripts.tests.test_run_stories_coreml_parity scripts.tests.test_espresso_llama_weights scripts.tests.test_stories_model_identity`
 - `python3 scripts/run_stories_coreml_parity.py --coreml-model /tmp/stories_exact_seq256.mlpackage --compute-units cpu_only --max-tokens 8`
 
+## Durable Note
+
+- The exact-weight stateful Core ML path was measured and then reverted because it did not clear the production keep gate.
+- The measured result that remains important:
+- exporting from Espresso's real Stories weights fixed CPU parity
+- the exact stateful package matched Torch and Espresso exact-CPU token-for-token and text-for-text on the fixed suite
+- `cpu_and_neural_engine` still failed before execution with Core ML `-14`
+- the ANE failure is not just sequence-length pressure:
+- stateful 1-layer and 2-layer diagnostic packages loaded and built compute plans on `cpu_and_neural_engine`
+- stateful 3-layer and above failed with the same Core ML `-14`
+- a shared-KV-state exporter experiment was also measured and reverted because it did not clear that ANE load gate
+- Production conclusion from this session:
+- HF Stories weights must not be treated as interchangeable with Espresso's runtime Stories weights
+- exact full-model ANE execution is blocked by the current single-package stateful Core ML format on this Apple runtime, not by a remaining CPU parity bug
+
 # Qwen ANE Serving Execution Spec Review 2026-03-20
 
 - [x] Compare the canonical execution spec against the local implementation plan and current workspace layout.
