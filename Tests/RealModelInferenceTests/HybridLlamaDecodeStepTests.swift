@@ -261,6 +261,39 @@ import ModelSupport
     )
 }
 
+@Test func test_llamaHybridFusedExactHeadDefaultsOnForStoriesAndAllowsDisableOverride() {
+    let gpt2Config = ModelRegistry.gpt2_124m
+    let storiesConfig = ModelRegistry.stories110m
+
+    #expect(
+        RealModelInferenceEngine.usesLlamaHybridFusedExactHead(
+            config: gpt2Config,
+            environment: ["ESPRESSO_ENABLE_LLAMA_HYBRID_FUSED_EXACT_HEAD": "1"]
+        ) == false
+    )
+    #expect(
+        RealModelInferenceEngine.usesLlamaHybridFusedExactHead(
+            config: storiesConfig,
+            environment: [:]
+        ) == true
+    )
+    #expect(
+        RealModelInferenceEngine.usesLlamaHybridFusedExactHead(
+            config: storiesConfig,
+            environment: ["ESPRESSO_DISABLE_LLAMA_HYBRID_FUSED_EXACT_HEAD": "1"]
+        ) == false
+    )
+}
+
+@Test func test_llamaHybridFusedExactHeadEnablesForStoriesWhenRequested() {
+    #expect(
+        RealModelInferenceEngine.usesLlamaHybridFusedExactHead(
+            config: ModelRegistry.stories110m,
+            environment: ["ESPRESSO_ENABLE_LLAMA_HYBRID_FUSED_EXACT_HEAD": "1"]
+        ) == true
+    )
+}
+
 @Test func test_forceExactHeadBackendOverrideParsesKnownValues() {
     #expect(
         RealModelInferenceEngine.forcedExactHeadBackend(

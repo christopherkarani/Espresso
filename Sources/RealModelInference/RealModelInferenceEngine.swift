@@ -205,6 +205,22 @@ public struct RealModelInferenceEngine: ~Copyable {
         return architecture != .llama || environment["ESPRESSO_ENABLE_LLAMA_HYBRID_LAYER_INPUT_REBIND"] == "1"
     }
 
+    static func usesLlamaHybridFusedExactHead(
+        config: MultiModelConfig,
+        environment: [String: String]
+    ) -> Bool {
+        guard config.architecture == .llama else {
+            return false
+        }
+        if environment["ESPRESSO_DISABLE_LLAMA_HYBRID_FUSED_EXACT_HEAD"] == "1" {
+            return false
+        }
+        if environment["ESPRESSO_ENABLE_LLAMA_HYBRID_FUSED_EXACT_HEAD"] == "1" {
+            return true
+        }
+        return Self.isStories110MVariant(config)
+    }
+
     static func prefersCPUDecodeAttention(
         config: MultiModelConfig,
         environment: [String: String]
@@ -4371,6 +4387,13 @@ public struct RealModelInferenceEngine: ~Copyable {
 
         let hybridHeadSpatial = Self.incrementalHeadSpatial(channels: config.dModel)
         let useFactoredGreedyHead = llamaAssets.factoredOutputHead != nil
+        let useFusedExactGreedyHead =
+            classifierStrategy.usesANEClassifier &&
+            !useFactoredGreedyHead &&
+            Self.usesLlamaHybridFusedExactHead(
+                config: config,
+                environment: ProcessInfo.processInfo.environment
+            )
 
         // Compile RMSNorm head (no beta) for llama
         if compiledHybridHead.count != 1 || compiledHybridHeadSpatial != hybridHeadSpatial {
@@ -4409,6 +4432,25 @@ public struct RealModelInferenceEngine: ~Copyable {
                         )
                         compiledHybridGreedyClassifier = Self.emptyStorage(CompiledClassifier.self)
                     }
+                    didCompile = true
+                }
+                if compiledHybridGreedyClassifier.count == 1,
+                   let finalSurface = compiledHybridSurfaceHandles.last?.ffnOut {
+                    try compiledHybridGreedyClassifier[0].kernel.rebindInput(at: 0, to: finalSurface)
+                }
+            } else if useFusedExactGreedyHead {
+                if compiledHybridGreedyNorm.count != 0 {
+                    compiledHybridGreedyNorm = Self.emptyStorage(CompiledHead.self)
+                    didCompile = true
+                }
+                if compiledHybridGreedyClassifier.count != 1 {
+                    compiledHybridGreedyClassifier = try LayerStorage<CompiledClassifier>(count: 1, throwingInitializer: { _ in
+                        try Self.compileLlamaRMSNormClassifier(
+                            config: config,
+                            assets: llamaAssets,
+                            spatial: hybridHeadSpatial
+                        )
+                    })
                     didCompile = true
                 }
                 if compiledHybridGreedyClassifier.count == 1,
@@ -4541,13 +4583,20 @@ public struct RealModelInferenceEngine: ~Copyable {
         }
         var timings = HybridDecodeTimingBreakdown()
         let usingFactoredGreedyHead = llamaAssets.factoredOutputHead != nil
+        let usingFusedExactGreedyHead =
+            !usingFactoredGreedyHead &&
+            Self.usesLlamaHybridFusedExactHead(
+                config: config,
+                environment: ProcessInfo.processInfo.environment
+            )
         let useANEGreedyHead =
             temperature == 0 &&
             classifierStrategy.usesANEClassifier &&
             compiledHybridGreedyClassifier.count == 1 &&
             (
                 (usingFactoredGreedyHead && compiledHybridGreedyNorm.count == 0) ||
-                (!usingFactoredGreedyHead && compiledHybridGreedyNorm.count == 1)
+                (usingFusedExactGreedyHead && compiledHybridGreedyNorm.count == 0) ||
+                (!usingFactoredGreedyHead && !usingFusedExactGreedyHead && compiledHybridGreedyNorm.count == 1)
             )
 
         for (position, token) in promptTokens.enumerated() {
@@ -5315,13 +5364,20 @@ public struct RealModelInferenceEngine: ~Copyable {
         }
         var timings = HybridDecodeTimingBreakdown()
         let usingFactoredGreedyHead = llamaAssets.factoredOutputHead != nil
+        let usingFusedExactGreedyHead =
+            !usingFactoredGreedyHead &&
+            Self.usesLlamaHybridFusedExactHead(
+                config: config,
+                environment: ProcessInfo.processInfo.environment
+            )
         let useANEGreedyHead =
             temperature == 0 &&
             classifierStrategy.usesANEClassifier &&
             compiledHybridGreedyClassifier.count == 1 &&
             (
                 (usingFactoredGreedyHead && compiledHybridGreedyNorm.count == 0) ||
-                (!usingFactoredGreedyHead && compiledHybridGreedyNorm.count == 1)
+                (usingFusedExactGreedyHead && compiledHybridGreedyNorm.count == 0) ||
+                (!usingFactoredGreedyHead && !usingFusedExactGreedyHead && compiledHybridGreedyNorm.count == 1)
             )
 
         let useCPUExactGreedyHead =
@@ -5597,7 +5653,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             let nextToken: TokenID
             if useANEGreedyHead {
                 do {
-                    if usingFactoredGreedyHead {
+                    if usingFactoredGreedyHead || usingFusedExactGreedyHead {
                         try compiledHybridGreedyClassifier[0].kernel.eval()
                     } else {
                         try compiledHybridGreedyNorm[0].kernel.eval()
@@ -6947,6 +7003,58 @@ public struct RealModelInferenceEngine: ~Copyable {
             maxValueSurface = try kernel.outputSurface(at: 1)
         } catch {
             throw RealModelInferenceError.runtimeFailure("Llama classifier surfaces unavailable: \(error)")
+        }
+        return CompiledClassifier(
+            kernel: kernel,
+            inputSurface: inputSurface,
+            outputSurface: outputSurface,
+            maxValueSurface: maxValueSurface
+        )
+    }
+
+    private static func compileLlamaRMSNormClassifier(
+        config: MultiModelConfig,
+        assets: LlamaTopLevelAssets,
+        spatial: Int
+    ) throws -> CompiledClassifier {
+        guard config.dModel == ModelConfig.dim else {
+            throw RealModelInferenceError.runtimeFailure(
+                "Llama fused RMSNorm classifier currently requires dModel \(ModelConfig.dim), got \(config.dModel)"
+            )
+        }
+        let generator = GenerationRMSNormClassifierGenerator(vocabSize: config.vocab, laneSpatial: spatial)
+        let rmsBlob = assets.finalNormGamma.withUnsafeBufferPointer { ptr in
+            WeightBlob.build(from: ptr, rows: 1, cols: config.dModel)
+        }
+        let classifierBlob = if let lmHeadFP16 = assets.lmHeadFP16 {
+            WeightBlob.buildFP16(from: lmHeadFP16)
+        } else {
+            WeightBlob.build(from: assets.lmHead, rows: config.vocab, cols: config.dModel)
+        }
+        let kernel: ANEKernel
+        do {
+            kernel = try ANEKernel(
+                milText: generator.milText,
+                weights: [
+                    (path: "@model_path/weights/rms_final.bin", data: rmsBlob),
+                    (path: "@model_path/weights/classifier.bin", data: classifierBlob),
+                ],
+                inputSizes: generator.inputByteSizes,
+                outputSizes: generator.outputByteSizes
+            )
+        } catch {
+            throw RealModelInferenceError.runtimeFailure("Llama fused RMSNorm classifier compilation failed: \(error)")
+        }
+
+        let inputSurface: IOSurfaceRef
+        let outputSurface: IOSurfaceRef
+        let maxValueSurface: IOSurfaceRef
+        do {
+            inputSurface = try kernel.inputSurface(at: 0)
+            outputSurface = try kernel.outputSurface(at: 0)
+            maxValueSurface = try kernel.outputSurface(at: 1)
+        } catch {
+            throw RealModelInferenceError.runtimeFailure("Llama fused RMSNorm classifier surfaces unavailable: \(error)")
         }
         return CompiledClassifier(
             kernel: kernel,
