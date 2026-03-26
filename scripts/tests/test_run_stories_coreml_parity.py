@@ -15,6 +15,12 @@ from scripts import run_stories_coreml_parity as script
 
 
 class DummyTokenizer:
+    def __init__(self, mapping=None):
+        self.mapping = mapping or {}
+
+    def encode(self, text):
+        return self.mapping.get(text, [0])
+
     def decode(self, tokens):
         return ",".join(str(token) for token in tokens)
 
@@ -118,6 +124,20 @@ class StoriesCoreMLParityTests(unittest.TestCase):
         self.assertIn(script.CPU_EXACT_ENV_KEY, message)
         self.assertIn("stdout detail", message)
         self.assertIn("stderr detail", message)
+
+    def test_validate_prompt_suite_capacity_rejects_undersized_sequence_length(self) -> None:
+        tokenizer = DummyTokenizer(mapping={"long": list(range(5))})
+
+        with self.assertRaises(ValueError) as context:
+            script.validate_prompt_suite_capacity(
+                tokenizer=tokenizer,
+                prompt_suite=[("long_id", "long")],
+                seq_len=6,
+                max_tokens=2,
+            )
+
+        self.assertIn("long_id", str(context.exception))
+        self.assertIn("requires sequence length 7", str(context.exception))
 
 
 def subprocess_completed_process(*, returncode: int, stdout: str, stderr: str) -> subprocess.CompletedProcess[str]:

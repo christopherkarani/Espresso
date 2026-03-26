@@ -27,6 +27,7 @@ DEFAULT_TOKENIZER_DIR = DEFAULT_WEIGHTS_DIR
 DEFAULT_PROMPT_SUITE = REPO_ROOT / "scripts" / "stories_prompt_suite.txt"
 DEFAULT_ESPRESSO_BIN = REPO_ROOT / "espresso"
 CPU_EXACT_ENV_KEY = "ESPRESSO_USE_CPU_EXACT_DECODE"
+DEFAULT_SEQ_LEN = 256
 
 
 def parse_args() -> argparse.Namespace:
@@ -37,7 +38,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt-suite", default=str(DEFAULT_PROMPT_SUITE))
     parser.add_argument("--espresso-bin", default=str(DEFAULT_ESPRESSO_BIN))
     parser.add_argument("--compute-units", default="cpu_only")
-    parser.add_argument("--seq-len", type=int, default=128)
+    parser.add_argument("--seq-len", type=int, default=DEFAULT_SEQ_LEN)
     parser.add_argument("--max-tokens", type=int, default=8)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--compare-warmup", type=int, default=0)
@@ -180,6 +181,22 @@ def compare_results(
     }
 
 
+def validate_prompt_suite_capacity(
+    tokenizer: EspressoSentencePieceTokenizer,
+    prompt_suite: list[tuple[str, str]],
+    seq_len: int,
+    max_tokens: int,
+) -> None:
+    for prompt_id, prompt_text in prompt_suite:
+        prompt_tokens = tokenizer.encode(prompt_text)
+        required = len(prompt_tokens) + max_tokens
+        if required > seq_len:
+            raise ValueError(
+                f"Prompt suite entry '{prompt_id}' requires sequence length {required}, "
+                f"but seq-len is {seq_len}"
+            )
+
+
 def main() -> None:
     args = parse_args()
     weights_dir = Path(args.weights_dir).expanduser().resolve()
@@ -188,6 +205,7 @@ def main() -> None:
     espresso_bin = Path(args.espresso_bin).expanduser().resolve()
     prompt_suite = load_prompt_suite(Path(args.prompt_suite).expanduser().resolve())
     tokenizer = EspressoSentencePieceTokenizer(tokenizer_dir / "tokenizer.model")
+    validate_prompt_suite_capacity(tokenizer, prompt_suite, args.seq_len, args.max_tokens)
     _, model = load_espresso_llama_for_causal_lm(weights_dir, torch_dtype=torch.float16)
 
     prompt_reports = []

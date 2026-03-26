@@ -9,7 +9,7 @@
 - [x] Restore and harden the stateful Core ML runner contract with explicit stateless/stateful detection plus public `MLState` execution.
 - [x] Extend compare/report payloads with Core ML stateful/load/compute-plan diagnostics.
 - [ ] Investigate exporter/state lowering correctness if CPU parity fails, using first-mismatch token/tensor evidence rather than guesswork.
-- [ ] Require CPU exactness on the full fixed prompt suite before any ANE optimization work.
+- [x] Require CPU exactness on the full fixed prompt suite before any ANE optimization work.
 - [ ] Probe `cpu_and_neural_engine` compute-plan generation and stateful prediction directly on the exact package.
 - [ ] Investigate Core ML `-14` failures one factor at a time and revert any failed exporter/runtime experiment commit immediately.
 - [ ] Benchmark the exact kept path against the current Stories warm baseline, `cpu_only`, and `cpu_and_neural_engine`.
@@ -29,13 +29,15 @@
 - restored stateful `MLState` execution using the public async Core ML API
 - added load/compute-plan diagnostics to compare JSON payloads
 - added focused contract tests in `EspressoGenerateTests`
-- Current measured CPU smoke result on the exact stateful package (`results/diag_full12_seq128.mlpackage`) with `ESPRESSO_USE_CPU_EXACT_DECODE=1`:
-- `token_match=true`
-- `text_match=true`
-- Core ML load succeeded and compute-plan generation succeeded on `cpu_only`
+- The CPU parity harness now enforces `ESPRESSO_USE_CPU_EXACT_DECODE=1`, validates prompt-suite sequence capacity up front, and defaults to `seq_len=256` so the checked-in long prompt is valid.
+- Full CPU exactness is proven on the fixed prompt suite with `/tmp/stories_exact_seq256.mlpackage`:
+- Torch wrapper, Espresso exact-CPU runtime, and Core ML `cpu_only` all matched on generated tokens and decoded text for every prompt
+- Core ML stateful load succeeded and `compute_plan_succeeded=true` for every prompt in that run
 - Verification:
 - `swift build`
 - `swift test --filter EspressoGenerateTests`
+- `python3 -m unittest scripts.tests.test_run_stories_coreml_parity scripts.tests.test_espresso_llama_weights scripts.tests.test_stories_model_identity`
+- `python3 scripts/run_stories_coreml_parity.py --coreml-model /tmp/stories_exact_seq256.mlpackage --compute-units cpu_only --max-tokens 8`
 
 # Qwen ANE Serving Execution Spec Review 2026-03-20
 
