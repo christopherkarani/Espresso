@@ -1,0 +1,54 @@
+{
+  "teacher": {
+    "source": "espresso",
+    "weights_dir": "/tmp/stories110m-ctx256-v1.esp/weights",
+    "tokenizer_dir": "/tmp/stories110m-ctx256-v1.esp/tokenizer"
+  },
+  "student": {
+    "name": "stories110m-8l-gqa4-native-student",
+    "n_layer": 8,
+    "n_head": 12,
+    "n_kv_head": 4,
+    "d_model": 768,
+    "head_dim": 64,
+    "hidden_dim": 2048,
+    "vocab": 32000,
+    "max_seq": 256,
+    "norm_eps": 1e-5,
+    "rope_theta": 10000.0
+  },
+  "initialization": {
+    "mode": "teacher_grouped_kv_mean"
+  },
+  "train": {
+    "texts_file": "scripts/stories_prompt_suite.txt",
+    "sequence_length": 128,
+    "max_samples": 64,
+    "batch_size": 1,
+    "steps": 64,
+    "learning_rate": 1e-5,
+    "kl_weight": 1.0,
+    "ce_weight": 0.1,
+    "temperature": 1.0,
+    "device": "auto",
+    "generated_corpus": {
+      "prompts_file": "scripts/stories_prompt_suite.txt",
+      "samples_per_prompt": 1,
+      "max_new_tokens": 64,
+      "temperature": 0.8,
+      "top_k": 50,
+      "seed": 0
+    }
+  },
+  "export": {
+    "output_dir": "/tmp/stories110m-8l-gqa4-native-student",
+    "bundle_path": "/tmp/stories110m-8l-gqa4-native-student.esp",
+    "context_target_tokens": 256,
+    "model_tier": "optimized",
+    "behavior_class": "exact",
+    "optimization_recipe": "stories-8l-gqa4-native-student",
+    "quality_gate": "oracle-first-student-candidate",
+    "teacher_model": "espresso://stories110m-ctx256",
+    "performance_target": "exact-student-oracle-ladder"
+  }
+}

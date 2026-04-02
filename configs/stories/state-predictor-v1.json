@@ -1,0 +1,55 @@
+{
+  "base_bundle": {
+    "weights_dir": "/tmp/stories110m-8l-gqa4-native-student.esp/weights",
+    "tokenizer_dir": "/tmp/stories110m-8l-gqa4-native-student.esp/tokenizer",
+    "teacher_model": "espresso://stories110m-8l-gqa4-native-student"
+  },
+  "train": {
+    "texts_file": "scripts/stories_prompt_suite.txt",
+    "sequence_length": 128,
+    "window_stride": 64,
+    "max_samples": 64,
+    "steps": 128,
+    "learning_rate": 0.0001,
+    "hidden_weight": 1.0,
+    "token_weight": 0.25,
+    "confidence_weight": 0.1,
+    "device": "auto",
+    "generated_corpus": {
+      "prompts_file": "scripts/stories_prompt_suite.txt",
+      "samples_per_prompt": 1,
+      "max_new_tokens": 64,
+      "temperature": 0.8,
+      "top_k": 50,
+      "seed": 0
+    }
+  },
+  "draft": {
+    "proposer_mode": "state_predictor",
+    "max_horizon": 4,
+    "supported_verify_steps": [1, 2, 4],
+    "model_dir": "/tmp/stories110m-state-predictor-v1",
+    "bundle_descriptor_path": "draft/multi-token-draft.json"
+  },
+  "predictor": {
+    "name": "stories110m-state-predictor-v1",
+    "architecture": "residual_mlp",
+    "residual_blocks": 2,
+    "internal_width": 384,
+    "conditioning": "token_embedding_plus_committed_hidden",
+    "prediction_target": "projected_hidden",
+    "projection_dim": 384,
+    "future_steps": 3,
+    "confidence_head": "per_step_scalar"
+  },
+  "export": {
+    "output_model_dir": "/tmp/stories110m-state-predictor-bundle",
+    "bundle_path": "/tmp/stories110m-state-predictor-bundle.esp",
+    "context_target_tokens": 256,
+    "model_tier": "optimized",
+    "behavior_class": "exact",
+    "optimization_recipe": "stories-state-predictor-v1",
+    "quality_gate": "oracle-ceiling-cleared-only",
+    "performance_target": "confidence-gated-1-2-4-ladder"
+  }
+}
