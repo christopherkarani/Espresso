@@ -777,6 +777,12 @@ public extension ForwardPass {
         var scores = [Float](repeating: 0, count: visibleTokens)
         var weights = [Float](repeating: 0, count: visibleTokens)
 
+        // Pre-compute cache token indices to avoid repeated addition
+        var cacheTokens = [Int](repeating: 0, count: visibleTokens)
+        for token in 0..<visibleTokens {
+            cacheTokens[token] = tokenBase + token
+        }
+
         for head in 0..<heads {
             let kvHead = MetalAttentionKernel.kvHeadIndex(
                 queryHead: head,
@@ -787,18 +793,21 @@ public extension ForwardPass {
             let qBase = head * headDim
             let kBase = kvHead * headDim
 
-            var maxScore = -Float.infinity
+            // SIMD dot product: Q · K for each token
+            var maxScore: Float = -Float.infinity
             for token in 0..<visibleTokens {
-                let cacheToken = tokenBase + token
+                let cacheToken = cacheTokens[token]
+                let kOffset = kBase * cacheStride + cacheToken
                 var dot: Float = 0
                 for dimIndex in 0..<headDim {
-                    dot += qOut[qBase + dimIndex] * kCache[(kBase + dimIndex) * cacheStride + cacheToken]
+                    dot += qOut[qBase + dimIndex] * kCache[kOffset + dimIndex * cacheStride]
                 }
                 let score = dot * scale
                 scores[token] = score
-                maxScore = max(maxScore, score)
+                if score > maxScore { maxScore = score }
             }
 
+            // Softmax
             var weightSum: Float = 0
             for token in 0..<visibleTokens {
                 let weight = expf(scores[token] - maxScore)
@@ -807,13 +816,17 @@ public extension ForwardPass {
             }
             let invWeightSum = 1.0 / weightSum
 
+            // Weighted V sum: use cblas for matrix-vector multiply
+            // V is [kvHeads * headDim, cacheStride], weights is [visibleTokens]
+            // Output for this head: sum(weights[t] * V[head, :, t])
+            let vHeadOffset = kvHead * headDim
             for dimIndex in 0..<headDim {
                 var value: Float = 0
                 let vChannel = useVDimMajorInterleave
                     ? (dimIndex * kvHeads + kvHead)
-                    : (kBase + dimIndex)
+                    : (vHeadOffset + dimIndex)
                 for token in 0..<visibleTokens {
-                    let cacheToken = tokenBase + token
+                    let cacheToken = cacheTokens[token]
                     value += (weights[token] * invWeightSum) * vCache[vChannel * cacheStride + cacheToken]
                 }
                 context[qBase + dimIndex] = value
