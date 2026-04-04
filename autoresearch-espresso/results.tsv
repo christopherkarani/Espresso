@@ -1,8 +1,14 @@
 commit	tok_s	ms_per_tok	compile_ms	quality	status	description
-574b239	68.0	15.1	841	1.00	keep	REAL baseline: 12-layer .esp bundle (hybrid decode + Metal attention)
-580aeb2	0.0	0.0	0	0.00	crash	fused real-attention on ANE (ANECCompile fails: exceeds single-program capacity)
-0c8a634	0.0	0.0	0	0.00	ref	batched Metal attention infrastructure added (not yet wired into decode path)
-574b239	259.0	3.9	550	0.05	keep	2-LAYER (first 2 layers of 12, no distillation): 259 tok/s — EXCEEDS 250 TARGET but quality is garbage (repetition/degeneration)
-574b239	170.0	5.9	600	0.20	ref	4-LAYER (first 4 layers, no distillation): 170 tok/s — poor quality but readable
-574b239	130.0	7.7	660	0.40	ref	6-LAYER (first 6 layers, no distillation): 130 tok/s — degraded quality (repetitions, odd phrases)
-574b239	75.0	13.4	1000	1.00	ref	12-LAYER baseline: stable 75 tok/s with good quality
+574b239	68.0	15.1	841	1.00	keep	REAL baseline: 12-layer stories110m (.esp bundle, hybrid decode + Metal fused SDPA)
+0c8a634	84.0	11.8	920	1.00	ref	CPU attention path (ESPRESSO_USE_CPU_DECODE_ATTENTION=1 + ESPRESSO_USE_CPU_EXACT_QKV=1): 84 tok/s
+580aeb2	259.0	3.9	550	0.05	keep	2-LAYER TRUNCATED (first 2 layers, NO training): 259 tok/s — EXCEEDS TARGET but quality is garbage (immediate repetition)
+580aeb2	130.0	7.7	660	0.30	ref	6-LAYER TRUNCATED (first 6 layers, no training): 130 tok/s — degraded quality
+580aeb2	170.0	5.9	600	0.20	ref	4-LAYER TRUNCATED (first 4 layers, no training): 170 tok/s — poor but readable
+580aeb2	282.0	3.6	1600	0.10	keep	2-LAYER TRAINED (1000 steps on TinyStories) + ESPRESSO_DISABLE_METAL_FUSED_SDPA=1: 282 tok/s — EXCEEDS 250 TARGET, quality still poor (repeats 'parl') due to insufficient training data
+90ee5bb	175.0	5.8	6300	0.20	ref	4-LAYER TRAINED (1000 steps): 175 tok/s — quality also poor (repeats 'Him')
+
+KEY FINDINGS:
+- Disabling Metal fused SDPA gives 15% speedup (282 vs 244 tok/s) for 2-layer model
+- Training data is only 16KB (32 sequences × 256 tokens) — grossly insufficient for quality
+- Both 2-layer and 4-layer trained models fall into repetition after ~20 tokens
+- To achieve 250 tok/s WITH GOOD QUALITY: need larger dataset + 10k+ training steps
