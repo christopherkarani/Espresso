@@ -87,7 +87,7 @@ def swift_build(product="espresso-bench", timeout=300):
 # ---------------------------------------------------------------------------
 
 def run_bench_decode(timeout=180):
-    """Run espresso-bench --decode (pure ANE decode path)."""
+    """Run espresso-bench --decode --fused (fused ANE decode path)."""
     bench_path = PROJECT_ROOT / ".build" / "release" / "espresso-bench"
     if not bench_path.exists():
         success, _ = swift_build("espresso-bench")
@@ -96,7 +96,7 @@ def run_bench_decode(timeout=180):
 
     cmd = [
         str(bench_path),
-        "--decode", "--ane-only",
+        "--decode", "--fused", "--ane-only",
         "--decode-steps", str(BENCH_DECODE_STEPS),
         "--warmup", str(BENCH_DECODE_WARMUP),
         "--iterations", str(BENCH_DECODE_ITERATIONS),
