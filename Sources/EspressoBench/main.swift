@@ -12,6 +12,7 @@ struct BenchmarkOptions {
     var inference: Bool = false
     var decode: Bool = false
     var fused: Bool = false
+    var fusedRealAttention: Bool = false
     var fusedTwoLayer: Bool = false
     var inferenceFP16Handoff: Bool = false
     var inferenceOnly: Bool = false
@@ -62,6 +63,8 @@ struct BenchmarkOptions {
                 opts.decode = true
             case "--fused":
                 opts.fused = true
+            case "--fused-real-attention":
+                opts.fusedRealAttention = true
             case "--fused-two-layer":
                 opts.fusedTwoLayer = true
             case "--inference-fp16-handoff":
@@ -692,6 +695,18 @@ if opts.decode {
     do {
         if opts.fusedTwoLayer {
             decodeResult = try ANEDirectBench.runFusedTwoLayerDecode(
+                warmup: opts.warmup,
+                iterations: opts.iterations,
+                decodeSteps: opts.decodeSteps,
+                decodeMaxSeq: opts.decodeMaxSeq,
+                nLayers: opts.nLayers,
+                profileKernels: opts.profileKernels
+            )
+        } else if opts.fusedRealAttention {
+            // TODO: Wire up real attention fused decode benchmark
+            // For now, fall back to regular fused decode
+            printStderr("WARNING: --fused-real-attention not yet wired up, using regular fused decode")
+            decodeResult = try ANEDirectBench.runFusedDecode(
                 warmup: opts.warmup,
                 iterations: opts.iterations,
                 decodeSteps: opts.decodeSteps,
