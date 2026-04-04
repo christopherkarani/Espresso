@@ -175,6 +175,16 @@ enum DecodeRuntimeOptions {
     }
 
     @inline(__always)
+    static func batchedMetalAttention(env: [String: String]) -> Bool {
+        env["ESPRESSO_BATCHED_METAL_ATTENTION"] == "1"
+    }
+
+    @inline(__always)
+    static var batchedMetalAttention: Bool {
+        batchedMetalAttention(env: ProcessInfo.processInfo.environment)
+    }
+
+    @inline(__always)
     static func hybridAttentionWindow(env: [String: String]) -> Int? {
         guard let rawValue = env["ESPRESSO_HYBRID_ATTENTION_WINDOW"]?
             .trimmingCharacters(in: .whitespacesAndNewlines),
@@ -1606,6 +1616,133 @@ public extension ForwardPass {
                     timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
                 }
             }
+        }
+
+        try decodeState.commitTokenStep(expectedIndex: tokenIndex)
+    }
+
+    /// Batched Metal attention: all QKV → 1 Metal CB for all layers → all FFN.
+    static func runHybridDecodeBatchedMetalTimed(
+        xCur: borrowing TensorBuffer,
+        kernels: borrowing LayerStorage<HybridDecodeKernelSet>,
+        surfaceHandles: [HybridDecodeSurfaceHandles],
+        metalAttention: MetalAttentionKernel,
+        decodeState: inout DecodeState,
+        dim: Int = ModelConfig.dim,
+        nHeads: Int = ModelConfig.heads,
+        nKVHeads: Int? = nil,
+        headDim: Int = ModelConfig.headDim,
+        postQKVHook: ((Int, IOSurfaceRef, IOSurfaceRef, Int, Int) throws -> Void)? = nil,
+        cachedBindings: [MetalAttentionKernel.CachedLayerBindings]? = nil,
+        timings: inout HybridDecodeTimingBreakdown
+    ) throws(ANEError) {
+        precondition(kernels.count > 0)
+        precondition(surfaceHandles.count == kernels.count)
+        precondition(dim > 0)
+        guard let cached = cachedBindings else {
+            throw .invalidArguments("batched Metal decode requires cached bindings")
+        }
+        precondition(cached.count == kernels.count)
+
+        let resolvedKVHeads = nKVHeads ?? nHeads
+        let kvDim = resolvedKVHeads * headDim
+        let maxSeq = decodeState.maxSeq
+        let tokenIndex = try decodeState.beginTokenStep()
+        let attentionRange = resolvedHybridAttentionRange(
+            tokenIndex: tokenIndex,
+            attentionWindow: DecodeRuntimeOptions.hybridAttentionWindow
+        )
+        let visibleTokens = attentionRange.visibleTokens
+        let laneSpatial = surfaceHandles[0].laneSpatial
+
+        let metalShape: MetalDecodeAttentionShape
+        do {
+            metalShape = try MetalDecodeAttentionShape(
+                heads: nHeads, kvHeads: resolvedKVHeads, headDim: headDim,
+                visibleTokens: visibleTokens, tokenBase: attentionRange.tokenBase,
+                cacheStride: maxSeq, laneStride: laneSpatial
+            )
+        } catch {
+            throw .invalidArguments("hybrid metal shape invalid: \(error)")
+        }
+
+        var t0 = RuntimeClock.now()
+
+        // Phase 1: All layers' ANE QKV (serial chain)
+        for layerIndex in 0..<kernels.count {
+            let handles = surfaceHandles[layerIndex]
+            if layerIndex > 0 {
+                t0 = RuntimeClock.now()
+                do {
+                    try SurfaceIO.copyFP16SpatialSlice(
+                        dst: handles.qkvIn, dstChannelOffset: 0,
+                        dstSpatialIndex: 0, dstSpatial: laneSpatial,
+                        src: surfaceHandles[layerIndex - 1].ffnOut,
+                        srcChannelOffset: 0, srcSpatialIndex: 0,
+                        srcSpatial: laneSpatial, channels: dim
+                    )
+                } catch {
+                    throw .invalidArguments("batched chain failed at layer \(layerIndex): \(error)")
+                }
+                timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
+            }
+            t0 = RuntimeClock.now()
+            do {
+                try kernels[layerIndex].decodeQKVOnly.eval()
+            } catch {
+                throw .invalidArguments("decodeQKVOnly eval failed at layer \(layerIndex): \(error)")
+            }
+            timings.tAneQKV += RuntimeClock.ms(RuntimeClock.now() - t0)
+
+            t0 = RuntimeClock.now()
+            do {
+                try updateHybridKVCacheSlices(
+                    handles: handles, tokenIndex: tokenIndex, maxSeq: maxSeq,
+                    laneSpatial: laneSpatial, kvDim: kvDim,
+                    kvHeads: resolvedKVHeads, headDim: headDim
+                )
+            } catch {
+                throw .invalidArguments("hybrid KV cache update failed: \(error)")
+            }
+            timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
+
+            if let hook = postQKVHook {
+                t0 = RuntimeClock.now()
+                do {
+                    try hook(layerIndex, handles.qOut, handles.kOut, laneSpatial, tokenIndex)
+                } catch let error as ANEError {
+                    throw error
+                } catch {
+                    throw .invalidArguments("hybrid post-QKV hook failed at layer \(layerIndex): \(error)")
+                }
+                timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
+            }
+        }
+
+        // Phase 2: ALL layers' Metal in ONE command buffer
+        t0 = RuntimeClock.now()
+        do {
+            let cb = try metalAttention.submitBatchedFusedDecodeSDPA(cachedLayers: cached, shape: metalShape)
+            try metalAttention.waitForMetalCompletion(cb)
+        } catch {
+            throw .invalidArguments("batched Metal attention failed: \(error)")
+        }
+        timings.tMetal += RuntimeClock.ms(RuntimeClock.now() - t0)
+
+        // Phase 3: All layers' ANE ProjFFN
+        for layerIndex in 0..<kernels.count {
+            t0 = RuntimeClock.now()
+            do {
+                try kernels[layerIndex].decodeProjection.eval()
+                if !kernels[layerIndex].usesFusedPostAttention {
+                    try kernels[layerIndex].decodeFFN.eval()
+                }
+            } catch {
+                let kernelName = kernels[layerIndex].usesFusedPostAttention
+                    ? "decodeProjectionFFN" : "decodeProjection+decodeFFN"
+                throw .invalidArguments("batched \(kernelName) failed at layer \(layerIndex): \(error)")
+            }
+            timings.tAneFFN += RuntimeClock.ms(RuntimeClock.now() - t0)
         }
 
         try decodeState.commitTokenStep(expectedIndex: tokenIndex)

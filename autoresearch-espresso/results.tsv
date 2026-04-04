@@ -1,14 +1,18 @@
 commit	tok_s	ms_per_tok	compile_ms	quality	status	description
-574b239	68.0	15.1	841	1.00	keep	REAL baseline: 12-layer stories110m (.esp bundle, hybrid decode + Metal fused SDPA)
-0c8a634	84.0	11.8	920	1.00	ref	CPU attention path (ESPRESSO_USE_CPU_DECODE_ATTENTION=1 + ESPRESSO_USE_CPU_EXACT_QKV=1): 84 tok/s
-580aeb2	259.0	3.9	550	0.05	keep	2-LAYER TRUNCATED (first 2 layers, NO training): 259 tok/s — EXCEEDS TARGET but quality is garbage (immediate repetition)
-580aeb2	130.0	7.7	660	0.30	ref	6-LAYER TRUNCATED (first 6 layers, no training): 130 tok/s — degraded quality
-580aeb2	170.0	5.9	600	0.20	ref	4-LAYER TRUNCATED (first 4 layers, no training): 170 tok/s — poor but readable
-580aeb2	282.0	3.6	1600	0.10	keep	2-LAYER TRAINED (1000 steps on TinyStories) + ESPRESSO_DISABLE_METAL_FUSED_SDPA=1: 282 tok/s — EXCEEDS 250 TARGET, quality still poor (repeats 'parl') due to insufficient training data
-90ee5bb	175.0	5.8	6300	0.20	ref	4-LAYER TRAINED (1000 steps): 175 tok/s — quality also poor (repeats 'Him')
+574b239	73.0	13.7	1200	1.00	keep	12-LAYER pre-trained baseline: perfect quality, slow (36 Metal + 36 ANE dispatches/token)
+ec20ca3	284.0	3.6	1600	0.10	ref	2-LAYER TRAINED (3330 steps on TinyStories): 284 tok/s EXCEEDS TARGET but quality poor (repeats 'Gro' after ~5 tokens). Loss still at 5.7 after 3330 steps — needs much more training.
+90ee5bb	131.0	7.9	6100	0.15	ref	4-LAYER TRAINED (1000 steps on TinyStories): 131 tok/s, quality degrades after ~20 tokens (repeats 'Him')
+a0299bc	133.0	7.8	756	0.05	ref	4-LAYER pre-trained (first 4 of 12 layers): 133 tok/s, immediate degeneration into 'redients' repetition
+a0299bc	103.0	9.5	909	0.30	ref	6-LAYER pre-trained (first 6 of 12 layers): 103 tok/s, quality degrades after ~20 tokens
+a0299bc	63.0	16.0	1100	1.00	discard	12-LAYER + ESPRESSO_DISABLE_METAL_FUSED_SDPA=1: WORSE than baseline (63 vs 73). Fused SDPA helps for 12 layers.
+a0299bc	64.0	15.8	1200	1.00	discard	12-LAYER + ESPRESSO_BATCHED_METAL_ATTENTION=1: WORSE than baseline (64 vs 73). Batching Metal loses pipelining overlap.
 
-KEY FINDINGS:
-- Disabling Metal fused SDPA gives 15% speedup (282 vs 244 tok/s) for 2-layer model
-- Training data is only 16KB (32 sequences × 256 tokens) — grossly insufficient for quality
-- Both 2-layer and 4-layer trained models fall into repetition after ~20 tokens
-- To achieve 250 tok/s WITH GOOD QUALITY: need larger dataset + 10k+ training steps
+CONCLUSION: Cannot achieve 250 tok/s with good quality via layer reduction alone.
+- 2-layer trained (284 tok/s): poor quality, needs much more training
+- 4-layer trained (131 tok/s): better but still degraded, needs more training
+- 12-layer (73 tok/s): perfect quality but slow
+
+Remaining paths to 250 tok/s with quality:
+1. Speculative decoding (draft model + verify with full model)
+2. Full distillation training (4+ layer model, 50k+ steps on full TinyStories)
+3. ANE kernel fusion (2-layer fused kernels — currently fails to compile)

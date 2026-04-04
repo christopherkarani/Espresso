@@ -934,6 +934,56 @@ public final class MetalAttentionKernel {
         }
     }
 
+    /// Submit all layers' fused SDPA as a SINGLE command buffer.
+    /// Eliminates per-layer command buffer creation/commit/sync overhead.
+    public func submitBatchedFusedDecodeSDPA(
+        cachedLayers: [CachedLayerBindings],
+        shape: MetalDecodeAttentionShape
+    ) throws(MetalAttentionError) -> MTLCommandBuffer {
+        guard let commandBuffer = commandQueue.makeCommandBuffer() else {
+            throw .commandBufferUnavailable
+        }
+
+        let decodeParams = DecodeParams(
+            heads: UInt32(shape.heads),
+            headDim: UInt32(shape.headDim),
+            visibleTokens: UInt32(shape.visibleTokens),
+            cacheStride: UInt32(shape.cacheStride),
+            laneStride: UInt32(shape.laneStride),
+            kvHeads: UInt32(shape.kvHeads),
+            tokenBase: UInt32(shape.tokenBase),
+            scale: 1.0 / sqrt(Float(shape.headDim))
+        )
+
+        var retainedBindings: [SurfaceBinding] = []
+        for cached in cachedLayers {
+            let bindings = try cached.makeTransientAttentionBindings(device: device)
+            guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
+                throw .commandEncoderUnavailable
+            }
+            encoder.setComputePipelineState(fusedDecodeSDPAPipeline)
+            encoder.setBuffer(bindings.qBinding.buffer, offset: 0, index: 0)
+            encoder.setBuffer(bindings.kBinding.buffer, offset: 0, index: 1)
+            encoder.setBuffer(bindings.vBinding.buffer, offset: 0, index: 2)
+            encoder.setBuffer(bindings.contextBinding.buffer, offset: 0, index: 3)
+            withUnsafeBytes(of: decodeParams) { rawBytes in
+                encoder.setBytes(rawBytes.baseAddress!, length: rawBytes.count, index: 4)
+            }
+            let tgMemSize = shape.visibleTokens * MemoryLayout<Float>.stride
+            encoder.setThreadgroupMemoryLength(tgMemSize, index: 0)
+            let tgWidth = min(shape.visibleTokens, fusedDecodeSDPAPipeline.maxTotalThreadsPerThreadgroup)
+            encoder.dispatchThreadgroups(
+                MTLSize(width: shape.heads, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: tgWidth, height: 1, depth: 1)
+            )
+            encoder.endEncoding()
+            retainedBindings.append(contentsOf: bindings.all)
+        }
+        Self.retain(bindings: retainedBindings, until: commandBuffer)
+        commandBuffer.commit()
+        return commandBuffer
+    }
+
     // MARK: - Fused RoPE + KV Scatter + SDPA (Phase 5)
 
     /// Submit a single command buffer that encodes:

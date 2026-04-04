@@ -5917,27 +5917,44 @@ public struct RealModelInferenceEngine: ~Copyable {
 
             try writeIncrementalEmbeddingLlama(token: nextToken, into: xCur)
             do {
-                try ForwardPass.runHybridDecodeTimed(
-                    xCur: xCur,
-                    kernels: compiledHybridLayers,
-                    surfaceHandles: compiledHybridSurfaceHandles,
-                    metalAttention: metalAttention,
-                    decodeState: &decodeState,
-                    dim: config.dModel,
-                    nHeads: nHeads,
-                    nKVHeads: nKVHeads,
-                    headDim: headDim,
-                    preferCPUDecodeAttention: Self.prefersCPUDecodeAttention(
-                        config: config,
-                        environment: ProcessInfo.processInfo.environment
-                    ),
-                    qkvOverride: cpuExactQKV,
-                    postQKVHook: metalRoPEConfig != nil ? nil : ropeHook,
-                    readFinalOutputIntoXCur: !useANEGreedyHead,
-                    cachedBindings: cachedBindings,
-                    metalRoPEConfig: metalRoPEConfig,
-                    timings: &timings
-                )
+                if ProcessInfo.processInfo.environment["ESPRESSO_BATCHED_METAL_ATTENTION"] == "1" && metalRoPEConfig == nil && cpuExactQKV == nil {
+                    try ForwardPass.runHybridDecodeBatchedMetalTimed(
+                        xCur: xCur,
+                        kernels: compiledHybridLayers,
+                        surfaceHandles: compiledHybridSurfaceHandles,
+                        metalAttention: metalAttention,
+                        decodeState: &decodeState,
+                        dim: config.dModel,
+                        nHeads: nHeads,
+                        nKVHeads: nKVHeads,
+                        headDim: headDim,
+                        postQKVHook: ropeHook,
+                        cachedBindings: cachedBindings,
+                        timings: &timings
+                    )
+                } else {
+                    try ForwardPass.runHybridDecodeTimed(
+                        xCur: xCur,
+                        kernels: compiledHybridLayers,
+                        surfaceHandles: compiledHybridSurfaceHandles,
+                        metalAttention: metalAttention,
+                        decodeState: &decodeState,
+                        dim: config.dModel,
+                        nHeads: nHeads,
+                        nKVHeads: nKVHeads,
+                        headDim: headDim,
+                        preferCPUDecodeAttention: Self.prefersCPUDecodeAttention(
+                            config: config,
+                            environment: ProcessInfo.processInfo.environment
+                        ),
+                        qkvOverride: cpuExactQKV,
+                        postQKVHook: metalRoPEConfig != nil ? nil : ropeHook,
+                        readFinalOutputIntoXCur: !useANEGreedyHead,
+                        cachedBindings: cachedBindings,
+                        metalRoPEConfig: metalRoPEConfig,
+                        timings: &timings
+                    )
+                }
             } catch {
                 throw RealModelInferenceError.runtimeFailure(
                     "Llama hybrid decode failed at generated token \(generatedTokens.count - 1): \(error)"
