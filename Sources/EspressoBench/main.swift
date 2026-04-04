@@ -12,6 +12,7 @@ struct BenchmarkOptions {
     var inference: Bool = false
     var decode: Bool = false
     var fused: Bool = false
+    var fusedTwoLayer: Bool = false
     var inferenceFP16Handoff: Bool = false
     var inferenceOnly: Bool = false
     var profileKernels: Bool = false
@@ -61,6 +62,8 @@ struct BenchmarkOptions {
                 opts.decode = true
             case "--fused":
                 opts.fused = true
+            case "--fused-two-layer":
+                opts.fusedTwoLayer = true
             case "--inference-fp16-handoff":
                 opts.inferenceFP16Handoff = true
             case "--inference-only":
@@ -687,7 +690,16 @@ func decodeProfileAverages(_ profile: DecodeKernelProfile) -> [[String: Any]] {
 if opts.decode {
     let decodeResult: ANEDirectBench.Result
     do {
-        if opts.fused {
+        if opts.fusedTwoLayer {
+            decodeResult = try ANEDirectBench.runFusedTwoLayerDecode(
+                warmup: opts.warmup,
+                iterations: opts.iterations,
+                decodeSteps: opts.decodeSteps,
+                decodeMaxSeq: opts.decodeMaxSeq,
+                nLayers: opts.nLayers,
+                profileKernels: opts.profileKernels
+            )
+        } else if opts.fused {
             decodeResult = try ANEDirectBench.runFusedDecode(
                 warmup: opts.warmup,
                 iterations: opts.iterations,

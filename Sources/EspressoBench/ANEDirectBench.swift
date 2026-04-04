@@ -612,6 +612,156 @@ enum ANEDirectBench {
         )
     }
 
+    /// Two-layer fused decode benchmark: uses FusedTwoLayerDecodeKernelSet (2 layers per kernel)
+    static func runFusedTwoLayerDecode(
+        warmup: Int,
+        iterations: Int,
+        decodeSteps: Int,
+        decodeMaxSeq: Int,
+        nLayers: Int = 1,
+        profileKernels: Bool = false
+    ) throws -> Result {
+        guard nLayers % 2 == 0 else {
+            throw ANEError.invalidArguments("nLayers must be even for two-layer fused decode, got \(nLayers)")
+        }
+        guard decodeSteps > 0 else {
+            throw ANEError.invalidArguments("decodeSteps must be > 0")
+        }
+        guard decodeMaxSeq > 1 else {
+            throw ANEError.invalidArguments("decodeMaxSeq must be > 1")
+        }
+        let decodeLaneSpatial = FusedTwoLayerDecodeKernelSet.resolvedLaneSpatialForCurrentProcess()
+        guard decodeMaxSeq >= decodeLaneSpatial else {
+            throw ANEError.invalidArguments(
+                "decodeMaxSeq (\(decodeMaxSeq)) must be >= two-layer fused decode lane spatial (\(decodeLaneSpatial))"
+            )
+        }
+        guard decodeMaxSeq % decodeLaneSpatial == 0 else {
+            throw ANEError.invalidArguments(
+                "decodeMaxSeq (\(decodeMaxSeq)) must be a multiple of two-layer fused decode lane spatial (\(decodeLaneSpatial))"
+            )
+        }
+        guard decodeSteps <= decodeMaxSeq else {
+            throw ANEError.invalidArguments("decodeSteps (\(decodeSteps)) must be <= decodeMaxSeq (\(decodeMaxSeq))")
+        }
+
+        printStderr("\n=== ANE Two-Layer Fused Decode Benchmark (KV Cache) ===")
+        printStderr("Setting up \(nLayers)-layer two-layer fused decode path (steps=\(decodeSteps), maxSeq=\(decodeMaxSeq))...")
+
+        var rng: SplitMix64? = nil
+        if let seed = benchSeed() {
+            rng = SplitMix64(seed: seed)
+            printStderr("  RNG seed: \(seed)")
+        }
+
+        // 1. Random weights
+        let layers = LayerStorage<LayerWeights>(count: nLayers) { _ in
+            let w = LayerWeights()
+            randomFill(w.Wq, rng: &rng); randomFill(w.Wk, rng: &rng); randomFill(w.Wv, rng: &rng); randomFill(w.Wo, rng: &rng)
+            randomFill(w.W1, rng: &rng); randomFill(w.W2, rng: &rng); randomFill(w.W3, rng: &rng)
+            onesFill(w.rmsAtt); onesFill(w.rmsFfn)
+            return w
+        }
+
+        // 2. Compile two-layer fused decode kernels (nLayers/2 kernels)
+        let numKernels = nLayers / 2
+        printStderr("Compiling \(numKernels) two-layer fused decode ANE kernels...")
+        let compileStart = ContinuousClock.now
+        let kernels = try LayerStorage<FusedTwoLayerDecodeKernelSet>(count: numKernels, throwingInitializer: { i in
+            try FusedTwoLayerDecodeKernelSet(
+                layer0Weights: layers[i * 2],
+                layer1Weights: layers[i * 2 + 1],
+                maxSeq: decodeMaxSeq
+            )
+        })
+        let compileMs = durationMs(ContinuousClock.now - compileStart)
+        printStderr(String(format: "  Compilation: %.1f ms (budget remaining: %d)", compileMs, CompileBudget.remaining))
+
+        // 3. Pre-resolve surface handles
+        var handles: [FusedTwoLayerDecodeSurfaceHandles] = []
+        handles.reserveCapacity(numKernels)
+        for i in 0..<numKernels {
+            handles.append(try FusedTwoLayerDecodeSurfaceHandles(kernels: kernels[i], logicalMaxSeq: decodeMaxSeq))
+        }
+
+        // 4. Pre-generate token embeddings
+        var tokenInputs = [Float](repeating: 0, count: decodeSteps * ModelConfig.dim)
+        for i in 0..<tokenInputs.count {
+            if rng != nil {
+                tokenInputs[i] = rng!.nextFloat(in: -0.1...0.1)
+            } else {
+                tokenInputs[i] = Float.random(in: -0.1...0.1)
+            }
+        }
+
+        let xCur = TensorBuffer(count: ModelConfig.dim, zeroed: true)
+        let measuredTokens = iterations * decodeSteps
+
+        // 5. Warmup
+        printStderr("Warmup: \(warmup) sequences × \(decodeSteps) steps...")
+        for _ in 0..<warmup {
+            ForwardPass.initializeFusedTwoLayerDecodeCachesAndMask(surfaceHandles: handles)
+            var decodeState = try DecodeState(maxSeq: decodeMaxSeq)
+            for step in 0..<decodeSteps {
+                loadDecodeToken(step: step, tokenInputs: tokenInputs, into: xCur)
+                var timings = StepTimingBreakdown()
+                try ForwardPass.runFusedTwoLayerDecodeTimed(
+                    xCur: xCur,
+                    kernels: kernels,
+                    surfaceHandles: handles,
+                    decodeState: &decodeState,
+                    timings: &timings
+                )
+            }
+        }
+
+        // 6. Measured token latencies
+        printStderr("Measuring: \(iterations) sequences × \(decodeSteps) steps...")
+        var latencies: [Double] = []
+        latencies.reserveCapacity(measuredTokens)
+        for seqIdx in 0..<iterations {
+            ForwardPass.initializeFusedTwoLayerDecodeCachesAndMask(surfaceHandles: handles)
+            var decodeState = try DecodeState(maxSeq: decodeMaxSeq)
+            for step in 0..<decodeSteps {
+                loadDecodeToken(step: step, tokenInputs: tokenInputs, into: xCur)
+                var timings = StepTimingBreakdown()
+                let t0 = ContinuousClock.now
+                try ForwardPass.runFusedTwoLayerDecodeTimed(
+                    xCur: xCur,
+                    kernels: kernels,
+                    surfaceHandles: handles,
+                    decodeState: &decodeState,
+                    timings: &timings
+                )
+                let dt = durationMs(ContinuousClock.now - t0)
+                latencies.append(dt)
+                if step < 10 || ((seqIdx * decodeSteps) + step + 1) % 100 == 0 {
+                    let runningMean = latencies.reduce(0, +) / Double(latencies.count)
+                    printStderr(String(format: "  [ANE 2L Fused Decode] %d/%d tokens — mean: %.3f ms", (seqIdx * decodeSteps) + step + 1, measuredTokens, runningMean))
+                }
+            }
+        }
+
+        let result = BenchmarkResult(
+            label: "ANE Two-Layer Fused Decode",
+            latencies: latencies,
+            warmupCount: warmup * decodeSteps,
+            iterationCount: measuredTokens
+        )
+        let tokensPerSecond = result.mean > 0 ? 1000.0 / result.mean : 0
+        printStderr(String(format: "  Done. Mean: %.3f ms/token, Median: %.3f ms/token, Throughput: %.1f tok/s", result.mean, result.median, tokensPerSecond))
+
+        return Result(
+            benchmarkResult: result,
+            avgTimingBreakdown: (ane: 0, io: 0, elem: 0),
+            kernelDispatches: numKernels,
+            compileTimeMs: compileMs,
+            kernelProfile: nil,
+            decodeKernelProfile: nil,
+            tokensPerSecond: tokensPerSecond
+        )
+    }
+
     // MARK: - Helpers
 
     private static func randomFill(_ buffer: borrowing TensorBuffer, range: ClosedRange<Float> = -0.1...0.1) {
