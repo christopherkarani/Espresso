@@ -87,23 +87,24 @@ def swift_build(product="espresso-bench", timeout=300):
 # ---------------------------------------------------------------------------
 
 def run_bench_decode(timeout=180):
-    """Run espresso-bench --decode --fused (fused ANE decode path)."""
-    bench_path = PROJECT_ROOT / ".build" / "release" / "espresso-bench"
-    if not bench_path.exists():
-        success, _ = swift_build("espresso-bench")
+    """Run espresso-generate benchmark (.esp bundle) for REAL tok/s with actual attention."""
+    gen_path = PROJECT_ROOT / ".build" / "release" / "espresso-generate"
+    if not gen_path.exists():
+        success, _ = swift_build("espresso-generate")
         if not success:
             return BenchmarkResult(0, 0, 0, "build_failed")
 
     cmd = [
-        str(bench_path),
-        "--decode", "--fused", "--ane-only",
-        "--decode-steps", str(BENCH_DECODE_STEPS),
-        "--warmup", str(BENCH_DECODE_WARMUP),
-        "--iterations", str(BENCH_DECODE_ITERATIONS),
-        "--layers", str(BENCH_DECODE_LAYERS),
+        str(gen_path), "bench",
+        "--bundle", ESP_BUNDLE,
+        "--max-tokens", str(32),
+        "--no-power", "--no-stats",
+        "--compare-warmup", "1",
+        "--compare-iterations", "10",
+        BENCHMARK_PROMPTS[0],
     ]
 
-    print(f"[bench-decode] {' '.join(cmd)}")
+    print(f"[bench-generate] {' '.join(cmd)}")
     try:
         result = subprocess.run(
             cmd,
@@ -113,9 +114,9 @@ def run_bench_decode(timeout=180):
             timeout=timeout
         )
         output = result.stdout + result.stderr
-        return parse_decode_benchmark(output)
+        return parse_generate_benchmark(output)
     except subprocess.TimeoutExpired:
-        print(f"[bench-decode] TIMED OUT after {timeout}s")
+        print(f"[bench-generate] TIMED OUT after {timeout}s")
         return BenchmarkResult(0, 0, 0, "timeout")
 
 def run_bench_generate(timeout=180):
