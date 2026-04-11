@@ -37,7 +37,7 @@ Key properties to keep in mind when editing:
 ├── espresso                 # zsh launcher (./espresso demo|doctor|...)
 ├── README.md                # user-facing docs
 ├── CONTRIBUTING.md          # human contributor guide (read this too)
-├── CLAUDE.md                # this file (gitignored by default; force-added)
+├── CLAUDE.md                # this file (tracked — guide for AI assistants)
 ├── Sources/                 # Swift/ObjC/C source modules
 ├── Tests/                   # mirror of Sources (one *Tests folder per target)
 ├── Examples/                # SimpleInference, TrainingLoop, BenchmarkSuite
@@ -210,9 +210,9 @@ Pulled from `CONTRIBUTING.md` and what the codebase already does — match it.
 `.gitignore` hides a lot of internal content. If you go looking for files
 and they're "missing", check here first:
 
-- `.claude/`, `CLAUDE.md`, `AGENTS.md` — Claude/agent config. `CLAUDE.md`
-  is ignored by default; force-add it (`git add -f CLAUDE.md`) when the
-  user asks to commit it.
+- `.claude/`, `AGENTS.md` — Claude/agent config is ignored. `CLAUDE.md`
+  itself is tracked (this file). `.claude/` local settings and `AGENTS.md`
+  stay untracked.
 - `tasks/`, `prompts/`, `agents/`, `marketing/`, `archive/`,
   `autoresearch-master/`, `training/`, `results/` — internal planning,
   not committed.
