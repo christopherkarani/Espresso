@@ -2183,6 +2183,9 @@ Verdict:
 - Scope correction:
   the active throughput campaign was reset from grouped-dual-state to `LiquidAI/LFM2.5-350M` after user direction.
   Grouped-dual-state and other families remain background research only and are not valid baselines for this campaign.
+- Objective correction:
+  the goal on this branch is the maximum achievable tok/s number on `LiquidAI/LFM2.5-350M`, with lane labeling kept honest.
+  That means LFM2 remains the optimization target even if other model families have materially higher retained ceilings.
 - Baseline rerun on current release binary:
   command = `./.build/release/espresso-generate generate --bundle /tmp/lfm2-350m.esp --prompt 'Hello' --max-tokens 16 --benchmark-generate --compare-warmup 1 --compare-iterations 5 --no-tui --no-power`
   result = `57.33 tok/s`, `first_token_ms=12.77`, `median_token_ms=18.00`, `p95_token_ms=19.20`
@@ -2210,3 +2213,55 @@ Verdict:
   backend = `cpu_partitioned_fp32`
   output stayed coherent across the full `128`-token sample and continued the same Elara story thread without collapse.
   verdict = KEEP. This is not a breakthrough lane, but it is the correct LFM2 default on the current exact-CPU runtime.
+- Experiment 3: run LFM2 on the same prompt/horizon contract as the retained `805.89 tok/s` publication-style recurrent lane.
+  contract note:
+  the retained `4k+ tok/s` result is a recurrent ANE microbench (`espresso-bench` / recurrent-scaling) and is not a normal text-serving benchmark, so it is not valid for LFM2 coherence comparison.
+  The closest honest comparison is the `24`-prompt, `128`-token publication-style text suite used by the recurrent publication candidates.
+  command shape:
+  repeated `3x` per prompt with
+  `./.build/release/espresso-generate generate --bundle /tmp/lfm2-350m.esp --prompt '<prompt>' --max-tokens 128 --benchmark-generate --compare-warmup 1 --compare-iterations 1 --no-tui --no-power`
+  over every prompt in `scripts/stories_publication_benchmark_prompts.txt`
+  retained artifact = `results/lfm2-350m-publication-shape-20260418/summary.json` plus per-prompt JSON outputs in the same directory.
+  aggregate result:
+  lane = `microbench`,
+  benchmark_shape = publication-style prompt suite without Core ML compare,
+  prompt_count = `24`,
+  median of per-prompt medians = `55.68 tok/s`,
+  min prompt median = `46.06 tok/s`,
+  max prompt median = `61.49 tok/s`,
+  mean prompt median = `55.54 tok/s`.
+  coherence verdict:
+  mixed.
+  Several prompts stayed coherent as ordinary long-form continuations (`hello_long`, `spaceship_log`, `storm_warning`, `journal_entry`).
+  Several prompts were clearly not publication-quality despite avoiding total recurrent-style collapse:
+  `market_scene` repeated the same clock-order sentence until `fifth fifth fifth`,
+  `ocean_mystery` degenerated into `fourth piece of the fourth piece`,
+  `train_station` collapsed into `harbor harbor dockageage...`,
+  `library_note` ended with `left left left...`,
+  `bedtime_story` mostly echoed the instruction prompt instead of telling the story.
+  verdict = KEEP as evidence that LFM2 can survive the long-horizon text contract without the catastrophic all-token attractors seen in some recurrent lanes.
+  KILL any claim that it is competitive with the retained `805.89 tok/s` lane or that it passes a publication-grade coherence gate on this benchmark shape.
+- Experiment 4: prove a real ANE short-conv parity lane instead of guessing from tiny synthetic shapes.
+  initial result:
+  the direct `k=3` short-conv MIL compiled and evaluated on ANE once all IO allocations were padded to a uniform size with a `49_152`-byte floor, but semantic parity stayed broken.
+  bounded audit:
+  a toy `dim=32, lane=8` probe also broke on plain identity grouped `1x1`, which made the small-shape evidence untrustworthy for LFM2.
+  corrected probe contract:
+  switched the hardware test to the actual LFM2 width (`dim=1024`, `laneSpatial=32`) with bounded FP16 input amplitudes,
+  added a grouped depthwise `1x1` identity control,
+  and changed the short-conv recurrent state contract from `spatial=2` to a full previous chunk (`spatial=32`) while slicing the last `2` positions inside the kernel.
+  verification:
+  `swift test --filter 'LFM2ShortConv(KernelTests|FactorizedKernelTests)'`
+  `ANE_HARDWARE_TESTS=1 swift test --filter LFM2ShortConvRuntimeTests`
+  results:
+  grouped identity `1x1` on ANE passes at real LFM2 width,
+  the factorized short-conv kernel matches passthrough under the full-chunk state contract,
+  and the original direct generic `k=3` short-conv kernel also matches passthrough once re-tested under the same corrected contract.
+  benchmark-only follow-up:
+  `ANE_HARDWARE_TESTS=1 LFM2_SHORT_CONV_BENCH=1 swift test --filter 'LFM2ShortConvRuntimeTests/test_lfm2_(factorized|short_conv_kernel_direct)_.*microbench_on_ane'`
+  direct generic = `median_us=113.79`, `p95_us=201.79`, `tok_s=281217.32`
+  factorized = `median_us=124.00`, `p95_us=287.21`, `tok_s=258064.52`
+  lane label = `probe`
+  verdict = KEEP the direct generic ANE short-conv path and the full-chunk recurrent-state contract as the preferred direct-ANE LFM2 conv runtime surface.
+  KILL the factorized variant as the production candidate; keep it only as bounded diagnostic evidence if needed.
+  next question = measure its runtime economics and only then decide whether to integrate it into a broader LFM2 decode lane.

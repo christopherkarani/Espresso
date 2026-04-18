@@ -9,6 +9,21 @@
 - 2026-04-18: On the current `LiquidAI/LFM2.5-350M` exact-CPU lane, the raw FP16 tiled classifier is slower than the partitioned FP32 classifier despite looking like the more specialized path.
   Rule: do not assume the llama large-vocab head policy transfers to LFM2. Force both backends on the real artifact before choosing a default, and keep the benchmark label tied to the backend actually executed rather than the nominal strategy.
 
+- 2026-04-18: A long-horizon publication-style prompt suite and a recurrent ANE microbench are not interchangeable just because both report tok/s.
+  Rule: if the question is output coherence, only use text-serving prompt/horizon contracts. Treat recurrent-scaling or synthetic ANE microbenches as runtime-economics evidence only; they cannot validate or invalidate narrative quality for a dense model like LFM2.
+
+- 2026-04-18: When the user asks for the maximum number on a specific model, optimize that model directly instead of redirecting to a different family with a better known ceiling.
+  Rule: keep the throughput campaign anchored to the named model and define separate lanes for `max raw number`, `max coherent number`, and `publication-shape number` if needed, rather than substituting a different architecture.
+
+- 2026-04-18: Tiny ANE probe shapes can lie about the real LFM2 conv path.
+  Rule: do not treat `dim=32` / `lane=8` grouped-conv behavior as evidence for `LiquidAI/LFM2.5-350M`. Re-run ANE parity probes at the actual LFM2 width (`dim=1024`) with bounded FP16 amplitudes before keeping or killing the short-conv lane.
+
+- 2026-04-18: The LFM2 short-conv ANE kernel can be parity-correct if the recurrent state contract carries a full previous chunk instead of a tiny `spatial=2` output.
+  Rule: for the current ANE lane, keep `convStateIn` / `convStateOut` at full `laneSpatial`, slice the last `kernelWidth - 1` positions inside the kernel, and avoid tiny ANE output surfaces for recurrent carry state.
+
+- 2026-04-18: A previously-killed ANE kernel path can become viable again once the runtime contract is corrected.
+  Rule: after fixing the state contract or probe shape, re-run semantic parity on the original implementation before locking in a slower fallback. On LFM2 short-conv, the direct generic `k=3` kernel became both parity-correct and faster than the factorized fallback under the full-chunk state contract.
+
 - 2026-04-12: Do not build new Espresso import paths on top of `EdgeRunner` when the dependency is already slated for removal.
   Rule: if a model-conversion feature needs parser, tensor-mapping, or BLOBFILE-writing logic that currently exists in `EdgeRunner`, cherry-pick only the minimal logic into Espresso-owned code and keep the new path dependency-free from the start.
 
