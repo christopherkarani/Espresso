@@ -525,6 +525,111 @@ private func shouldRunLegacyQwenExperimentTests(
     )
 }
 
+@Test func test_classifierArgmaxBlockSizeDefaultsTo4000() {
+    #expect(RealModelInferenceEngine.classifierArgmaxBlockSize(environment: [:]) == 4_000)
+    #expect(
+        RealModelInferenceEngine.classifierArgmaxBlockSize(
+            environment: ["ESPRESSO_CLASSIFIER_ARGMAX_BLOCK_SIZE": "0"]
+        ) == 4_000
+    )
+    #expect(
+        RealModelInferenceEngine.classifierArgmaxBlockSize(
+            environment: ["ESPRESSO_CLASSIFIER_ARGMAX_BLOCK_SIZE": "nope"]
+        ) == 4_000
+    )
+}
+
+@Test func test_classifierArgmaxBlockSizeReadsEnvironmentOverride() {
+    #expect(
+        RealModelInferenceEngine.classifierArgmaxBlockSize(
+            environment: ["ESPRESSO_CLASSIFIER_ARGMAX_BLOCK_SIZE": "8192"]
+        ) == 8_192
+    )
+}
+
+@Test func test_decodeContextFromCachesMatchesNaiveReference() {
+    let heads = 4
+    let kvHeads = 2
+    let headDim = 8
+    let visibleTokenCount = 5
+    let cacheStride = 8
+    let qOut = (0..<(heads * headDim)).map { Float(($0 % 7) - 3) * 0.125 }
+    let kCache = (0..<(kvHeads * headDim * cacheStride)).map { Float(($0 % 11) - 5) * 0.0625 }
+    let vCache = (0..<(kvHeads * headDim * cacheStride)).map { Float(($0 % 13) - 6) * 0.05 }
+
+    let actual = RealModelInferenceEngine.decodeContextFromCachesForTesting(
+        qOut: qOut,
+        kCache: kCache,
+        vCache: vCache,
+        heads: heads,
+        kvHeads: kvHeads,
+        headDim: headDim,
+        visibleTokenCount: visibleTokenCount,
+        cacheStride: cacheStride
+    )
+    let expected = naiveDecodeContextFromCaches(
+        qOut: qOut,
+        kCache: kCache,
+        vCache: vCache,
+        heads: heads,
+        kvHeads: kvHeads,
+        headDim: headDim,
+        visibleTokenCount: visibleTokenCount,
+        cacheStride: cacheStride
+    )
+
+    #expect(maxAbsoluteDifference(actual, expected) < 1e-4)
+}
+
+@Test func test_fusedFFNGateUpProjectionMatchesSeparateSwiGLUPath() {
+    let cols = 3
+    let hiddenDim = 2
+    let gate: [Float] = [
+        1, 2, 3,
+        4, 5, 6,
+    ]
+    let up: [Float] = [
+        7, 8, 9,
+        10, 11, 12,
+    ]
+    let vector: [Float] = [0.25, -0.5, 1.5]
+
+    let fused = RealModelInferenceEngine.concatenateRowMajorMatricesVertically(
+        upper: gate,
+        lower: up,
+        cols: cols
+    )
+    let fusedProjection = RealModelInferenceEngine.multiplyRowMajorMatrix(
+        matrix: fused,
+        rows: hiddenDim * 2,
+        cols: cols,
+        vector: vector
+    )
+    let activated = RealModelInferenceEngine.swiGLUActivatedFromFusedProjection(
+        fusedProjection,
+        hiddenDim: hiddenDim
+    )
+
+    let separateGate = RealModelInferenceEngine.multiplyRowMajorMatrix(
+        matrix: gate,
+        rows: hiddenDim,
+        cols: cols,
+        vector: vector
+    )
+    let separateUp = RealModelInferenceEngine.multiplyRowMajorMatrix(
+        matrix: up,
+        rows: hiddenDim,
+        cols: cols,
+        vector: vector
+    )
+    let expected = zip(separateGate, separateUp).map { gateValue, upValue in
+        let silu = gateValue / (1 + Float(Darwin.exp(Double(-gateValue))))
+        return silu * upValue
+    }
+
+    #expect(activated.elementsEqual(expected, by: { abs($0 - $1) < 1e-5 }))
+}
+
 @Test func test_evalHybridSingleLayerRawQKVOutputsForTestingRejectsUnsupportedArchitecture() throws {
     let config = makeTinyGPT2Config()
     try expectRealModelInferenceError(containing: "llama-family artifacts only") {
@@ -1337,6 +1442,27 @@ private func shouldRunLegacyQwenExperimentTests(
     #expect(maxDiff < 0.01)
 }
 
+@Test func test_hybridSingleLayerRunsForActualLFM2AttentionWeights() throws {
+    guard shouldRunANEHardwareTests() else { return }
+    guard let weightsDir = lfm2ProbeWeightDirectory() else { return }
+
+    let metadataURL = URL(fileURLWithPath: weightsDir, isDirectory: true).appendingPathComponent("metadata.json")
+    let metadata = try JSONDecoder().decode(DebugWeightMetadataFile.self, from: Data(contentsOf: metadataURL))
+    let config = try metadata.asConfig()
+    let attentionLayer = try #require(config.resolvedLFM2LayerTypes.firstIndex(of: .fullAttention))
+
+    let output = try RealModelInferenceEngine.evalHybridSingleLayerForTesting(
+        config: config,
+        weightDir: weightsDir,
+        layer: attentionLayer,
+        tokens: [11, 22]
+    )
+
+    #expect(output.count == config.dModel)
+    #expect(output.allSatisfy { $0.isFinite })
+    #expect(output.contains(where: { abs($0) > 0.0001 }))
+}
+
 @Test func test_fullModelGeneration() throws {
     guard shouldRunANEHardwareTests() else { return }
 
@@ -1450,6 +1576,9 @@ private struct DebugWeightMetadataFile: Decodable {
     let ropeTheta: Float?
     let eosToken: UInt32?
     let architecture: String
+    let layerTypes: [LFM2LayerType]?
+    let convCacheLength: Int?
+    let tieEmbedding: Bool?
 
     func asConfig() throws -> MultiModelConfig {
         let parsedArchitecture: MultiModelConfig.Architecture
@@ -1458,6 +1587,8 @@ private struct DebugWeightMetadataFile: Decodable {
             parsedArchitecture = .gpt2
         case "llama":
             parsedArchitecture = .llama
+        case "lfm2":
+            parsedArchitecture = .lfm2
         default:
             throw RealModelInferenceError.runtimeFailure("Unsupported architecture in metadata.json: \(architecture)")
         }
@@ -1474,7 +1605,10 @@ private struct DebugWeightMetadataFile: Decodable {
             normEps: normEps,
             ropeTheta: ropeTheta ?? 10_000.0,
             eosToken: eosToken,
-            architecture: parsedArchitecture
+            architecture: parsedArchitecture,
+            lfm2LayerTypes: layerTypes,
+            lfm2ConvCacheLength: convCacheLength,
+            tieEmbedding: tieEmbedding ?? false
         )
     }
 }
@@ -4449,8 +4583,64 @@ private func maxAbsoluteDifference(_ lhs: [Float], _ rhs: [Float]) -> Float {
     return maxValue
 }
 
+private func naiveDecodeContextFromCaches(
+    qOut: [Float],
+    kCache: [Float],
+    vCache: [Float],
+    heads: Int,
+    kvHeads: Int,
+    headDim: Int,
+    visibleTokenCount: Int,
+    cacheStride: Int
+) -> [Float] {
+    let queriesPerKVHead = max(heads / max(kvHeads, 1), 1)
+    let scale: Float = 1.0 / sqrt(Float(headDim))
+    var context = [Float](repeating: 0, count: heads * headDim)
+
+    for head in 0..<heads {
+        let kvHead = min(head / queriesPerKVHead, kvHeads - 1)
+        let qBase = head * headDim
+        let kvBase = kvHead * headDim
+        var scores = [Float](repeating: 0, count: visibleTokenCount)
+        for token in 0..<visibleTokenCount {
+            var dot: Float = 0
+            for dim in 0..<headDim {
+                dot += qOut[qBase + dim] * kCache[(kvBase + dim) * cacheStride + token]
+            }
+            scores[token] = dot * scale
+        }
+
+        let maxScore = scores.max() ?? 0
+        var denom: Float = 0
+        for token in 0..<visibleTokenCount {
+            scores[token] = exp(scores[token] - maxScore)
+            denom += scores[token]
+        }
+        let invDenom: Float = denom > 0 ? 1 / denom : 0
+
+        for dim in 0..<headDim {
+            var accum: Float = 0
+            for token in 0..<visibleTokenCount {
+                accum += scores[token] * invDenom * vCache[(kvBase + dim) * cacheStride + token]
+            }
+            context[qBase + dim] = accum
+        }
+    }
+
+    return context
+}
+
 private func shouldRunANEHardwareTests() -> Bool {
     ProcessInfo.processInfo.environment["ANE_HARDWARE_TESTS"] == "1" && aneIsAvailable()
+}
+
+private func lfm2ProbeWeightDirectory() -> String? {
+    let environment = ProcessInfo.processInfo.environment
+    if let explicit = environment["ESPRESSO_LFM2_WEIGHT_DIR"], !explicit.isEmpty {
+        return FileManager.default.fileExists(atPath: explicit) ? explicit : nil
+    }
+    let defaultPath = "/tmp/lfm2-350m.esp/weights"
+    return FileManager.default.fileExists(atPath: defaultPath) ? defaultPath : nil
 }
 
 private func aneIsAvailable() -> Bool {

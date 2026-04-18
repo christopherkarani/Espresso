@@ -1,5 +1,14 @@
 # Lessons
 
+- 2026-04-18: A real LFM2 `full_attention` layer compiling through `HybridDecodeKernelSet` on ANE does NOT imply that a mixed-runtime serving lane is semantically usable.
+  Rule: after any single-layer hybrid or ANE probe succeeds, run a real free-form text rollout before keeping the architecture splice. On `LiquidAI/LFM2.5-350M`, the attention-layer probe compiled and executed cleanly, but the six-layer mixed-runtime decode collapsed into `a little girl named ...` loops and had to be killed despite the apparent runtime viability.
+
+- 2026-04-18: On the retained exact LFM2 lane, long-horizon throughput was more sensitive to the attention-context implementation than the short `128`-token benchmark suggested.
+  Rule: when a profile shows a scalar `Q*K^T` / `V*softmax` cache loop on the hot path, optimize that visible-token-dependent loop first and re-measure on a long coherent rollout, not only the short benchmark. Rewriting `decodeContextFromCaches` to BLAS-backed matrix-vector ops moved the retained long-horizon `Once upon a time` run from `46.78 tok/s` to repeated `56.74-56.86 tok/s` while preserving coherent output.
+
+- 2026-04-18: Small single-run wins in classifier partition size are too noisy to justify a new default on this repo.
+  Rule: treat `ESPRESSO_CLASSIFIER_ARGMAX_BLOCK_SIZE` or similar tuning knobs as research surfaces until at least two repeated same-contract runs show a stable edge. On LFM2, `8192` briefly beat the default `4000` block size once but failed to repeat strongly enough to change the default.
+
 - 2026-04-18: Hugging Face BPE tokenizers do not always encode BOS as `<|begin_of_text|>` or inline numeric `ids` on `TemplateProcessing` entries.
   Rule: when importing a new tokenizer-json model family, resolve BOS/prefix tokens through the `post_processor.special_tokens` map as well as direct `ids`, and accept alternate BOS token names such as `<|startoftext|>`. Otherwise Espresso can silently drop BOS, appear parity-broken, and report meaningless throughput on the wrong prompt contract.
 

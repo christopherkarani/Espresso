@@ -119,7 +119,7 @@ public enum RealModelInferenceError: Error, Sendable, Equatable, LocalizedError 
 
 public struct RealModelInferenceEngine: ~Copyable {
     private static let minimumANEIOSurfaceBytes = 49_152
-    private static let classifierArgmaxBlockSize = 4_000
+    private static let defaultClassifierArgmaxBlockSize = 4_000
 
     public struct GPT2AttentionCompileProbeResult: Sendable, Equatable {
         public let spatial: Int
@@ -301,6 +301,17 @@ public struct RealModelInferenceEngine: ~Copyable {
         default:
             return false
         }
+    }
+
+    static func classifierArgmaxBlockSize(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Int {
+        guard let rawValue = environment["ESPRESSO_CLASSIFIER_ARGMAX_BLOCK_SIZE"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+              let parsed = Int(rawValue),
+              parsed > 0 else {
+            return defaultClassifierArgmaxBlockSize
+        }
+        return parsed
     }
 
     static func prefersCPUExactDecode(
@@ -513,9 +524,8 @@ public struct RealModelInferenceEngine: ~Copyable {
         let wv: [Float]
         let wo: [Float]
         let rmsFfn: [Float]
-        let w1: [Float]
+        let ffnGateUp: [Float]
         let w2: [Float]
-        let w3: [Float]
         let qNorm: [Float]?
         let kNorm: [Float]?
     }
@@ -540,9 +550,8 @@ public struct RealModelInferenceEngine: ~Copyable {
         let rmsAtt: [Float]
         let operatorWeights: ExactCPULFM2OperatorWeights
         let rmsFfn: [Float]
-        let w1: [Float]
+        let ffnGateUp: [Float]
         let w2: [Float]
-        let w3: [Float]
     }
 
     private struct CachedExactCPULlamaWeights: Sendable {
@@ -592,6 +601,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         let finalNormGamma: [Float]
         let lmHead: [Float]
         let layers: [ExactCPULlamaLayerWeights]
+        let classifierBlockSize: Int
         let classifierBlockMaxNorms: [Float]
         var classifierLogitsScratch: [Float]
         var kCaches: [[Float]]
@@ -618,6 +628,7 @@ public struct RealModelInferenceEngine: ~Copyable {
                 at: topLevelPaths.lmHead,
                 expectedCount: config.vocab * config.dModel
             )
+            let classifierBlockSize = RealModelInferenceEngine.classifierArgmaxBlockSize()
             self.layers = try (0..<config.nLayer).map { layerIndex in
                 let paths = LayerWeightPaths.forLayer(
                     layerIndex,
@@ -634,12 +645,13 @@ public struct RealModelInferenceEngine: ~Copyable {
                     classifier: weightBuffer.baseAddress!,
                     vocabSize: config.vocab,
                     dim: config.dModel,
-                    blockSize: RealModelInferenceEngine.classifierArgmaxBlockSize
+                    blockSize: classifierBlockSize
                 )
             }
+            self.classifierBlockSize = classifierBlockSize
             self.classifierLogitsScratch = [Float](
                 repeating: 0,
-                count: min(RealModelInferenceEngine.classifierArgmaxBlockSize, config.vocab)
+                count: min(classifierBlockSize, config.vocab)
             )
             self.kCaches = Array(
                 repeating: [Float](repeating: 0, count: config.kvDim * config.maxSeq),
@@ -838,19 +850,16 @@ public struct RealModelInferenceEngine: ~Copyable {
                     weight: layer.rmsFfn,
                     eps: Float(config.normEps)
                 )
-                let gate = RealModelInferenceEngine.multiplyRowMajorMatrix(
-                    matrix: layer.w1,
-                    rows: config.hiddenDim,
+                let gateUp = RealModelInferenceEngine.multiplyRowMajorMatrix(
+                    matrix: layer.ffnGateUp,
+                    rows: config.hiddenDim * 2,
                     cols: config.dModel,
                     vector: ffnNormed
                 )
-                let up = RealModelInferenceEngine.multiplyRowMajorMatrix(
-                    matrix: layer.w3,
-                    rows: config.hiddenDim,
-                    cols: config.dModel,
-                    vector: ffnNormed
+                let activated = RealModelInferenceEngine.swiGLUActivatedFromFusedProjection(
+                    gateUp,
+                    hiddenDim: config.hiddenDim
                 )
-                let activated = zip(gate, up).map { RealModelInferenceEngine.silu($0) * $1 }
                 let down = RealModelInferenceEngine.multiplyRowMajorMatrix(
                     matrix: layer.w2,
                     rows: config.dModel,
@@ -880,7 +889,7 @@ public struct RealModelInferenceEngine: ~Copyable {
                                 blockMaxNorms: normsBase,
                                 vocabSize: config.vocab,
                                 dim: config.dModel,
-                                blockSize: RealModelInferenceEngine.classifierArgmaxBlockSize
+                                blockSize: classifierBlockSize
                             )
                         }
                     }
@@ -1393,12 +1402,13 @@ public struct RealModelInferenceEngine: ~Copyable {
             lmHead = a.lmHead
             hasExactFloat32LMHead = a.lmHeadHasExactFloat32Sidecar
         }
+        let classifierBlockSize = Self.classifierArgmaxBlockSize(environment: environment)
         let classifierBlockMaxNorms = lmHead.withUnsafeBufferPointer { weightBuffer in
-            Self.precomputeClassifierBlockMaxNorms(
+            return Self.precomputeClassifierBlockMaxNorms(
                 classifier: weightBuffer.baseAddress!,
                 vocabSize: config.vocab,
                 dim: config.dModel,
-                blockSize: Self.classifierArgmaxBlockSize
+                blockSize: classifierBlockSize
             )
         }
         self.config = config
@@ -1424,7 +1434,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         self.classifierBlockMaxNorms = classifierBlockMaxNorms
         self.classifierLogitsScratch = [Float](
             repeating: 0,
-            count: min(Self.classifierArgmaxBlockSize, config.vocab)
+            count: min(classifierBlockSize, config.vocab)
         )
         self.classifierStrategy = Self.resolveClassifierStrategy(
             config: config,
@@ -6334,9 +6344,18 @@ public struct RealModelInferenceEngine: ~Copyable {
             rmsAtt: try loadWeightTablePreferringFloat32Sidecar(at: paths.rmsAtt, expectedCount: config.dModel),
             operatorWeights: operatorWeights,
             rmsFfn: try loadWeightTablePreferringFloat32Sidecar(at: paths.rmsFfn, expectedCount: config.dModel),
-            w1: try loadWeightTablePreferringFloat32Sidecar(at: paths.w1, expectedCount: config.hiddenDim * config.dModel),
+            ffnGateUp: Self.concatenateRowMajorMatricesVertically(
+                upper: try loadWeightTablePreferringFloat32Sidecar(
+                    at: paths.w1,
+                    expectedCount: config.hiddenDim * config.dModel
+                ),
+                lower: try loadWeightTablePreferringFloat32Sidecar(
+                    at: w3Path,
+                    expectedCount: config.hiddenDim * config.dModel
+                ),
+                cols: config.dModel
+            ),
             w2: try loadWeightTablePreferringFloat32Sidecar(at: paths.w2, expectedCount: config.dModel * config.hiddenDim),
-            w3: try loadWeightTablePreferringFloat32Sidecar(at: w3Path, expectedCount: config.hiddenDim * config.dModel)
         )
     }
 
@@ -6690,19 +6709,16 @@ public struct RealModelInferenceEngine: ~Copyable {
                     ).map(+)
                 )
                 let ffnNormed = Self.rmsNorm(projected, weight: layer.rmsFfn, eps: Float(config.normEps))
-                let gate = Self.multiplyRowMajorMatrix(
-                    matrix: layer.w1,
-                    rows: config.hiddenDim,
+                let gateUp = Self.multiplyRowMajorMatrix(
+                    matrix: layer.ffnGateUp,
+                    rows: config.hiddenDim * 2,
                     cols: config.dModel,
                     vector: ffnNormed
                 )
-                let up = Self.multiplyRowMajorMatrix(
-                    matrix: layer.w3,
-                    rows: config.hiddenDim,
-                    cols: config.dModel,
-                    vector: ffnNormed
+                let activated = Self.swiGLUActivatedFromFusedProjection(
+                    gateUp,
+                    hiddenDim: config.hiddenDim
                 )
-                let activated = zip(gate, up).map { Self.silu($0) * $1 }
                 let down = Self.multiplyRowMajorMatrix(
                     matrix: layer.w2,
                     rows: config.dModel,
@@ -6981,19 +6997,16 @@ public struct RealModelInferenceEngine: ~Copyable {
 
                 let projected = maybeRound(zip(hidden, operatorOut).map(+))
                 let ffnNormed = Self.rmsNorm(projected, weight: layer.rmsFfn, eps: Float(config.normEps))
-                let gate = Self.multiplyRowMajorMatrix(
-                    matrix: layer.w1,
-                    rows: config.hiddenDim,
+                let gateUp = Self.multiplyRowMajorMatrix(
+                    matrix: layer.ffnGateUp,
+                    rows: config.hiddenDim * 2,
                     cols: config.dModel,
                     vector: ffnNormed
                 )
-                let up = Self.multiplyRowMajorMatrix(
-                    matrix: layer.w3,
-                    rows: config.hiddenDim,
-                    cols: config.dModel,
-                    vector: ffnNormed
+                let activated = Self.swiGLUActivatedFromFusedProjection(
+                    gateUp,
+                    hiddenDim: config.hiddenDim
                 )
-                let activated = zip(gate, up).map { Self.silu($0) * $1 }
                 let down = Self.multiplyRowMajorMatrix(
                     matrix: layer.w2,
                     rows: config.dModel,
@@ -7300,9 +7313,18 @@ public struct RealModelInferenceEngine: ~Copyable {
             wv: try loadWeightTablePreferringFloat32Sidecar(at: paths.wv, expectedCount: config.dModel * config.kvDim),
             wo: try loadWeightTablePreferringFloat32Sidecar(at: paths.wo, expectedCount: config.dModel * config.attentionDim),
             rmsFfn: try loadWeightTablePreferringFloat32Sidecar(at: paths.rmsFfn, expectedCount: config.dModel),
-            w1: try loadWeightTablePreferringFloat32Sidecar(at: paths.w1, expectedCount: config.hiddenDim * config.dModel),
+            ffnGateUp: Self.concatenateRowMajorMatricesVertically(
+                upper: try loadWeightTablePreferringFloat32Sidecar(
+                    at: paths.w1,
+                    expectedCount: config.hiddenDim * config.dModel
+                ),
+                lower: try loadWeightTablePreferringFloat32Sidecar(
+                    at: w3Path,
+                    expectedCount: config.hiddenDim * config.dModel
+                ),
+                cols: config.dModel
+            ),
             w2: try loadWeightTablePreferringFloat32Sidecar(at: paths.w2, expectedCount: config.dModel * config.hiddenDim),
-            w3: try loadWeightTablePreferringFloat32Sidecar(at: w3Path, expectedCount: config.hiddenDim * config.dModel),
             qNorm: qkNormWeights?.q,
             kNorm: qkNormWeights?.k
         )
@@ -7359,7 +7381,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         }
     }
 
-    private static func multiplyRowMajorMatrix(
+    static func multiplyRowMajorMatrix(
         matrix: [Float],
         rows: Int,
         cols: Int,
@@ -7378,6 +7400,36 @@ public struct RealModelInferenceEngine: ~Copyable {
             }
         }
         return output
+    }
+
+    static func concatenateRowMajorMatricesVertically(
+        upper: [Float],
+        lower: [Float],
+        cols: Int
+    ) -> [Float] {
+        precondition(cols > 0)
+        precondition(upper.count.isMultiple(of: cols))
+        precondition(lower.count.isMultiple(of: cols))
+
+        var fused = [Float]()
+        fused.reserveCapacity(upper.count + lower.count)
+        fused.append(contentsOf: upper)
+        fused.append(contentsOf: lower)
+        return fused
+    }
+
+    static func swiGLUActivatedFromFusedProjection(
+        _ gateUp: [Float],
+        hiddenDim: Int
+    ) -> [Float] {
+        precondition(hiddenDim > 0)
+        precondition(gateUp.count == hiddenDim * 2)
+
+        var activated = [Float](repeating: 0, count: hiddenDim)
+        for index in 0..<hiddenDim {
+            activated[index] = silu(gateUp[index]) * gateUp[hiddenDim + index]
+        }
+        return activated
     }
 
     private static func roundFloat16Vector(_ values: [Float]) -> [Float] {
@@ -7449,40 +7501,101 @@ public struct RealModelInferenceEngine: ~Copyable {
         precondition(vCache.count == kvHeads * headDim * cacheStride)
         precondition(visibleTokenCount > 0 && visibleTokenCount <= cacheStride)
         let queriesPerKVHead = max(heads / max(kvHeads, 1), 1)
-        let scale = 1.0 / sqrt(Float(headDim))
+        let scale: Float = 1.0 / sqrt(Float(headDim))
         var context = [Float](repeating: 0, count: heads * headDim)
+        var scores = [Float](repeating: 0, count: visibleTokenCount)
 
-        for head in 0..<heads {
-            let kvHead = min(head / queriesPerKVHead, kvHeads - 1)
-            let qBase = head * headDim
-            let kvBase = kvHead * headDim
-            var scores = [Float](repeating: 0, count: visibleTokenCount)
-            for token in 0..<visibleTokenCount {
-                var dot: Float = 0
-                for dim in 0..<headDim {
-                    dot += qOut[qBase + dim] * kCache[(kvBase + dim) * cacheStride + token]
+        qOut.withUnsafeBufferPointer { qBuffer in
+            kCache.withUnsafeBufferPointer { kBuffer in
+                vCache.withUnsafeBufferPointer { vBuffer in
+                    context.withUnsafeMutableBufferPointer { contextBuffer in
+                        scores.withUnsafeMutableBufferPointer { scoresBuffer in
+                            guard let qBasePtr = qBuffer.baseAddress,
+                                  let kBasePtr = kBuffer.baseAddress,
+                                  let vBasePtr = vBuffer.baseAddress,
+                                  let contextBasePtr = contextBuffer.baseAddress,
+                                  let scoresBasePtr = scoresBuffer.baseAddress else {
+                                return
+                            }
+
+                            for head in 0..<heads {
+                                let kvHead = min(head / queriesPerKVHead, kvHeads - 1)
+                                let qBase = head * headDim
+                                let kvBase = kvHead * headDim
+
+                                cblas_sgemv(
+                                    CblasRowMajor,
+                                    CblasTrans,
+                                    Int32(headDim),
+                                    Int32(visibleTokenCount),
+                                    scale,
+                                    kBasePtr.advanced(by: kvBase * cacheStride),
+                                    Int32(cacheStride),
+                                    qBasePtr.advanced(by: qBase),
+                                    1,
+                                    0,
+                                    scoresBasePtr,
+                                    1
+                                )
+
+                                var maxScore: Float = -.infinity
+                                for token in 0..<visibleTokenCount {
+                                    maxScore = max(maxScore, scoresBuffer[token])
+                                }
+                                var denom: Float = 0
+                                for token in 0..<visibleTokenCount {
+                                    scoresBuffer[token] = exp(scoresBuffer[token] - maxScore)
+                                    denom += scoresBuffer[token]
+                                }
+                                let invDenom: Float = denom > 0 ? 1 / denom : 0
+                                for token in 0..<visibleTokenCount {
+                                    scoresBuffer[token] *= invDenom
+                                }
+
+                                cblas_sgemv(
+                                    CblasRowMajor,
+                                    CblasNoTrans,
+                                    Int32(headDim),
+                                    Int32(visibleTokenCount),
+                                    1,
+                                    vBasePtr.advanced(by: kvBase * cacheStride),
+                                    Int32(cacheStride),
+                                    scoresBasePtr,
+                                    1,
+                                    0,
+                                    contextBasePtr.advanced(by: qBase),
+                                    1
+                                )
+                            }
+                        }
+                    }
                 }
-                scores[token] = dot * scale
-            }
-
-            let maxScore = scores.max() ?? 0
-            var denom: Float = 0
-            for token in 0..<visibleTokenCount {
-                scores[token] = exp(scores[token] - maxScore)
-                denom += scores[token]
-            }
-            let invDenom: Float = denom > 0 ? 1 / denom : 0
-
-            for dim in 0..<headDim {
-                var accum: Float = 0
-                for token in 0..<visibleTokenCount {
-                    accum += scores[token] * invDenom * vCache[(kvBase + dim) * cacheStride + token]
-                }
-                context[qBase + dim] = accum
             }
         }
 
         return context
+    }
+
+    static func decodeContextFromCachesForTesting(
+        qOut: [Float],
+        kCache: [Float],
+        vCache: [Float],
+        heads: Int,
+        kvHeads: Int,
+        headDim: Int,
+        visibleTokenCount: Int,
+        cacheStride: Int
+    ) -> [Float] {
+        decodeContextFromCaches(
+            qOut: qOut,
+            kCache: kCache,
+            vCache: vCache,
+            heads: heads,
+            kvHeads: kvHeads,
+            headDim: headDim,
+            visibleTokenCount: visibleTokenCount,
+            cacheStride: cacheStride
+        )
     }
 
     private static func silu(_ value: Float) -> Float {
@@ -8765,7 +8878,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         precondition(hidden.count == config.dModel)
         switch classifierStrategy {
         case .ane, .cpuPartitionedFP32:
-            let blockSize = Self.classifierArgmaxBlockSize
+            let blockSize = Self.classifierArgmaxBlockSize()
             return hidden.withUnsafeBufferPointer { hiddenBuffer in
                 lmHeadWeights.withUnsafeBufferPointer { weightBuffer in
                     classifierBlockMaxNorms.withUnsafeBufferPointer { normsBuffer in
@@ -8804,12 +8917,12 @@ public struct RealModelInferenceEngine: ~Copyable {
                                 return Self.partitionedArgmax(
                                     classifier: weightBase,
                                     input: hiddenBase,
-                                    logitsScratch: scratchBase,
-                                    blockMaxNorms: normsBase,
-                                    vocabSize: config.vocab,
-                                    dim: config.dModel,
-                                    blockSize: Self.classifierArgmaxBlockSize
-                                )
+                                logitsScratch: scratchBase,
+                                blockMaxNorms: normsBase,
+                                vocabSize: config.vocab,
+                                dim: config.dModel,
+                                blockSize: Self.classifierArgmaxBlockSize()
+                            )
                             }
                         }
                     }

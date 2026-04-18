@@ -2171,6 +2171,7 @@ Verdict:
 - [x] Reproduce the retained Liquid 350M baseline on the current codebase.
 - [x] Audit likely free LFM2 runtime wins on the current codebase.
 - [x] Run bounded LFM2-specific experiments and log keep / kill verdicts.
+- [x] Probe whether a real LFM2 `full_attention` layer can execute through the existing hybrid decode helper on ANE.
 - [ ] Promote only a materially better coherent Liquid 350M lane.
 
 ### Kill Criteria
@@ -2265,3 +2266,41 @@ Verdict:
   verdict = KEEP the direct generic ANE short-conv path and the full-chunk recurrent-state contract as the preferred direct-ANE LFM2 conv runtime surface.
   KILL the factorized variant as the production candidate; keep it only as bounded diagnostic evidence if needed.
   next question = measure its runtime economics and only then decide whether to integrate it into a broader LFM2 decode lane.
+- Experiment 5: test whether real LFM2 `full_attention` layers can be stolen by the existing hybrid decode runtime.
+  verification:
+  `ANE_HARDWARE_TESTS=1 ESPRESSO_LFM2_WEIGHT_DIR=/tmp/lfm2-350m.esp/weights swift test --filter test_hybridSingleLayerRunsForActualLFM2AttentionWeights`
+  result:
+  a real LFM2 attention layer (`layer 2` from the retained `350M` bundle) compiles and executes through `HybridDecodeKernelSet` on ANE in roughly `0.9s`.
+  bounded follow-up:
+  a feature-gated mixed-runtime splice that replaced only the six `full_attention` layers with cached hybrid runtimes was benchmarked on the retained `128`-token contract.
+  `ESPRESSO_ENABLE_LFM2_HYBRID_ATTENTION=1 ./.build/release/espresso-generate generate --bundle /tmp/lfm2-350m.esp --prompt 'Once upon a time' --max-tokens 128 --benchmark-generate --compare-warmup 1 --compare-iterations 3 --no-tui --no-power`
+  -> `42.77 tok/s`, `first_token_ms=14.03`, incoherent repetitive continuation (`a little girl named ...`).
+  `ESPRESSO_ENABLE_LFM2_HYBRID_ATTENTION=1 ESPRESSO_USE_CPU_DECODE_ATTENTION=1 ...`
+  -> `50.26 tok/s`, same coherence failure.
+  verdict = KEEP the single-layer probe as runtime evidence.
+  KILL the mixed-runtime LFM2 attention splice as a coherent serving lane; compile success alone was not enough.
+- Experiment 6: optimize the exact CPU attention-context hot loop instead of forcing a broader runtime splice.
+  profile result before the change:
+  the long-horizon retained sample was dominated by FFN GEMVs, the exact classifier, and the scalar `decodeContextFromCaches` loop.
+  code change:
+  rewrote `decodeContextFromCaches` to use BLAS-backed matrix-vector multiplies for both `Q*K^T` and `V*softmax(scores)`,
+  added an explicit numeric parity test against the previous naive implementation,
+  and added a bounded `ESPRESSO_CLASSIFIER_ARGMAX_BLOCK_SIZE` tuning hook for the partitioned FP32 classifier without changing the default block size.
+  verification:
+  `swift test --filter 'test_(classifierArgmaxBlockSizeDefaultsTo4000|classifierArgmaxBlockSizeReadsEnvironmentOverride|decodeContextFromCachesMatchesNaiveReference|fusedFFNGateUpProjectionMatchesSeparateSwiGLUPath)'`
+  `ANE_HARDWARE_TESTS=1 ESPRESSO_LFM2_WEIGHT_DIR=/tmp/lfm2-350m.esp/weights swift test --filter test_hybridSingleLayerRunsForActualLFM2AttentionWeights`
+  `swift build -c release --product espresso-generate`
+  retained long-horizon benchmark:
+  `./.build/release/espresso-generate generate --bundle /tmp/lfm2-350m.esp --prompt 'Once upon a time' --max-tokens 4096 --benchmark-generate --compare-warmup 0 --compare-iterations 1 --no-tui --no-power`
+  repeated results = `56.74 tok/s`, `56.83 tok/s`, `56.86 tok/s`,
+  `generated_tokens=519`,
+  coherent Elara continuation preserved through EOS.
+  retained short-horizon spot-check:
+  `./.build/release/espresso-generate generate --bundle /tmp/lfm2-350m.esp --prompt 'Once upon a time' --max-tokens 128 --benchmark-generate --compare-warmup 1 --compare-iterations 3 --no-tui --no-power`
+  -> `57.85 tok/s`, `first_token_ms=3.26`, `median_token_ms=17.28`, `p95_token_ms=17.91`.
+  classifier sweep:
+  `ESPRESSO_CLASSIFIER_ARGMAX_BLOCK_SIZE=8192` -> `57.17 tok/s` once, `56.31 tok/s` on repeat,
+  `16384` -> `57.01 tok/s`,
+  `32768` -> `56.39 tok/s`.
+  verdict = KEEP the BLAS attention-context rewrite as a real long-horizon win on the retained coherent LFM2 lane.
+  KEEP the classifier block-size tuning hook for bounded future sweeps, but KILL any default change from the current evidence; the `8192` edge was not stable enough to promote.
