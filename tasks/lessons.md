@@ -9,6 +9,15 @@
 - 2026-04-18: Small single-run wins in classifier partition size are too noisy to justify a new default on this repo.
   Rule: treat `ESPRESSO_CLASSIFIER_ARGMAX_BLOCK_SIZE` or similar tuning knobs as research surfaces until at least two repeated same-contract runs show a stable edge. On LFM2, `8192` briefly beat the default `4000` block size once but failed to repeat strongly enough to change the default.
 
+- 2026-04-18: A BLAS-backed speedup in one LFM2 hot loop does not generalize automatically to the rest of the exact CPU lane.
+  Rule: do not replace generic `vDSP_mmul` matvec helpers with direct `cblas_sgemv` just because the attention-cache rewrite improved. On the retained `LiquidAI/LFM2.5-350M` lane, swapping the shared `multiplyRowMajorMatrix` helper to `cblas_sgemv` dropped the long coherent benchmark from `56.74-56.86 tok/s` to `44.70 tok/s`, so every BLAS substitution must be justified by the exact shape and call pattern it serves.
+
+- 2026-04-18: Throughput benchmarks on this repo cannot be parallelized without contaminating the result.
+  Rule: never run two long tok/s jobs concurrently on the same host. A mistakenly parallelized LFM2 control/candidate pair collapsed from the mid-50 tok/s range to roughly `36.7-36.9 tok/s`, which made the first comparison unusable.
+
+- 2026-04-18: Reordering partitioned-classifier blocks by descending max row norm is too weak to matter on the retained LFM2 lane.
+  Rule: do not keep classifier scheduling heuristics unless they clear a material repeated win on the long coherent contract. On `LiquidAI/LFM2.5-350M`, `ESPRESSO_CLASSIFIER_ORDER_BLOCKS_BY_MAX_NORM=1` preserved exactness and coherence but moved the retained long run only from `55.29 tok/s` to `55.39 tok/s`, which is noise, not a publishable gain.
+
 - 2026-04-18: Hugging Face BPE tokenizers do not always encode BOS as `<|begin_of_text|>` or inline numeric `ids` on `TemplateProcessing` entries.
   Rule: when importing a new tokenizer-json model family, resolve BOS/prefix tokens through the `post_processor.special_tokens` map as well as direct `ids`, and accept alternate BOS token names such as `<|startoftext|>`. Otherwise Espresso can silently drop BOS, appear parity-broken, and report meaningless throughput on the wrong prompt contract.
 

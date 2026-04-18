@@ -2304,3 +2304,31 @@ Verdict:
   `32768` -> `56.39 tok/s`.
   verdict = KEEP the BLAS attention-context rewrite as a real long-horizon win on the retained coherent LFM2 lane.
   KEEP the classifier block-size tuning hook for bounded future sweeps, but KILL any default change from the current evidence; the `8192` edge was not stable enough to promote.
+- Experiment 7: test whether the generic row-major matvec helper should also switch from `vDSP_mmul` to direct `cblas_sgemv`.
+  hypothesis:
+  the attention-cache rewrite benefited from explicit BLAS matvecs, so the same might also help the generic `multiplyRowMajorMatrix` helper used by FFN, projection, and other exact-CPU paths.
+  code change:
+  temporarily replaced `multiplyRowMajorMatrix(...into:)` with direct `cblas_sgemv` and added a bounded parity test against a naive row-major reference.
+  retained benchmark:
+  `./.build/release/espresso-generate generate --bundle /tmp/lfm2-350m.esp --prompt 'Once upon a time' --max-tokens 4096 --benchmark-generate --compare-warmup 0 --compare-iterations 1 --no-tui --no-power`
+  result:
+  `44.70 tok/s`, `first_token_ms=10.59`, `median_token_ms=21.90`, `p95_token_ms=25.49`.
+  output stayed coherent, but throughput cratered versus the retained `56.74-56.86 tok/s` baseline.
+  verdict = KILL. Keep the helper on `vDSP_mmul`; the earlier BLAS win was specific to the visible-token attention-cache path, not a global matrix-vector replacement rule.
+- Experiment 8: test whether partitioned-classifier block scheduling should evaluate the highest-norm blocks first.
+  hypothesis:
+  the partitioned FP32 classifier already prunes blocks with a Cauchy-Schwarz upper bound. Reordering blocks by descending precomputed max row norm might raise `bestValue` earlier and skip more later blocks without changing exactness.
+  code change:
+  added a bounded `ESPRESSO_CLASSIFIER_ORDER_BLOCKS_BY_MAX_NORM=1` research path,
+  kept the classifier math identical,
+  and added exactness tests showing reordered evaluation still matches naive argmax.
+  invalid first measurement:
+  an initial control/candidate pair was mistakenly run concurrently and both collapsed to roughly `36.7-36.9 tok/s`.
+  That pair was discarded as contaminated because parallel throughput jobs on the same host are not comparable.
+  retained serial comparison:
+  control = `./.build/release/espresso-generate generate --bundle /tmp/lfm2-350m.esp --prompt 'Once upon a time' --max-tokens 4096 --benchmark-generate --compare-warmup 0 --compare-iterations 1 --no-tui --no-power`
+  -> `55.29 tok/s`, `first_token_ms=3.35`, `median_token_ms=18.07`, `p95_token_ms=18.88`
+  candidate = `ESPRESSO_CLASSIFIER_ORDER_BLOCKS_BY_MAX_NORM=1 ./.build/release/espresso-generate generate --bundle /tmp/lfm2-350m.esp --prompt 'Once upon a time' --max-tokens 4096 --benchmark-generate --compare-warmup 0 --compare-iterations 1 --no-tui --no-power`
+  -> `55.39 tok/s`, `first_token_ms=3.47`, `median_token_ms=18.01`, `p95_token_ms=18.82`
+  output stayed coherent and identical in quality shape, but the throughput delta was only `+0.10 tok/s`, well inside local noise.
+  verdict = KILL. The block-ordering heuristic is too weak to justify additional exact-head complexity on the retained LFM2 lane.
