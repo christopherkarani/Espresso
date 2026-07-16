@@ -24,9 +24,12 @@ Thank you for your interest in contributing to Espresso. This document covers de
 ```bash
 git clone https://github.com/christopherkarani/Espresso.git
 cd Espresso
+swift package resolve   # default graph has no third-party packages
 swift build
-swift test                    # unit tests, no ANE required
+swift test              # unit tests, no ANE required
 ```
+
+A clean clone must resolve and build **without** any sibling repositories. Optional GGUF support requires a local Edgerunner checkout (see [README Dependencies](README.md#dependencies)).
 
 **Run the demo**
 
@@ -47,7 +50,7 @@ ANE_HARDWARE_TESTS=1 swift test --filter "ANERuntimeTests|EspressoTests|CrossVal
 Sources/
   ANEInterop/          # ObjC/C bridge to _ANEClient private API
   ANETypes/            # ~Copyable tensors, SurfaceIO, weight serialization
-  MILGenerator/        # MIL text generation (28+ kernel variants)
+  MILGenerator/        # MIL text generation (kernel variants)
   CPUOps/              # CPU fallbacks via Accelerate/vDSP
   ANERuntime/          # Compile, eval, IOSurface management
   Espresso/            # Transformer layers, training, generation
@@ -55,11 +58,13 @@ Sources/
   ANECodegen/          # MIL codegen from Graph IR
   ANEPasses/           # Graph optimization passes
   ANEBuilder/          # End-to-end kernel builder
-  ModelSupport/        # GPT-2 and Llama model configs
+  ModelSupport/        # GPT-2 and Llama model configs + ModelFamily
   DeltaCompilation/    # Delta compilation for LoRA adapters
   LoRAAdapter/         # LoRA adapter support
-  RealModelInference/  # GPT-2 real model inference engine
+  RealModelInference/  # Real model hybrid inference engine
   EspressoGenerate/    # Generation CLI target
+  ESPBundle/           # Portable .esp bundle format
+  ESPRuntime/          # Bundle-aware runtime resolution
 Tests/                 # Mirror of Sources structure
 scripts/               # Benchmark and reproduction scripts
 docs/                  # Architecture docs and research logs
@@ -72,11 +77,13 @@ artifacts/             # Generated benchmark artifacts (gitignored)
 
 **Key conventions**:
 - Use `~Copyable` for move-only resources (kernels, surfaces, weights)
-- Immutable value types by default — avoid mutation
+- Prefer immutable value types; document intentional mutation
 - Typed throws where the error set is bounded
-- No external dependencies — Apple system frameworks only
-- Files ≤400 lines, functions ≤50 lines
-- 80%+ test coverage for new code
+- Default package graph stays free of third-party Swift packages (Apple frameworks only)
+- Prefer typed options over new process-environment feature flags
+- Model-family special cases go through `ModelFamily` in `ModelSupport` — do not add new string `contains("stories110m")` checks elsewhere
+- Prefer smaller, cohesive files and functions for new code. Existing modules include large historical files; do not grow them further without a split plan
+- Test new behavior; CI does not currently enforce a coverage percentage
 
 **MIL programs**: Kernel generators go in `Sources/MILGenerator/`. Follow the naming pattern `*Generator.swift` and output a `milText: String` property. Test with a corresponding `Tests/MILGeneratorTests/` file.
 
@@ -84,11 +91,11 @@ artifacts/             # Generated benchmark artifacts (gitignored)
 
 ## Testing
 
-Run the full test suite before submitting:
+Run tests before submitting:
 
 ```bash
-# Unit tests (no hardware required — runs in CI)
-swift test --filter "ANETypesTests|MILGeneratorTests|CPUOpsTests|ANEGraphIRTests|ANECodegenTests|ANEPassesTests|ANEBuilderTests|ModelSupportTests|DeltaCompilationTests|LoRAAdapterTests|MigrationParityTests|EspressoGenerateTests"
+# Unit tests (no hardware required — matches CI)
+swift test --filter "ANETypesTests|MILGeneratorTests|CPUOpsTests|ANEGraphIRTests|ANECodegenTests|ANEPassesTests|ANEBuilderTests|ModelSupportTests|DeltaCompilationTests|LoRAAdapterTests|MigrationParityTests|EspressoGenerateTests|ESPBundleTests|ESPCompilerTests|ESPRuntimeTests|ESPConvertTests|ESPBenchSupportTests|ESPCompilerCLITests|RealModelInferenceTests"
 
 # Hardware tests (Apple Silicon required)
 ANE_HARDWARE_TESTS=1 swift test --filter "ANERuntimeTests|EspressoTests"
@@ -97,13 +104,15 @@ ANE_HARDWARE_TESTS=1 swift test --filter "ANERuntimeTests|EspressoTests"
 OBJC_CROSS_VALIDATION=1 ANE_HARDWARE_TESTS=1 swift test --filter CrossValidationTests
 ```
 
-Write tests first (TDD). Place them in `Tests/<TargetName>Tests/`. The CI pipeline runs all non-hardware tests automatically.
+Write tests for new behavior. Place them in `Tests/<TargetName>Tests/`. CI runs the non-hardware filter above on every PR that touches package sources/tests.
+
+**GGUF tests** only build when Edgerunner is present (`EspressoGGUFTests`).
 
 ## Submitting Changes
 
 1. **Fork** the repository and create a branch from `main`.
 2. **Make your changes** — keep commits focused; one logical change per commit.
-3. **Run tests** — all unit tests must pass. Hardware tests are strongly encouraged.
+3. **Run tests** — all unit tests in the CI filter must pass. Hardware tests are strongly encouraged on Apple Silicon.
 4. **Open a PR** against `main`. Fill in the PR template.
 5. **CI must pass** before merge.
 
@@ -117,7 +126,11 @@ Commit message format:
 
 Types: `feat`, `fix`, `refactor`, `docs`, `test`, `chore`, `perf`, `ci`
 
-**Benchmark claims**: Any PR that includes a performance claim must include a machine-readable benchmark artifact from `./scripts/reproduce_local_real_artifact_claim.sh`. Self-reported numbers without artifacts will not be accepted.
+**Benchmark claims**: Any PR that includes a performance claim must either:
+- update `benchmarks/results/latest.json` and the README table together, or
+- attach a machine-readable artifact from `./scripts/reproduce_local_real_artifact_claim.sh`
+
+Self-reported numbers without artifacts will not be accepted. Do not put peak research numbers in the README headline without a matching checked-in result file.
 
 ## Issue Guidelines
 

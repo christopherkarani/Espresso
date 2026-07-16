@@ -1,10 +1,7 @@
 import ANEGraphIR
 import ANETypes
 import Darwin
-import EdgeRunnerIO
-import EspressoEdgeRunner
 import Foundation
-import Metal
 import ModelSupport
 import Testing
 @testable import RealModelInference
@@ -1493,119 +1490,6 @@ private struct DebugWeightMetadataFile: Decodable {
     if let expectedRaw = ProcessInfo.processInfo.environment["ESPRESSO_DEBUG_EXPECT_TOKEN"],
        let expected = TokenID(expectedRaw) {
         #expect(TokenID(nextToken) == expected)
-    }
-}
-
-@Test func test_debugQwenRawGGUFTopWeightsPromptNextTokenFromWeightDir() async throws {
-    guard shouldRunLegacyQwenExperimentTests() else { return }
-    guard shouldRunANEHardwareTests() else { return }
-    guard let weightDir = ProcessInfo.processInfo.environment["ESPRESSO_DEBUG_WEIGHT_DIR"], !weightDir.isEmpty else {
-        return
-    }
-    guard let ggufModel = ProcessInfo.processInfo.environment["ESPRESSO_DEBUG_GGUF_MODEL"], !ggufModel.isEmpty else {
-        return
-    }
-    guard ProcessInfo.processInfo.environment["ESPRESSO_DEBUG_CHECK_RAW_GGUF_TOP_WEIGHTS_NEXT_TOKEN"] == "1" else {
-        return
-    }
-
-    let metadataURL = URL(fileURLWithPath: weightDir, isDirectory: true).appendingPathComponent("metadata.json")
-    let metadata = try JSONDecoder().decode(DebugWeightMetadataFile.self, from: Data(contentsOf: metadataURL))
-    let config = try metadata.asConfig()
-    let promptTokens: [TokenID]
-    if let rawPromptTokens = ProcessInfo.processInfo.environment["ESPRESSO_DEBUG_PROMPT_TOKENS"], !rawPromptTokens.isEmpty {
-        promptTokens = rawPromptTokens
-            .split(separator: ",")
-            .compactMap { TokenID($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
-    } else {
-        promptTokens = [9707]
-    }
-    #expect(!promptTokens.isEmpty)
-
-    let runtime = try RealModelInferenceEngine.evalHybridLlamaLayerHiddenLineageForTesting(
-        config: config,
-        weightDir: weightDir,
-        tokens: promptTokens
-    )
-    guard let finalHidden = runtime.layerHiddenStates.last else {
-        Issue.record("Runtime lineage did not produce a final hidden state")
-        return
-    }
-
-    let artifactToken = try cpuArtifactLlamaNextTokenFromFinalHidden(
-        finalHidden,
-        weightDir: URL(fileURLWithPath: weightDir, isDirectory: true),
-        config: config
-    )
-    let rawGGUFToken = try await rawGGUFLlamaNextTokenFromFinalHidden(
-        finalHidden,
-        ggufURL: URL(fileURLWithPath: ggufModel),
-        config: config
-    )
-    fputs(
-        "[qwen-debug-raw-gguf-top-weights-next-token] weightDir=\(weightDir) gguf=\(ggufModel) prompt=\(promptTokens) artifactToken=\(artifactToken) rawGGUFToken=\(rawGGUFToken)\n",
-        stderr
-    )
-
-    if let expectedRaw = ProcessInfo.processInfo.environment["ESPRESSO_DEBUG_EXPECT_TOKEN"],
-       let expected = TokenID(expectedRaw) {
-        #expect(TokenID(rawGGUFToken) == expected)
-    }
-}
-
-@Test func test_debugQwenCPUArtifactRawGGUFTopWeightsPromptNextTokenFromWeightDir() async throws {
-    guard shouldRunLegacyQwenExperimentTests() else { return }
-    guard let weightDir = ProcessInfo.processInfo.environment["ESPRESSO_DEBUG_WEIGHT_DIR"], !weightDir.isEmpty else {
-        return
-    }
-    guard let ggufModel = ProcessInfo.processInfo.environment["ESPRESSO_DEBUG_GGUF_MODEL"], !ggufModel.isEmpty else {
-        return
-    }
-    guard ProcessInfo.processInfo.environment["ESPRESSO_DEBUG_CHECK_CPU_ARTIFACT_RAW_GGUF_TOP_WEIGHTS_NEXT_TOKEN"] == "1" else {
-        return
-    }
-
-    let metadataURL = URL(fileURLWithPath: weightDir, isDirectory: true).appendingPathComponent("metadata.json")
-    let metadata = try JSONDecoder().decode(DebugWeightMetadataFile.self, from: Data(contentsOf: metadataURL))
-    let config = try metadata.asConfig()
-    let promptTokens: [Int]
-    if let rawPromptTokens = ProcessInfo.processInfo.environment["ESPRESSO_DEBUG_PROMPT_TOKENS"], !rawPromptTokens.isEmpty {
-        promptTokens = rawPromptTokens
-            .split(separator: ",")
-            .compactMap { Int($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
-    } else {
-        promptTokens = [9707]
-    }
-    #expect(!promptTokens.isEmpty)
-
-    let finalStates = try cpuArtifactLlamaLayerHiddenLineage(
-        weightDir: URL(fileURLWithPath: weightDir, isDirectory: true),
-        config: config,
-        tokens: promptTokens
-    )
-    guard let finalHidden = finalStates.last else {
-        Issue.record("CPU artifact lineage did not produce a final hidden state")
-        return
-    }
-
-    let artifactToken = try cpuArtifactLlamaNextTokenFromFinalHidden(
-        finalHidden,
-        weightDir: URL(fileURLWithPath: weightDir, isDirectory: true),
-        config: config
-    )
-    let rawGGUFToken = try await rawGGUFLlamaNextTokenFromFinalHidden(
-        finalHidden,
-        ggufURL: URL(fileURLWithPath: ggufModel),
-        config: config
-    )
-    fputs(
-        "[qwen-debug-cpu-artifact-raw-gguf-top-weights-next-token] weightDir=\(weightDir) gguf=\(ggufModel) prompt=\(promptTokens) artifactToken=\(artifactToken) rawGGUFToken=\(rawGGUFToken)\n",
-        stderr
-    )
-
-    if let expectedRaw = ProcessInfo.processInfo.environment["ESPRESSO_DEBUG_EXPECT_TOKEN"],
-       let expected = Int(expectedRaw) {
-        #expect(rawGGUFToken == expected)
     }
 }
 
@@ -3629,66 +3513,6 @@ private func cpuArtifactLlamaNextTokenFromFinalHidden(
         ])
     }
     return nextToken
-}
-
-private func rawGGUFLlamaNextTokenFromFinalHidden(
-    _ finalHidden: [Float],
-    ggufURL: URL,
-    config: MultiModelConfig
-) async throws -> Int {
-    let topWeights = try await loadRawGGUFLlamaTopWeights(ggufURL: ggufURL, config: config)
-    let normalized = rmsNorm(finalHidden, weight: topWeights.rmsFinal, eps: Float(config.normEps))
-    let logits = multiplyRowMajorFlatMatrix(
-        matrix: topWeights.lmHead,
-        rows: config.vocab,
-        cols: config.dModel,
-        vector: normalized
-    )
-    guard let nextToken = logits.enumerated().max(by: { $0.element < $1.element })?.offset else {
-        throw NSError(domain: "RealModelInferenceTests", code: 3, userInfo: [
-            NSLocalizedDescriptionKey: "Raw GGUF logits were empty"
-        ])
-    }
-    return nextToken
-}
-
-private struct RawGGUFLlamaTopWeights {
-    let rmsFinal: [Float]
-    let lmHead: [Float]
-}
-
-private func loadRawGGUFLlamaTopWeights(
-    ggufURL: URL,
-    config: MultiModelConfig
-) async throws -> RawGGUFLlamaTopWeights {
-    guard let device = MTLCreateSystemDefaultDevice() else {
-        throw NSError(domain: "RealModelInferenceTests", code: 4, userInfo: [
-            NSLocalizedDescriptionKey: "Metal device unavailable for GGUF dequantization"
-        ])
-    }
-
-    let loader = try GGUFLoader(url: ggufURL)
-    let weightMap = try await loader.load(from: ggufURL)
-
-    guard let rmsTensor = weightMap["output_norm.weight"] else {
-        throw NSError(domain: "RealModelInferenceTests", code: 5, userInfo: [
-            NSLocalizedDescriptionKey: "Missing output_norm.weight in raw GGUF"
-        ])
-    }
-    guard let lmHeadTensorName = QwenGGUFVerificationSupport.rawGGUFLMHeadTensorName(from: weightMap),
-          let lmHeadTensor = weightMap[lmHeadTensorName] else {
-        throw NSError(domain: "RealModelInferenceTests", code: 6, userInfo: [
-            NSLocalizedDescriptionKey: "Missing output.weight/token_embd.weight in raw GGUF"
-        ])
-    }
-
-    let rmsFinal = try await DequantDispatcher.dequantize(tensor: rmsTensor, device: device)
-    let lmHead = try await DequantDispatcher.dequantize(tensor: lmHeadTensor, device: device)
-
-    #expect(rmsFinal.count == config.dModel)
-    #expect(lmHead.count == config.vocab * config.dModel)
-
-    return RawGGUFLlamaTopWeights(rmsFinal: rmsFinal, lmHead: lmHead)
 }
 
 private func makeDeterministicLayerInputs(

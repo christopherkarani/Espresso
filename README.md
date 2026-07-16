@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <strong>Direct Neural Engine inference for transformers on Apple Silicon — 4.76x faster than CoreML.</strong>
+  <strong>Direct Neural Engine inference for transformers on Apple Silicon.</strong>
 </p>
 
 <p align="center">
@@ -12,19 +12,18 @@
   <a href="https://swift.org"><img src="https://img.shields.io/badge/Swift-6.2-orange.svg" alt="Swift 6.2"></a>
   <a href="https://github.com/christopherkarani/Espresso/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"></a>
   <img src="https://img.shields.io/badge/macOS-15+-lightgrey.svg" alt="macOS 15+">
-  <img src="https://img.shields.io/badge/Dependencies-0-brightgreen.svg" alt="Zero Dependencies">
   <a href="https://github.com/christopherkarani/Espresso/releases"><img src="https://img.shields.io/github/v/release/christopherkarani/Espresso?color=purple" alt="Latest Release"></a>
 </p>
 
 ---
 
-Espresso compiles MIL programs straight to ANE silicon through reverse-engineered private APIs (`_ANEClient`, `_ANEInMemoryModel`). No CoreML. No per-token recompilation. Just IOSurface buffers, fused multi-layer kernels, and two verified tokens per decode step.
+Espresso compiles MIL programs straight to ANE silicon through reverse-engineered private APIs (`_ANEClient`, `_ANEInMemoryModel`). No CoreML in the hot path. No per-token recompilation. IOSurface buffers, fused multi-layer kernels, and hybrid decode for Llama-family artifacts.
 
-- **4.76x faster decode** — 1.08 ms/token vs CoreML's 5.09 ms/token on the same 6-layer model
-- **Fused 3-layer kernels** — 6 transformer layers in 2 ANE dispatches, not 6
-- **Zero-copy I/O** — NEON-vectorized reads, vDSP argmax, no marshaling
-- **Full training on ANE** — forward + backward passes with gradient accumulation and Adam
-- **Pure Swift 6.2** — `~Copyable` move-only tensors, strict concurrency, typed throws, zero dependencies
+- **Direct ANE path** — private-API compile once, reuse across decode steps
+- **Fused multi-layer kernels** — fewer ANE dispatches per token
+- **Zero-copy I/O** — NEON-vectorized surface reads, vDSP/Metal where useful
+- **Training experiments on ANE** — forward + backward with gradient accumulation and Adam
+- **Pure Swift 6.2 core** — `~Copyable` move-only tensors, strict concurrency, typed throws
 
 <p align="center">
   <img src=".github/assets/demo.gif" alt="Espresso generating tokens on ANE" width="700">
@@ -38,7 +37,7 @@ cd Espresso
 ./espresso          # builds, downloads demo weights, launches TUI
 ```
 
-Five lines to first ANE inference in your own project:
+Core ANE kernel usage (library surface):
 
 ```swift
 // Package.swift — add the dependency
@@ -66,7 +65,7 @@ swift run esprun generate /tmp/model.esp "Hello" 32
 
 ## ESP Model Platform
 
-Espresso now ships a private-only model platform around portable `.esp` bundles and bundle-aware runtime selection.
+Espresso ships a model platform around portable `.esp` bundles and bundle-aware runtime selection.
 
 - `.esp` is the canonical portable model bundle
 - `.espc` is the derived compiled-cache layer
@@ -74,7 +73,7 @@ Espresso now ships a private-only model platform around portable `.esp` bundles 
 - `esprun` inspects, resolves, and runs bundle artifacts
 - `espresso-generate --bundle <path>` runs the same bundle boundary used by the runtime
 
-Current public docs for this layer:
+Current docs for this layer:
 
 - [Convert / Optimize / Native-Fast strategy](docs/platform/2026-03-26-convert-optimize-native-fast-plan.md)
 - [Stories Convert -> Optimize execution plan](docs/platform/2026-03-26-stories-convert-optimize-execution-plan.md)
@@ -82,19 +81,31 @@ Current public docs for this layer:
 
 ## Benchmark
 
-### Espresso vs CoreML vs llama.cpp
+Numbers below match the checked-in machine-readable results in
+[`benchmarks/results/latest.json`](benchmarks/results/latest.json)
+(M3 Max, macOS 15.0, Espresso 1.1.0).
+
+### Espresso vs CoreML (local 6-layer Stories artifact)
 
 | Backend | ms/token | tok/s | Notes |
 |---------|----------|-------|-------|
-| **Espresso ANE** (exact two-step) | **1.08** | **926** | Direct ANE, 2 dispatches / 6 layers |
-| CoreML `.cpuAndNeuralEngine` | 5.09 | 196 | Apple's standard ANE path |
-| llama.cpp Metal | ~12–20 | ~50–85 | GPU path, CPU-bound decode¹ |
-| llama.cpp CPU (`ggml`) | ~25–40 | ~25–40 | Pure CPU, no ANE¹ |
-| **Espresso speedup vs CoreML** | | **4.76x** | |
-| **Espresso speedup vs llama.cpp Metal** | | **~11x** | |
+| **Espresso ANE** (recurrent fused, 6-layer) | **1.93** | **519** | Fused 3-layer recurrent decode + ANE classifier |
+| Espresso ANE (direct transformer, 6-layer) | 6.56 | 153 | Same model without recurrent fusion |
+| CoreML `.cpuAndNeuralEngine` | 6.58 | 152 | Apple's standard ANE path |
+| **Espresso speedup vs CoreML** | | **3.41×** | fused recurrent path |
 
-> ¹ llama.cpp has no ANE backend. Metal figures are representative for GPT-2 117M on M3 Max; actual performance varies by quantization and prompt length.
 > All Espresso / CoreML numbers: 6-layer local artifact · dim=768 · 12 heads · 32k vocab · seqLen=256 · M3 Max · macOS 15.
+> This is a **research / demo artifact family**, not a pretrained production model.
+
+### What these numbers are *not*
+
+- Not a claim about full GPT-2 117M or llama.cpp Metal on the same workload
+- Not the only serving path: the retained exact Stories hybrid path (`.esp` bundles)
+  typically lands lower in wall-clock tok/s after compile and full decode accounting —
+  see the experiment ledger in `tasks/todo.md` for same-binary retain/reject numbers
+- Peak research configurations can exceed the table when measuring a narrower path;
+  only figures with a checked-in `latest.json` (or a PR artifact from the reproduce script)
+  are treated as project claims
 
 <details>
 <summary>Reproduce Espresso benchmarks</summary>
@@ -106,6 +117,7 @@ REPEATS=5 WARMUP=3 ITERATIONS=20 \
 ```
 
 Machine-readable output lands in `artifacts/benchmarks/` and is kept out of git.
+Update `benchmarks/results/latest.json` only when you intentionally refresh the public table.
 
 </details>
 
@@ -147,7 +159,7 @@ macOS 15+ required. iOS / tvOS not supported out of the box (private API entitle
             └──────────────eval───────────────┘
 ```
 
-The decode loop compiles once and reuses the program across all steps. KV cache lives in IOSurface buffers — not marshaled through CoreML. Each step produces two exact tokens with verified parity. Fused triplet kernels process 3 layers per dispatch, reducing 6 layers to 2 eval calls.
+The decode loop compiles once and reuses the program across all steps. KV cache lives in IOSurface buffers — not marshaled through CoreML.
 
 ## Architecture
 
@@ -170,7 +182,9 @@ ANEInterop (ObjC/C — private API bridge)
 | **MILGenerator** | Generates MIL text for forward, backward, decode, and fused kernels. |
 | **CPUOps** | RMSNorm, RoPE, embedding, softmax, Adam via Accelerate/vDSP. |
 | **ANERuntime** | Compiles MIL to ANE E5 binaries. Manages IOSurface buffers and compile budget. |
-| **Espresso** | Transformer layers, generation harnesses, exact two-token decode, training loop. |
+| **Espresso** | Transformer layers, generation harnesses, decode, training loop. |
+| **RealModelInference** | GPT-2 / Llama hybrid serving path used by `espresso-generate`. |
+| **ESPBundle / ESPRuntime** | Portable `.esp` bundles and runtime resolution. |
 
 ## SPM Integration
 
@@ -191,22 +205,39 @@ targets: [
 import ANERuntime
 import ANETypes
 
-// 1. Define your kernel shape
-let gen = MyMILGenerator(config: .init(dim: 768, heads: 12))
-
-// 2. Compile once to ANE E5 binary
+// 1. Provide MIL text + weight blobs for your kernel shape
 let kernel = try ANEKernel(
-    milText: gen.milText,
-    weights: gen.weightBlobs,
-    inputSizes: [gen.inputSize],
-    outputSizes: [gen.outputSize]
+    milText: milText,
+    weights: weightBlobs,
+    inputSizes: [inputByteSize],
+    outputSizes: [outputByteSize]
 )
 
-// 3. Run inference — stays on ANE the whole time
+// 2. Run inference — stays on ANE the whole time
 try kernel.eval()
 
-// 4. Read results via zero-copy IOSurface
-let output = kernel.outputSurface(at: 0)
+// 3. Read results via zero-copy IOSurface
+let output = try kernel.outputSurface(at: 0)
+```
+
+For end-to-end generation, use `RealModelInference` / `esprun` with a prepared model directory or `.esp` bundle rather than hand-writing MIL.
+
+## Dependencies
+
+**Default package graph: zero third-party Swift packages.** Only Apple system frameworks (Foundation, Accelerate, IOSurface, Metal, CoreML).
+
+Optional GGUF / EdgeRunner integration is **not** part of the default graph. It enables only when a local [Edgerunner](https://github.com/christopherkarani) checkout is present:
+
+```bash
+# Sibling checkout (default discovery path)
+#   ../Edgerunner/Package.swift
+
+# Or explicit path
+export ESPRESSO_EDGERUNNER_PATH=/path/to/Edgerunner
+swift build
+
+# Force-disable even if Edgerunner is present
+export ESPRESSO_DISABLE_GGUF=1
 ```
 
 ## Requirements
@@ -215,8 +246,8 @@ let output = kernel.outputSurface(at: 0)
 |---|---|
 | Hardware | Apple Silicon (M1+) with Neural Engine |
 | macOS | 15.0+ |
-| Swift | 6.0+ |
-| Dependencies | None — only Apple system frameworks |
+| Swift | 6.0+ (6.2 recommended) |
+| Dependencies | None required — Apple system frameworks only |
 
 ## Testing
 
@@ -226,7 +257,7 @@ ANE_HARDWARE_TESTS=1 swift test --filter "ANERuntimeTests|EspressoTests"  # hard
 OBJC_CROSS_VALIDATION=1 ANE_HARDWARE_TESTS=1 swift test --filter CrossValidationTests  # parity
 ```
 
-7 test suites cover MIL generation, tensor ops, CPU kernels, ANE compilation, hardware eval, cross-validation, and end-to-end generation.
+CI runs non-hardware unit tests including ESP bundle/runtime and RealModelInference unit suites. Hardware ANE tests run on self-hosted matrix jobs.
 
 ## Disclaimer
 
@@ -234,7 +265,7 @@ OBJC_CROSS_VALIDATION=1 ANE_HARDWARE_TESTS=1 swift test --filter CrossValidation
 >
 > **Everywhere else**: Internal tools, research, sideloaded apps, enterprise distribution — all fine.
 
-This project uses undocumented private Apple APIs discovered through runtime introspection. Results are hardware- and OS-dependent. Benchmarks run on a local artifact family built by this repo, not a pretrained production model. Not affiliated with or endorsed by Apple Inc. 
+This project uses undocumented private Apple APIs discovered through runtime introspection. Results are hardware- and OS-dependent. Benchmarks run on a local artifact family built by this repo, not a pretrained production model. Not affiliated with or endorsed by Apple Inc.
 
 ## Contributing
 

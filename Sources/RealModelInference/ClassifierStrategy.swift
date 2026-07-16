@@ -51,11 +51,8 @@ public enum ClassifierStrategy: Sendable, Equatable {
         // Stories 110M benefits from the ANE classifier path even though the
         // raw vocab*dModel product exceeds the conservative global SRAM cutoff.
         // Keep this as an explicit allowlist entry until a broader policy is proven.
-        let normalizedName = config.name
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-        if config.architecture == .llama,
-           (normalizedName == "stories110m" || normalizedName.contains("stories110m")) {
+        // See `ModelFamily.isStories110MVariant` for the single name match.
+        if config.architecture == .llama, ModelFamily.isStories110MVariant(config) {
             return .ane
         }
         let elements = config.vocab * config.dModel

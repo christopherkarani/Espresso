@@ -89,3 +89,14 @@ import ANETypes
     #expect(config.kvDim == 1024)
     #expect(config.dModel != config.attentionDim)
 }
+
+@Test func modelFamilyRecognizesStories110MVariants() {
+    #expect(ModelFamily.isStories110MVariant(name: "stories110m"))
+    #expect(ModelFamily.isStories110MVariant(name: "stories110m-ctx256"))
+    #expect(ModelFamily.isStories110MVariant(name: "llama2.c-stories110M"))
+    #expect(ModelFamily.isStories110MVariant(name: "  Stories110M  "))
+    #expect(!ModelFamily.isStories110MVariant(name: "gpt2_124m"))
+    #expect(!ModelFamily.isStories110MVariant(name: "tinyLlama_1_1b"))
+    #expect(!ModelFamily.isStories110MVariant(name: "qwen3-0.6b"))
+    #expect(ModelFamily.isStories110MVariant(ModelRegistry.stories110m))
+}

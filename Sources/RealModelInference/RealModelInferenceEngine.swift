@@ -169,7 +169,9 @@ public struct RealModelInferenceEngine: ~Copyable {
             return false
         }
         if config.architecture == .llama {
-            if isStories110MVariant(config) {
+            // Default-on for the retained Stories demo family; other Llama
+            // models require an explicit opt-in until proven.
+            if ModelFamily.isStories110MVariant(config) {
                 return true
             }
             return environment["ESPRESSO_ENABLE_LLAMA_HYBRID_CACHED_BINDINGS"] == "1"
@@ -190,11 +192,9 @@ public struct RealModelInferenceEngine: ~Copyable {
         return true
     }
 
+    /// Stories 110M family recognition — delegates to `ModelFamily`.
     static func isStories110MVariant(_ config: MultiModelConfig) -> Bool {
-        let normalizedName = config.name
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-        return normalizedName == "stories110m" || normalizedName.contains("stories110m")
+        ModelFamily.isStories110MVariant(config)
     }
 
     static func resolveClassifierStrategy(

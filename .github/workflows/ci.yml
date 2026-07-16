@@ -14,6 +14,9 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Default package graph has zero third-party deps. GGUF/Edgerunner is optional
+# and must not be required for CI green.
+
 jobs:
   build-test:
     name: "Build & Test (Xcode ${{ matrix.xcode }})"
@@ -44,18 +47,33 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .build
-          key: spm-${{ runner.os }}-${{ matrix.xcode }}-${{ hashFiles('Package.swift', 'Package.resolved') }}
+          key: spm-${{ runner.os }}-${{ matrix.xcode }}-${{ hashFiles('Package.swift') }}
           restore-keys: |
             spm-${{ runner.os }}-${{ matrix.xcode }}-
             spm-${{ runner.os }}-
 
+      - name: Resolve package (no third-party deps)
+        run: |
+          set -euo pipefail
+          # Ensure optional Edgerunner path is never required for CI.
+          export ESPRESSO_DISABLE_GGUF=1
+          swift package resolve
+          # Fail if a non-empty dependency graph snuck back into the default build.
+          DEPS=$(swift package show-dependencies --format json)
+          echo "$DEPS"
+          echo "$DEPS" | python3 -c 'import json,sys; d=json.load(sys.stdin); deps=d.get("dependencies") or [];
+assert not deps, f"default package graph must have zero dependencies, found: {deps}"'
+
       - name: Build (release)
-        run: swift build -c release
+        run: |
+          export ESPRESSO_DISABLE_GGUF=1
+          swift build -c release
 
       - name: Test (unit — no ANE required)
         run: |
+          export ESPRESSO_DISABLE_GGUF=1
           swift test \
-            --filter "ANETypesTests|MILGeneratorTests|CPUOpsTests|ANEGraphIRTests|ANECodegenTests|ANEPassesTests|ANEBuilderTests|ModelSupportTests|DeltaCompilationTests|LoRAAdapterTests|MigrationParityTests|EspressoGenerateTests"
+            --filter "ANETypesTests|MILGeneratorTests|CPUOpsTests|ANEGraphIRTests|ANECodegenTests|ANEPassesTests|ANEBuilderTests|ModelSupportTests|DeltaCompilationTests|LoRAAdapterTests|MigrationParityTests|EspressoGenerateTests|ESPBundleTests|ESPCompilerTests|ESPRuntimeTests|ESPConvertTests|ESPBenchSupportTests|ESPCompilerCLITests|RealModelInferenceTests"
 
   lint:
     name: Swift Package Lint
@@ -63,6 +81,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Resolve dependencies
-        run: swift package resolve
+        run: |
+          export ESPRESSO_DISABLE_GGUF=1
+          swift package resolve
       - name: Show dependency graph
-        run: swift package show-dependencies
+        run: |
+          export ESPRESSO_DISABLE_GGUF=1
+          swift package show-dependencies
+      - name: Assert macOS platform is 15+
+        run: |
+          set -euo pipefail
+          export ESPRESSO_DISABLE_GGUF=1
+          python3 - <<'PY'
+          import json, subprocess, sys
+          out = subprocess.check_output(["swift", "package", "describe", "--type", "json"], text=True)
+          desc = json.loads(out)
+          platforms = desc.get("platforms") or []
+          macos = next((p for p in platforms if p.get("name") == "macos"), None)
+          assert macos is not None, f"missing macOS platform: {platforms}"
+          version = macos.get("version", "")
+          major = int(str(version).split(".")[0])
+          assert major == 15, f"expected macOS 15.x, got {version}"
+          print(f"ok: platforms={platforms}")
+          PY
