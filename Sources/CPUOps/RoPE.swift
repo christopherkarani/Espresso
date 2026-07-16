@@ -2,7 +2,7 @@ import Accelerate
 
 public enum RoPE {
     /// Row-major layout: data[t * nHeads * headDim + h * headDim + i]
-    /// Llama-family/Qwen GGUF decode expects half-split rotation:
+    /// Llama-family/Qwen decode expects half-split rotation:
     /// (0, halfDim), (1, halfDim+1), ...
     /// Mutates q and k IN PLACE.
     public static func apply(
@@ -50,7 +50,7 @@ public enum RoPE {
 
     /// Single-token RoPE for decode step. Applies rotation at the given
     /// `position` to Q (`nHeads` heads) and K (`nKVHeads` heads).
-    /// Row-major layout: `h * headDim + i`. Llama-family/Qwen GGUF decode
+    /// Row-major layout: `h * headDim + i`. Llama-family/Qwen decode
     /// expects half-split rotation: (0, halfDim), (1, halfDim+1), ...
     /// Mutates q and k IN PLACE.
     public static func applyDecodeStep(

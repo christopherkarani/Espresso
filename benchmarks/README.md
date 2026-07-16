@@ -1,8 +1,17 @@
 # Benchmarks
 
-This folder is for benchmark setup, models, and documentation.
+- `benchmarks/results/latest.json` — **checked-in** public claims source of truth
+- `benchmarks/results/*` (other files) — local run dumps, gitignored
+- `benchmarks/models/` — placeholders / curated benchmark inputs
 
-- `benchmarks/models/` stores tracked placeholders or curated benchmark model inputs.
-- `benchmarks/results/` is generated output and stays local (ignored by git).
+Public README and site numbers must match `latest.json`. Refresh that file only
+when intentionally publishing a new claim, and update the README table in the
+same change. CI runs `scripts/assert_readme_claims.py` to enforce this.
 
-Use this folder for reproducible benchmark structure, not for ad-hoc run output.
+Reproduce:
+
+```bash
+RESULTS_DIR=results/$(date +%Y%m%d-%H%M%S) \
+REPEATS=5 WARMUP=3 ITERATIONS=20 \
+./scripts/reproduce_local_real_artifact_claim.sh
+```

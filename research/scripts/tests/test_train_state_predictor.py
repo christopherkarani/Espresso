@@ -7,11 +7,11 @@ from pathlib import Path
 import torch
 
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts import train_state_predictor as script
+from research.scripts import train_state_predictor as script
 
 
 class TrainStatePredictorTests(unittest.TestCase):

@@ -83,7 +83,7 @@
       </div>
       <p class="post-summary">
         We measured CoreML's <code>cpuAndNeuralEngine</code> path against Espresso's direct ANE inference on M3 Max.
-        The gap is <span class="stat-inline">4.76x</span>. Here's the breakdown: why it exists, how to reproduce it,
+        The gap is <span class="stat-inline">3.41×</span> end-to-end. Here's the breakdown: why it exists, how to reproduce it,
         and what to expect on M1/M2/M4.
       </p>
       <a href="coreml-vs-espresso-benchmarks.html" class="read-more">Read → CoreML vs Espresso benchmarks</a>
@@ -96,14 +96,13 @@
         <span class="tag">GPT-2</span>
       </div>
       <div class="post-title">
-        <a href="gpt2-926-tokens-per-second.html">How to Run GPT-2 at 926 tok/s on a MacBook</a>
+        <a href="gpt2-926-tokens-per-second.html">How Espresso Hits 519 tok/s End-to-End on Apple Silicon</a>
       </div>
       <p class="post-summary">
-        <span class="stat-inline">1.08 ms/token</span>. <span class="stat-inline">926 tok/s</span>. No Python. No CoreML. No GPU.
-        Step-by-step: the four optimizations (direct ANE access, 3-layer fusion, recurrent architecture,
-        zero-copy argmax) that together hit these numbers on consumer hardware.
+        <span class="stat-inline">1.93 ms/token</span>. <span class="stat-inline">519 tok/s</span> end-to-end. No Python. No CoreML in the hot path.
+        Step-by-step: the optimizations that produce the checked-in claim in latest.json.
       </p>
-      <a href="gpt2-926-tokens-per-second.html" class="read-more">Read → GPT-2 at 926 tok/s</a>
+      <a href="gpt2-926-tokens-per-second.html" class="read-more">Read → 519 tok/s end-to-end guide</a>
     </div>
 
     <div class="post-item">

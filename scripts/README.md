@@ -1,30 +1,27 @@
 # Scripts
 
-This folder contains stable scripts that developers can run to reproduce models and benchmark claims.
+Stable, product-facing helper scripts. Research-only tooling lives under
+[`../research/scripts/`](../research/scripts/).
 
-Tracked scripts are intentionally limited to:
+## Tracked product scripts
 
-- `ensure_coreml_model.sh`
-- `generate_coreml_model.py`
-- `reproduce_local_real_artifact_claim.sh`
-- `run_power_benchmark.sh`
-- `run_autoresearch_compare.sh`
-- `run_autoresearch_suite.sh`
-- `judge_suite_results.sh`
-- `run_anemll_coreml_benchmark.py`
-- `stories_model_identity.py`
-- `benchmark-prompts.txt`
+| Script | Purpose |
+|--------|---------|
+| `ensure_coreml_model.sh` | Ensure a CoreML baseline model is available for compare benches |
+| `generate_coreml_model.py` | Build CoreML packages used in comparisons |
+| `reproduce_local_real_artifact_claim.sh` | Reproduce the public real-artifact claim path |
+| `run_power_benchmark.sh` | Power / energy-oriented local runs |
+| `generate-benchmark-dashboard.sh` | Regenerate `docs/benchmarks.md` from `latest.json` |
+| `assert_readme_claims.py` | CI guard: README numbers must match `latest.json` |
+| `convert_weights_gpt2.py` / `convert_weights_llama.py` | Weight conversion helpers |
+| `espresso_llama_weights.py` / `stories_model_identity.py` | Stories/Llama weight identity helpers |
+| `export_llama_coreml.py` | Export Llama-family CoreML baselines |
+| `benchmark-prompts.txt` / `stories_prompt_suite.txt` | Fixed prompt suites |
 
-For one-off or personal helper scripts, use `scripts/internal/` locally. That area is ignored by git and does not appear on GitHub.
+Python unit tests for product helpers: `scripts/tests/`.
 
-## Benchmark Automation
+## Research scripts (not product)
 
-Use `run_autoresearch_compare.sh` as the source-of-truth real-model throughput benchmark wrapper for autoresearch lanes. It drives `./espresso bench`, exports the compare report, and appends a results row when `--results-tsv` is passed or when `autoresearch-results.tsv` is present in the current directory. Supports `--prompt-id` to tag runs by prompt.
-
-Use `run_autoresearch_suite.sh` to run the full hardened benchmark suite: multiple prompts from `benchmark-prompts.txt` across multiple runs, with cold-run gating and per-prompt median/min/max aggregation into `suite-summary.json`. When `--results-tsv` is provided, it forwards the raw compare rows for every prompt/run pair into that TSV.
-
-Use `judge_suite_results.sh` to evaluate a single suite summary or compare baseline vs candidate with a configurable improvement threshold (default 2%). Outputs a machine-readable verdict with `merge_recommended`.
-
-Use `run_anemll_coreml_benchmark.py` to measure fixed-token generation against the public exact-base `anemll` Core ML Llama 3.2 1B packages. It is intended for publishable Espresso-vs-Core ML comparisons when the Core ML baseline is split across embeddings, FFN/prefill, and lm-head compiled models instead of a single `.mlpackage`.
-
-`benchmark-prompts.txt` defines the fixed prompt suite (short/medium/long) used by the suite runner.
+Autoresearch suite runners, Stories distillation, factored-head packaging, and
+rejected draft packaging live in `research/scripts/`. Do not link them from the
+README product journey.

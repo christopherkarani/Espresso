@@ -8,14 +8,16 @@ on:
       - "Package.swift"
       - "Sources/**"
       - "Tests/**"
+      - "README.md"
+      - "benchmarks/results/latest.json"
+      - "scripts/assert_readme_claims.py"
       - ".github/workflows/ci.yml"
 
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-# Default package graph has zero third-party deps. GGUF/Edgerunner is optional
-# and must not be required for CI green.
+# Package graph has zero third-party deps. CI fails if any dependency reappears.
 
 jobs:
   build-test:
@@ -55,23 +57,21 @@ jobs:
       - name: Resolve package (no third-party deps)
         run: |
           set -euo pipefail
-          # Ensure optional Edgerunner path is never required for CI.
-          export ESPRESSO_DISABLE_GGUF=1
           swift package resolve
-          # Fail if a non-empty dependency graph snuck back into the default build.
+          # Fail if a non-empty dependency graph snuck back into the package.
           DEPS=$(swift package show-dependencies --format json)
           echo "$DEPS"
           echo "$DEPS" | python3 -c 'import json,sys; d=json.load(sys.stdin); deps=d.get("dependencies") or [];
-assert not deps, f"default package graph must have zero dependencies, found: {deps}"'
+assert not deps, f"package graph must have zero dependencies, found: {deps}"'
+
+      - name: Assert README claims match latest.json
+        run: python3 scripts/assert_readme_claims.py
 
       - name: Build (release)
-        run: |
-          export ESPRESSO_DISABLE_GGUF=1
-          swift build -c release
+        run: swift build -c release
 
       - name: Test (unit — no ANE required)
         run: |
-          export ESPRESSO_DISABLE_GGUF=1
           swift test \
             --filter "ANETypesTests|MILGeneratorTests|CPUOpsTests|ANEGraphIRTests|ANECodegenTests|ANEPassesTests|ANEBuilderTests|ModelSupportTests|DeltaCompilationTests|LoRAAdapterTests|MigrationParityTests|EspressoGenerateTests|ESPBundleTests|ESPCompilerTests|ESPRuntimeTests|ESPConvertTests|ESPBenchSupportTests|ESPCompilerCLITests|RealModelInferenceTests"
 
@@ -81,17 +81,12 @@ assert not deps, f"default package graph must have zero dependencies, found: {de
     steps:
       - uses: actions/checkout@v4
       - name: Resolve dependencies
-        run: |
-          export ESPRESSO_DISABLE_GGUF=1
-          swift package resolve
+        run: swift package resolve
       - name: Show dependency graph
-        run: |
-          export ESPRESSO_DISABLE_GGUF=1
-          swift package show-dependencies
+        run: swift package show-dependencies
       - name: Assert macOS platform is 15+
         run: |
           set -euo pipefail
-          export ESPRESSO_DISABLE_GGUF=1
           python3 - <<'PY'
           import json, subprocess, sys
           out = subprocess.check_output(["swift", "package", "describe", "--type", "json"], text=True)

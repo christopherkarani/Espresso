@@ -4,21 +4,21 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>CoreML vs Espresso: Benchmarks on M1/M2/M3 Apple Silicon | Espresso</title>
-  <meta name="description" content="Detailed benchmark comparison of CoreML vs Espresso for transformer inference on Apple Silicon. 4.76x faster, 926 tok/s vs 196 tok/s. Data across M1, M2, and M3 chips.">
+  <meta name="description" content="Detailed benchmark comparison of CoreML vs Espresso for transformer inference on Apple Silicon. 3.41× faster end-to-end (519 vs 152 tok/s). Source: benchmarks/results/latest.json.">
   <meta name="keywords" content="CoreML alternative, CoreML vs Espresso, Apple Neural Engine benchmark, Apple Silicon ML inference, swift ml framework, coreml performance, ANE inference speed, on-device LLM macOS">
   <link rel="canonical" href="https://christopherkarani.github.io/Espresso/coreml-vs-espresso-benchmarks.html">
 
   <!-- Open Graph -->
-  <meta property="og:title" content="CoreML vs Espresso: 4.76x Faster on Apple Silicon">
-  <meta property="og:description" content="We measured CoreML against direct ANE inference. The gap is 4.76x. Here are the numbers.">
+  <meta property="og:title" content="CoreML vs Espresso: 3.41× Faster End-to-End on Apple Silicon">
+  <meta property="og:description" content="We measured CoreML against direct ANE inference. The end-to-end gap is 3.41×. Here are the numbers.">
   <meta property="og:type" content="article">
   <meta property="og:url" content="https://christopherkarani.github.io/Espresso/coreml-vs-espresso-benchmarks.html">
   <meta property="og:site_name" content="Espresso">
 
   <!-- Twitter Card -->
   <meta name="twitter:card" content="summary_large_image">
-  <meta name="twitter:title" content="CoreML vs Espresso: 4.76x Faster on Apple Silicon">
-  <meta name="twitter:description" content="Detailed benchmarks showing direct ANE inference is 4.76x faster than CoreML's neural engine path.">
+  <meta name="twitter:title" content="CoreML vs Espresso: 3.41× Faster End-to-End on Apple Silicon">
+  <meta name="twitter:description" content="Detailed benchmarks showing direct ANE inference is 3.41× faster end-to-end than CoreML's neural engine path.">
 
   <style>
     :root {
@@ -87,7 +87,7 @@
     "@context": "https://schema.org",
     "@type": "TechArticle",
     "headline": "CoreML vs Espresso: Benchmarks on Apple Silicon",
-    "description": "Detailed benchmark comparison of CoreML vs Espresso for transformer inference. 4.76x faster on M3 Max.",
+    "description": "Detailed benchmark comparison of CoreML vs Espresso for transformer inference. 3.41x faster end-to-end on M3 Max.",
     "datePublished": "2026-03-17",
     "author": { "@type": "Organization", "name": "Espresso" },
     "keywords": ["CoreML", "Apple Neural Engine", "benchmark", "Swift", "inference"]
@@ -120,13 +120,13 @@
 
   <p class="lede">
     We benchmarked CoreML's neural engine path against Espresso's direct ANE inference on Apple Silicon.
-    The gap is <strong style="color: var(--accent)">4.76x</strong>. Here's what we measured, how we measured it, and why the gap exists.
+    The end-to-end gap is <strong style="color: var(--accent)">3.41×</strong>. Here's what we measured, how we measured it, and why the gap exists.
   </p>
 
   <div class="callout">
     <strong>Bottom line:</strong> On an M3 Max, Espresso generates tokens at 519 tok/s (1.929 ms/token).
     CoreML's <code>.cpuAndNeuralEngine</code> path runs at 152 tok/s (6.582 ms/token) on the same model.
-    That's a 3.41x difference in end-to-end generation, and 4.76x at the raw inference layer.
+    That's a 3.41× difference in end-to-end generation on the checked-in claim artifact. Trunk-only peaks are not product claims.
   </div>
 
   <h2>The Setup</h2>
@@ -271,21 +271,19 @@ swift run espresso-bench --ane-only --inference --layers 6 --warmup 20 --iterati
 
   <p>The benchmarks above are on M3 Max (16-core ANE, 18 TFLOPS fp16). The performance gap between CoreML and direct ANE access is structural, not hardware-specific — it comes from the abstraction layers, not the silicon. You should expect similar relative speedups on M1 and M2 chips, with absolute throughput scaling roughly with ANE TFLOPS.</p>
 
-  <p>Rough expectations based on ANE TFLOPS scaling:</p>
+  <p>Only M3 Max is a checked-in claim (<code>benchmarks/results/latest.json</code>). Other chips are not published product claims:</p>
 
   <table>
     <thead>
-      <tr><th>Chip</th><th>ANE TFLOPS</th><th>Expected Espresso</th><th>Expected CoreML</th></tr>
+      <tr><th>Chip</th><th>ANE TFLOPS</th><th>Espresso</th><th>CoreML</th></tr>
     </thead>
     <tbody>
-      <tr><td>M1</td><td>11.0</td><td>~320 tok/s</td><td>~95 tok/s</td></tr>
-      <tr><td>M2</td><td>15.8</td><td>~460 tok/s</td><td>~136 tok/s</td></tr>
-      <tr><td>M3 Max</td><td>18.0</td><td class="winner">519 tok/s (measured)</td><td class="loser">152 tok/s (measured)</td></tr>
-      <tr><td>M4</td><td>38.0</td><td>~1,090 tok/s (projected)</td><td>~322 tok/s (projected)</td></tr>
+      <tr><td>M3 Max</td><td>18.0</td><td class="winner">519 tok/s (measured, latest.json)</td><td class="loser">152 tok/s (measured)</td></tr>
+      <tr><td>M1 / M2 / M4</td><td>varies</td><td colspan="2">Not a published claim — re-run the reproduce script on that hardware</td></tr>
     </tbody>
   </table>
 
-  <p>M4 numbers are projections based on TFLOPS scaling. We'll update with measured data as hardware becomes available.</p>
+  <p>Do not scale TFLOPS into tok/s for marketing; measure on the target SoC and refresh <code>latest.json</code> if promoting a new number.</p>
 
   <h2>Caveats</h2>
 
@@ -309,7 +307,7 @@ let result = kernel.outputSurface(at: 0)</code></pre>
 
   <div class="callout">
     <strong>See also:</strong>
-    <a href="gpt2-926-tokens-per-second.html">How to Run GPT-2 at 926 tok/s on a MacBook</a> ·
+    <a href="gpt2-926-tokens-per-second.html">How Espresso Hits 519 tok/s End-to-End</a> ·
     <a href="reverse-engineering-apple-neural-engine.html">Reverse-Engineering Apple's Neural Engine</a>
   </div>
 </article>

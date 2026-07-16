@@ -17,67 +17,88 @@
 
 ---
 
-Espresso compiles MIL programs straight to ANE silicon through reverse-engineered private APIs (`_ANEClient`, `_ANEInMemoryModel`). No CoreML in the hot path. No per-token recompilation. IOSurface buffers, fused multi-layer kernels, and hybrid decode for Llama-family artifacts.
+Espresso compiles MIL programs straight to ANE silicon through reverse-engineered private APIs (`_ANEClient`, `_ANEInMemoryModel`). No CoreML in the hot path. No per-token recompilation. IOSurface buffers and fused multi-layer kernels for Apple Silicon.
 
 - **Direct ANE path** — private-API compile once, reuse across decode steps
 - **Fused multi-layer kernels** — fewer ANE dispatches per token
 - **Zero-copy I/O** — NEON-vectorized surface reads, vDSP/Metal where useful
-- **Training experiments on ANE** — forward + backward with gradient accumulation and Adam
 - **Pure Swift 6.2 core** — `~Copyable` move-only tensors, strict concurrency, typed throws
+- **Zero required third-party packages** — clean clone resolves and builds on macOS 15+
 
 <p align="center">
   <img src=".github/assets/demo.gif" alt="Espresso generating tokens on ANE" width="700">
 </p>
 
-## Quick Start
+## Product journeys
+
+Pick one path. Everything else is optional or research.
+
+### 1. Try it (demo)
 
 ```bash
 git clone https://github.com/christopherkarani/Espresso.git
 cd Espresso
 ./espresso          # builds, downloads demo weights, launches TUI
+./espresso doctor   # host readiness check
 ```
 
-Core ANE kernel usage (library surface):
+### 2. Serve a model (`.esp` bundles)
+
+Portable model bundles are the retained serving path:
+
+```bash
+# Pack a prepared native model directory into a portable bundle
+swift run espc pack-native /path/to/model /tmp/model.esp --overwrite
+
+# Inspect / run
+swift run esprun inspect /tmp/model.esp
+swift run esprun generate /tmp/model.esp "Hello" 32
+
+# Same bundle boundary via the generate CLI
+swift run espresso-generate generate --bundle /tmp/model.esp --max-tokens 32 "Hello"
+```
+
+| Artifact | Role |
+|----------|------|
+| `.esp` | Canonical portable model bundle |
+| `.espc` | Derived compiled-cache layer (host-local) |
+| `espc` | Pack native model dirs into `.esp` |
+| `esprun` | Inspect, resolve, generate from bundles |
+| `espresso-generate --bundle` | Full generate/benchmark CLI on the same boundary |
+
+### 3. Embed the library (`ANEKernel`)
 
 ```swift
-// Package.swift — add the dependency
+// Package.swift
 .package(url: "https://github.com/christopherkarani/Espresso.git", from: "1.0.0")
 
 import ANERuntime
 
-let kernel = try ANEKernel(milText: myMIL, weights: blobs, inputSizes: [input], outputSizes: [output])
-try kernel.eval()                          // runs on Neural Engine
+let kernel = try ANEKernel(
+    milText: myMIL,
+    weights: blobs,
+    inputSizes: [input],
+    outputSizes: [output]
+)
+try kernel.eval()                         // runs on Neural Engine
 let result = kernel.outputSurface(at: 0)  // zero-copy read
 ```
 
-Other entry points:
+For end-to-end text generation from prepared weights, use `RealModelInference` or a `.esp` bundle rather than hand-writing MIL.
+
+<details>
+<summary>Optional tooling (bench, install, training)</summary>
 
 ```bash
-./espresso "Hello"                          # generate text
-./espresso doctor                           # check host readiness
-./espresso compare --no-power "Hello"       # side-by-side vs CoreML
-./espresso install                          # install to ~/.local/bin
+./espresso install                            # shim → ~/.local/bin
+./espresso compare --no-power "Hello"         # side-by-side vs CoreML (demo weights)
 swift run espresso-bench --ane-only --inference --layers 6
-swift run espc pack-native /path/to/model /tmp/model.esp --overwrite
-swift run esprun inspect /tmp/model.esp
-swift run esprun generate /tmp/model.esp "Hello" 32
+swift run espresso-train                      # experimental ANE training loop
 ```
 
-## ESP Model Platform
+Rejected experiment configs and distillation scripts live under [`research/`](research/) and are **not** product entry points.
 
-Espresso ships a model platform around portable `.esp` bundles and bundle-aware runtime selection.
-
-- `.esp` is the canonical portable model bundle
-- `.espc` is the derived compiled-cache layer
-- `espc` packs native model directories into `.esp`
-- `esprun` inspects, resolves, and runs bundle artifacts
-- `espresso-generate --bundle <path>` runs the same bundle boundary used by the runtime
-
-Current docs for this layer:
-
-- [Convert / Optimize / Native-Fast strategy](docs/platform/2026-03-26-convert-optimize-native-fast-plan.md)
-- [Stories Convert -> Optimize execution plan](docs/platform/2026-03-26-stories-convert-optimize-execution-plan.md)
-- [Stories agent prompt](docs/platform/2026-03-26-stories-convert-optimize-agent-prompt.md)
+</details>
 
 ## Benchmark
 
@@ -100,12 +121,8 @@ Numbers below match the checked-in machine-readable results in
 ### What these numbers are *not*
 
 - Not a claim about full GPT-2 117M or llama.cpp Metal on the same workload
-- Not the only serving path: the retained exact Stories hybrid path (`.esp` bundles)
-  typically lands lower in wall-clock tok/s after compile and full decode accounting —
-  see the experiment ledger in `tasks/todo.md` for same-binary retain/reject numbers
-- Peak research configurations can exceed the table when measuring a narrower path;
-  only figures with a checked-in `latest.json` (or a PR artifact from the reproduce script)
-  are treated as project claims
+- Not every serving path: retained exact hybrid `.esp` Stories runs can land lower in wall-clock tok/s after compile and full decode accounting
+- Not trunk-only or partial-pipeline peaks from blog posts — only figures backed by `latest.json` (or a PR artifact from the reproduce script) are project claims
 
 <details>
 <summary>Reproduce Espresso benchmarks</summary>
@@ -118,6 +135,7 @@ REPEATS=5 WARMUP=3 ITERATIONS=20 \
 
 Machine-readable output lands in `artifacts/benchmarks/` and is kept out of git.
 Update `benchmarks/results/latest.json` only when you intentionally refresh the public table.
+CI fails if the README table drifts from `latest.json`.
 
 </details>
 
@@ -166,13 +184,12 @@ The decode loop compiles once and reuses the program across all steps. KV cache 
 ```
 ANEInterop (ObjC/C — private API bridge)
   └── ANETypes (~Copyable value types, IOSurface I/O)
-          ├── MILGenerator (28+ kernel variants)
+          ├── MILGenerator (kernel variants)
           │       └── ANERuntime (compile, eval, surface management)
-          │               └── Espresso (training, generation, decode)
-          │                       ├── EspressoTrain (CLI)
-          │                       └── EspressoBench (CLI)
+          │               └── Espresso / RealModelInference (serving, decode)
+          │                       ├── espresso-generate / esprun (CLI)
+          │                       └── ESPBundle (portable .esp)
           └── CPUOps (Accelerate/vDSP kernels)
-                  └── Espresso
 ```
 
 | Module | What it does |
@@ -182,8 +199,8 @@ ANEInterop (ObjC/C — private API bridge)
 | **MILGenerator** | Generates MIL text for forward, backward, decode, and fused kernels. |
 | **CPUOps** | RMSNorm, RoPE, embedding, softmax, Adam via Accelerate/vDSP. |
 | **ANERuntime** | Compiles MIL to ANE E5 binaries. Manages IOSurface buffers and compile budget. |
-| **Espresso** | Transformer layers, generation harnesses, decode, training loop. |
-| **RealModelInference** | GPT-2 / Llama hybrid serving path used by `espresso-generate`. |
+| **Espresso** | Generation harnesses, decode, training experiments. |
+| **RealModelInference** | Hybrid serving path used by `espresso-generate` / `.esp` runtime. |
 | **ESPBundle / ESPRuntime** | Portable `.esp` bundles and runtime resolution. |
 
 ## SPM Integration
@@ -205,40 +222,19 @@ targets: [
 import ANERuntime
 import ANETypes
 
-// 1. Provide MIL text + weight blobs for your kernel shape
 let kernel = try ANEKernel(
     milText: milText,
     weights: weightBlobs,
     inputSizes: [inputByteSize],
     outputSizes: [outputByteSize]
 )
-
-// 2. Run inference — stays on ANE the whole time
 try kernel.eval()
-
-// 3. Read results via zero-copy IOSurface
 let output = try kernel.outputSurface(at: 0)
 ```
 
-For end-to-end generation, use `RealModelInference` / `esprun` with a prepared model directory or `.esp` bundle rather than hand-writing MIL.
-
 ## Dependencies
 
-**Default package graph: zero third-party Swift packages.** Only Apple system frameworks (Foundation, Accelerate, IOSurface, Metal, CoreML).
-
-Optional GGUF / EdgeRunner integration is **not** part of the default graph. It enables only when a local [Edgerunner](https://github.com/christopherkarani) checkout is present:
-
-```bash
-# Sibling checkout (default discovery path)
-#   ../Edgerunner/Package.swift
-
-# Or explicit path
-export ESPRESSO_EDGERUNNER_PATH=/path/to/Edgerunner
-swift build
-
-# Force-disable even if Edgerunner is present
-export ESPRESSO_DISABLE_GGUF=1
-```
+**Zero third-party Swift packages.** The package graph depends only on Apple system frameworks (Foundation, Accelerate, IOSurface, Metal, CoreML). A clean clone of this repo alone must resolve and build.
 
 ## Requirements
 
@@ -257,7 +253,16 @@ ANE_HARDWARE_TESTS=1 swift test --filter "ANERuntimeTests|EspressoTests"  # hard
 OBJC_CROSS_VALIDATION=1 ANE_HARDWARE_TESTS=1 swift test --filter CrossValidationTests  # parity
 ```
 
-CI runs non-hardware unit tests including ESP bundle/runtime and RealModelInference unit suites. Hardware ANE tests run on self-hosted matrix jobs.
+CI runs non-hardware unit tests including ESP bundle/runtime and RealModelInference unit suites, asserts a zero-dependency default graph, and checks README claim numbers against `latest.json`. Hardware ANE tests run on self-hosted matrix jobs.
+
+## Research vs product
+
+| Path | Location |
+|------|----------|
+| Retained product surface | `Sources/`, `./espresso`, `espc` / `esprun` / `espresso-generate`, public docs |
+| Quarantined experiments | [`research/`](research/) — rejected draft/student/future-head configs and tooling |
+
+Do not treat `research/` numbers or flags as supported product behavior.
 
 ## Disclaimer
 

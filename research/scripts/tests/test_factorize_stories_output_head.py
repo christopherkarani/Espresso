@@ -4,8 +4,8 @@ from pathlib import Path
 
 import numpy as np
 
-from scripts import espresso_llama_weights
-from scripts import factorize_stories_output_head as script
+from research.scripts import espresso_llama_weights
+from research.scripts import factorize_stories_output_head as script
 from scripts.tests.test_espresso_llama_weights import write_fixture
 
 

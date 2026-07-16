@@ -24,12 +24,12 @@ Thank you for your interest in contributing to Espresso. This document covers de
 ```bash
 git clone https://github.com/christopherkarani/Espresso.git
 cd Espresso
-swift package resolve   # default graph has no third-party packages
+swift package resolve   # zero third-party packages
 swift build
 swift test              # unit tests, no ANE required
 ```
 
-A clean clone must resolve and build **without** any sibling repositories. Optional GGUF support requires a local Edgerunner checkout (see [README Dependencies](README.md#dependencies)).
+A clean clone must resolve and build with **no** external package dependencies (Apple frameworks only).
 
 **Run the demo**
 
@@ -79,7 +79,7 @@ artifacts/             # Generated benchmark artifacts (gitignored)
 - Use `~Copyable` for move-only resources (kernels, surfaces, weights)
 - Prefer immutable value types; document intentional mutation
 - Typed throws where the error set is bounded
-- Default package graph stays free of third-party Swift packages (Apple frameworks only)
+- Package graph stays free of third-party Swift packages (Apple frameworks only)
 - Prefer typed options over new process-environment feature flags
 - Model-family special cases go through `ModelFamily` in `ModelSupport` — do not add new string `contains("stories110m")` checks elsewhere
 - Prefer smaller, cohesive files and functions for new code. Existing modules include large historical files; do not grow them further without a split plan
@@ -106,8 +106,6 @@ OBJC_CROSS_VALIDATION=1 ANE_HARDWARE_TESTS=1 swift test --filter CrossValidation
 
 Write tests for new behavior. Place them in `Tests/<TargetName>Tests/`. CI runs the non-hardware filter above on every PR that touches package sources/tests.
 
-**GGUF tests** only build when Edgerunner is present (`EspressoGGUFTests`).
-
 ## Submitting Changes
 
 1. **Fork** the repository and create a branch from `main`.
@@ -130,7 +128,9 @@ Types: `feat`, `fix`, `refactor`, `docs`, `test`, `chore`, `perf`, `ci`
 - update `benchmarks/results/latest.json` and the README table together, or
 - attach a machine-readable artifact from `./scripts/reproduce_local_real_artifact_claim.sh`
 
-Self-reported numbers without artifacts will not be accepted. Do not put peak research numbers in the README headline without a matching checked-in result file.
+Self-reported numbers without artifacts will not be accepted. Do not put peak research numbers in the README headline without a matching checked-in result file. CI runs `scripts/assert_readme_claims.py` to keep the table honest.
+
+**Product path vs research**: Preferred product journeys are (1) `./espresso` demo, (2) `.esp` + `esprun` / `espresso-generate --bundle`, (3) `ANEKernel` library. Rejected experiment configs and distillation tooling live under `research/` — do not reintroduce them as default entry points or public claim sources.
 
 ## Issue Guidelines
 

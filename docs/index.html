@@ -3,19 +3,19 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Espresso — 4.76× Faster Than CoreML on Apple Neural Engine</title>
-  <meta name="description" content="Direct ANE inference for transformers on Apple Silicon. 926 tok/s vs CoreML's 196 tok/s. Pure Swift 6.2, zero dependencies, IOSurface KV cache, fused 3-layer kernels.">
+  <title>Espresso — 3.41× Faster Than CoreML on Apple Neural Engine</title>
+  <meta name="description" content="Direct ANE inference for transformers on Apple Silicon. 519 tok/s end-to-end vs CoreML's 152 tok/s (3.41×) on a 6-layer Stories demo artifact. Pure Swift 6.2, zero required third-party packages.">
 
   <!-- Open Graph -->
-  <meta property="og:title" content="Espresso — 4.76× Faster Than CoreML">
-  <meta property="og:description" content="Direct ANE access in pure Swift. 926 tok/s on M3 Max. No CoreML. No dependencies.">
+  <meta property="og:title" content="Espresso — 3.41× Faster Than CoreML">
+  <meta property="og:description" content="Direct ANE access in pure Swift. 519 tok/s end-to-end on M3 Max (checked-in claim). No CoreML in the hot path.">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://christopherkarani.github.io/Espresso/">
 
   <!-- Twitter Card -->
   <meta name="twitter:card" content="summary_large_image">
-  <meta name="twitter:title" content="Espresso — 4.76× Faster Than CoreML">
-  <meta name="twitter:description" content="Direct ANE access in pure Swift. 926 tok/s. No CoreML overhead.">
+  <meta name="twitter:title" content="Espresso — 3.41× Faster Than CoreML">
+  <meta name="twitter:description" content="Direct ANE access in pure Swift. 519 tok/s end-to-end. No CoreML in the hot path.">
 
   <!-- Keywords for SEO -->
   <meta name="keywords" content="Apple Neural Engine, ANE, CoreML alternative, Swift transformer inference, Apple Silicon ML, on-device LLM, fast inference macOS, MIL compiler, IOSurface ML">
@@ -503,7 +503,7 @@
     "@context": "https://schema.org",
     "@type": "SoftwareApplication",
     "name": "Espresso",
-    "description": "Direct Apple Neural Engine inference for transformers — 4.76x faster than CoreML",
+    "description": "Direct Apple Neural Engine inference for transformers — 3.41x faster than CoreML end-to-end",
     "url": "https://github.com/christopherkarani/Espresso",
     "applicationCategory": "DeveloperApplication",
     "operatingSystem": "macOS 15+",
@@ -542,12 +542,12 @@
 
       <h1>
         Direct ANE inference.<br>
-        <span class="accent">4.76× faster</span> than CoreML.
+        <span class="accent">3.41× faster</span> than CoreML.
       </h1>
 
       <p class="hero-sub">
         Espresso compiles MIL programs straight to Apple's Neural Engine through private APIs,
-        bypassing CoreML entirely. Fused 3-layer kernels. IOSurface KV cache. 926 tok/s.
+        bypassing CoreML entirely. Fused 3-layer kernels. IOSurface KV cache. 519 tok/s end-to-end.
       </p>
 
       <div class="cta-group">
@@ -562,28 +562,29 @@
       <div class="bench-hero">
         <div class="bench-col">
           <div class="bench-label">Espresso</div>
-          <div class="bench-value accent">1.08</div>
+          <div class="bench-value accent">1.93</div>
           <div class="bench-unit">ms / token</div>
         </div>
         <div class="bench-col">
           <div class="bench-label">Tokens / sec</div>
-          <div class="bench-value accent">926</div>
-          <div class="bench-unit">Espresso direct ANE</div>
+          <div class="bench-value accent">519</div>
+          <div class="bench-unit">tok/s end-to-end</div>
         </div>
         <div class="bench-col">
           <div class="bench-label">vs CoreML</div>
-          <div class="bench-value green">4.76×</div>
-          <div class="bench-unit">faster</div>
+          <div class="bench-value green">3.41×</div>
+          <div class="bench-unit">faster vs CoreML</div>
         </div>
         <div class="bench-col">
           <div class="bench-label">CoreML baseline</div>
-          <div class="bench-value" style="color: var(--muted)">196</div>
-          <div class="bench-unit">tok/s · 5.09 ms/token</div>
+          <div class="bench-value" style="color: var(--muted)">152</div>
+          <div class="bench-unit">tok/s · 6.58 ms/token</div>
         </div>
       </div>
 
       <p style="font-size: 0.78rem; color: var(--muted); margin-top: 8px;">
-        6-layer transformer · dim=768 · 12 heads · 32k vocab · seqLen=256 · M3 Max · macOS 15
+        6-layer Stories demo artifact · dim=768 · 12 heads · 32k vocab · seqLen=256 · M3 Max · macOS 15<br>
+        Public claims match <code>benchmarks/results/latest.json</code>. Not a production pretrained model.
       </p>
     </div>
   </section>
@@ -709,9 +710,9 @@
   <section id="benchmark">
     <div class="container">
       <div class="section-label">Benchmark</div>
-      <h2>Espresso vs CoreML vs llama.cpp</h2>
+      <h2>Espresso vs CoreML</h2>
       <p class="section-sub">
-        Same 6-layer transformer model, same M3 Max hardware.
+        Same 6-layer Stories demo artifact, same M3 Max hardware. Numbers match <code>benchmarks/results/latest.json</code>.
       </p>
 
       <div class="table-wrap">
@@ -721,70 +722,55 @@
               <th>Metric</th>
               <th>Espresso</th>
               <th>CoreML</th>
-              <th>llama.cpp*</th>
             </tr>
           </thead>
           <tbody>
             <tr>
               <td>Decode (ms/token)</td>
-              <td class="td-highlight">1.08</td>
-              <td class="td-mono">5.09</td>
-              <td class="td-mono">~15–40</td>
+              <td class="td-highlight">1.93</td>
+              <td class="td-mono">6.58</td>
             </tr>
             <tr>
               <td>Tokens / sec</td>
-              <td class="td-highlight">926</td>
-              <td class="td-mono">196</td>
-              <td class="td-mono">~25–65</td>
+              <td class="td-highlight">519</td>
+              <td class="td-mono">152</td>
             </tr>
             <tr>
               <td>Speedup vs CoreML</td>
-              <td class="td-highlight">4.76×</td>
+              <td class="td-highlight">3.41×</td>
               <td class="td-mono">baseline</td>
-              <td class="td-mono">0.3–0.5×</td>
             </tr>
             <tr>
               <td>KV cache</td>
               <td>IOSurface (zero-copy)</td>
               <td>CoreML-managed</td>
-              <td>CPU / GPU</td>
             </tr>
             <tr>
               <td>Recompilation per token</td>
               <td><span class="badge-yes">Never</span></td>
               <td>Seq-length dependent</td>
-              <td><span class="badge-yes">Never</span></td>
             </tr>
             <tr>
-              <td>Dependencies</td>
+              <td>Required third-party packages</td>
               <td><span class="badge-yes">0</span></td>
               <td>Apple framework</td>
-              <td>Multiple</td>
-            </tr>
-            <tr>
-              <td>Training on ANE</td>
-              <td><span class="badge-yes">Yes</span></td>
-              <td><span class="badge-no">No</span></td>
-              <td><span class="badge-no">No</span></td>
             </tr>
             <tr>
               <td>App Store</td>
               <td><span class="badge-no">No†</span></td>
               <td><span class="badge-yes">Yes</span></td>
-              <td><span class="badge-no">No</span></td>
             </tr>
             <tr>
               <td>Language</td>
               <td>Swift 6.2</td>
               <td>—</td>
-              <td>C / C++</td>
             </tr>
           </tbody>
         </table>
       </div>
 
       <p style="font-size: 0.78rem; color: var(--muted); margin-top: 14px;">
-        *llama.cpp estimates for comparable 6-layer model on M3 Max CPU+Metal path.<br>
+        Source: <code>benchmarks/results/latest.json</code> (M3 Max, macOS 15, 6-layer Stories demo artifact).<br>
         †Private APIs are rejected by App Store review. Fine for enterprise, research, sideloaded apps.
       </p>
     </div>
@@ -887,11 +873,11 @@
         <a href="coreml-vs-espresso-benchmarks.html" style="display: block; padding: 20px 0; border-bottom: 1px solid var(--border); text-decoration: none; color: inherit;">
           <div style="font-size: 0.8rem; color: var(--muted); font-family: var(--mono); margin-bottom: 6px;">benchmarks · CoreML</div>
           <div style="font-size: 1.1rem; font-weight: 600; color: var(--text); margin-bottom: 6px;">CoreML vs Espresso: Benchmarks on Apple Silicon</div>
-          <div style="font-size: 0.9rem; color: var(--muted);">4.76x faster. Here's where every millisecond goes.</div>
+          <div style="font-size: 0.9rem; color: var(--muted);">3.41× end-to-end vs CoreML. Numbers match benchmarks/results/latest.json.</div>
         </a>
         <a href="gpt2-926-tokens-per-second.html" style="display: block; padding: 20px 0; border-bottom: 1px solid var(--border); text-decoration: none; color: inherit;">
           <div style="font-size: 0.8rem; color: var(--muted); font-family: var(--mono); margin-bottom: 6px;">tutorial · GPT-2</div>
-          <div style="font-size: 1.1rem; font-weight: 600; color: var(--text); margin-bottom: 6px;">How to Run GPT-2 at 926 tok/s on a MacBook</div>
+          <div style="font-size: 1.1rem; font-weight: 600; color: var(--text); margin-bottom: 6px;">How Espresso Hits 519 tok/s End-to-End on Apple Silicon</div>
           <div style="font-size: 0.9rem; color: var(--muted);">The four optimizations: direct ANE, layer fusion, recurrent arch, zero-copy argmax.</div>
         </a>
         <a href="reverse-engineering-apple-neural-engine.html" style="display: block; padding: 20px 0; text-decoration: none; color: inherit;">

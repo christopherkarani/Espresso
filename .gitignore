@@ -40,7 +40,8 @@ benchmarks/models/*.mlpackage
 artifacts/*
 !artifacts/benchmarks/
 artifacts/benchmarks/*
-scripts/__pycache__/
+**/__pycache__/
+*.pyc
 .codex/skills/**/__pycache__/
 
 # Local macOS benchmark app source (kept local for now)
@@ -76,14 +77,14 @@ scripts/internal/**
 !scripts/generate_coreml_model.py
 !scripts/reproduce_local_real_artifact_claim.sh
 !scripts/run_power_benchmark.sh
-!scripts/run_autoresearch_compare.sh
-!scripts/run_autoresearch_suite.sh
-!scripts/judge_suite_results.sh
+!scripts/assert_readme_claims.py
 !scripts/benchmark-prompts.txt
 !scripts/generate-benchmark-dashboard.sh
 !scripts/stories_model_identity.py
 !scripts/espresso_llama_weights.py
 !scripts/export_llama_coreml.py
+!scripts/convert_weights_gpt2.py
+!scripts/convert_weights_llama.py
 !scripts/stories_prompt_suite.txt
 !scripts/tests/
 !scripts/tests/test_stories_model_identity.py

@@ -3,21 +3,21 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>How to Run GPT-2 at 926 tok/s on a MacBook | Espresso</title>
-  <meta name="description" content="Step-by-step guide to running GPT-2 inference at 926 tokens per second on Apple Silicon using Espresso's direct ANE inference framework. Pure Swift, zero dependencies.">
-  <meta name="keywords" content="GPT-2 Apple Silicon, fast GPT-2 inference macOS, run GPT-2 swift, apple neural engine LLM, on-device GPT-2 fast, 926 tokens per second, swift transformer inference, gpt2 mac performance">
+  <title>How Espresso Hits 519 tok/s End-to-End on Apple Silicon | Espresso</title>
+  <meta name="description" content="Step-by-step guide to Espresso end-to-end generation at 519 tokens per second (1.93 ms/token) on a 6-layer Stories demo artifact. Pure Swift, zero required third-party packages.">
+  <meta name="keywords" content="GPT-2 Apple Silicon, fast GPT-2 inference macOS, run GPT-2 swift, apple neural engine LLM, on-device GPT-2 fast, 519 tokens per second, swift transformer inference, gpt2 mac performance">
   <link rel="canonical" href="https://christopherkarani.github.io/Espresso/gpt2-926-tokens-per-second.html">
 
   <!-- Open Graph -->
-  <meta property="og:title" content="How to Run GPT-2 at 926 tok/s on a MacBook">
-  <meta property="og:description" content="GPT-2 inference at 926 tokens/sec on Apple Silicon using direct ANE access. Pure Swift, no Python, no CoreML.">
+  <meta property="og:title" content="How Espresso Hits 519 tok/s End-to-End on Apple Silicon">
+  <meta property="og:description" content="Espresso end-to-end generation at 519 tok/s on Apple Silicon using direct ANE access. Pure Swift, no Python, no CoreML in the hot path.">
   <meta property="og:type" content="article">
   <meta property="og:url" content="https://christopherkarani.github.io/Espresso/gpt2-926-tokens-per-second.html">
 
   <!-- Twitter Card -->
   <meta name="twitter:card" content="summary_large_image">
-  <meta name="twitter:title" content="GPT-2 at 926 tok/s on Apple Silicon (Pure Swift)">
-  <meta name="twitter:description" content="Step-by-step: how Espresso achieves 926 tokens/sec on a MacBook using direct Neural Engine access.">
+  <meta name="twitter:title" content="519 tok/s End-to-End on Apple Silicon (Pure Swift)">
+  <meta name="twitter:description" content="Step-by-step: how Espresso achieves 519 tok/s end-to-end on a MacBook using direct Neural Engine access.">
 
   <style>
     :root {
@@ -90,8 +90,8 @@
   {
     "@context": "https://schema.org",
     "@type": "TechArticle",
-    "headline": "How to Run GPT-2 at 926 tok/s on a MacBook",
-    "description": "Step-by-step guide to GPT-2 inference at 926 tokens per second on Apple Silicon using Espresso.",
+    "headline": "How Espresso Hits 519 tok/s End-to-End on Apple Silicon",
+    "description": "Step-by-step guide to Espresso end-to-end generation at 519 tokens per second on Apple Silicon.",
     "datePublished": "2026-03-17",
     "author": { "@type": "Organization", "name": "Espresso" },
     "keywords": ["GPT-2", "Apple Silicon", "Neural Engine", "Swift", "inference", "tokens per second"]
@@ -120,25 +120,25 @@
     <span class="tag">performance</span>
   </div>
 
-  <h1>How to Run GPT-2 at 926 tok/s on a MacBook</h1>
+  <h1>How Espresso Hits 519 tok/s End-to-End on Apple Silicon</h1>
 
   <p class="lede">
-    1.08 ms/token. 926 tokens per second. No Python. No CoreML. No GPU.
-    Pure Swift, running directly on the Neural Engine inside your MacBook.
+    1.93 ms/token. 519 tokens per second end-to-end. No Python. No CoreML in the hot path.
+    Pure Swift, running directly on the Neural Engine. Numbers match benchmarks/results/latest.json.
     Here's exactly how it works.
   </p>
 
   <div class="stat-row">
     <div class="stat-card">
-      <div class="stat-value">926</div>
-      <div class="stat-label">tok/s peak</div>
+      <div class="stat-value">519</div>
+      <div class="stat-label">tok/s end-to-end</div>
     </div>
     <div class="stat-card">
-      <div class="stat-value">1.08</div>
+      <div class="stat-value">1.93</div>
       <div class="stat-label">ms/token</div>
     </div>
     <div class="stat-card">
-      <div class="stat-value">4.76x</div>
+      <div class="stat-value">3.41×</div>
       <div class="stat-label">over CoreML</div>
     </div>
     <div class="stat-card">
@@ -176,9 +176,9 @@
 
   <p>The TUI launches, downloads demo weights, compiles the ANE kernels, and starts generating. On first run, kernel compilation takes about 350ms. After that, the compiled E5 binaries are cached by the OS — cold start on subsequent runs is under 5ms.</p>
 
-  <h2>Where Does 926 tok/s Come From?</h2>
+  <h2>What About Higher Peak Numbers?</h2>
 
-  <p>926 tok/s is the peak inference rate measured on the trunk model — 6 transformer layers, ANE only, no logits head overhead. The all-in generation number (including the output head) is 519 tok/s on the same hardware. Here's the breakdown of what we optimized to get there.</p>
+  <p>The public product claim is <strong>519 tok/s</strong> end-to-end (1.929 ms/token), checked in as <code>benchmarks/results/latest.json</code>. Narrower trunk-only measurements can look higher because they omit the output head; those are not product claims. Here's what we optimized to hit the end-to-end number.</p>
 
   <h3>Step 1: Bypass CoreML entirely</h3>
 
@@ -334,7 +334,7 @@ for _ in 0..&lt;200 {
 
   <p>Espresso uses private APIs. They work on macOS 15 / Apple Silicon today, but Apple could change them. The project monitors OS updates and adapts as needed.</p>
 
-  <p>The 926 tok/s figure is trunk-only (no output head). All-in with generation is 519 tok/s. Both are real measured numbers — we just report both because the distinction matters for understanding where time is spent.</p>
+  <p>Only end-to-end figures backed by <code>latest.json</code> are project claims. Trunk-only or partial-pipeline peaks may appear in engineering notes; do not treat them as the product headline.</p>
 
   <p>This is a 6-layer demo model (stories110M, ~110M parameters). Full GPT-2 (12 layers) and larger models will be slower, scaling roughly linearly with layer count. Expect ~260 tok/s for full GPT-2 with the current architecture.</p>
 
