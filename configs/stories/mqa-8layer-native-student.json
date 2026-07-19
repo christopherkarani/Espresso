@@ -1,0 +1,46 @@
+{
+  "teacher": {
+    "source": "espresso",
+    "weights_dir": "/tmp/stories110m-ctx256-v1.esp/weights",
+    "tokenizer_dir": "/tmp/stories110m-ctx256-v1.esp/tokenizer"
+  },
+  "student": {
+    "name": "stories110m-8l-mqa-native-student",
+    "n_layer": 8,
+    "n_head": 12,
+    "n_kv_head": 1,
+    "d_model": 768,
+    "head_dim": 64,
+    "hidden_dim": 2048,
+    "vocab": 32000,
+    "max_seq": 256,
+    "norm_eps": 1e-5,
+    "rope_theta": 10000.0
+  },
+  "initialization": {
+    "mode": "teacher_grouped_kv_mean"
+  },
+  "train": {
+    "texts_file": "scripts/stories_prompt_suite.txt",
+    "sequence_length": 128,
+    "max_samples": 32,
+    "batch_size": 1,
+    "steps": 0,
+    "learning_rate": 1e-5,
+    "kl_weight": 1.0,
+    "ce_weight": 0.1,
+    "temperature": 1.0,
+    "device": "auto"
+  },
+  "export": {
+    "output_dir": "/tmp/stories110m-8l-mqa-native-student",
+    "bundle_path": "/tmp/stories110m-8l-mqa-native-student.esp",
+    "context_target_tokens": 256,
+    "model_tier": "optimized",
+    "behavior_class": "approximate",
+    "optimization_recipe": "stories-8l-mqa-native-student",
+    "quality_gate": "mqa-followup-candidate",
+    "teacher_model": "espresso://stories110m-ctx256",
+    "performance_target": "exact-student-secondary-sweep"
+  }
+}

@@ -94,6 +94,26 @@ import Espresso
     #expect(ClassifierStrategy.select(for: config) == .cpuFP16Tiled)
 }
 
+@Test func lfm2LargeVocabWithoutSidecarSelectsPartitionedCPU() {
+    let config = MultiModelConfig(
+        name: "lfm2-350m-test",
+        nLayer: 16,
+        nHead: 16,
+        nKVHead: 8,
+        dModel: 1024,
+        headDim: 64,
+        hiddenDim: 4608,
+        vocab: 65_536,
+        maxSeq: 4_096,
+        normEps: 1e-5,
+        architecture: .lfm2,
+        lfm2LayerTypes: [.conv, .conv, .fullAttention, .conv, .conv, .fullAttention, .conv, .conv, .fullAttention, .conv, .fullAttention, .conv, .fullAttention, .conv, .fullAttention, .conv],
+        lfm2ConvCacheLength: 3,
+        tieEmbedding: true
+    )
+    #expect(ClassifierStrategy.select(for: config) == .cpuPartitionedFP32)
+}
+
 @Test func gpt2LargeVocabKeepsPartitionedCPUPath() {
     let config = MultiModelConfig(
         name: "gpt2-large-vocab",

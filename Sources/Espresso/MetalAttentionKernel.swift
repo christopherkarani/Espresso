@@ -934,6 +934,56 @@ public final class MetalAttentionKernel {
         }
     }
 
+    /// Submit all layers' fused SDPA as a SINGLE command buffer.
+    /// Eliminates per-layer command buffer creation/commit/sync overhead.
+    public func submitBatchedFusedDecodeSDPA(
+        cachedLayers: [CachedLayerBindings],
+        shape: MetalDecodeAttentionShape
+    ) throws(MetalAttentionError) -> MTLCommandBuffer {
+        guard let commandBuffer = commandQueue.makeCommandBuffer() else {
+            throw .commandBufferUnavailable
+        }
+
+        let decodeParams = DecodeParams(
+            heads: UInt32(shape.heads),
+            headDim: UInt32(shape.headDim),
+            visibleTokens: UInt32(shape.visibleTokens),
+            cacheStride: UInt32(shape.cacheStride),
+            laneStride: UInt32(shape.laneStride),
+            kvHeads: UInt32(shape.kvHeads),
+            tokenBase: UInt32(shape.tokenBase),
+            scale: 1.0 / sqrt(Float(shape.headDim))
+        )
+
+        var retainedBindings: [SurfaceBinding] = []
+        for cached in cachedLayers {
+            let bindings = try cached.makeTransientAttentionBindings(device: device)
+            guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
+                throw .commandEncoderUnavailable
+            }
+            encoder.setComputePipelineState(fusedDecodeSDPAPipeline)
+            encoder.setBuffer(bindings.qBinding.buffer, offset: 0, index: 0)
+            encoder.setBuffer(bindings.kBinding.buffer, offset: 0, index: 1)
+            encoder.setBuffer(bindings.vBinding.buffer, offset: 0, index: 2)
+            encoder.setBuffer(bindings.contextBinding.buffer, offset: 0, index: 3)
+            withUnsafeBytes(of: decodeParams) { rawBytes in
+                encoder.setBytes(rawBytes.baseAddress!, length: rawBytes.count, index: 4)
+            }
+            let tgMemSize = shape.visibleTokens * MemoryLayout<Float>.stride
+            encoder.setThreadgroupMemoryLength(tgMemSize, index: 0)
+            let tgWidth = min(shape.visibleTokens, fusedDecodeSDPAPipeline.maxTotalThreadsPerThreadgroup)
+            encoder.dispatchThreadgroups(
+                MTLSize(width: shape.heads, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: tgWidth, height: 1, depth: 1)
+            )
+            encoder.endEncoding()
+            retainedBindings.append(contentsOf: bindings.all)
+        }
+        Self.retain(bindings: retainedBindings, until: commandBuffer)
+        commandBuffer.commit()
+        return commandBuffer
+    }
+
     // MARK: - Fused RoPE + KV Scatter + SDPA (Phase 5)
 
     /// Submit a single command buffer that encodes:
@@ -1391,6 +1441,134 @@ public final class MetalAttentionKernel {
             )
         )
         projectionEncoder.endEncoding()
+
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        if commandBuffer.status != .completed {
+            throw .commandExecutionFailed(commandBuffer.error?.localizedDescription ?? "status=\(commandBuffer.status.rawValue)")
+        }
+    }
+
+    /// Batched decode attention: encodes ALL layers' attention into ONE command buffer.
+    /// Eliminates per-layer command buffer creation/commit/sync overhead.
+    struct LayerAttentionBindings {
+        fileprivate let qBinding: SurfaceBinding
+        fileprivate let kBinding: SurfaceBinding
+        fileprivate let vBinding: SurfaceBinding
+        let contextBuffer: MTLBuffer
+    }
+
+    struct BatchedDecodeScratch {
+        let scoresBuffer: MTLBuffer
+        let weightsBuffer: MTLBuffer
+
+        init(device: MTLDevice, nLayers: Int, heads: Int, visibleTokens: Int) throws(MetalAttentionError) {
+            let perLayerElements = heads * visibleTokens
+            let totalElements = perLayerElements * nLayers
+            let byteCount = totalElements * MemoryLayout<Float>.stride
+            guard let scoresBuffer = device.makeBuffer(length: byteCount, options: .storageModeShared),
+                  let weightsBuffer = device.makeBuffer(length: byteCount, options: .storageModeShared) else {
+                throw .temporaryBufferAllocationFailed
+            }
+            self.scoresBuffer = scoresBuffer
+            self.weightsBuffer = weightsBuffer
+        }
+    }
+
+    func encodeBatchedDecodeContext(
+        layers: [LayerAttentionBindings],
+        shape: MetalDecodeAttentionShape,
+        scratch: BatchedDecodeScratch
+    ) throws(MetalAttentionError) {
+        guard let commandBuffer = commandQueue.makeCommandBuffer() else {
+            throw .commandBufferUnavailable
+        }
+
+        let decodeParams = DecodeParams(
+            heads: UInt32(shape.heads),
+            headDim: UInt32(shape.headDim),
+            visibleTokens: UInt32(shape.visibleTokens),
+            cacheStride: UInt32(shape.cacheStride),
+            laneStride: UInt32(shape.laneStride),
+            kvHeads: UInt32(shape.kvHeads),
+            tokenBase: UInt32(shape.tokenBase),
+            scale: 1.0 / sqrt(Float(shape.headDim))
+        )
+        let softmaxParams = AttentionParams(
+            heads: UInt32(shape.heads),
+            headDim: UInt32(shape.headDim),
+            seqLen: UInt32(shape.visibleTokens),
+            scale: 1.0 / sqrt(Float(shape.headDim))
+        )
+
+        let perLayerElements = shape.heads * shape.visibleTokens
+
+        // Encode all layers' logits + softmax + output into single command buffer
+        for (layerIdx, layer) in layers.enumerated() {
+            // Retain bindings until command buffer completes
+            Self.retain(bindings: [layer.qBinding, layer.kBinding, layer.vBinding], until: commandBuffer)
+
+            let scoresOffset = layerIdx * perLayerElements * MemoryLayout<Float>.stride
+
+            // Logits: Q × K^T → scores
+            guard let logitsEncoder = commandBuffer.makeComputeCommandEncoder() else {
+                throw .commandEncoderUnavailable
+            }
+            logitsEncoder.setComputePipelineState(decodeLogitsPipeline)
+            logitsEncoder.setBuffer(layer.qBinding.buffer, offset: 0, index: 0)
+            logitsEncoder.setBuffer(layer.kBinding.buffer, offset: 0, index: 1)
+            logitsEncoder.setBuffer(scratch.scoresBuffer, offset: scoresOffset, index: 2)
+            withUnsafeBytes(of: decodeParams) { rawBytes in
+                logitsEncoder.setBytes(rawBytes.baseAddress!, length: rawBytes.count, index: 3)
+            }
+            logitsEncoder.dispatchThreads(
+                MTLSize(width: shape.visibleTokens, height: shape.heads, depth: 1),
+                threadsPerThreadgroup: MTLSize(
+                    width: max(1, min(decodeLogitsPipeline.threadExecutionWidth, shape.visibleTokens)),
+                    height: 1, depth: 1
+                )
+            )
+            logitsEncoder.endEncoding()
+
+            // Softmax: scores → weights
+            guard let softmaxEncoder = commandBuffer.makeComputeCommandEncoder() else {
+                throw .commandEncoderUnavailable
+            }
+            softmaxEncoder.setComputePipelineState(softmaxPipeline)
+            softmaxEncoder.setBuffer(scratch.scoresBuffer, offset: scoresOffset, index: 0)
+            softmaxEncoder.setBuffer(scratch.weightsBuffer, offset: scoresOffset, index: 1)
+            withUnsafeBytes(of: softmaxParams) { rawBytes in
+                softmaxEncoder.setBytes(rawBytes.baseAddress!, length: rawBytes.count, index: 2)
+            }
+            softmaxEncoder.dispatchThreads(
+                MTLSize(width: shape.heads, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(
+                    width: max(1, min(softmaxPipeline.maxTotalThreadsPerThreadgroup, shape.heads)),
+                    height: 1, depth: 1
+                )
+            )
+            softmaxEncoder.endEncoding()
+
+            // Output: weights × V → context
+            guard let outputEncoder = commandBuffer.makeComputeCommandEncoder() else {
+                throw .commandEncoderUnavailable
+            }
+            outputEncoder.setComputePipelineState(decodeOutputStridedPipeline)
+            outputEncoder.setBuffer(scratch.weightsBuffer, offset: scoresOffset, index: 0)
+            outputEncoder.setBuffer(layer.vBinding.buffer, offset: 0, index: 1)
+            outputEncoder.setBuffer(layer.contextBuffer, offset: 0, index: 2)
+            withUnsafeBytes(of: decodeParams) { rawBytes in
+                outputEncoder.setBytes(rawBytes.baseAddress!, length: rawBytes.count, index: 3)
+            }
+            outputEncoder.dispatchThreads(
+                MTLSize(width: shape.headDim, height: shape.heads, depth: 1),
+                threadsPerThreadgroup: MTLSize(
+                    width: max(1, min(outputPipeline.threadExecutionWidth, shape.headDim)),
+                    height: 1, depth: 1
+                )
+            )
+            outputEncoder.endEncoding()
+        }
 
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()

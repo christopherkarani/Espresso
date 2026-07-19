@@ -95,6 +95,37 @@ import Testing
     }
 }
 
+@Test func test_buildRejectsLFM2WithoutLayerMetadata() throws {
+    let tokenizerDir = try makeSentencePieceTokenizerDirectory()
+    let weightDir = try makeTempDirectory()
+    defer {
+        try? FileManager.default.removeItem(at: tokenizerDir.deletingLastPathComponent())
+        try? FileManager.default.removeItem(at: weightDir)
+    }
+
+    let config = MultiModelConfig(
+        name: "invalid-lfm2",
+        nLayer: 16,
+        nHead: 16,
+        nKVHead: 8,
+        dModel: 1024,
+        headDim: 64,
+        hiddenDim: 4608,
+        vocab: 65_536,
+        maxSeq: 4_096,
+        normEps: 1e-5,
+        architecture: .lfm2
+    )
+
+    try expectRealModelInferenceError(containing: "layerTypes") {
+        _ = try RealModelInferenceEngine.build(
+            config: config,
+            weightDir: weightDir.path,
+            tokenizerDir: tokenizerDir.deletingLastPathComponent().path
+        )
+    }
+}
+
 @Test func test_spatialBucketSelection() {
     #expect(RealModelInferenceEngine.spatialBucket(for: 1, maxSeq: 16) == 1)
     #expect(RealModelInferenceEngine.spatialBucket(for: 2, maxSeq: 16) == 2)
@@ -111,6 +142,12 @@ import Testing
 
 @Test func test_milDeploymentTargetDefaultsToIOS18() {
     #expect(RealModelInferenceEngine.milDeploymentTarget(environment: [:]) == "ios18")
+}
+
+@Test func test_requireANEHardwareTestsEnabledUsesInjectedEnvironment() throws {
+    try expectRealModelInferenceError(containing: "ANE_HARDWARE_TESTS=1") {
+        try RealModelInferenceEngine.requireANEHardwareTestsEnabled(environment: [:])
+    }
 }
 
 @Test func test_milDeploymentTargetReadsEnvironmentOverride() {
@@ -306,6 +343,82 @@ import Testing
     #expect(resolved == draftDir.path)
 }
 
+@Test func test_exactTwoTokenDraftCPUFallbackReportsPassMetrics() throws {
+    let bundleRoot = try makeTempDirectory()
+    let tokenizerModel = try makeSentencePieceTokenizerDirectory()
+    defer {
+        try? FileManager.default.removeItem(at: bundleRoot)
+        try? FileManager.default.removeItem(at: tokenizerModel.deletingLastPathComponent())
+    }
+
+    let baseConfig = makeTinyLlamaConfig()
+    let config = MultiModelConfig(
+        name: baseConfig.name,
+        nLayer: baseConfig.nLayer,
+        nHead: baseConfig.nHead,
+        nKVHead: baseConfig.nKVHead,
+        dModel: baseConfig.dModel,
+        headDim: baseConfig.headDim,
+        hiddenDim: baseConfig.hiddenDim,
+        vocab: baseConfig.vocab,
+        maxSeq: 4_096,
+        normEps: baseConfig.normEps,
+        ropeTheta: baseConfig.ropeTheta,
+        eosToken: baseConfig.eosToken,
+        architecture: baseConfig.architecture
+    )
+    let weightDir = bundleRoot.appendingPathComponent("weights", isDirectory: true)
+    let draftDir = weightDir.appendingPathComponent("draft/student", isDirectory: true)
+    try populateMinimalLlamaWeightDirectory(at: weightDir, config: config)
+    try populateMinimalLlamaWeightDirectory(at: draftDir, config: config)
+
+    let descriptor: [String: Any] = [
+        "model_dir": "draft/student",
+        "tokenizer_dir": "tokenizer",
+        "model_id": "tiny-llama-draft",
+    ]
+    let descriptorURL = bundleRoot.appendingPathComponent("weights/draft/exact-two-token.json")
+    try FileManager.default.createDirectory(
+        at: descriptorURL.deletingLastPathComponent(),
+        withIntermediateDirectories: true
+    )
+    try JSONSerialization.data(withJSONObject: descriptor, options: [.sortedKeys]).write(to: descriptorURL)
+
+    let keys = [
+        "ESPRESSO_USE_CPU_EXACT_DECODE",
+        "ESPRESSO_FORCE_HYBRID_DECODE",
+        "ESPRESSO_BUNDLE_DRAFT_KIND",
+        "ESPRESSO_BUNDLE_DRAFT_HORIZON",
+        "ESPRESSO_BUNDLE_DRAFT_ARTIFACT_REF",
+    ]
+    let previous = Dictionary(uniqueKeysWithValues: keys.map { ($0, ProcessInfo.processInfo.environment[$0]) })
+    setenv("ESPRESSO_USE_CPU_EXACT_DECODE", "1", 1)
+    unsetenv("ESPRESSO_FORCE_HYBRID_DECODE")
+    setenv("ESPRESSO_BUNDLE_DRAFT_KIND", "exact_two_token", 1)
+    setenv("ESPRESSO_BUNDLE_DRAFT_HORIZON", "2", 1)
+    setenv("ESPRESSO_BUNDLE_DRAFT_ARTIFACT_REF", "weights/draft/exact-two-token.json", 1)
+    defer {
+        for (key, value) in previous {
+            if let value {
+                setenv(key, value, 1)
+            } else {
+                unsetenv(key)
+            }
+        }
+    }
+
+    var engine = try RealModelInferenceEngine.build(
+        config: config,
+        weightDir: weightDir.path,
+        tokenizerDir: tokenizerModel.deletingLastPathComponent().path
+    )
+    let result = try engine.generate(prompt: "Hello", maxTokens: 2, temperature: 0.0)
+
+    #expect(result.exactHeadBackend == "cpu_exact_two_token_draft")
+    #expect(result.committedExactTokensPerPass != nil)
+    #expect(result.acceptedFutureTokensPerPass != nil)
+}
+
 private func shouldRunLegacyQwenExperimentTests(
     env: [String: String] = ProcessInfo.processInfo.environment
 ) -> Bool {
@@ -383,6 +496,135 @@ private func shouldRunLegacyQwenExperimentTests(
         expectedCount: 3
     )
     #expect(raw == nil)
+}
+
+@Test func test_effectiveExactHeadBackendLabelAllowsLFM2FP16TiledHead() {
+    #expect(
+        RealModelInferenceEngine.effectiveExactHeadBackendLabelForTesting(
+            strategy: .cpuFP16Tiled,
+            architecture: .lfm2,
+            hasRawFP16Head: true
+        ) == "cpu_fp16_tiled"
+    )
+    #expect(
+        RealModelInferenceEngine.effectiveExactHeadBackendLabelForTesting(
+            strategy: .cpuFP16Tiled,
+            architecture: .lfm2,
+            hasRawFP16Head: false
+        ) == "cpu_partitioned_fp32"
+    )
+    #expect(
+        RealModelInferenceEngine.effectiveExactHeadBackendLabelForTesting(
+            strategy: .cpuFP16Tiled,
+            architecture: .gpt2,
+            hasRawFP16Head: true
+        ) == "cpu_partitioned_fp32"
+    )
+}
+
+@Test func test_classifierArgmaxBlockSizeDefaultsTo4000() {
+    #expect(RealModelInferenceEngine.classifierArgmaxBlockSize(environment: [:]) == 4_000)
+    #expect(
+        RealModelInferenceEngine.classifierArgmaxBlockSize(
+            environment: ["ESPRESSO_CLASSIFIER_ARGMAX_BLOCK_SIZE": "0"]
+        ) == 4_000
+    )
+    #expect(
+        RealModelInferenceEngine.classifierArgmaxBlockSize(
+            environment: ["ESPRESSO_CLASSIFIER_ARGMAX_BLOCK_SIZE": "nope"]
+        ) == 4_000
+    )
+}
+
+@Test func test_classifierArgmaxBlockSizeReadsEnvironmentOverride() {
+    #expect(
+        RealModelInferenceEngine.classifierArgmaxBlockSize(
+            environment: ["ESPRESSO_CLASSIFIER_ARGMAX_BLOCK_SIZE": "8192"]
+        ) == 8_192
+    )
+}
+
+@Test func test_decodeContextFromCachesMatchesNaiveReference() {
+    let heads = 4
+    let kvHeads = 2
+    let headDim = 8
+    let visibleTokenCount = 5
+    let cacheStride = 8
+    let qOut = (0..<(heads * headDim)).map { Float(($0 % 7) - 3) * 0.125 }
+    let kCache = (0..<(kvHeads * headDim * cacheStride)).map { Float(($0 % 11) - 5) * 0.0625 }
+    let vCache = (0..<(kvHeads * headDim * cacheStride)).map { Float(($0 % 13) - 6) * 0.05 }
+
+    let actual = RealModelInferenceEngine.decodeContextFromCachesForTesting(
+        qOut: qOut,
+        kCache: kCache,
+        vCache: vCache,
+        heads: heads,
+        kvHeads: kvHeads,
+        headDim: headDim,
+        visibleTokenCount: visibleTokenCount,
+        cacheStride: cacheStride
+    )
+    let expected = naiveDecodeContextFromCaches(
+        qOut: qOut,
+        kCache: kCache,
+        vCache: vCache,
+        heads: heads,
+        kvHeads: kvHeads,
+        headDim: headDim,
+        visibleTokenCount: visibleTokenCount,
+        cacheStride: cacheStride
+    )
+
+    #expect(maxAbsoluteDifference(actual, expected) < 1e-4)
+}
+
+@Test func test_fusedFFNGateUpProjectionMatchesSeparateSwiGLUPath() {
+    let cols = 3
+    let hiddenDim = 2
+    let gate: [Float] = [
+        1, 2, 3,
+        4, 5, 6,
+    ]
+    let up: [Float] = [
+        7, 8, 9,
+        10, 11, 12,
+    ]
+    let vector: [Float] = [0.25, -0.5, 1.5]
+
+    let fused = RealModelInferenceEngine.concatenateRowMajorMatricesVertically(
+        upper: gate,
+        lower: up,
+        cols: cols
+    )
+    let fusedProjection = RealModelInferenceEngine.multiplyRowMajorMatrix(
+        matrix: fused,
+        rows: hiddenDim * 2,
+        cols: cols,
+        vector: vector
+    )
+    let activated = RealModelInferenceEngine.swiGLUActivatedFromFusedProjection(
+        fusedProjection,
+        hiddenDim: hiddenDim
+    )
+
+    let separateGate = RealModelInferenceEngine.multiplyRowMajorMatrix(
+        matrix: gate,
+        rows: hiddenDim,
+        cols: cols,
+        vector: vector
+    )
+    let separateUp = RealModelInferenceEngine.multiplyRowMajorMatrix(
+        matrix: up,
+        rows: hiddenDim,
+        cols: cols,
+        vector: vector
+    )
+    let expected = zip(separateGate, separateUp).map { gateValue, upValue in
+        let silu = gateValue / (1 + Float(Darwin.exp(Double(-gateValue))))
+        return silu * upValue
+    }
+
+    #expect(activated.elementsEqual(expected, by: { abs($0 - $1) < 1e-5 }))
 }
 
 @Test func test_evalHybridSingleLayerRawQKVOutputsForTestingRejectsUnsupportedArchitecture() throws {
@@ -704,6 +946,45 @@ private func shouldRunLegacyQwenExperimentTests(
             config: llamaConfig,
             environment: ["ESPRESSO_USE_CPU_EXACT_QKV": "1"]
         ) == true
+    )
+}
+
+@Test func test_shouldUseBatchedMetalAttentionRequiresCachedBindings() {
+    let enabledPolicy = RealModelExecutionPolicy(
+        environment: ["ESPRESSO_BATCHED_METAL_ATTENTION": "1"]
+    )
+
+    #expect(
+        RealModelInferenceEngine.shouldUseBatchedMetalAttention(
+            policy: enabledPolicy,
+            cachedBindingsAvailable: true,
+            hasMetalRoPEConfig: false,
+            hasCPUExactQKV: false
+        )
+    )
+    #expect(
+        !RealModelInferenceEngine.shouldUseBatchedMetalAttention(
+            policy: enabledPolicy,
+            cachedBindingsAvailable: false,
+            hasMetalRoPEConfig: false,
+            hasCPUExactQKV: false
+        )
+    )
+    #expect(
+        !RealModelInferenceEngine.shouldUseBatchedMetalAttention(
+            policy: enabledPolicy,
+            cachedBindingsAvailable: true,
+            hasMetalRoPEConfig: true,
+            hasCPUExactQKV: false
+        )
+    )
+    #expect(
+        !RealModelInferenceEngine.shouldUseBatchedMetalAttention(
+            policy: enabledPolicy,
+            cachedBindingsAvailable: true,
+            hasMetalRoPEConfig: false,
+            hasCPUExactQKV: true
+        )
     )
 }
 
@@ -1158,6 +1439,27 @@ private func shouldRunLegacyQwenExperimentTests(
     #expect(maxDiff < 0.01)
 }
 
+@Test func test_hybridSingleLayerRunsForActualLFM2AttentionWeights() throws {
+    guard shouldRunANEHardwareTests() else { return }
+    guard let weightsDir = lfm2ProbeWeightDirectory() else { return }
+
+    let metadataURL = URL(fileURLWithPath: weightsDir, isDirectory: true).appendingPathComponent("metadata.json")
+    let metadata = try JSONDecoder().decode(DebugWeightMetadataFile.self, from: Data(contentsOf: metadataURL))
+    let config = try metadata.asConfig()
+    let attentionLayer = try #require(config.resolvedLFM2LayerTypes.firstIndex(of: .fullAttention))
+
+    let output = try RealModelInferenceEngine.evalHybridSingleLayerForTesting(
+        config: config,
+        weightDir: weightsDir,
+        layer: attentionLayer,
+        tokens: [11, 22]
+    )
+
+    #expect(output.count == config.dModel)
+    #expect(output.allSatisfy { $0.isFinite })
+    #expect(output.contains(where: { abs($0) > 0.0001 }))
+}
+
 @Test func test_fullModelGeneration() throws {
     guard shouldRunANEHardwareTests() else { return }
 
@@ -1271,6 +1573,9 @@ private struct DebugWeightMetadataFile: Decodable {
     let ropeTheta: Float?
     let eosToken: UInt32?
     let architecture: String
+    let layerTypes: [LFM2LayerType]?
+    let convCacheLength: Int?
+    let tieEmbedding: Bool?
 
     func asConfig() throws -> MultiModelConfig {
         let parsedArchitecture: MultiModelConfig.Architecture
@@ -1279,6 +1584,8 @@ private struct DebugWeightMetadataFile: Decodable {
             parsedArchitecture = .gpt2
         case "llama":
             parsedArchitecture = .llama
+        case "lfm2":
+            parsedArchitecture = .lfm2
         default:
             throw RealModelInferenceError.runtimeFailure("Unsupported architecture in metadata.json: \(architecture)")
         }
@@ -1295,7 +1602,10 @@ private struct DebugWeightMetadataFile: Decodable {
             normEps: normEps,
             ropeTheta: ropeTheta ?? 10_000.0,
             eosToken: eosToken,
-            architecture: parsedArchitecture
+            architecture: parsedArchitecture,
+            lfm2LayerTypes: layerTypes,
+            lfm2ConvCacheLength: convCacheLength,
+            tieEmbedding: tieEmbedding ?? false
         )
     }
 }
@@ -3128,6 +3438,66 @@ private func makeMinimalLlamaLayerWeightDirectory(
     return root
 }
 
+private func populateMinimalLlamaWeightDirectory(
+    at root: URL,
+    config: MultiModelConfig
+) throws {
+    try FileManager.default.createDirectory(
+        at: root.appendingPathComponent("embeddings", isDirectory: true),
+        withIntermediateDirectories: true
+    )
+    try writeBlob(
+        repeating: 0.03125,
+        count: config.vocab * config.dModel,
+        to: root.appendingPathComponent("embeddings/token.bin")
+    )
+    try writeBlob(
+        repeating: 1.0,
+        count: config.dModel,
+        to: root.appendingPathComponent("rms_final.bin")
+    )
+    try writeBlob(
+        repeating: 0.0078125,
+        count: config.vocab * config.dModel,
+        to: root.appendingPathComponent("lm_head.bin")
+    )
+
+    let metadata: [String: Any] = [
+        "name": config.name,
+        "nLayer": config.nLayer,
+        "nHead": config.nHead,
+        "nKVHead": config.nKVHead,
+        "dModel": config.dModel,
+        "headDim": config.headDim,
+        "hiddenDim": config.hiddenDim,
+        "vocab": config.vocab,
+        "maxSeq": config.maxSeq,
+        "normEps": config.normEps,
+        "ropeTheta": config.ropeTheta,
+        "architecture": "llama",
+    ]
+    try JSONSerialization.data(withJSONObject: metadata, options: [.sortedKeys]).write(
+        to: root.appendingPathComponent("metadata.json")
+    )
+
+    let layerDir = root
+        .appendingPathComponent("layers", isDirectory: true)
+        .appendingPathComponent("0", isDirectory: true)
+    try FileManager.default.createDirectory(at: layerDir, withIntermediateDirectories: true)
+
+    let qDim = config.attentionDim
+    let kvDim = config.kvDim
+    try writeBlob(repeating: 1.0, count: config.dModel, to: layerDir.appendingPathComponent("rms_att.bin"))
+    try writeBlob(repeating: 0.03125, count: config.dModel * qDim, to: layerDir.appendingPathComponent("wq.bin"))
+    try writeBlob(repeating: 0.015625, count: config.dModel * kvDim, to: layerDir.appendingPathComponent("wk.bin"))
+    try writeBlob(repeating: 0.0234375, count: config.dModel * kvDim, to: layerDir.appendingPathComponent("wv.bin"))
+    try writeBlob(repeating: 0.02734375, count: config.dModel * qDim, to: layerDir.appendingPathComponent("wo.bin"))
+    try writeBlob(repeating: 1.0, count: config.dModel, to: layerDir.appendingPathComponent("rms_ffn.bin"))
+    try writeBlob(repeating: 0.01953125, count: config.hiddenDim * config.dModel, to: layerDir.appendingPathComponent("w1.bin"))
+    try writeBlob(repeating: 0.01171875, count: config.dModel * config.hiddenDim, to: layerDir.appendingPathComponent("w2.bin"))
+    try writeBlob(repeating: 0.017578125, count: config.hiddenDim * config.dModel, to: layerDir.appendingPathComponent("w3.bin"))
+}
+
 private func writeBlob(repeating value: Float, count: Int, to url: URL) throws {
     let data = makeBlobData(repeating: value, count: count)
     try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -3354,7 +3724,7 @@ private func cpuArtifactLlamaLayerHiddenLineage(
                 cols: config.dModel,
                 vector: attnNormed
             )
-            var k = multiplyRowMajorFlatMatrix(
+            let k = multiplyRowMajorFlatMatrix(
                 matrix: layer.wk,
                 rows: config.kvDim,
                 cols: config.dModel,
@@ -4037,8 +4407,64 @@ private func maxAbsoluteDifference(_ lhs: [Float], _ rhs: [Float]) -> Float {
     return maxValue
 }
 
+private func naiveDecodeContextFromCaches(
+    qOut: [Float],
+    kCache: [Float],
+    vCache: [Float],
+    heads: Int,
+    kvHeads: Int,
+    headDim: Int,
+    visibleTokenCount: Int,
+    cacheStride: Int
+) -> [Float] {
+    let queriesPerKVHead = max(heads / max(kvHeads, 1), 1)
+    let scale: Float = 1.0 / sqrt(Float(headDim))
+    var context = [Float](repeating: 0, count: heads * headDim)
+
+    for head in 0..<heads {
+        let kvHead = min(head / queriesPerKVHead, kvHeads - 1)
+        let qBase = head * headDim
+        let kvBase = kvHead * headDim
+        var scores = [Float](repeating: 0, count: visibleTokenCount)
+        for token in 0..<visibleTokenCount {
+            var dot: Float = 0
+            for dim in 0..<headDim {
+                dot += qOut[qBase + dim] * kCache[(kvBase + dim) * cacheStride + token]
+            }
+            scores[token] = dot * scale
+        }
+
+        let maxScore = scores.max() ?? 0
+        var denom: Float = 0
+        for token in 0..<visibleTokenCount {
+            scores[token] = exp(scores[token] - maxScore)
+            denom += scores[token]
+        }
+        let invDenom: Float = denom > 0 ? 1 / denom : 0
+
+        for dim in 0..<headDim {
+            var accum: Float = 0
+            for token in 0..<visibleTokenCount {
+                accum += scores[token] * invDenom * vCache[(kvBase + dim) * cacheStride + token]
+            }
+            context[qBase + dim] = accum
+        }
+    }
+
+    return context
+}
+
 private func shouldRunANEHardwareTests() -> Bool {
     ProcessInfo.processInfo.environment["ANE_HARDWARE_TESTS"] == "1" && aneIsAvailable()
+}
+
+private func lfm2ProbeWeightDirectory() -> String? {
+    let environment = ProcessInfo.processInfo.environment
+    if let explicit = environment["ESPRESSO_LFM2_WEIGHT_DIR"], !explicit.isEmpty {
+        return FileManager.default.fileExists(atPath: explicit) ? explicit : nil
+    }
+    let defaultPath = "/tmp/lfm2-350m.esp/weights"
+    return FileManager.default.fileExists(atPath: defaultPath) ? defaultPath : nil
 }
 
 private func aneIsAvailable() -> Bool {
