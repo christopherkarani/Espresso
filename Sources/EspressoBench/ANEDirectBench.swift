@@ -347,7 +347,7 @@ enum ANEDirectBench {
         // 5. Warmup sequences
         printStderr("Warmup: \(warmup) sequences × \(decodeSteps) steps...")
         for _ in 0..<warmup {
-            ForwardPass.initializeDecodeCachesAndMask(surfaceHandles: handles)
+            try ForwardPass.initializeDecodeCachesAndMask(surfaceHandles: handles)
             var decodeState = try DecodeState(maxSeq: decodeMaxSeq)
             for step in 0..<decodeSteps {
                 loadDecodeToken(step: step, tokenInputs: tokenInputs, into: xCur)
@@ -371,7 +371,7 @@ enum ANEDirectBench {
 
         var completedTokens = 0
         for _ in 0..<iterations {
-            ForwardPass.initializeDecodeCachesAndMask(surfaceHandles: handles)
+            try ForwardPass.initializeDecodeCachesAndMask(surfaceHandles: handles)
             var decodeState = try DecodeState(maxSeq: decodeMaxSeq)
             for step in 0..<decodeSteps {
                 loadDecodeToken(step: step, tokenInputs: tokenInputs, into: xCur)

@@ -939,8 +939,8 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         var xInValues = [Float](repeating: 0, count: surfaceCount)
         var xOutValues = [Float](repeating: 0, count: surfaceCount)
         var stateOutValues = [Float](repeating: 0, count: surfaceCount)
-        xInValues.withUnsafeMutableBufferPointer { buffer in
-            SurfaceIO.readFP16(
+        try xInValues.withUnsafeMutableBufferPointer { buffer in
+            try SurfaceIO.readFP16(
                 from: session.handles.xIn,
                 into: buffer,
                 channelOffset: 0,
@@ -951,8 +951,8 @@ final class GenerationHarnessHardwareTests: XCTestCase {
 
         try session.kernels.step.eval()
 
-        xOutValues.withUnsafeMutableBufferPointer { buffer in
-            SurfaceIO.readFP16(
+        try xOutValues.withUnsafeMutableBufferPointer { buffer in
+            try SurfaceIO.readFP16(
                 from: session.handles.xOut,
                 into: buffer,
                 channelOffset: 0,
@@ -960,8 +960,8 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                 spatial: session.handles.laneSpatial
             )
         }
-        stateOutValues.withUnsafeMutableBufferPointer { buffer in
-            SurfaceIO.readFP16(
+        try stateOutValues.withUnsafeMutableBufferPointer { buffer in
+            try SurfaceIO.readFP16(
                 from: session.handles.stateOut,
                 into: buffer,
                 channelOffset: 0,

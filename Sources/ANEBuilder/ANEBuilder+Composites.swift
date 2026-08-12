@@ -144,7 +144,11 @@ extension ANEGraph {
             let out32 = try mul("\(prefix)_out32", x: input32, y: sigmoid32)
             return try castToFP16("\(prefix)_out", input: out32)
         }
-        if ProcessInfo.processInfo.environment["ESPRESSO_SILU_USE_SIGMOID"] != "1" {
+        // Default is true SiLU (x * sigmoid(x)): it matches the training-side
+        // generators and the retained migration fixtures. The tanh identity
+        // (mathematically equal, differently rounded in fp16) stays available
+        // as an experiment behind ESPRESSO_SILU_USE_TANH=1.
+        if ProcessInfo.processInfo.environment["ESPRESSO_SILU_USE_TANH"] == "1" {
             let half = try constScalar("\(prefix)_half", 0.5)
             let halfInput = try mul("\(prefix)_half_input", x: input, y: half)
             let tanhNode = try tanh("\(prefix)_tanh", input: halfInput)

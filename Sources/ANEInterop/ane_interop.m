@@ -195,6 +195,17 @@ static NSString *ane_interop_unique_reload_directory(NSString *prefix) {
         [NSString stringWithFormat:@"%@-%@", prefix, [NSUUID UUID].UUIDString]];
 }
 
+/// Guarded unload: the private `unloadWithQoS:error:` selector is not guaranteed
+/// to exist on every OS build. Returns false when the selector is missing or the
+/// send fails; teardown callers may ignore the result, reload callers must not.
+static bool ane_interop_unload_model(id mdl) {
+    if (!mdl) return false;
+    SEL sel = @selector(unloadWithQoS:error:);
+    if (![mdl respondsToSelector:sel]) return false;
+    NSError *e = nil;
+    return ((BOOL(*)(id,SEL,unsigned int,NSError**))objc_msgSend)(mdl, sel, 21, &e);
+}
+
 static bool ane_interop_move_directory_entries(NSString *sourceDir,
                                                NSString *destinationDir,
                                                NSSet<NSString *> *excludedRootNames) {
@@ -552,9 +563,7 @@ static ANEHandle *ane_interop_make_loaded_handle(id mdl,
 
     ANEHandle *h = (ANEHandle *)calloc(1, sizeof(ANEHandle));
     if (!h) {
-        NSError *e = nil;
-        ((BOOL(*)(id,SEL,unsigned int,NSError**))objc_msgSend)(
-            mdl, @selector(unloadWithQoS:error:), 21, &e);
+        ane_interop_unload_model(mdl);
         ane_interop_remove_tmpdir(td);
         ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE);
         return NULL;
@@ -915,8 +924,7 @@ bool ane_interop_fast_reload(ANEHandle *handle,
         }
 
         NSError *e = nil;
-        if (!((BOOL(*)(id,SEL,unsigned int,NSError**))objc_msgSend)(
-                mdl, @selector(unloadWithQoS:error:), 21, &e)) {
+        if (!ane_interop_unload_model(mdl)) {
             ane_interop_move_directory_entries(backupDir, td, nil);
             ane_interop_remove_tmpdir(stageDir);
             ane_interop_remove_tmpdir(backupDir);
@@ -2195,7 +2203,7 @@ ANEHandle *ane_interop_compile(const uint8_t *milText, size_t milLen,
         if (!h) {
             fprintf(stderr, "ANE compile failed: OOM allocating ANEHandle\n");
             ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE);
-            ((BOOL(*)(id,SEL,unsigned int,NSError**))objc_msgSend)(mdl, @selector(unloadWithQoS:error:), 21, &e);
+            ane_interop_unload_model(mdl);
             ane_interop_remove_tmpdir(td);
             return NULL;
         }
@@ -2446,10 +2454,7 @@ void ane_interop_free(ANEHandle *handle) {
     }
 
     if (handle->model) {
-        id mdl = (__bridge id)handle->model;
-        NSError *e = nil;
-        ((BOOL(*)(id,SEL,unsigned int,NSError**))objc_msgSend)(
-            mdl, @selector(unloadWithQoS:error:), 21, &e);
+        ane_interop_unload_model((__bridge id)handle->model);
     }
 
     if (handle->ioInputs) {

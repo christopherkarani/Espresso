@@ -13,6 +13,7 @@ public enum MetalAttentionError: Error, Equatable {
     case libraryBuildFailed(String)
     case pipelineBuildFailed(String)
     case surfaceCreateFailed
+    case surfaceIOFailed
     case surfaceLockFailed(Int32)
     case surfaceBaseAddressNil
     case bufferBindingFailed
@@ -433,7 +434,7 @@ public final class MetalAttentionKernel {
         let resources = try RunResources(device: device, shape: shape)
         try loadInputs(q: q, k: k, v: v, mask: mask, resources: resources, shape: shape)
         try encodeAndWait(resources: resources, shape: shape)
-        return readOutput(resources: resources, shape: shape)
+        return try readOutput(resources: resources, shape: shape)
     }
 
     public func benchmark(
@@ -1131,41 +1132,41 @@ public final class MetalAttentionKernel {
         resources: RunResources,
         shape: MetalAttentionShape
     ) throws(MetalAttentionError) {
-        q.withUnsafeBufferPointer { ptr in
-            SurfaceIO.writeFP16(to: resources.qSurface, data: ptr, channels: shape.heads, spatial: shape.headDim)
-        }
-        k.withUnsafeBufferPointer { ptr in
-            SurfaceIO.writeFP16(
+        try mapSurfaceIOToMetalAttentionError { try q.withUnsafeBufferPointer { ptr in
+            try SurfaceIO.writeFP16(to: resources.qSurface, data: ptr, channels: shape.heads, spatial: shape.headDim)
+        } }
+        try mapSurfaceIOToMetalAttentionError { try k.withUnsafeBufferPointer { ptr in
+            try SurfaceIO.writeFP16(
                 to: resources.kSurface,
                 data: ptr,
                 channels: shape.heads * shape.seqLen,
                 spatial: shape.headDim
             )
-        }
-        v.withUnsafeBufferPointer { ptr in
-            SurfaceIO.writeFP16(
+        } }
+        try mapSurfaceIOToMetalAttentionError { try v.withUnsafeBufferPointer { ptr in
+            try SurfaceIO.writeFP16(
                 to: resources.vSurface,
                 data: ptr,
                 channels: shape.heads * shape.seqLen,
                 spatial: shape.headDim
             )
-        }
-        mask.withUnsafeBufferPointer { ptr in
-            SurfaceIO.writeFP16(to: resources.maskSurface, data: ptr, channels: shape.heads, spatial: shape.seqLen)
-        }
+        } }
+        try mapSurfaceIOToMetalAttentionError { try mask.withUnsafeBufferPointer { ptr in
+            try SurfaceIO.writeFP16(to: resources.maskSurface, data: ptr, channels: shape.heads, spatial: shape.seqLen)
+        } }
     }
 
-    private func readOutput(resources: RunResources, shape: MetalAttentionShape) -> [Float] {
+    private func readOutput(resources: RunResources, shape: MetalAttentionShape) throws(MetalAttentionError) -> [Float] {
         var output = [Float](repeating: 0, count: shape.heads * shape.headDim)
-        output.withUnsafeMutableBufferPointer { ptr in
-            SurfaceIO.readFP16(
+        try mapSurfaceIOToMetalAttentionError { try output.withUnsafeMutableBufferPointer { ptr in
+            try SurfaceIO.readFP16(
                 from: resources.outputSurface,
                 into: ptr,
                 channelOffset: 0,
                 channels: shape.heads,
                 spatial: shape.headDim
             )
-        }
+        } }
         return output
     }
 

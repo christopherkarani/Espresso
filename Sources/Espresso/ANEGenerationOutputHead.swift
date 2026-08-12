@@ -56,14 +56,14 @@ enum ANEGenerationOutputHeadIO {
     ) throws(GenerationError) {
         guard laneSpatial > 1 else { return }
         let zeroInput = TensorBuffer(count: ModelConfig.dim * laneSpatial, zeroed: true)
-        zeroInput.withUnsafeBufferPointer { zeroPtr in
-            SurfaceIO.writeFP16(
+        try mapSurfaceIOToGenerationError { try zeroInput.withUnsafeBufferPointer { zeroPtr in
+            try SurfaceIO.writeFP16(
                 to: surface,
                 data: zeroPtr,
                 channels: ModelConfig.dim,
                 spatial: laneSpatial
             )
-        }
+        } }
     }
 
     static func writeSingleToken(
@@ -73,14 +73,14 @@ enum ANEGenerationOutputHeadIO {
     ) throws(GenerationError) {
         precondition(input.count == ModelConfig.dim)
         if laneSpatial == 1 {
-            input.withUnsafeBufferPointer { src in
-                SurfaceIO.writeFP16(to: surface, data: src, channels: ModelConfig.dim, spatial: 1)
-            }
+            try mapSurfaceIOToGenerationError { try input.withUnsafeBufferPointer { src in
+                try SurfaceIO.writeFP16(to: surface, data: src, channels: ModelConfig.dim, spatial: 1)
+            } }
             return
         }
 
         do {
-            try input.withUnsafeBufferPointer { src in
+            try mapSurfaceIOToGenerationError { try input.withUnsafeBufferPointer { src in
                 try SurfaceIO.writeFP16SpatialSlice(
                     to: surface,
                     channelOffset: 0,
@@ -89,7 +89,7 @@ enum ANEGenerationOutputHeadIO {
                     data: src,
                     channels: ModelConfig.dim
                 )
-            }
+            } }
         } catch {
             throw .runtimeFailure("ANE output-head input write failed: \(error)")
         }
@@ -108,7 +108,7 @@ enum ANEGenerationOutputHeadIO {
         }
 
         do {
-            try inputA.withUnsafeBufferPointer { src in
+            try mapSurfaceIOToGenerationError { try inputA.withUnsafeBufferPointer { src in
                 try SurfaceIO.writeFP16SpatialSlice(
                     to: surface,
                     channelOffset: 0,
@@ -117,8 +117,8 @@ enum ANEGenerationOutputHeadIO {
                     data: src,
                     channels: ModelConfig.dim
                 )
-            }
-            try inputB.withUnsafeBufferPointer { src in
+            } }
+            try mapSurfaceIOToGenerationError { try inputB.withUnsafeBufferPointer { src in
                 try SurfaceIO.writeFP16SpatialSlice(
                     to: surface,
                     channelOffset: 0,
@@ -127,7 +127,7 @@ enum ANEGenerationOutputHeadIO {
                     data: src,
                     channels: ModelConfig.dim
                 )
-            }
+            } }
         } catch {
             throw .runtimeFailure("ANE output-head pair input write failed: \(error)")
         }
@@ -142,17 +142,17 @@ enum ANEGenerationOutputHeadIO {
         precondition(logits.count == vocabSize)
         do {
             if laneSpatial == 1 {
-                logits.withUnsafeMutableBufferPointer { dst in
-                    SurfaceIO.readFP16(
+                try mapSurfaceIOToGenerationError { try logits.withUnsafeMutableBufferPointer { dst in
+                    try SurfaceIO.readFP16(
                         from: surface,
                         into: dst,
                         channelOffset: 0,
                         channels: vocabSize,
                         spatial: 1
                     )
-                }
+                } }
             } else {
-                try logits.withUnsafeMutableBufferPointer { dst in
+                try mapSurfaceIOToGenerationError { try logits.withUnsafeMutableBufferPointer { dst in
                     try SurfaceIO.readFP16SpatialSlice(
                         from: surface,
                         channelOffset: 0,
@@ -161,7 +161,7 @@ enum ANEGenerationOutputHeadIO {
                         into: dst,
                         channels: vocabSize
                     )
-                }
+                } }
             }
         } catch {
             throw .runtimeFailure("ANE output-head output read failed: \(error)")

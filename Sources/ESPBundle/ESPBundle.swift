@@ -474,16 +474,12 @@ public enum ESPBundleLayout {
     public static let manifestFileName = "manifest.toml"
     public static let signatureCatalogFileName = "content-hashes.json"
 
+    /// Only directories that actually carry content. Older bundles may contain
+    /// additional empty directories (arch, graphs, states, adapters, compiled,
+    /// benchmarks, licenses); they are ignored, not required.
     public static let requiredTopLevelEntries = [
-        "arch",
         "tokenizer",
         "weights",
-        "graphs",
-        "states",
-        "adapters",
-        "compiled",
-        "benchmarks",
-        "licenses",
         "signatures",
     ]
 }

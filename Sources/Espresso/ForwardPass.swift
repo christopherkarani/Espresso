@@ -100,9 +100,9 @@ public enum ForwardPass {
                 attnIn = try kernels[L].fwdAttn.inputSurface(at: 0)
             }
             var t0 = RuntimeClock.now()
-            xCur.withUnsafeBufferPointer { xBuf in
-                SurfaceIO.writeFP16(to: attnIn, data: xBuf, channels: dim, spatial: seqLen)
-            }
+            try mapSurfaceIOToANEError { try xCur.withUnsafeBufferPointer { xBuf in
+                try SurfaceIO.writeFP16(to: attnIn, data: xBuf, channels: dim, spatial: seqLen)
+            } }
             timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
 
             t0 = RuntimeClock.now()
@@ -116,18 +116,18 @@ public enum ForwardPass {
                 attnOut = try kernels[L].fwdAttn.outputSurface(at: 0)
             }
             t0 = RuntimeClock.now()
-            acts[L].oOut.withUnsafeMutableBufferPointer { oOut in
-                acts[L].attnOut.withUnsafeMutableBufferPointer { attnOutBuf in
-                    acts[L].xnorm.withUnsafeMutableBufferPointer { xnormBuf in
+            try mapSurfaceIOToANEError { try acts[L].oOut.withUnsafeMutableBufferPointer { oOut in
+                try acts[L].attnOut.withUnsafeMutableBufferPointer { attnOutBuf in
+                    try acts[L].xnorm.withUnsafeMutableBufferPointer { xnormBuf in
                         let regions = [
                             SurfaceIO.FP16ReadRegion(destination: requireBase(oOut), channelOffset: 0, channels: dim),
                             SurfaceIO.FP16ReadRegion(destination: requireBase(attnOutBuf), channelOffset: 4 * dim, channels: dim),
                             SurfaceIO.FP16ReadRegion(destination: requireBase(xnormBuf), channelOffset: 5 * dim, channels: dim),
                         ]
-                        SurfaceIO.readFP16Batched(from: attnOut, spatial: seqLen, regions: regions)
+                        try SurfaceIO.readFP16Batched(from: attnOut, spatial: seqLen, regions: regions)
                     }
                 }
-            }
+            } }
             timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
             // NOTE: Q/K/V at offsets 1*dim, 2*dim, 3*dim are intentionally not read back to CPU.
 
@@ -150,9 +150,9 @@ public enum ForwardPass {
                 ffnIn = try kernels[L].fwdFFN.inputSurface(at: 0)
             }
             t0 = RuntimeClock.now()
-            acts[L].x2.withUnsafeBufferPointer { x2Buf in
-                SurfaceIO.writeFP16(to: ffnIn, data: x2Buf, channels: dim, spatial: seqLen)
-            }
+            try mapSurfaceIOToANEError { try acts[L].x2.withUnsafeBufferPointer { x2Buf in
+                try SurfaceIO.writeFP16(to: ffnIn, data: x2Buf, channels: dim, spatial: seqLen)
+            } }
             timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
 
             t0 = RuntimeClock.now()
@@ -166,11 +166,11 @@ public enum ForwardPass {
                 ffnOut = try kernels[L].fwdFFN.outputSurface(at: 0)
             }
             t0 = RuntimeClock.now()
-            acts[L].ffnOut.withUnsafeMutableBufferPointer { ffnOutBuf in
-                acts[L].h1.withUnsafeMutableBufferPointer { h1Buf in
-                    acts[L].h3.withUnsafeMutableBufferPointer { h3Buf in
-                        acts[L].siluOut.withUnsafeMutableBufferPointer { siluBuf in
-                            acts[L].x2norm.withUnsafeMutableBufferPointer { x2normBuf in
+            try mapSurfaceIOToANEError { try acts[L].ffnOut.withUnsafeMutableBufferPointer { ffnOutBuf in
+                try acts[L].h1.withUnsafeMutableBufferPointer { h1Buf in
+                    try acts[L].h3.withUnsafeMutableBufferPointer { h3Buf in
+                        try acts[L].siluOut.withUnsafeMutableBufferPointer { siluBuf in
+                            try acts[L].x2norm.withUnsafeMutableBufferPointer { x2normBuf in
                                 let regions = [
                                     SurfaceIO.FP16ReadRegion(destination: requireBase(ffnOutBuf), channelOffset: 0, channels: dim),
                                     SurfaceIO.FP16ReadRegion(destination: requireBase(h1Buf), channelOffset: dim, channels: hidden),
@@ -178,12 +178,12 @@ public enum ForwardPass {
                                     SurfaceIO.FP16ReadRegion(destination: requireBase(siluBuf), channelOffset: dim + 2 * hidden, channels: hidden),
                                     SurfaceIO.FP16ReadRegion(destination: requireBase(x2normBuf), channelOffset: dim + 3 * hidden, channels: dim),
                                 ]
-                                SurfaceIO.readFP16Batched(from: ffnOut, spatial: seqLen, regions: regions)
+                                try SurfaceIO.readFP16Batched(from: ffnOut, spatial: seqLen, regions: regions)
                             }
                         }
                     }
                 }
-            }
+            } }
             timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
 
             // Residual: xCur = x2 + ffnOut.
@@ -276,9 +276,9 @@ public enum ForwardPass {
 
             let attnWriteStart = RuntimeClock.now()
             if profiler == nil {
-                xCur.withUnsafeBufferPointer { xBuf in
-                    SurfaceIO.writeFP16(to: attnIn, data: xBuf, channels: dim, spatial: seqLen)
-                }
+                try mapSurfaceIOToANEError { try xCur.withUnsafeBufferPointer { xBuf in
+                    try SurfaceIO.writeFP16(to: attnIn, data: xBuf, channels: dim, spatial: seqLen)
+                } }
             } else {
                 let lockStart = RuntimeClock.now()
                 precondition(SurfaceIO.lockWrite(attnIn))
@@ -337,15 +337,15 @@ public enum ForwardPass {
             case .cpuRoundTrip:
                 let attnReadStart = RuntimeClock.now()
                 if profiler == nil {
-                    xCur.withUnsafeMutableBufferPointer { xBuf in
-                        SurfaceIO.readFP16(
+                    try mapSurfaceIOToANEError { try xCur.withUnsafeMutableBufferPointer { xBuf in
+                        try SurfaceIO.readFP16(
                             from: attnOut,
                             into: xBuf,
                             channelOffset: 0,
                             channels: dim,
                             spatial: seqLen
                         )
-                    }
+                    } }
                 } else {
                     let lockStart = RuntimeClock.now()
                     precondition(SurfaceIO.lockRead(attnOut))
@@ -373,9 +373,9 @@ public enum ForwardPass {
 
                 let ffnWriteStart = RuntimeClock.now()
                 if profiler == nil {
-                    xCur.withUnsafeBufferPointer { xBuf in
-                        SurfaceIO.writeFP16(to: ffnIn, data: xBuf, channels: dim, spatial: seqLen)
-                    }
+                    try mapSurfaceIOToANEError { try xCur.withUnsafeBufferPointer { xBuf in
+                        try SurfaceIO.writeFP16(to: ffnIn, data: xBuf, channels: dim, spatial: seqLen)
+                    } }
                 } else {
                     let lockStart = RuntimeClock.now()
                     precondition(SurfaceIO.lockWrite(ffnIn))
@@ -438,15 +438,15 @@ public enum ForwardPass {
 
             let ffnReadStart = RuntimeClock.now()
             if profiler == nil {
-                xCur.withUnsafeMutableBufferPointer { xBuf in
-                    SurfaceIO.readFP16(
+                try mapSurfaceIOToANEError { try xCur.withUnsafeMutableBufferPointer { xBuf in
+                    try SurfaceIO.readFP16(
                         from: ffnOut,
                         into: xBuf,
                         channelOffset: 0,
                         channels: dim,
                         spatial: seqLen
                     )
-                }
+                } }
             } else {
                 let lockStart = RuntimeClock.now()
                 precondition(SurfaceIO.lockRead(ffnOut))

@@ -497,8 +497,8 @@ final class ANERuntimeTests: XCTestCase {
         let inputSurface = try kernel.inputSurface(at: 0)
         let outputSurface = try kernel.outputSurface(at: 0)
 
-        input.withUnsafeBufferPointer { inputBuf in
-            SurfaceIO.writeFP16(
+        try input.withUnsafeBufferPointer { inputBuf in
+            try SurfaceIO.writeFP16(
                 to: inputSurface,
                 data: inputBuf,
                 channels: identityChannels,
@@ -519,8 +519,8 @@ final class ANERuntimeTests: XCTestCase {
 
         try kernel.eval()
 
-        output.withUnsafeMutableBufferPointer { outputBuf in
-            SurfaceIO.readFP16(
+        try output.withUnsafeMutableBufferPointer { outputBuf in
+            try SurfaceIO.readFP16(
                 from: outputSurface,
                 into: outputBuf,
                 channelOffset: 0,
@@ -558,17 +558,17 @@ final class ANERuntimeTests: XCTestCase {
         let b: [Float] = [10, 20, 30, 40]
         var y = [Float](repeating: 0, count: channels)
 
-        a.withUnsafeBufferPointer { src in
-            SurfaceIO.writeFP16(to: inputA, data: src, channels: channels, spatial: spatial)
+        try a.withUnsafeBufferPointer { src in
+            try SurfaceIO.writeFP16(to: inputA, data: src, channels: channels, spatial: spatial)
         }
-        b.withUnsafeBufferPointer { src in
-            SurfaceIO.writeFP16(to: inputB, data: src, channels: channels, spatial: spatial)
+        try b.withUnsafeBufferPointer { src in
+            try SurfaceIO.writeFP16(to: inputB, data: src, channels: channels, spatial: spatial)
         }
 
         try kernel.eval()
 
-        y.withUnsafeMutableBufferPointer { dst in
-            SurfaceIO.readFP16(from: output, into: dst, channelOffset: 0, channels: channels, spatial: spatial)
+        try y.withUnsafeMutableBufferPointer { dst in
+            try SurfaceIO.readFP16(from: output, into: dst, channelOffset: 0, channels: channels, spatial: spatial)
         }
 
         XCTAssertEqual(y[0], 11, accuracy: 1e-2)
@@ -616,18 +616,18 @@ final class ANERuntimeTests: XCTestCase {
             }
         }
 
-        q.withUnsafeBufferPointer { src in
-            SurfaceIO.writeFP16(to: qSurface, data: src, channels: heads * headDim, spatial: 1)
+        try q.withUnsafeBufferPointer { src in
+            try SurfaceIO.writeFP16(to: qSurface, data: src, channels: heads * headDim, spatial: 1)
         }
-        k.withUnsafeBufferPointer { src in
-            SurfaceIO.writeFP16(to: kSurface, data: src, channels: heads * seq * headDim, spatial: 1)
+        try k.withUnsafeBufferPointer { src in
+            try SurfaceIO.writeFP16(to: kSurface, data: src, channels: heads * seq * headDim, spatial: 1)
         }
 
         try kernel.eval()
 
         var y = [Float](repeating: 0, count: outCount)
-        y.withUnsafeMutableBufferPointer { dst in
-            SurfaceIO.readFP16(from: outSurface, into: dst, channelOffset: 0, channels: heads * seq, spatial: 1)
+        try y.withUnsafeMutableBufferPointer { dst in
+            try SurfaceIO.readFP16(from: outSurface, into: dst, channelOffset: 0, channels: heads * seq, spatial: 1)
         }
 
         XCTAssertTrue(y.allSatisfy(\.isFinite))
@@ -694,24 +694,24 @@ final class ANERuntimeTests: XCTestCase {
                     let surface = try kernel.inputSurface(at: inputIndex)
                     switch kind {
                     case "x":
-                        Array(repeating: Float(0.25), count: dim * lane).withUnsafeBufferPointer { src in
-                            SurfaceIO.writeFP16(to: surface, data: src, channels: dim, spatial: lane)
+                        try Array(repeating: Float(0.25), count: dim * lane).withUnsafeBufferPointer { src in
+                            try SurfaceIO.writeFP16(to: surface, data: src, channels: dim, spatial: lane)
                         }
                     case "k", "v":
-                        Array(repeating: Float(0), count: dim * maxSeq).withUnsafeBufferPointer { src in
-                            SurfaceIO.writeFP16(to: surface, data: src, channels: dim, spatial: maxSeq)
+                        try Array(repeating: Float(0), count: dim * maxSeq).withUnsafeBufferPointer { src in
+                            try SurfaceIO.writeFP16(to: surface, data: src, channels: dim, spatial: maxSeq)
                         }
                     case "q":
-                        Array(repeating: Float(0), count: 2 * dim * maxSeq).withUnsafeBufferPointer { src in
-                            SurfaceIO.writeFP16(to: surface, data: src, channels: 2 * dim, spatial: maxSeq)
+                        try Array(repeating: Float(0), count: 2 * dim * maxSeq).withUnsafeBufferPointer { src in
+                            try SurfaceIO.writeFP16(to: surface, data: src, channels: 2 * dim, spatial: maxSeq)
                         }
                     case "m":
-                        Array(repeating: Float(-1e4), count: maxSeq).withUnsafeBufferPointer { src in
-                            SurfaceIO.writeFP16(to: surface, data: src, channels: 1, spatial: maxSeq)
+                        try Array(repeating: Float(-1e4), count: maxSeq).withUnsafeBufferPointer { src in
+                            try SurfaceIO.writeFP16(to: surface, data: src, channels: 1, spatial: maxSeq)
                         }
                     case "d":
-                        Array(repeating: Float(-1e4), count: dim * maxSeq).withUnsafeBufferPointer { src in
-                            SurfaceIO.writeFP16(to: surface, data: src, channels: dim, spatial: maxSeq)
+                        try Array(repeating: Float(-1e4), count: dim * maxSeq).withUnsafeBufferPointer { src in
+                            try SurfaceIO.writeFP16(to: surface, data: src, channels: dim, spatial: maxSeq)
                         }
                     default:
                         preconditionFailure("unknown input kind \(kind)")
@@ -721,8 +721,8 @@ final class ANERuntimeTests: XCTestCase {
                 try kernel.eval()
                 let ySurface = try kernel.outputSurface(at: 0)
                 var out = [Float](repeating: 0, count: dim * lane)
-                out.withUnsafeMutableBufferPointer { dst in
-                    SurfaceIO.readFP16(from: ySurface, into: dst, channelOffset: 0, channels: dim, spatial: lane)
+                try out.withUnsafeMutableBufferPointer { dst in
+                    try SurfaceIO.readFP16(from: ySurface, into: dst, channelOffset: 0, channels: dim, spatial: lane)
                 }
                 successes[variant.name] = out.allSatisfy(\.isFinite)
             } catch {
@@ -1163,8 +1163,8 @@ final class ANERuntimeTests: XCTestCase {
         for i in input.indices {
             input[i] = Float(i % 64 + 1) * 0.01
         }
-        input.withUnsafeBufferPointer { buf in
-            SurfaceIO.writeFP16(to: inputSurface, data: buf, channels: dim, spatial: seqLen)
+        try input.withUnsafeBufferPointer { buf in
+            try SurfaceIO.writeFP16(to: inputSurface, data: buf, channels: dim, spatial: seqLen)
         }
 
         try kernels.fwdAttn.eval()
@@ -1172,8 +1172,8 @@ final class ANERuntimeTests: XCTestCase {
         let offsets = [0, dim, 2 * dim, 3 * dim, 4 * dim, 5 * dim]
         for offset in offsets {
             var region = [Float](repeating: 0, count: dim * seqLen)
-            region.withUnsafeMutableBufferPointer { out in
-                SurfaceIO.readFP16(
+            try region.withUnsafeMutableBufferPointer { out in
+                try SurfaceIO.readFP16(
                     from: outputSurface,
                     into: out,
                     channelOffset: offset,
@@ -1209,15 +1209,15 @@ final class ANERuntimeTests: XCTestCase {
         for i in 0..<(dim * seqLen) {
             input[i] = Float(i % 64 + 1) * 0.01
         }
-        input.withUnsafeBufferPointer { buf in
-            SurfaceIO.writeFP16(to: inputSurface, data: buf, channels: dim, spatial: seqLen)
+        try input.withUnsafeBufferPointer { buf in
+            try SurfaceIO.writeFP16(to: inputSurface, data: buf, channels: dim, spatial: seqLen)
         }
 
         try kernels.fwdAttn.eval()
 
         var oOut = [Float](repeating: 0, count: dim * seqLen)
-        oOut.withUnsafeMutableBufferPointer { out in
-            SurfaceIO.readFP16(from: outputSurface, into: out, channelOffset: 0, channels: dim, spatial: seqLen)
+        try oOut.withUnsafeMutableBufferPointer { out in
+            try SurfaceIO.readFP16(from: outputSurface, into: out, channelOffset: 0, channels: dim, spatial: seqLen)
         }
 
         let worst = maxAbsDiff(actual: oOut, expected: expectedOOut)
@@ -1252,25 +1252,25 @@ final class ANERuntimeTests: XCTestCase {
         for i in 0..<(dim * seqLen) {
             input[i] = Float(i % 64 + 1) * 0.01
         }
-        input.withUnsafeBufferPointer { buf in
-            SurfaceIO.writeFP16(to: attnIn, data: buf, channels: dim, spatial: seqLen)
+        try input.withUnsafeBufferPointer { buf in
+            try SurfaceIO.writeFP16(to: attnIn, data: buf, channels: dim, spatial: seqLen)
         }
 
         try kernels.fwdAttn.eval()
 
         var oOut = [Float](repeating: 0, count: dim * seqLen)
-        oOut.withUnsafeMutableBufferPointer { out in
-            SurfaceIO.readFP16(from: attnOut, into: out, channelOffset: 0, channels: dim, spatial: seqLen)
+        try oOut.withUnsafeMutableBufferPointer { out in
+            try SurfaceIO.readFP16(from: attnOut, into: out, channelOffset: 0, channels: dim, spatial: seqLen)
         }
-        oOut.withUnsafeBufferPointer { buf in
-            SurfaceIO.writeFP16(to: ffnIn, data: buf, channels: dim, spatial: seqLen)
+        try oOut.withUnsafeBufferPointer { buf in
+            try SurfaceIO.writeFP16(to: ffnIn, data: buf, channels: dim, spatial: seqLen)
         }
 
         try kernels.fwdFFN.eval()
 
         var y = [Float](repeating: 0, count: dim * seqLen)
-        y.withUnsafeMutableBufferPointer { out in
-            SurfaceIO.readFP16(from: ffnOut, into: out, channelOffset: 0, channels: dim, spatial: seqLen)
+        try y.withUnsafeMutableBufferPointer { out in
+            try SurfaceIO.readFP16(from: ffnOut, into: out, channelOffset: 0, channels: dim, spatial: seqLen)
         }
 
         let worst = maxAbsDiff(actual: y, expected: expectedY)
@@ -1304,8 +1304,8 @@ final class ANERuntimeTests: XCTestCase {
         for i in 0..<((dim + 2 * hidden) * seqLen) {
             ffnBwdInput[i] = Float(i % 128 + 1) * 0.005
         }
-        ffnBwdInput.withUnsafeBufferPointer { buf in
-            SurfaceIO.writeFP16(
+        try ffnBwdInput.withUnsafeBufferPointer { buf in
+            try SurfaceIO.writeFP16(
                 to: ffnBwdIn,
                 data: buf,
                 channels: dim + 2 * hidden,
@@ -1316,8 +1316,8 @@ final class ANERuntimeTests: XCTestCase {
         try kernels.ffnBwd.eval()
 
         var dx = [Float](repeating: 0, count: dim * seqLen)
-        dx.withUnsafeMutableBufferPointer { out in
-            SurfaceIO.readFP16(from: ffnBwdOut, into: out, channelOffset: 0, channels: dim, spatial: seqLen)
+        try dx.withUnsafeMutableBufferPointer { out in
+            try SurfaceIO.readFP16(from: ffnBwdOut, into: out, channelOffset: 0, channels: dim, spatial: seqLen)
         }
 
         let worst = maxAbsDiff(actual: dx, expected: expectedDX)
@@ -1845,8 +1845,8 @@ final class ANERuntimeTests: XCTestCase {
         for i in input.indices {
             input[i] = Float((i % 113) + 1) * 0.001
         }
-        input.withUnsafeBufferPointer { buffer in
-            SurfaceIO.writeFP16(
+        try input.withUnsafeBufferPointer { buffer in
+            try SurfaceIO.writeFP16(
                 to: inputSurface,
                 data: buffer,
                 channels: sdpaBwd2InputChannels,
@@ -1868,8 +1868,8 @@ final class ANERuntimeTests: XCTestCase {
         try staticKernel.kernel.eval()
 
         var output = [Float](repeating: 0, count: sdpaBwd2OutputChannels * sdpaSpatial)
-        output.withUnsafeMutableBufferPointer { buffer in
-            SurfaceIO.readFP16(
+        try output.withUnsafeMutableBufferPointer { buffer in
+            try SurfaceIO.readFP16(
                 from: outputSurface,
                 into: buffer,
                 channelOffset: 0,

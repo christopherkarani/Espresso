@@ -193,17 +193,17 @@ final class MetalAttentionKernelTests: XCTestCase {
         let vCacheSurface = makeSurface(bytes: vCacheData.count * 2)
         let outputSurface = makeSurface(bytes: qSurfaceData.count * 2)
 
-        qSurfaceData.withUnsafeBufferPointer { src in
-            SurfaceIO.writeFP16(to: qSurface, data: src, channels: dim, spatial: shape.laneStride)
+        try qSurfaceData.withUnsafeBufferPointer { src in
+            try SurfaceIO.writeFP16(to: qSurface, data: src, channels: dim, spatial: shape.laneStride)
         }
-        residualSurfaceData.withUnsafeBufferPointer { src in
-            SurfaceIO.writeFP16(to: residualSurface, data: src, channels: dim, spatial: shape.laneStride)
+        try residualSurfaceData.withUnsafeBufferPointer { src in
+            try SurfaceIO.writeFP16(to: residualSurface, data: src, channels: dim, spatial: shape.laneStride)
         }
-        kCacheData.withUnsafeBufferPointer { src in
-            SurfaceIO.writeFP16(to: kCacheSurface, data: src, channels: dim, spatial: shape.cacheStride)
+        try kCacheData.withUnsafeBufferPointer { src in
+            try SurfaceIO.writeFP16(to: kCacheSurface, data: src, channels: dim, spatial: shape.cacheStride)
         }
-        vCacheData.withUnsafeBufferPointer { src in
-            SurfaceIO.writeFP16(to: vCacheSurface, data: src, channels: dim, spatial: shape.cacheStride)
+        try vCacheData.withUnsafeBufferPointer { src in
+            try SurfaceIO.writeFP16(to: vCacheSurface, data: src, channels: dim, spatial: shape.cacheStride)
         }
 
         try kernel.runDecode(
@@ -292,14 +292,14 @@ final class MetalAttentionKernelTests: XCTestCase {
         let vCacheSurface = makeSurface(bytes: vCacheData.count * 2)
         let contextSurface = makeSurface(bytes: dim * shape.laneStride * MemoryLayout<Float>.stride)
 
-        qSurfaceData.withUnsafeBufferPointer { src in
-            SurfaceIO.writeFP16(to: qSurface, data: src, channels: dim, spatial: shape.laneStride)
+        try qSurfaceData.withUnsafeBufferPointer { src in
+            try SurfaceIO.writeFP16(to: qSurface, data: src, channels: dim, spatial: shape.laneStride)
         }
-        kCacheData.withUnsafeBufferPointer { src in
-            SurfaceIO.writeFP16(to: kCacheSurface, data: src, channels: dim, spatial: shape.cacheStride)
+        try kCacheData.withUnsafeBufferPointer { src in
+            try SurfaceIO.writeFP16(to: kCacheSurface, data: src, channels: dim, spatial: shape.cacheStride)
         }
-        vCacheData.withUnsafeBufferPointer { src in
-            SurfaceIO.writeFP16(to: vCacheSurface, data: src, channels: dim, spatial: shape.cacheStride)
+        try vCacheData.withUnsafeBufferPointer { src in
+            try SurfaceIO.writeFP16(to: vCacheSurface, data: src, channels: dim, spatial: shape.cacheStride)
         }
 
         try kernel.runDecodeContextIntoSurface(
@@ -379,14 +379,14 @@ final class MetalAttentionKernelTests: XCTestCase {
         let vCacheSurface = makeSurface(bytes: vCacheData.count * 2)
         let contextSurface = makeSurface(bytes: dim * shape.laneStride * MemoryLayout<Float>.stride)
 
-        qSurfaceData.withUnsafeBufferPointer { src in
-            SurfaceIO.writeFP16(to: qSurface, data: src, channels: dim, spatial: shape.laneStride)
+        try qSurfaceData.withUnsafeBufferPointer { src in
+            try SurfaceIO.writeFP16(to: qSurface, data: src, channels: dim, spatial: shape.laneStride)
         }
-        kCacheData.withUnsafeBufferPointer { src in
-            SurfaceIO.writeFP16(to: kCacheSurface, data: src, channels: dim, spatial: shape.cacheStride)
+        try kCacheData.withUnsafeBufferPointer { src in
+            try SurfaceIO.writeFP16(to: kCacheSurface, data: src, channels: dim, spatial: shape.cacheStride)
         }
-        vCacheData.withUnsafeBufferPointer { src in
-            SurfaceIO.writeFP16(to: vCacheSurface, data: src, channels: dim, spatial: shape.cacheStride)
+        try vCacheData.withUnsafeBufferPointer { src in
+            try SurfaceIO.writeFP16(to: vCacheSurface, data: src, channels: dim, spatial: shape.cacheStride)
         }
 
         try kernel.runFusedDecodeSDPAIntoSurface(
@@ -465,14 +465,14 @@ final class MetalAttentionKernelTests: XCTestCase {
         let vCacheSurface = makeSurface(bytes: vCacheData.count * 2)
         let contextSurface = makeSurface(bytes: dim * shape.laneStride * MemoryLayout<Float>.stride)
 
-        qSurfaceData.withUnsafeBufferPointer { src in
-            SurfaceIO.writeFP16(to: qSurface, data: src, channels: dim, spatial: shape.laneStride)
+        try qSurfaceData.withUnsafeBufferPointer { src in
+            try SurfaceIO.writeFP16(to: qSurface, data: src, channels: dim, spatial: shape.laneStride)
         }
-        kCacheData.withUnsafeBufferPointer { src in
-            SurfaceIO.writeFP16(to: kCacheSurface, data: src, channels: kvDim, spatial: shape.cacheStride)
+        try kCacheData.withUnsafeBufferPointer { src in
+            try SurfaceIO.writeFP16(to: kCacheSurface, data: src, channels: kvDim, spatial: shape.cacheStride)
         }
-        vCacheData.withUnsafeBufferPointer { src in
-            SurfaceIO.writeFP16(to: vCacheSurface, data: src, channels: kvDim, spatial: shape.cacheStride)
+        try vCacheData.withUnsafeBufferPointer { src in
+            try SurfaceIO.writeFP16(to: vCacheSurface, data: src, channels: kvDim, spatial: shape.cacheStride)
         }
 
         try kernel.runFusedDecodeSDPAIntoSurface(
@@ -551,14 +551,14 @@ final class MetalAttentionKernelTests: XCTestCase {
         let vCacheSurface = makeSurface(bytes: vCacheData.count * 2)
         let contextSurface = makeSurface(bytes: dim * shape.laneStride * MemoryLayout<Float>.stride)
 
-        qSurfaceData.withUnsafeBufferPointer { src in
-            SurfaceIO.writeFP16(to: qSurface, data: src, channels: dim, spatial: shape.laneStride)
+        try qSurfaceData.withUnsafeBufferPointer { src in
+            try SurfaceIO.writeFP16(to: qSurface, data: src, channels: dim, spatial: shape.laneStride)
         }
-        kCacheData.withUnsafeBufferPointer { src in
-            SurfaceIO.writeFP16(to: kCacheSurface, data: src, channels: kvDim, spatial: shape.cacheStride)
+        try kCacheData.withUnsafeBufferPointer { src in
+            try SurfaceIO.writeFP16(to: kCacheSurface, data: src, channels: kvDim, spatial: shape.cacheStride)
         }
-        vCacheData.withUnsafeBufferPointer { src in
-            SurfaceIO.writeFP16(to: vCacheSurface, data: src, channels: kvDim, spatial: shape.cacheStride)
+        try vCacheData.withUnsafeBufferPointer { src in
+            try SurfaceIO.writeFP16(to: vCacheSurface, data: src, channels: kvDim, spatial: shape.cacheStride)
         }
 
         try kernel.runDecodeContextIntoSurface(

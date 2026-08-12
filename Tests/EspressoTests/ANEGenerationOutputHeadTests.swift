@@ -14,8 +14,8 @@ final class ANEGenerationOutputHeadTests: XCTestCase {
         let surface = makeOutputHeadTestSurface(channels: ModelConfig.dim, spatial: spatial)
 
         let zeros = Array(repeating: Float(0), count: ModelConfig.dim * spatial)
-        zeros.withUnsafeBufferPointer { src in
-            SurfaceIO.writeFP16(to: surface, data: src, channels: ModelConfig.dim, spatial: spatial)
+        try zeros.withUnsafeBufferPointer { src in
+            try SurfaceIO.writeFP16(to: surface, data: src, channels: ModelConfig.dim, spatial: spatial)
         }
 
         let tokenA = TensorBuffer(count: ModelConfig.dim, zeroed: true)

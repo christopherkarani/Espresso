@@ -67,12 +67,12 @@ public struct DecodeSurfaceHandles {
         let zeroLaneValues = Array(repeating: Float(0), count: ModelConfig.dim * kernels.laneSpatial)
         let maskFill: Float = ProcessInfo.processInfo.environment["ESPRESSO_DECODE_MASK_INIT_ZERO"] == "1" ? 0 : -1e4
         let maskedLaneValues = Array(repeating: maskFill, count: ModelConfig.dim * kernels.laneSpatial)
-        zeroLaneValues.withUnsafeBufferPointer { src in
-            SurfaceIO.writeFP16(to: zeroLane, data: src, channels: ModelConfig.dim, spatial: kernels.laneSpatial)
-        }
-        maskedLaneValues.withUnsafeBufferPointer { src in
-            SurfaceIO.writeFP16(to: maskedLane, data: src, channels: ModelConfig.dim, spatial: kernels.laneSpatial)
-        }
+        try mapSurfaceIOToANEError { try zeroLaneValues.withUnsafeBufferPointer { src in
+            try SurfaceIO.writeFP16(to: zeroLane, data: src, channels: ModelConfig.dim, spatial: kernels.laneSpatial)
+        } }
+        try mapSurfaceIOToANEError { try maskedLaneValues.withUnsafeBufferPointer { src in
+            try SurfaceIO.writeFP16(to: maskedLane, data: src, channels: ModelConfig.dim, spatial: kernels.laneSpatial)
+        } }
     }
 }
 
@@ -410,9 +410,9 @@ public struct HybridDecodeSurfaceHandles {
         self.zeroLane = zeroLane
 
         let zeroLaneValues = Array(repeating: Float(0), count: dim * kernels.laneSpatial)
-        zeroLaneValues.withUnsafeBufferPointer { src in
-            SurfaceIO.writeFP16(to: zeroLane, data: src, channels: dim, spatial: kernels.laneSpatial)
-        }
+        try mapSurfaceIOToANEError { try zeroLaneValues.withUnsafeBufferPointer { src in
+            try SurfaceIO.writeFP16(to: zeroLane, data: src, channels: dim, spatial: kernels.laneSpatial)
+        } }
     }
 }
 
@@ -480,12 +480,12 @@ public struct FusedDecodeSurfaceHandles {
         let zeroLaneValues = Array(repeating: Float(0), count: ModelConfig.dim * kernels.laneSpatial)
         let maskFill: Float = ProcessInfo.processInfo.environment["ESPRESSO_DECODE_MASK_INIT_ZERO"] == "1" ? 0 : -1e4
         let maskedLaneValues = Array(repeating: maskFill, count: ModelConfig.dim * kernels.laneSpatial)
-        zeroLaneValues.withUnsafeBufferPointer { src in
-            SurfaceIO.writeFP16(to: zeroLane, data: src, channels: ModelConfig.dim, spatial: kernels.laneSpatial)
-        }
-        maskedLaneValues.withUnsafeBufferPointer { src in
-            SurfaceIO.writeFP16(to: maskedLane, data: src, channels: ModelConfig.dim, spatial: kernels.laneSpatial)
-        }
+        try mapSurfaceIOToANEError { try zeroLaneValues.withUnsafeBufferPointer { src in
+            try SurfaceIO.writeFP16(to: zeroLane, data: src, channels: ModelConfig.dim, spatial: kernels.laneSpatial)
+        } }
+        try mapSurfaceIOToANEError { try maskedLaneValues.withUnsafeBufferPointer { src in
+            try SurfaceIO.writeFP16(to: maskedLane, data: src, channels: ModelConfig.dim, spatial: kernels.laneSpatial)
+        } }
     }
 }
 
@@ -554,15 +554,15 @@ public struct FusedTwoLayerDecodeSurfaceHandles {
         let zeroPackedKVValues = Array(repeating: Float(0), count: packedKVChannels * kernels.laneSpatial)
         let maskedValues = Array(repeating: maskFill, count: ModelConfig.dim * kernels.laneSpatial)
 
-        zeroLaneValues.withUnsafeBufferPointer { src in
-            SurfaceIO.writeFP16(to: zeroLane, data: src, channels: ModelConfig.dim, spatial: kernels.laneSpatial)
-        }
-        zeroPackedKVValues.withUnsafeBufferPointer { src in
-            SurfaceIO.writeFP16(to: zeroPackedKVLane, data: src, channels: packedKVChannels, spatial: kernels.laneSpatial)
-        }
-        maskedValues.withUnsafeBufferPointer { src in
-            SurfaceIO.writeFP16(to: maskedLane, data: src, channels: ModelConfig.dim, spatial: kernels.laneSpatial)
-        }
+        try mapSurfaceIOToANEError { try zeroLaneValues.withUnsafeBufferPointer { src in
+            try SurfaceIO.writeFP16(to: zeroLane, data: src, channels: ModelConfig.dim, spatial: kernels.laneSpatial)
+        } }
+        try mapSurfaceIOToANEError { try zeroPackedKVValues.withUnsafeBufferPointer { src in
+            try SurfaceIO.writeFP16(to: zeroPackedKVLane, data: src, channels: packedKVChannels, spatial: kernels.laneSpatial)
+        } }
+        try mapSurfaceIOToANEError { try maskedValues.withUnsafeBufferPointer { src in
+            try SurfaceIO.writeFP16(to: maskedLane, data: src, channels: ModelConfig.dim, spatial: kernels.laneSpatial)
+        } }
     }
 }
 
@@ -771,7 +771,7 @@ public extension ForwardPass {
         var vCache = [Float](repeating: 0, count: kvDim * cacheStride)
 
         do {
-            try qOut.withUnsafeMutableBufferPointer { destination in
+            try mapSurfaceIOToANEError { try qOut.withUnsafeMutableBufferPointer { destination in
                 try SurfaceIO.readFP16SpatialSlice(
                     from: handles.qOut,
                     channelOffset: 0,
@@ -780,25 +780,25 @@ public extension ForwardPass {
                     into: destination,
                     channels: qDim
                 )
-            }
-            kCache.withUnsafeMutableBufferPointer { destination in
-                SurfaceIO.readFP16(
+            } }
+            try mapSurfaceIOToANEError { try kCache.withUnsafeMutableBufferPointer { destination in
+                try SurfaceIO.readFP16(
                     from: handles.kCacheFull,
                     into: destination,
                     channelOffset: 0,
                     channels: kvDim,
                     spatial: cacheStride
                 )
-            }
-            vCache.withUnsafeMutableBufferPointer { destination in
-                SurfaceIO.readFP16(
+            } }
+            try mapSurfaceIOToANEError { try vCache.withUnsafeMutableBufferPointer { destination in
+                try SurfaceIO.readFP16(
                     from: handles.vCacheFull,
                     into: destination,
                     channelOffset: 0,
                     channels: kvDim,
                     spatial: cacheStride
                 )
-            }
+            } }
 
             let context = cpuDecodeContext(
                 qOut: qOut,
@@ -813,7 +813,7 @@ public extension ForwardPass {
                 useModuloKVHeadMapping: MetalAttentionKernel.resolvedKVHeadMappingMode() == .moduloInterleaved,
                 useVDimMajorInterleave: DecodeRuntimeOptions.cpuDecodeAttentionVDimMajor
             )
-            try context.withUnsafeBufferPointer { source in
+            try mapSurfaceIOToANEError { try context.withUnsafeBufferPointer { source in
                 try writeFP32SpatialSlice(
                     to: handles.projectionContextIn,
                     data: source,
@@ -821,7 +821,7 @@ public extension ForwardPass {
                     spatial: handles.laneSpatial,
                     channels: qDim
                 )
-            }
+            } }
         } catch let error as ANEError {
             throw error
         } catch {
@@ -889,15 +889,15 @@ public extension ForwardPass {
             }
 
             var rawV = [Float](repeating: 0, count: kvDim * laneSpatial)
-            rawV.withUnsafeMutableBufferPointer { destination in
-                SurfaceIO.readFP16(
+            try mapSurfaceIOToANEError { try rawV.withUnsafeMutableBufferPointer { destination in
+                try SurfaceIO.readFP16(
                     from: handles.vOut,
                     into: destination,
                     channelOffset: 0,
                     channels: kvDim,
                     spatial: laneSpatial
                 )
-            }
+            } }
             let repacked = rawV.withUnsafeBufferPointer { source in
                 repackVOutForSingleTokenExperiment(
                     source: source,
@@ -907,7 +907,7 @@ public extension ForwardPass {
                     sourceSpatialIndex: 0
                 )
             }
-            try repacked.withUnsafeBufferPointer { source in
+            try mapSurfaceIOToANEError { try repacked.withUnsafeBufferPointer { source in
                 try SurfaceIO.writeFP16SpatialSlice(
                     to: handles.vCacheFull,
                     channelOffset: 0,
@@ -916,7 +916,7 @@ public extension ForwardPass {
                     data: source,
                     channels: kvDim
                 )
-            }
+            } }
         } catch let error as ANEError {
             throw error
         } catch {
@@ -927,7 +927,7 @@ public extension ForwardPass {
     static func initializeDecodeCachesAndMask(
         surfaceHandles: [DecodeSurfaceHandles],
         dim: Int = ModelConfig.dim
-    ) {
+    ) throws(ANEError) {
         precondition(dim > 0)
         guard let first = surfaceHandles.first else { return }
         let maxSeq = first.maxSeq
@@ -939,13 +939,13 @@ public extension ForwardPass {
 
         for handles in surfaceHandles {
             precondition(handles.maxSeq == maxSeq)
-            zeroCache.withUnsafeBufferPointer { src in
-                SurfaceIO.writeFP16(to: handles.kCacheFull, data: src, channels: dim, spatial: maxSeq)
-                SurfaceIO.writeFP16(to: handles.vCacheFull, data: src, channels: dim, spatial: maxSeq)
-            }
-            masked.withUnsafeBufferPointer { src in
-                SurfaceIO.writeFP16(to: handles.maskCacheFull, data: src, channels: dim, spatial: maxSeq)
-            }
+            try mapSurfaceIOToANEError { try zeroCache.withUnsafeBufferPointer { src in
+                try SurfaceIO.writeFP16(to: handles.kCacheFull, data: src, channels: dim, spatial: maxSeq)
+                try SurfaceIO.writeFP16(to: handles.vCacheFull, data: src, channels: dim, spatial: maxSeq)
+            } }
+            try mapSurfaceIOToANEError { try masked.withUnsafeBufferPointer { src in
+                try SurfaceIO.writeFP16(to: handles.maskCacheFull, data: src, channels: dim, spatial: maxSeq)
+            } }
             if handles.maxSeq != handles.kernelMaxSeq {
                 do {
                     try synchronizeDecodeWindowCaches(handles: handles, windowBase: 0, dim: dim)
@@ -979,7 +979,7 @@ public extension ForwardPass {
     public static func initializeHybridDecodeCaches(
         surfaceHandles: [HybridDecodeSurfaceHandles],
         dim: Int = ModelConfig.dim
-    ) {
+    ) throws(ANEError) {
         precondition(dim > 0)
         guard let first = surfaceHandles.first else { return }
         let maxSeq = first.maxSeq
@@ -991,10 +991,10 @@ public extension ForwardPass {
             // Use each handle's own kvDim — matches its cache allocation size
             let handleKVDim = handles.kvDim
             let zeroKVCache = Array(repeating: Float(0), count: handleKVDim * maxSeq)
-            zeroKVCache.withUnsafeBufferPointer { src in
-                SurfaceIO.writeFP16(to: handles.kCacheFull, data: src, channels: handleKVDim, spatial: maxSeq)
-                SurfaceIO.writeFP16(to: handles.vCacheFull, data: src, channels: handleKVDim, spatial: maxSeq)
-            }
+            try mapSurfaceIOToANEError { try zeroKVCache.withUnsafeBufferPointer { src in
+                try SurfaceIO.writeFP16(to: handles.kCacheFull, data: src, channels: handleKVDim, spatial: maxSeq)
+                try SurfaceIO.writeFP16(to: handles.vCacheFull, data: src, channels: handleKVDim, spatial: maxSeq)
+            } }
             do {
                 try SurfaceIO.copyFP16(
                     dst: handles.qkvIn,
@@ -1020,9 +1020,9 @@ public extension ForwardPass {
                     channels: dim,
                     spatial: handles.laneSpatial
                 )
-                try zeroContext.withUnsafeBufferPointer { src in
+                try mapSurfaceIOToANEError { try zeroContext.withUnsafeBufferPointer { src in
                     try writeFP32(to: handles.projectionContextIn, data: src)
-                }
+                } }
             } catch {
                 preconditionFailure("hybrid decode lane zero-init failed: \(error)")
             }
@@ -1057,7 +1057,7 @@ public extension ForwardPass {
 
         var t0 = RuntimeClock.now()
         do {
-            try xCur.withUnsafeBufferPointer { xBuf in
+            try mapSurfaceIOToANEError { try xCur.withUnsafeBufferPointer { xBuf in
                 try SurfaceIO.writeFP16SpatialSlice(
                     to: surfaceHandles[0].qkvIn,
                     channelOffset: 0,
@@ -1066,7 +1066,7 @@ public extension ForwardPass {
                     data: xBuf,
                     channels: dim
                 )
-            }
+            } }
         } catch {
             throw .invalidArguments("hybrid decode token lane write failed: \(error)")
         }
@@ -1093,7 +1093,7 @@ public extension ForwardPass {
             let finalHandles = surfaceHandles[kernels.count - 1]
             let t0 = RuntimeClock.now()
             do {
-                try xCur.withUnsafeMutableBufferPointer { out in
+                try mapSurfaceIOToANEError { try xCur.withUnsafeMutableBufferPointer { out in
                     try SurfaceIO.readFP16SpatialSlice(
                         from: finalHandles.ffnOut,
                         channelOffset: 0,
@@ -1102,7 +1102,7 @@ public extension ForwardPass {
                         into: out,
                         channels: dim
                     )
-                }
+                } }
             } catch {
                 throw .invalidArguments("hybrid final decode lane unpack failed: \(error)")
             }
@@ -1563,7 +1563,7 @@ public extension ForwardPass {
         // CPU touch at decode boundary: write the current token directly into lane 0.
         var t0 = RuntimeClock.now()
         do {
-            try xCur.withUnsafeBufferPointer { xBuf in
+            try mapSurfaceIOToANEError { try xCur.withUnsafeBufferPointer { xBuf in
                 try SurfaceIO.writeFP16SpatialSlice(
                     to: surfaceHandles[0].attnIn,
                     channelOffset: 0,
@@ -1572,7 +1572,7 @@ public extension ForwardPass {
                     data: xBuf,
                     channels: dim
                 )
-            }
+            } }
         } catch {
             throw .invalidArguments("decode token lane write failed: \(error)")
         }
@@ -1817,7 +1817,7 @@ public extension ForwardPass {
         let finalOut = finalHandles.ffnOut
         t0 = RuntimeClock.now()
         do {
-            try xCur.withUnsafeMutableBufferPointer { out in
+            try mapSurfaceIOToANEError { try xCur.withUnsafeMutableBufferPointer { out in
                 try SurfaceIO.readFP16SpatialSlice(
                     from: finalOut,
                     channelOffset: 0,
@@ -1826,7 +1826,7 @@ public extension ForwardPass {
                     into: out,
                     channels: dim
                 )
-            }
+            } }
         } catch {
             throw .invalidArguments("final decode lane unpack failed: \(error)")
         }
@@ -1904,7 +1904,7 @@ public extension ForwardPass {
     static func initializeFusedDecodeCachesAndMask(
         surfaceHandles: [FusedDecodeSurfaceHandles],
         dim: Int = ModelConfig.dim
-    ) {
+    ) throws(ANEError) {
         precondition(dim > 0)
         guard let first = surfaceHandles.first else { return }
         let maxSeq = first.maxSeq
@@ -1916,13 +1916,13 @@ public extension ForwardPass {
 
         for handles in surfaceHandles {
             precondition(handles.maxSeq == maxSeq)
-            zeroCache.withUnsafeBufferPointer { src in
-                SurfaceIO.writeFP16(to: handles.kCacheFull, data: src, channels: dim, spatial: maxSeq)
-                SurfaceIO.writeFP16(to: handles.vCacheFull, data: src, channels: dim, spatial: maxSeq)
-            }
-            masked.withUnsafeBufferPointer { src in
-                SurfaceIO.writeFP16(to: handles.maskCacheFull, data: src, channels: dim, spatial: maxSeq)
-            }
+            try mapSurfaceIOToANEError { try zeroCache.withUnsafeBufferPointer { src in
+                try SurfaceIO.writeFP16(to: handles.kCacheFull, data: src, channels: dim, spatial: maxSeq)
+                try SurfaceIO.writeFP16(to: handles.vCacheFull, data: src, channels: dim, spatial: maxSeq)
+            } }
+            try mapSurfaceIOToANEError { try masked.withUnsafeBufferPointer { src in
+                try SurfaceIO.writeFP16(to: handles.maskCacheFull, data: src, channels: dim, spatial: maxSeq)
+            } }
             if handles.maxSeq != handles.kernelMaxSeq {
                 do {
                     try synchronizeFusedDecodeWindowCaches(handles: handles, windowBase: 0, dim: dim)
@@ -1979,7 +1979,7 @@ public extension ForwardPass {
         // CPU touch at decode boundary: write current token into fused input lane 0.
         var t0 = RuntimeClock.now()
         do {
-            try xCur.withUnsafeBufferPointer { xBuf in
+            try mapSurfaceIOToANEError { try xCur.withUnsafeBufferPointer { xBuf in
                 try SurfaceIO.writeFP16SpatialSlice(
                     to: surfaceHandles[0].fusedIn,
                     channelOffset: 0,
@@ -1988,7 +1988,7 @@ public extension ForwardPass {
                     data: xBuf,
                     channels: dim
                 )
-            }
+            } }
         } catch {
             throw .invalidArguments("fused decode token lane write failed: \(error)")
         }
@@ -2140,7 +2140,7 @@ public extension ForwardPass {
         let finalHandles = surfaceHandles[kernels.count - 1]
         t0 = RuntimeClock.now()
         do {
-            try xCur.withUnsafeMutableBufferPointer { out in
+            try mapSurfaceIOToANEError { try xCur.withUnsafeMutableBufferPointer { out in
                 try SurfaceIO.readFP16SpatialSlice(
                     from: finalHandles.xNextOut,
                     channelOffset: 0,
@@ -2149,7 +2149,7 @@ public extension ForwardPass {
                     into: out,
                     channels: dim
                 )
-            }
+            } }
         } catch {
             throw .invalidArguments("fused final decode lane unpack failed: \(error)")
         }
@@ -2303,7 +2303,7 @@ public extension ForwardPass {
     static func initializeFusedTwoLayerDecodeCachesAndMask(
         surfaceHandles: [FusedTwoLayerDecodeSurfaceHandles],
         dim: Int = ModelConfig.dim
-    ) {
+    ) throws(ANEError) {
         precondition(dim > 0)
         guard let first = surfaceHandles.first else { return }
         let maxSeq = first.maxSeq
@@ -2314,18 +2314,18 @@ public extension ForwardPass {
 
         for handles in surfaceHandles {
             precondition(handles.maxSeq == maxSeq)
-            packedKVCache.withUnsafeBufferPointer { src in
-                SurfaceIO.writeFP16(
+            try mapSurfaceIOToANEError { try packedKVCache.withUnsafeBufferPointer { src in
+                try SurfaceIO.writeFP16(
                     to: handles.packedKVCacheFull,
                     data: src,
                     channels: packedKVChannels,
                     spatial: maxSeq
                 )
-            }
-            masked.withUnsafeBufferPointer { src in
-                SurfaceIO.writeFP16(to: handles.maskCache0Full, data: src, channels: dim, spatial: maxSeq)
-                SurfaceIO.writeFP16(to: handles.maskCache1Full, data: src, channels: dim, spatial: maxSeq)
-            }
+            } }
+            try mapSurfaceIOToANEError { try masked.withUnsafeBufferPointer { src in
+                try SurfaceIO.writeFP16(to: handles.maskCache0Full, data: src, channels: dim, spatial: maxSeq)
+                try SurfaceIO.writeFP16(to: handles.maskCache1Full, data: src, channels: dim, spatial: maxSeq)
+            } }
             if handles.maxSeq != handles.kernelMaxSeq {
                 do {
                     try synchronizeFusedTwoLayerDecodeWindowCaches(
@@ -2384,7 +2384,7 @@ public extension ForwardPass {
 
         var t0 = RuntimeClock.now()
         do {
-            try xCur.withUnsafeBufferPointer { xBuf in
+            try mapSurfaceIOToANEError { try xCur.withUnsafeBufferPointer { xBuf in
                 try SurfaceIO.writeFP16SpatialSlice(
                     to: surfaceHandles[0].fusedIn,
                     channelOffset: 0,
@@ -2393,7 +2393,7 @@ public extension ForwardPass {
                     data: xBuf,
                     channels: dim
                 )
-            }
+            } }
         } catch {
             throw .invalidArguments("fused two-layer token lane write failed: \(error)")
         }
@@ -2551,7 +2551,7 @@ public extension ForwardPass {
         let finalHandles = surfaceHandles[kernels.count - 1]
         t0 = RuntimeClock.now()
         do {
-            try xCur.withUnsafeMutableBufferPointer { out in
+            try mapSurfaceIOToANEError { try xCur.withUnsafeMutableBufferPointer { out in
                 try SurfaceIO.readFP16SpatialSlice(
                     from: finalHandles.xNextOut,
                     channelOffset: 0,
@@ -2560,7 +2560,7 @@ public extension ForwardPass {
                     into: out,
                     channels: dim
                 )
-            }
+            } }
         } catch {
             throw .invalidArguments("fused two-layer final decode lane unpack failed: \(error)")
         }

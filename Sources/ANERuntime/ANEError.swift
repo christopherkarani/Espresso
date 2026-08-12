@@ -1,3 +1,4 @@
+import ANETypes
 import Foundation
 
 public enum ANEError: Error, Sendable, CustomStringConvertible, LocalizedError {
@@ -17,6 +18,8 @@ public enum ANEError: Error, Sendable, CustomStringConvertible, LocalizedError {
     case inputSurfaceUnavailable(Int)
     /// Output surface unavailable for the requested index.
     case outputSurfaceUnavailable(Int)
+    /// IOSurface I/O failed at runtime (lock failure, bounds, or conversion).
+    case surfaceIO(SurfaceIOError)
 
     public var description: String {
         switch self {
@@ -36,6 +39,8 @@ public enum ANEError: Error, Sendable, CustomStringConvertible, LocalizedError {
             return "ANE input surface unavailable at index \(index)"
         case let .outputSurfaceUnavailable(index):
             return "ANE output surface unavailable at index \(index)"
+        case let .surfaceIO(error):
+            return "Surface I/O failed: \(error)"
         }
     }
 

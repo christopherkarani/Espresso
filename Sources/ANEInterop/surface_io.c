@@ -555,11 +555,16 @@ bool ane_interop_io_write_embedding_batch_fp16(
          * row per channel. Much better cache behavior than per-stream scattered writes.
          */
         if (stream_count > 0 && (stream_count % 8) == 0 && stream_count <= 32768) {
-            /* Pre-compute row pointers for each stream (avoid repeated multiply in inner loop) */
-            const float *embRows[32768];
+            /* Pre-compute row pointers for each stream (avoid repeated multiply in inner loop).
+             * Heap-allocated: 32768 pointers would be 256KB of stack. */
+            const float **embRows = (const float **)malloc((size_t)stream_count * sizeof(const float *));
+            if (!embRows) goto cleanup;
             for (int s = 0; s < stream_count; s++) {
                 int token = (int)token_ids[s];
-                if (token < 0 || token >= vocab_size) goto cleanup;
+                if (token < 0 || token >= vocab_size) {
+                    free(embRows);
+                    goto cleanup;
+                }
                 embRows[s] = embedding_table + (size_t)token * (size_t)dim;
             }
 
@@ -580,6 +585,7 @@ bool ane_interop_io_write_embedding_batch_fp16(
                     vst1q_f16(dstRow + s, combined);
                 }
             }
+            free(embRows);
             ok = true;
             goto cleanup;
         }
@@ -737,7 +743,7 @@ bool ane_interop_io_read_fp16(IOSurfaceRef surface, int ch_off,
     size_t allocSize = IOSurfaceGetAllocSize(surface);
     if (endBytes > allocSize) goto cleanup;
 
-    ane_interop_cvt_f16_to_f32(data, ((const _Float16 *)base) + offElems, channels * spatial);
+    ane_interop_cvt_f16_to_f32(data, ((const _Float16 *)base) + offElems, elemCount);
     ok = true;
 
 cleanup:
@@ -819,7 +825,7 @@ bool ane_interop_io_write_fp16_at(IOSurfaceRef surface, int ch_off,
     size_t allocSize = IOSurfaceGetAllocSize(surface);
     if (endBytes > allocSize) goto cleanup;
 
-    ane_interop_cvt_f32_to_f16(((_Float16 *)base) + offElems, data, channels * spatial);
+    ane_interop_cvt_f32_to_f16(((_Float16 *)base) + offElems, data, elemCount);
     ok = true;
 
 cleanup:
@@ -983,7 +989,7 @@ bool ane_interop_io_write_fp16_unlocked(IOSurfaceRef surface,
     size_t allocSize = IOSurfaceGetAllocSize(surface);
     if (bytes > allocSize) return false;
 
-    ane_interop_cvt_f32_to_f16((_Float16 *)base, data, channels * spatial);
+    ane_interop_cvt_f32_to_f16((_Float16 *)base, data, elemCount);
     return true;
 }
 
@@ -1010,7 +1016,7 @@ bool ane_interop_io_read_fp16_unlocked(IOSurfaceRef surface, int ch_off,
     size_t allocSize = IOSurfaceGetAllocSize(surface);
     if (endBytes > allocSize) return false;
 
-    ane_interop_cvt_f16_to_f32(data, ((const _Float16 *)base) + offElems, channels * spatial);
+    ane_interop_cvt_f16_to_f32(data, ((const _Float16 *)base) + offElems, elemCount);
     return true;
 }
 

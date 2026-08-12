@@ -243,8 +243,8 @@ final class CrossValidationTests: XCTestCase {
         let inputSurface = try kernel.inputSurface(at: 0)
         let outputSurface = try kernel.outputSurface(at: 0)
 
-        input.withUnsafeBufferPointer { ptr in
-            SurfaceIO.writeFP16(to: inputSurface, data: ptr, channels: cvDim, spatial: cvSeq)
+        try input.withUnsafeBufferPointer { ptr in
+            try SurfaceIO.writeFP16(to: inputSurface, data: ptr, channels: cvDim, spatial: cvSeq)
         }
 
         let evalMS = try measureElapsedMillis {
@@ -252,8 +252,8 @@ final class CrossValidationTests: XCTestCase {
         }
 
         var actual = [Float](repeating: 0, count: cvDim * cvSeq)
-        actual.withUnsafeMutableBufferPointer { ptr in
-            SurfaceIO.readFP16(from: outputSurface, into: ptr, channelOffset: 0, channels: cvDim, spatial: cvSeq)
+        try actual.withUnsafeMutableBufferPointer { ptr in
+            try SurfaceIO.readFP16(from: outputSurface, into: ptr, channelOffset: 0, channels: cvDim, spatial: cvSeq)
         }
 
         XCTAssertTrue(hasNonZero(expected), "ObjC expected output appears all-zero")

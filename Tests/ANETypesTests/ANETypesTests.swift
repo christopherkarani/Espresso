@@ -182,7 +182,7 @@ final class ANETypesTests: XCTestCase {
         XCTAssertLessThanOrEqual(maxAbsDiff, 1e-2)
     }
 
-    func test_build_blob_transposed_layout() {
+    func test_build_blob_transposed_layout() throws {
         // 3x4 matrix with unique values.
         let rows = 3
         let cols = 4
@@ -204,7 +204,7 @@ final class ANETypesTests: XCTestCase {
         }
     }
 
-    func test_build_blob_transposed_zero_shape_header_only() {
+    func test_build_blob_transposed_zero_shape_header_only() throws {
         let blob = WeightBlob.buildTransposed(from: [Float](), rows: 0, cols: 0)
         XCTAssertEqual(blob.count, 128)
         let bytes = [UInt8](blob)
@@ -221,7 +221,7 @@ final class ANETypesTests: XCTestCase {
         XCTAssertEqual(off, 128)
     }
 
-    func test_build_blob_fp16_payload_passthrough_exact_bits() {
+    func test_build_blob_fp16_payload_passthrough_exact_bits() throws {
         let payload: [UInt16] = [0x0000, 0x3C00, 0xC000, 0x7BFF, 0x3555]
         let blob = WeightBlob.buildFP16(from: payload)
         XCTAssertEqual(blob.count, 128 + payload.count * 2)
@@ -234,7 +234,7 @@ final class ANETypesTests: XCTestCase {
         }
     }
 
-    func test_surface_write_read_roundtrip() {
+    func test_surface_write_read_roundtrip() throws {
         let channels = 64
         let spatial = 32
         let count = channels * spatial
@@ -243,11 +243,11 @@ final class ANETypesTests: XCTestCase {
         let input = (0..<count).map { _ in Float.random(in: -10...10) }
         var output = Array(repeating: Float.nan, count: count)
 
-        input.withUnsafeBufferPointer { inputBuf in
-            SurfaceIO.writeFP16(to: s, data: inputBuf, channels: channels, spatial: spatial)
+        try input.withUnsafeBufferPointer { inputBuf in
+            try SurfaceIO.writeFP16(to: s, data: inputBuf, channels: channels, spatial: spatial)
         }
-        output.withUnsafeMutableBufferPointer { outBuf in
-            SurfaceIO.readFP16(from: s, into: outBuf, channelOffset: 0, channels: channels, spatial: spatial)
+        try output.withUnsafeMutableBufferPointer { outBuf in
+            try SurfaceIO.readFP16(from: s, into: outBuf, channelOffset: 0, channels: channels, spatial: spatial)
         }
 
         var maxAbsDiff: Float = 0
@@ -257,24 +257,24 @@ final class ANETypesTests: XCTestCase {
         XCTAssertLessThanOrEqual(maxAbsDiff, 1e-2)
     }
 
-    func test_surface_read_fp16_batched_regions_match_individual_reads() {
+    func test_surface_read_fp16_batched_regions_match_individual_reads() throws {
         let totalChannels = 16
         let spatial = 4
         let totalCount = totalChannels * spatial
         let surface = makeSurface(bytes: totalCount * 2)
 
         let input = (0..<totalCount).map { Float($0) * 0.125 - 3.0 }
-        input.withUnsafeBufferPointer { inputBuf in
-            SurfaceIO.writeFP16(to: surface, data: inputBuf, channels: totalChannels, spatial: spatial)
+        try input.withUnsafeBufferPointer { inputBuf in
+            try SurfaceIO.writeFP16(to: surface, data: inputBuf, channels: totalChannels, spatial: spatial)
         }
 
         var out0 = Array(repeating: Float.nan, count: 4 * spatial)
         var out1 = Array(repeating: Float.nan, count: 6 * spatial)
         var out2 = Array(repeating: Float.nan, count: 3 * spatial)
 
-        out0.withUnsafeMutableBufferPointer { out0Buf in
-            out1.withUnsafeMutableBufferPointer { out1Buf in
-                out2.withUnsafeMutableBufferPointer { out2Buf in
+        try out0.withUnsafeMutableBufferPointer { out0Buf in
+            try out1.withUnsafeMutableBufferPointer { out1Buf in
+                try out2.withUnsafeMutableBufferPointer { out2Buf in
                     let regions = [
                         SurfaceIO.FP16ReadRegion(
                             destination: out0Buf.baseAddress!,
@@ -292,7 +292,7 @@ final class ANETypesTests: XCTestCase {
                             channels: 3
                         ),
                     ]
-                    SurfaceIO.readFP16Batched(from: surface, spatial: spatial, regions: regions)
+                    try SurfaceIO.readFP16Batched(from: surface, spatial: spatial, regions: regions)
                 }
             }
         }
@@ -319,22 +319,22 @@ final class ANETypesTests: XCTestCase {
         }
     }
 
-    func test_surface_read_with_channel_offset() {
+    func test_surface_read_with_channel_offset() throws {
         let totalChannels = 16
         let spatial = 4
         let totalCount = totalChannels * spatial
         let s = makeSurface(bytes: totalCount * 2)
 
         let input = (0..<totalCount).map { Float($0) * 0.1 - 2.0 }
-        input.withUnsafeBufferPointer { inputBuf in
-            SurfaceIO.writeFP16(to: s, data: inputBuf, channels: totalChannels, spatial: spatial)
+        try input.withUnsafeBufferPointer { inputBuf in
+            try SurfaceIO.writeFP16(to: s, data: inputBuf, channels: totalChannels, spatial: spatial)
         }
 
         let chOff = 5
         let channels = 6
         var output = Array(repeating: Float.nan, count: channels * spatial)
-        output.withUnsafeMutableBufferPointer { outBuf in
-            SurfaceIO.readFP16(from: s, into: outBuf, channelOffset: chOff, channels: channels, spatial: spatial)
+        try output.withUnsafeMutableBufferPointer { outBuf in
+            try SurfaceIO.readFP16(from: s, into: outBuf, channelOffset: chOff, channels: channels, spatial: spatial)
         }
 
         for ch in 0..<channels {
@@ -354,8 +354,8 @@ final class ANETypesTests: XCTestCase {
 
         // Start with zeroed surface.
         let zeros = Array(repeating: Float(0), count: count)
-        zeros.withUnsafeBufferPointer { z in
-            SurfaceIO.writeFP16(to: s, data: z, channels: channels, spatial: spatial)
+        try zeros.withUnsafeBufferPointer { z in
+            try SurfaceIO.writeFP16(to: s, data: z, channels: channels, spatial: spatial)
         }
 
         let chOff = 3
@@ -366,8 +366,8 @@ final class ANETypesTests: XCTestCase {
         }
 
         var out = Array(repeating: Float.nan, count: count)
-        out.withUnsafeMutableBufferPointer { outBuf in
-            SurfaceIO.readFP16(from: s, into: outBuf, channelOffset: 0, channels: channels, spatial: spatial)
+        try out.withUnsafeMutableBufferPointer { outBuf in
+            try SurfaceIO.readFP16(from: s, into: outBuf, channelOffset: 0, channels: channels, spatial: spatial)
         }
 
         for ch in 0..<channels {
@@ -392,13 +392,13 @@ final class ANETypesTests: XCTestCase {
         let dst = makeSurface(bytes: count * 2)
 
         let input = (0..<count).map { Float($0) * 0.25 - 1.0 }
-        input.withUnsafeBufferPointer { inputBuf in
-            SurfaceIO.writeFP16(to: src, data: inputBuf, channels: channels, spatial: spatial)
+        try input.withUnsafeBufferPointer { inputBuf in
+            try SurfaceIO.writeFP16(to: src, data: inputBuf, channels: channels, spatial: spatial)
         }
 
         let zeros = Array(repeating: Float(0), count: count)
-        zeros.withUnsafeBufferPointer { z in
-            SurfaceIO.writeFP16(to: dst, data: z, channels: channels, spatial: spatial)
+        try zeros.withUnsafeBufferPointer { z in
+            try SurfaceIO.writeFP16(to: dst, data: z, channels: channels, spatial: spatial)
         }
 
         let dstOff = 2
@@ -406,8 +406,8 @@ final class ANETypesTests: XCTestCase {
         try SurfaceIO.copyFP16(dst: dst, dstChannelOffset: dstOff, src: src, srcChannelOffset: 0, channels: copyChannels, spatial: spatial)
 
         var out = Array(repeating: Float.nan, count: count)
-        out.withUnsafeMutableBufferPointer { outBuf in
-            SurfaceIO.readFP16(from: dst, into: outBuf, channelOffset: 0, channels: channels, spatial: spatial)
+        try out.withUnsafeMutableBufferPointer { outBuf in
+            try SurfaceIO.readFP16(from: dst, into: outBuf, channelOffset: 0, channels: channels, spatial: spatial)
         }
 
         for ch in 0..<channels {
@@ -435,13 +435,13 @@ final class ANETypesTests: XCTestCase {
             // Distinct per channel/spatial, representable in fp16 without large error.
             Float(i) * 0.5 - 7.0
         }
-        srcInput.withUnsafeBufferPointer { inputBuf in
-            SurfaceIO.writeFP16(to: src, data: inputBuf, channels: channels, spatial: srcSpatial)
+        try srcInput.withUnsafeBufferPointer { inputBuf in
+            try SurfaceIO.writeFP16(to: src, data: inputBuf, channels: channels, spatial: srcSpatial)
         }
 
         let zeros = Array(repeating: Float(0), count: channels * dstSpatial)
-        zeros.withUnsafeBufferPointer { z in
-            SurfaceIO.writeFP16(to: dst, data: z, channels: channels, spatial: dstSpatial)
+        try zeros.withUnsafeBufferPointer { z in
+            try SurfaceIO.writeFP16(to: dst, data: z, channels: channels, spatial: dstSpatial)
         }
 
         let srcIndex = 1
@@ -459,8 +459,8 @@ final class ANETypesTests: XCTestCase {
         )
 
         var out = Array(repeating: Float.nan, count: channels * dstSpatial)
-        out.withUnsafeMutableBufferPointer { outBuf in
-            SurfaceIO.readFP16(from: dst, into: outBuf, channelOffset: 0, channels: channels, spatial: dstSpatial)
+        try out.withUnsafeMutableBufferPointer { outBuf in
+            try SurfaceIO.readFP16(from: dst, into: outBuf, channelOffset: 0, channels: channels, spatial: dstSpatial)
         }
 
         for ch in 0..<channels {
@@ -482,13 +482,13 @@ final class ANETypesTests: XCTestCase {
         let dst = makeSurface(bytes: 1 * dstSpatial * 2)
 
         let zero: [Float] = [0]
-        zero.withUnsafeBufferPointer { srcBuf in
-            SurfaceIO.writeFP16(to: src, data: srcBuf, channels: 1, spatial: 1)
+        try zero.withUnsafeBufferPointer { srcBuf in
+            try SurfaceIO.writeFP16(to: src, data: srcBuf, channels: 1, spatial: 1)
         }
 
         let masked = Array(repeating: Float(-1e4), count: dstSpatial)
-        masked.withUnsafeBufferPointer { dstBuf in
-            SurfaceIO.writeFP16(to: dst, data: dstBuf, channels: 1, spatial: dstSpatial)
+        try masked.withUnsafeBufferPointer { dstBuf in
+            try SurfaceIO.writeFP16(to: dst, data: dstBuf, channels: 1, spatial: dstSpatial)
         }
 
         let flipIndex = 3
@@ -505,8 +505,8 @@ final class ANETypesTests: XCTestCase {
         )
 
         var out = Array(repeating: Float.nan, count: dstSpatial)
-        out.withUnsafeMutableBufferPointer { outBuf in
-            SurfaceIO.readFP16(from: dst, into: outBuf, channelOffset: 0, channels: 1, spatial: dstSpatial)
+        try out.withUnsafeMutableBufferPointer { outBuf in
+            try SurfaceIO.readFP16(from: dst, into: outBuf, channelOffset: 0, channels: 1, spatial: dstSpatial)
         }
 
         for i in 0..<dstSpatial {
@@ -524,8 +524,8 @@ final class ANETypesTests: XCTestCase {
         let surface = makeSurface(bytes: channels * spatial * 2)
 
         let zeros = Array(repeating: Float(0), count: channels * spatial)
-        zeros.withUnsafeBufferPointer { src in
-            SurfaceIO.writeFP16(to: surface, data: src, channels: channels, spatial: spatial)
+        try zeros.withUnsafeBufferPointer { src in
+            try SurfaceIO.writeFP16(to: surface, data: src, channels: channels, spatial: spatial)
         }
 
         let slice: [Float] = (0..<channels).map { Float($0) * 0.5 - 1.0 }
@@ -541,8 +541,8 @@ final class ANETypesTests: XCTestCase {
         }
 
         var out = Array(repeating: Float.nan, count: channels * spatial)
-        out.withUnsafeMutableBufferPointer { dst in
-            SurfaceIO.readFP16(from: surface, into: dst, channelOffset: 0, channels: channels, spatial: spatial)
+        try out.withUnsafeMutableBufferPointer { dst in
+            try SurfaceIO.readFP16(from: surface, into: dst, channelOffset: 0, channels: channels, spatial: spatial)
         }
 
         for ch in 0..<channels {
@@ -563,8 +563,8 @@ final class ANETypesTests: XCTestCase {
         let surface = makeSurface(bytes: channels * spatial * 2)
 
         let input: [Float] = (0..<(channels * spatial)).map { Float($0) * 0.25 - 2.0 }
-        input.withUnsafeBufferPointer { src in
-            SurfaceIO.writeFP16(to: surface, data: src, channels: channels, spatial: spatial)
+        try input.withUnsafeBufferPointer { src in
+            try SurfaceIO.writeFP16(to: surface, data: src, channels: channels, spatial: spatial)
         }
 
         var lane = Array(repeating: Float.nan, count: channels)
@@ -598,8 +598,8 @@ final class ANETypesTests: XCTestCase {
             0.0, 0.25, 3.0, 4.0,
             -6.0, -5.0, -4.0, -3.0,
         ]
-        input.withUnsafeBufferPointer { src in
-            SurfaceIO.writeFP16(to: surface, data: src, channels: channels, spatial: spatial)
+        try input.withUnsafeBufferPointer { src in
+            try SurfaceIO.writeFP16(to: surface, data: src, channels: channels, spatial: spatial)
         }
 
         var lane = Array(repeating: Float.nan, count: channels)
@@ -651,8 +651,8 @@ final class ANETypesTests: XCTestCase {
             -4.0, -3.0, -2.0,
             1.0, 0.5, 0.25,
         ]
-        input.withUnsafeBufferPointer { src in
-            SurfaceIO.writeFP16(to: surface, data: src, channels: totalChannels, spatial: spatial)
+        try input.withUnsafeBufferPointer { src in
+            try SurfaceIO.writeFP16(to: surface, data: src, channels: totalChannels, spatial: spatial)
         }
 
         var lane = Array(repeating: Float.nan, count: channels)
@@ -707,8 +707,8 @@ final class ANETypesTests: XCTestCase {
             8.0, 7.0,
             9.0, 10.0,
         ]
-        input.withUnsafeBufferPointer { src in
-            SurfaceIO.writeFP16(to: surface, data: src, channels: totalChannels, spatial: spatial)
+        try input.withUnsafeBufferPointer { src in
+            try SurfaceIO.writeFP16(to: surface, data: src, channels: totalChannels, spatial: spatial)
         }
 
         var lane = Array(repeating: Float.nan, count: channels)
@@ -762,8 +762,8 @@ final class ANETypesTests: XCTestCase {
             input.append(value)
             input.append(Float(index) * 0.5 - 6.0)
         }
-        input.withUnsafeBufferPointer { src in
-            SurfaceIO.writeFP16(to: surface, data: src, channels: totalChannels, spatial: spatial)
+        try input.withUnsafeBufferPointer { src in
+            try SurfaceIO.writeFP16(to: surface, data: src, channels: totalChannels, spatial: spatial)
         }
 
         var lane = Array(repeating: Float.nan, count: channels)
@@ -805,8 +805,8 @@ final class ANETypesTests: XCTestCase {
         let surface = makeSurface(bytes: channels * spatial * 2)
 
         let zeros = Array(repeating: Float(0), count: channels * spatial)
-        zeros.withUnsafeBufferPointer { src in
-            SurfaceIO.writeFP16(to: surface, data: src, channels: channels, spatial: spatial)
+        try zeros.withUnsafeBufferPointer { src in
+            try SurfaceIO.writeFP16(to: surface, data: src, channels: channels, spatial: spatial)
         }
 
         let first: [Float] = [1.0, -2.0, 3.0, -4.0]
@@ -834,8 +834,8 @@ final class ANETypesTests: XCTestCase {
         }
 
         var out = Array(repeating: Float.nan, count: channels * spatial)
-        out.withUnsafeMutableBufferPointer { dst in
-            SurfaceIO.readFP16(from: surface, into: dst, channelOffset: 0, channels: channels, spatial: spatial)
+        try out.withUnsafeMutableBufferPointer { dst in
+            try SurfaceIO.readFP16(from: surface, into: dst, channelOffset: 0, channels: channels, spatial: spatial)
         }
 
         for ch in 0..<channels {
@@ -862,13 +862,13 @@ final class ANETypesTests: XCTestCase {
         let srcInput: [Float] = (0..<(srcChannels * srcSpatial)).map { i in
             Float(i) * 0.25 - 3.0
         }
-        srcInput.withUnsafeBufferPointer { srcBuf in
-            SurfaceIO.writeFP16(to: src, data: srcBuf, channels: srcChannels, spatial: srcSpatial)
+        try srcInput.withUnsafeBufferPointer { srcBuf in
+            try SurfaceIO.writeFP16(to: src, data: srcBuf, channels: srcChannels, spatial: srcSpatial)
         }
 
         let zeros = Array(repeating: Float(0), count: dstChannels * dstSpatial)
-        zeros.withUnsafeBufferPointer { z in
-            SurfaceIO.writeFP16(to: dst, data: z, channels: dstChannels, spatial: dstSpatial)
+        try zeros.withUnsafeBufferPointer { z in
+            try SurfaceIO.writeFP16(to: dst, data: z, channels: dstChannels, spatial: dstSpatial)
         }
 
         let srcChannelOffset = 3
@@ -890,8 +890,8 @@ final class ANETypesTests: XCTestCase {
         )
 
         var out = Array(repeating: Float.nan, count: dstChannels * dstSpatial)
-        out.withUnsafeMutableBufferPointer { outBuf in
-            SurfaceIO.readFP16(from: dst, into: outBuf, channelOffset: 0, channels: dstChannels, spatial: dstSpatial)
+        try out.withUnsafeMutableBufferPointer { outBuf in
+            try SurfaceIO.readFP16(from: dst, into: outBuf, channelOffset: 0, channels: dstChannels, spatial: dstSpatial)
         }
 
         for ch in 0..<dstChannels {
@@ -917,8 +917,8 @@ final class ANETypesTests: XCTestCase {
         let s = makeSurface(bytes: count * 2)
 
         let zeros = Array(repeating: Float(0), count: count)
-        zeros.withUnsafeBufferPointer { z in
-            SurfaceIO.writeFP16(to: s, data: z, channels: channels, spatial: spatial)
+        try zeros.withUnsafeBufferPointer { z in
+            try SurfaceIO.writeFP16(to: s, data: z, channels: channels, spatial: spatial)
         }
 
         let reg0Offset = 2
@@ -939,8 +939,8 @@ final class ANETypesTests: XCTestCase {
         }
 
         var out = Array(repeating: Float.nan, count: count)
-        out.withUnsafeMutableBufferPointer { outBuf in
-            SurfaceIO.readFP16(from: s, into: outBuf, channelOffset: 0, channels: channels, spatial: spatial)
+        try out.withUnsafeMutableBufferPointer { outBuf in
+            try SurfaceIO.readFP16(from: s, into: outBuf, channelOffset: 0, channels: channels, spatial: spatial)
         }
 
         for ch in 0..<channels {
@@ -968,12 +968,12 @@ final class ANETypesTests: XCTestCase {
         let dst = makeSurface(bytes: count * 2)
 
         let input = (0..<count).map { Float($0) * 0.1 - 3.0 }
-        input.withUnsafeBufferPointer { inputBuf in
-            SurfaceIO.writeFP16(to: src, data: inputBuf, channels: channels, spatial: spatial)
+        try input.withUnsafeBufferPointer { inputBuf in
+            try SurfaceIO.writeFP16(to: src, data: inputBuf, channels: channels, spatial: spatial)
         }
         let zeros = Array(repeating: Float(0), count: count)
-        zeros.withUnsafeBufferPointer { z in
-            SurfaceIO.writeFP16(to: dst, data: z, channels: channels, spatial: spatial)
+        try zeros.withUnsafeBufferPointer { z in
+            try SurfaceIO.writeFP16(to: dst, data: z, channels: channels, spatial: spatial)
         }
 
         let regions = [
@@ -983,8 +983,8 @@ final class ANETypesTests: XCTestCase {
         try SurfaceIO.copyFP16Batched(dst: dst, src: src, spatial: spatial, regions: regions)
 
         var out = Array(repeating: Float.nan, count: count)
-        out.withUnsafeMutableBufferPointer { outBuf in
-            SurfaceIO.readFP16(from: dst, into: outBuf, channelOffset: 0, channels: channels, spatial: spatial)
+        try out.withUnsafeMutableBufferPointer { outBuf in
+            try SurfaceIO.readFP16(from: dst, into: outBuf, channelOffset: 0, channels: channels, spatial: spatial)
         }
 
         for ch in 0..<channels {
@@ -1013,15 +1013,15 @@ final class ANETypesTests: XCTestCase {
 
         let inputA = (0..<count).map { Float($0) * 0.1 + 1.0 }
         let inputB = (0..<count).map { Float($0) * 0.2 - 3.0 }
-        inputA.withUnsafeBufferPointer { inputBuf in
-            SurfaceIO.writeFP16(to: srcA, data: inputBuf, channels: channels, spatial: spatial)
+        try inputA.withUnsafeBufferPointer { inputBuf in
+            try SurfaceIO.writeFP16(to: srcA, data: inputBuf, channels: channels, spatial: spatial)
         }
-        inputB.withUnsafeBufferPointer { inputBuf in
-            SurfaceIO.writeFP16(to: srcB, data: inputBuf, channels: channels, spatial: spatial)
+        try inputB.withUnsafeBufferPointer { inputBuf in
+            try SurfaceIO.writeFP16(to: srcB, data: inputBuf, channels: channels, spatial: spatial)
         }
         let zeros = Array(repeating: Float(0), count: count)
-        zeros.withUnsafeBufferPointer { z in
-            SurfaceIO.writeFP16(to: dst, data: z, channels: channels, spatial: spatial)
+        try zeros.withUnsafeBufferPointer { z in
+            try SurfaceIO.writeFP16(to: dst, data: z, channels: channels, spatial: spatial)
         }
 
         let regions = [
@@ -1031,8 +1031,8 @@ final class ANETypesTests: XCTestCase {
         try SurfaceIO.copyFP16FromMultipleSources(dst: dst, spatial: spatial, regions: regions)
 
         var out = Array(repeating: Float.nan, count: count)
-        out.withUnsafeMutableBufferPointer { outBuf in
-            SurfaceIO.readFP16(from: dst, into: outBuf, channelOffset: 0, channels: channels, spatial: spatial)
+        try out.withUnsafeMutableBufferPointer { outBuf in
+            try SurfaceIO.readFP16(from: dst, into: outBuf, channelOffset: 0, channels: channels, spatial: spatial)
         }
 
         for ch in 0..<channels {
@@ -1057,11 +1057,11 @@ final class ANETypesTests: XCTestCase {
         var emptyOut: [Float] = []
 
         try emptyIn.withUnsafeBufferPointer { inputBuf in
-            SurfaceIO.writeFP16(to: s, data: inputBuf, channels: 0, spatial: 0)
+            try SurfaceIO.writeFP16(to: s, data: inputBuf, channels: 0, spatial: 0)
             try SurfaceIO.writeFP16At(to: s, channelOffset: 0, data: inputBuf, channels: 0, spatial: 0)
         }
-        emptyOut.withUnsafeMutableBufferPointer { outBuf in
-            SurfaceIO.readFP16(from: s, into: outBuf, channelOffset: 0, channels: 0, spatial: 0)
+        try emptyOut.withUnsafeMutableBufferPointer { outBuf in
+            try SurfaceIO.readFP16(from: s, into: outBuf, channelOffset: 0, channels: 0, spatial: 0)
         }
         try SurfaceIO.writeFP16AtBatched(to: s, spatial: 0, regions: [])
         try SurfaceIO.copyFP16(dst: s, dstChannelOffset: 0, src: s, srcChannelOffset: 0, channels: 0, spatial: 0)

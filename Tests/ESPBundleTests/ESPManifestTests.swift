@@ -90,15 +90,8 @@ import Foundation
 @Test func bundleLayoutIncludesCanonicalTopLevelEntries() {
     #expect(ESPBundleLayout.manifestFileName == "manifest.toml")
     #expect(ESPBundleLayout.requiredTopLevelEntries == [
-        "arch",
         "tokenizer",
         "weights",
-        "graphs",
-        "states",
-        "adapters",
-        "compiled",
-        "benchmarks",
-        "licenses",
         "signatures",
     ])
 }

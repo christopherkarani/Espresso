@@ -962,9 +962,9 @@ public struct RealModelInferenceEngine: ~Copyable {
             )
         }
 
-        func resetAll(dim: Int) {
-            draftRuntime.reset(dim: dim)
-            verifierRuntime.reset(dim: dim)
+        func resetAll(dim: Int) throws(ANEError) {
+            try draftRuntime.reset(dim: dim)
+            try verifierRuntime.reset(dim: dim)
         }
     }
 
@@ -1075,7 +1075,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             }
 
             var decodeState = try DecodeState(maxSeq: maxSeq)
-            ForwardPass.initializeHybridDecodeCaches(
+            try ForwardPass.initializeHybridDecodeCaches(
                 surfaceHandles: surfaceHandles,
                 dim: config.dModel
             )
@@ -1107,8 +1107,8 @@ public struct RealModelInferenceEngine: ~Copyable {
             decodeState.visibleTokenCount
         }
 
-        mutating func reset(dim: Int) {
-            ForwardPass.initializeHybridDecodeCaches(
+        mutating func reset(dim: Int) throws(ANEError) {
+            try ForwardPass.initializeHybridDecodeCaches(
                 surfaceHandles: surfaceHandles,
                 dim: dim
             )
@@ -2470,7 +2470,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         let xCur = TensorBuffer(count: config.dModel, zeroed: true)
         var decodeState = try DecodeState(maxSeq: maxSeq)
 
-        ForwardPass.initializeHybridDecodeCaches(surfaceHandles: handles, dim: config.dModel)
+        try ForwardPass.initializeHybridDecodeCaches(surfaceHandles: handles, dim: config.dModel)
 
         for (position, token) in tokens.enumerated() {
             writeTestingIncrementalEmbedding(
@@ -2560,7 +2560,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         let xCur = TensorBuffer(count: config.dModel, zeroed: true)
         var decodeState = try DecodeState(maxSeq: maxSeq)
 
-        ForwardPass.initializeHybridDecodeCaches(surfaceHandles: handles, dim: config.dModel)
+        try ForwardPass.initializeHybridDecodeCaches(surfaceHandles: handles, dim: config.dModel)
 
         for (position, token) in tokens.enumerated() {
             writeTestingIncrementalEmbedding(
@@ -2604,24 +2604,24 @@ public struct RealModelInferenceEngine: ~Copyable {
         let kvDim = config.kvDim
         var kCache = [Float](repeating: 0, count: kvDim * maxSeq)
         var vCache = [Float](repeating: 0, count: kvDim * maxSeq)
-        kCache.withUnsafeMutableBufferPointer { buffer in
-            SurfaceIO.readFP16(
+        try mapSurfaceIOToRealModelError { try kCache.withUnsafeMutableBufferPointer { buffer in
+            try SurfaceIO.readFP16(
                 from: handles[0].kCacheFull,
                 into: buffer,
                 channelOffset: 0,
                 channels: kvDim,
                 spatial: maxSeq
             )
-        }
-        vCache.withUnsafeMutableBufferPointer { buffer in
-            SurfaceIO.readFP16(
+        } }
+        try mapSurfaceIOToRealModelError { try vCache.withUnsafeMutableBufferPointer { buffer in
+            try SurfaceIO.readFP16(
                 from: handles[0].vCacheFull,
                 into: buffer,
                 channelOffset: 0,
                 channels: kvDim,
                 spatial: maxSeq
             )
-        }
+        } }
         return AttentionTestingOutputs(hidden: hidden, kCache: kCache, vCache: vCache)
     }
 
@@ -2770,7 +2770,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             }
         }
 
-        ForwardPass.initializeHybridDecodeCaches(surfaceHandles: handles, dim: config.dModel)
+        try ForwardPass.initializeHybridDecodeCaches(surfaceHandles: handles, dim: config.dModel)
 
         for (position, token) in tokens.enumerated() {
             writeTestingIncrementalEmbedding(
@@ -2802,15 +2802,15 @@ public struct RealModelInferenceEngine: ~Copyable {
         }
 
         var kCache = [Float](repeating: 0, count: config.kvDim * maxSeq)
-        kCache.withUnsafeMutableBufferPointer { buffer in
-            SurfaceIO.readFP16(
+        try mapSurfaceIOToRealModelError { try kCache.withUnsafeMutableBufferPointer { buffer in
+            try SurfaceIO.readFP16(
                 from: handles[0].kCacheFull,
                 into: buffer,
                 channelOffset: 0,
                 channels: config.kvDim,
                 spatial: maxSeq
             )
-        }
+        } }
 
         return HookedKCacheTestingOutputs(
             rawKOut: lastRawKOut,
@@ -3632,7 +3632,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             }
         }
 
-        ForwardPass.initializeHybridDecodeCaches(surfaceHandles: handles, dim: config.dModel)
+        try ForwardPass.initializeHybridDecodeCaches(surfaceHandles: handles, dim: config.dModel)
 
         for (position, token) in tokens.enumerated() {
             writeTestingIncrementalEmbedding(
@@ -3677,24 +3677,24 @@ public struct RealModelInferenceEngine: ~Copyable {
 
         var kCache = [Float](repeating: 0, count: config.kvDim * maxSeq)
         var vCache = [Float](repeating: 0, count: config.kvDim * maxSeq)
-        kCache.withUnsafeMutableBufferPointer { buffer in
-            SurfaceIO.readFP16(
+        try mapSurfaceIOToRealModelError { try kCache.withUnsafeMutableBufferPointer { buffer in
+            try SurfaceIO.readFP16(
                 from: handles[0].kCacheFull,
                 into: buffer,
                 channelOffset: 0,
                 channels: config.kvDim,
                 spatial: maxSeq
             )
-        }
-        vCache.withUnsafeMutableBufferPointer { buffer in
-            SurfaceIO.readFP16(
+        } }
+        try mapSurfaceIOToRealModelError { try vCache.withUnsafeMutableBufferPointer { buffer in
+            try SurfaceIO.readFP16(
                 from: handles[0].vCacheFull,
                 into: buffer,
                 channelOffset: 0,
                 channels: config.kvDim,
                 spatial: maxSeq
             )
-        }
+        } }
 
         var context = [Float](repeating: 0, count: config.attentionDim)
         try context.withUnsafeMutableBufferPointer { buffer in
@@ -3846,7 +3846,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             }
         }
 
-        ForwardPass.initializeHybridDecodeCaches(surfaceHandles: handles, dim: config.dModel)
+        try ForwardPass.initializeHybridDecodeCaches(surfaceHandles: handles, dim: config.dModel)
 
         for (position, token) in tokens.enumerated() {
             writeTestingIncrementalEmbedding(
@@ -4046,7 +4046,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             }
         }
 
-        ForwardPass.initializeHybridDecodeCaches(surfaceHandles: handles, dim: config.dModel)
+        try ForwardPass.initializeHybridDecodeCaches(surfaceHandles: handles, dim: config.dModel)
 
         var outputs: [[Float]] = []
         outputs.reserveCapacity(inputs.count)
@@ -4201,7 +4201,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             }
         }
 
-        ForwardPass.initializeHybridDecodeCaches(surfaceHandles: handles, dim: config.dModel)
+        try ForwardPass.initializeHybridDecodeCaches(surfaceHandles: handles, dim: config.dModel)
 
         for input in inputs {
             xCur.withUnsafeMutableBufferPointer { dst in
@@ -4266,24 +4266,24 @@ public struct RealModelInferenceEngine: ~Copyable {
 
         var kCache = [Float](repeating: 0, count: config.kvDim * maxSeq)
         var vCache = [Float](repeating: 0, count: config.kvDim * maxSeq)
-        kCache.withUnsafeMutableBufferPointer { buffer in
-            SurfaceIO.readFP16(
+        try mapSurfaceIOToRealModelError { try kCache.withUnsafeMutableBufferPointer { buffer in
+            try SurfaceIO.readFP16(
                 from: handles[0].kCacheFull,
                 into: buffer,
                 channelOffset: 0,
                 channels: config.kvDim,
                 spatial: maxSeq
             )
-        }
-        vCache.withUnsafeMutableBufferPointer { buffer in
-            SurfaceIO.readFP16(
+        } }
+        try mapSurfaceIOToRealModelError { try vCache.withUnsafeMutableBufferPointer { buffer in
+            try SurfaceIO.readFP16(
                 from: handles[0].vCacheFull,
                 into: buffer,
                 channelOffset: 0,
                 channels: config.kvDim,
                 spatial: maxSeq
             )
-        }
+        } }
 
         return SingleLayerDetailedTestingOutputs(
             hidden: hidden,
@@ -4718,7 +4718,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             throw RealModelInferenceError.runtimeFailure("Hybrid decode state is unavailable")
         }
 
-        ForwardPass.initializeHybridDecodeCaches(
+        try ForwardPass.initializeHybridDecodeCaches(
             surfaceHandles: compiledHybridSurfaceHandles,
             dim: config.dModel
         )
@@ -4994,7 +4994,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         cachedRuntimePair: CachedSpeculativeRuntimePair,
         onStep: ((GenerationStep) -> Void)?
     ) throws -> GenerationResult {
-        cachedRuntimePair.resetAll(dim: config.dModel)
+        try cachedRuntimePair.resetAll(dim: config.dModel)
 
         let xCur = TensorBuffer(count: config.dModel, zeroed: true)
         for (position, token) in promptTokens.enumerated() {
@@ -5502,7 +5502,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             )
         }
 
-        ForwardPass.initializeHybridDecodeCaches(
+        try ForwardPass.initializeHybridDecodeCaches(
             surfaceHandles: compiledHybridSurfaceHandles,
             dim: config.dModel
         )
@@ -7627,6 +7627,9 @@ public struct RealModelInferenceEngine: ~Copyable {
         }
         guard config.nHead * config.headDim > 0, config.nKVHead * config.headDim > 0 else {
             throw RealModelInferenceError.invalidConfig("attention dimensions must be > 0")
+        }
+        guard config.dModel == config.nHead * config.headDim else {
+            throw RealModelInferenceError.invalidConfig("dModel must equal nHead * headDim")
         }
         guard config.nHead % config.nKVHead == 0 else {
             throw RealModelInferenceError.invalidConfig("nHead must be divisible by nKVHead")

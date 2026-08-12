@@ -281,18 +281,18 @@ public enum BackwardPass {
                 ffnBwdOut = try kernels[L].ffnBwd.outputSurface(at: 0)
             }
             t0 = RuntimeClock.now()
-            scratch.dxFfn.withUnsafeMutableBufferPointer { dxFfnBuf in
-                scratch.dh1.withUnsafeMutableBufferPointer { dh1Buf in
-                    scratch.dh3.withUnsafeMutableBufferPointer { dh3Buf in
-                        let regions = [
-                            SurfaceIO.FP16ReadRegion(destination: requireBase(dxFfnBuf), channelOffset: 0, channels: dim),
-                            SurfaceIO.FP16ReadRegion(destination: requireBase(dh1Buf), channelOffset: dim, channels: hidden),
-                            SurfaceIO.FP16ReadRegion(destination: requireBase(dh3Buf), channelOffset: dim + hidden, channels: hidden),
-                        ]
-                        SurfaceIO.readFP16Batched(from: ffnBwdOut, spatial: seqLen, regions: regions)
+            try mapSurfaceIOToANEError { try scratch.dxFfn.withUnsafeMutableBufferPointer { dxFfnBuf in
+                    try scratch.dh1.withUnsafeMutableBufferPointer { dh1Buf in
+                        try scratch.dh3.withUnsafeMutableBufferPointer { dh3Buf in
+                            let regions = [
+                                SurfaceIO.FP16ReadRegion(destination: requireBase(dxFfnBuf), channelOffset: 0, channels: dim),
+                                SurfaceIO.FP16ReadRegion(destination: requireBase(dh1Buf), channelOffset: dim, channels: hidden),
+                                SurfaceIO.FP16ReadRegion(destination: requireBase(dh3Buf), channelOffset: dim + hidden, channels: hidden),
+                            ]
+                            try SurfaceIO.readFP16Batched(from: ffnBwdOut, spatial: seqLen, regions: regions)
+                        }
                     }
-                }
-            }
+            } }
             timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
 
             // === STEP 1b: Async dW FFN (CPU) ===
@@ -487,22 +487,22 @@ public enum BackwardPass {
 
             // #10/#11: read dq/dk from sdpaBwd2 output
             t0 = RuntimeClock.now()
-            scratch.dq.withUnsafeMutableBufferPointer { dqBuf in
-                scratch.dk.withUnsafeMutableBufferPointer { dkBuf in
-                    let regions = [
-                        SurfaceIO.FP16ReadRegion(destination: requireBase(dqBuf), channelOffset: 0, channels: dim),
-                        SurfaceIO.FP16ReadRegion(destination: requireBase(dkBuf), channelOffset: dim, channels: dim),
-                    ]
-                    SurfaceIO.readFP16Batched(from: sdpa2Out, spatial: seqLen, regions: regions)
-                }
-            }
+            try mapSurfaceIOToANEError { try scratch.dq.withUnsafeMutableBufferPointer { dqBuf in
+                    try scratch.dk.withUnsafeMutableBufferPointer { dkBuf in
+                        let regions = [
+                            SurfaceIO.FP16ReadRegion(destination: requireBase(dqBuf), channelOffset: 0, channels: dim),
+                            SurfaceIO.FP16ReadRegion(destination: requireBase(dkBuf), channelOffset: dim, channels: dim),
+                        ]
+                        try SurfaceIO.readFP16Batched(from: sdpa2Out, spatial: seqLen, regions: regions)
+                    }
+            } }
             timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
 
             // #12: read dv from sdpaBwd1 output (dv is NOT produced by sdpaBwd2)
             t0 = RuntimeClock.now()
-            scratch.dv.withUnsafeMutableBufferPointer { dst in
-                SurfaceIO.readFP16(from: sdpa1Out, into: dst, channelOffset: 0, channels: dim, spatial: seqLen)
-            }
+            try mapSurfaceIOToANEError { try scratch.dv.withUnsafeMutableBufferPointer { dst in
+                try SurfaceIO.readFP16(from: sdpa1Out, into: dst, channelOffset: 0, channels: dim, spatial: seqLen)
+            } }
             timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
 
             // === STEP 5: Async dWq/dWk/dWv (CPU) ===
@@ -590,9 +590,9 @@ public enum BackwardPass {
 
             // #15: read dx_attn
             t0 = RuntimeClock.now()
-            scratch.dxAttn.withUnsafeMutableBufferPointer { dst in
-                SurfaceIO.readFP16(from: qkvOut, into: dst, channelOffset: 0, channels: dim, spatial: seqLen)
-            }
+            try mapSurfaceIOToANEError { try scratch.dxAttn.withUnsafeMutableBufferPointer { dst in
+                try SurfaceIO.readFP16(from: qkvOut, into: dst, channelOffset: 0, channels: dim, spatial: seqLen)
+            } }
             timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
 
             // === STEP 7: RMSNorm1 backward (CPU) ===

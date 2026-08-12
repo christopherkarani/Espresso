@@ -23,9 +23,9 @@ private func makeRWKVZeroLaneSurface(laneSpatial: Int) throws(ANEError) -> IOSur
     }
 
     let zeroValues = Array(repeating: Float(0), count: ModelConfig.dim * laneSpatial)
-    zeroValues.withUnsafeBufferPointer { src in
-        SurfaceIO.writeFP16(to: zeroLane, data: src, channels: ModelConfig.dim, spatial: laneSpatial)
-    }
+    try mapSurfaceIOToANEError { try zeroValues.withUnsafeBufferPointer { src in
+        try SurfaceIO.writeFP16(to: zeroLane, data: src, channels: ModelConfig.dim, spatial: laneSpatial)
+    } }
     return zeroLane
 }
 
@@ -105,7 +105,7 @@ public struct RWKVStyleRecurrentSession: ~Copyable {
                 channels: ModelConfig.dim,
                 spatial: handles.laneSpatial
             )
-            try tokenInput.withUnsafeBufferPointer { tokenBuf in
+            try mapSurfaceIOToANEError { try tokenInput.withUnsafeBufferPointer { tokenBuf in
                 try SurfaceIO.writeFP16SpatialSlice(
                     to: handles.xIn,
                     channelOffset: 0,
@@ -114,7 +114,7 @@ public struct RWKVStyleRecurrentSession: ~Copyable {
                     data: tokenBuf,
                     channels: ModelConfig.dim
                 )
-            }
+            } }
         } catch {
             throw .invalidArguments("recurrent input write failed: \(error)")
         }
@@ -138,7 +138,7 @@ public struct RWKVStyleRecurrentSession: ~Copyable {
                 channels: ModelConfig.dim,
                 spatial: handles.laneSpatial
             )
-            try output.withUnsafeMutableBufferPointer { outBuf in
+            try mapSurfaceIOToANEError { try output.withUnsafeMutableBufferPointer { outBuf in
                 try SurfaceIO.readFP16SpatialSlice(
                     from: handles.xOut,
                     channelOffset: 0,
@@ -147,7 +147,7 @@ public struct RWKVStyleRecurrentSession: ~Copyable {
                     into: outBuf,
                     channels: ModelConfig.dim
                 )
-            }
+            } }
         } catch {
             throw .invalidArguments("recurrent output readback failed: \(error)")
         }
@@ -249,7 +249,7 @@ public struct RWKVStyleFusedTwoLayerSession: ~Copyable {
                 channels: ModelConfig.dim,
                 spatial: handles.laneSpatial
             )
-            try tokenInput.withUnsafeBufferPointer { tokenBuf in
+            try mapSurfaceIOToANEError { try tokenInput.withUnsafeBufferPointer { tokenBuf in
                 try SurfaceIO.writeFP16SpatialSlice(
                     to: handles.xIn,
                     channelOffset: 0,
@@ -258,7 +258,7 @@ public struct RWKVStyleFusedTwoLayerSession: ~Copyable {
                     data: tokenBuf,
                     channels: ModelConfig.dim
                 )
-            }
+            } }
         } catch {
             throw .invalidArguments("fused recurrent input write failed: \(error)")
         }
@@ -290,7 +290,7 @@ public struct RWKVStyleFusedTwoLayerSession: ~Copyable {
                 channels: ModelConfig.dim,
                 spatial: handles.laneSpatial
             )
-            try output.withUnsafeMutableBufferPointer { outBuf in
+            try mapSurfaceIOToANEError { try output.withUnsafeMutableBufferPointer { outBuf in
                 try SurfaceIO.readFP16SpatialSlice(
                     from: handles.xOut,
                     channelOffset: 0,
@@ -299,7 +299,7 @@ public struct RWKVStyleFusedTwoLayerSession: ~Copyable {
                     into: outBuf,
                     channels: ModelConfig.dim
                 )
-            }
+            } }
         } catch {
             throw .invalidArguments("fused recurrent output readback failed: \(error)")
         }
@@ -419,7 +419,7 @@ public struct RWKVStyleFusedThreeLayerSession: ~Copyable {
                 channels: ModelConfig.dim,
                 spatial: handles.laneSpatial
             )
-            try tokenInput.withUnsafeBufferPointer { tokenBuf in
+            try mapSurfaceIOToANEError { try tokenInput.withUnsafeBufferPointer { tokenBuf in
                 try SurfaceIO.writeFP16SpatialSlice(
                     to: handles.xIn,
                     channelOffset: 0,
@@ -428,7 +428,7 @@ public struct RWKVStyleFusedThreeLayerSession: ~Copyable {
                     data: tokenBuf,
                     channels: ModelConfig.dim
                 )
-            }
+            } }
         } catch {
             throw .invalidArguments("fused three-layer recurrent input write failed: \(error)")
         }
@@ -468,7 +468,7 @@ public struct RWKVStyleFusedThreeLayerSession: ~Copyable {
                 channels: ModelConfig.dim,
                 spatial: handles.laneSpatial
             )
-            try output.withUnsafeMutableBufferPointer { outBuf in
+            try mapSurfaceIOToANEError { try output.withUnsafeMutableBufferPointer { outBuf in
                 try SurfaceIO.readFP16SpatialSlice(
                     from: handles.xOut,
                     channelOffset: 0,
@@ -477,7 +477,7 @@ public struct RWKVStyleFusedThreeLayerSession: ~Copyable {
                     into: outBuf,
                     channels: ModelConfig.dim
                 )
-            }
+            } }
         } catch {
             throw .invalidArguments("fused three-layer recurrent output readback failed: \(error)")
         }
@@ -598,7 +598,7 @@ public enum RWKVStyleRecurrentBench {
         for idx in 0..<kernels.count {
             handles.append(try DecodeSurfaceHandles(kernels: kernels[idx], logicalMaxSeq: effectiveContext))
         }
-        ForwardPass.initializeDecodeCachesAndMask(surfaceHandles: handles)
+        try ForwardPass.initializeDecodeCachesAndMask(surfaceHandles: handles)
 
         var decodeState = try DecodeState(maxSeq: effectiveContext)
         let prefixSteps = effectiveContext - warmup - iterations

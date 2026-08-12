@@ -104,7 +104,20 @@ struct CompositeBuilderTests {
     #expect(graph.nodes.contains { $0.name == "gelu_scale" && $0.attrs == .scalar(0.7978846) })
 }
 
-@Test func siluUsesTanhIdentityByDefault() throws {
+@Test func siluUsesSigmoidByDefault() throws {
+    var graph = ANEGraph()
+    let x = try graph.input("x", dtype: .fp16, shape: try ANEShape(channels: 8, spatial: 8))
+    let out = try graph.silu("silu", input: x)
+
+    #expect(graph.nodes[out].op == .mul)
+    #expect(graph.nodes.contains { $0.name == "silu_sigmoid" && $0.op == .sigmoid })
+    #expect(!graph.nodes.contains { $0.name == "silu_tanh" && $0.op == .tanh })
+}
+
+@Test func siluCanForceTanhIdentityPath() throws {
+    setenv("ESPRESSO_SILU_USE_TANH", "1", 1)
+    defer { unsetenv("ESPRESSO_SILU_USE_TANH") }
+
     var graph = ANEGraph()
     let x = try graph.input("x", dtype: .fp16, shape: try ANEShape(channels: 8, spatial: 8))
     let out = try graph.silu("silu", input: x)
@@ -113,19 +126,6 @@ struct CompositeBuilderTests {
     #expect(graph.nodes.contains { $0.name == "silu_tanh" && $0.op == .tanh })
     #expect(graph.nodes.contains { $0.name == "silu_half" && $0.attrs == .scalar(0.5) })
     #expect(!graph.nodes.contains { $0.name == "silu_sigmoid" && $0.op == .sigmoid })
-}
-
-@Test func siluCanForceLegacySigmoidPath() throws {
-    setenv("ESPRESSO_SILU_USE_SIGMOID", "1", 1)
-    defer { unsetenv("ESPRESSO_SILU_USE_SIGMOID") }
-
-    var graph = ANEGraph()
-    let x = try graph.input("x", dtype: .fp16, shape: try ANEShape(channels: 8, spatial: 8))
-    let out = try graph.silu("silu", input: x)
-
-    #expect(graph.nodes[out].op == .mul)
-    #expect(graph.nodes.contains { $0.name == "silu_sigmoid" && $0.op == .sigmoid })
-    #expect(!graph.nodes.contains { $0.name == "silu_tanh" && $0.op == .tanh })
 }
 
 @Test func siluSupportsFP32Experiment() throws {

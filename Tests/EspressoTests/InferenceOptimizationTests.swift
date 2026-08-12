@@ -184,7 +184,7 @@ final class InferenceOptimizationTests: XCTestCase {
             try DecodeKernelSet(weights: layers[i], maxSeq: decodeMaxSeq)
         })
         let decodeHandles = [try DecodeSurfaceHandles(kernels: decodeKernels[0])]
-        ForwardPass.initializeDecodeCachesAndMask(surfaceHandles: decodeHandles)
+        try ForwardPass.initializeDecodeCachesAndMask(surfaceHandles: decodeHandles)
 
         var decodeState = try DecodeState(maxSeq: decodeMaxSeq)
         var rng = XorShift32(seed: 0xA11CE)
@@ -228,20 +228,20 @@ final class InferenceOptimizationTests: XCTestCase {
             let lane = decodeHandles[0].laneSpatial
             var kOut = [Float](repeating: 0, count: dim * lane)
             var vOut = [Float](repeating: 0, count: dim * lane)
-            kOut.withUnsafeMutableBufferPointer { dst in
-                SurfaceIO.readFP16(from: decodeHandles[0].attnKOut, into: dst, channelOffset: 0, channels: dim, spatial: lane)
+            try kOut.withUnsafeMutableBufferPointer { dst in
+                try SurfaceIO.readFP16(from: decodeHandles[0].attnKOut, into: dst, channelOffset: 0, channels: dim, spatial: lane)
             }
-            vOut.withUnsafeMutableBufferPointer { dst in
-                SurfaceIO.readFP16(from: decodeHandles[0].attnVOut, into: dst, channelOffset: 0, channels: dim, spatial: lane)
+            try vOut.withUnsafeMutableBufferPointer { dst in
+                try SurfaceIO.readFP16(from: decodeHandles[0].attnVOut, into: dst, channelOffset: 0, channels: dim, spatial: lane)
             }
 
             var kCache = [Float](repeating: 0, count: dim * decodeMaxSeq)
             var vCache = [Float](repeating: 0, count: dim * decodeMaxSeq)
-            kCache.withUnsafeMutableBufferPointer { dst in
-                SurfaceIO.readFP16(from: decodeHandles[0].kCacheFull, into: dst, channelOffset: 0, channels: dim, spatial: decodeMaxSeq)
+            try kCache.withUnsafeMutableBufferPointer { dst in
+                try SurfaceIO.readFP16(from: decodeHandles[0].kCacheFull, into: dst, channelOffset: 0, channels: dim, spatial: decodeMaxSeq)
             }
-            vCache.withUnsafeMutableBufferPointer { dst in
-                SurfaceIO.readFP16(from: decodeHandles[0].vCacheFull, into: dst, channelOffset: 0, channels: dim, spatial: decodeMaxSeq)
+            try vCache.withUnsafeMutableBufferPointer { dst in
+                try SurfaceIO.readFP16(from: decodeHandles[0].vCacheFull, into: dst, channelOffset: 0, channels: dim, spatial: decodeMaxSeq)
             }
 
             for d in 0..<min(32, dim) {
@@ -254,8 +254,8 @@ final class InferenceOptimizationTests: XCTestCase {
             }
 
             var maskCache = [Float](repeating: 0, count: dim * decodeMaxSeq)
-            maskCache.withUnsafeMutableBufferPointer { dst in
-                SurfaceIO.readFP16(from: decodeHandles[0].maskCacheFull, into: dst, channelOffset: 0, channels: dim, spatial: decodeMaxSeq)
+            try maskCache.withUnsafeMutableBufferPointer { dst in
+                try SurfaceIO.readFP16(from: decodeHandles[0].maskCacheFull, into: dst, channelOffset: 0, channels: dim, spatial: decodeMaxSeq)
             }
             for d in 0..<min(32, dim) {
                 XCTAssertEqual(maskCache[d * decodeMaxSeq + t], 0, accuracy: 1e-3, "mask not flipped at token \(t), channel \(d)")
@@ -290,7 +290,7 @@ final class InferenceOptimizationTests: XCTestCase {
             try DecodeKernelSet(weights: layers[i], maxSeq: decodeMaxSeq)
         })
         let decodeHandles = [try DecodeSurfaceHandles(kernels: decodeKernels[0], logicalMaxSeq: decodeMaxSeq)]
-        ForwardPass.initializeDecodeCachesAndMask(surfaceHandles: decodeHandles)
+        try ForwardPass.initializeDecodeCachesAndMask(surfaceHandles: decodeHandles)
 
         var decodeState = try DecodeState(maxSeq: decodeMaxSeq)
         var rng = XorShift32(seed: 0xFACECAFE)
@@ -315,12 +315,12 @@ final class InferenceOptimizationTests: XCTestCase {
 
             if t == 31 || t == 32 || t == 63 {
                 var kOut = [Float](repeating: 0, count: dim * lane)
-                kOut.withUnsafeMutableBufferPointer { dst in
-                    SurfaceIO.readFP16(from: decodeHandles[0].attnKOut, into: dst, channelOffset: 0, channels: dim, spatial: lane)
+                try kOut.withUnsafeMutableBufferPointer { dst in
+                    try SurfaceIO.readFP16(from: decodeHandles[0].attnKOut, into: dst, channelOffset: 0, channels: dim, spatial: lane)
                 }
                 var kCache = [Float](repeating: 0, count: dim * decodeMaxSeq)
-                kCache.withUnsafeMutableBufferPointer { dst in
-                    SurfaceIO.readFP16(from: decodeHandles[0].kCacheFull, into: dst, channelOffset: 0, channels: dim, spatial: decodeMaxSeq)
+                try kCache.withUnsafeMutableBufferPointer { dst in
+                    try SurfaceIO.readFP16(from: decodeHandles[0].kCacheFull, into: dst, channelOffset: 0, channels: dim, spatial: decodeMaxSeq)
                 }
                 for d in 0..<min(32, dim) {
                     XCTAssertEqual(
@@ -336,8 +336,8 @@ final class InferenceOptimizationTests: XCTestCase {
         XCTAssertEqual(decodeState.step, decodeSteps)
 
         var maskCache = [Float](repeating: 0, count: dim * decodeMaxSeq)
-        maskCache.withUnsafeMutableBufferPointer { dst in
-            SurfaceIO.readFP16(from: decodeHandles[0].maskCacheFull, into: dst, channelOffset: 0, channels: dim, spatial: decodeMaxSeq)
+        try maskCache.withUnsafeMutableBufferPointer { dst in
+            try SurfaceIO.readFP16(from: decodeHandles[0].maskCacheFull, into: dst, channelOffset: 0, channels: dim, spatial: decodeMaxSeq)
         }
         for d in 0..<min(16, dim) {
             XCTAssertEqual(maskCache[d * decodeMaxSeq + 31], 0, accuracy: 1e-3)

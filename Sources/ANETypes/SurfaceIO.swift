@@ -83,7 +83,9 @@ public enum SurfaceIO {
         return Int32(value)
     }
 
-    public static func writeFP16(to surface: IOSurfaceRef, data: UnsafeBufferPointer<Float>, channels: Int, spatial: Int) {
+    public static func writeFP16(to surface: IOSurfaceRef, data: UnsafeBufferPointer<Float>, channels: Int, spatial: Int) throws(SurfaceIOError) {
+        let channels32 = try checkedNonNegativeInt32(channels)
+        let spatial32 = try checkedNonNegativeInt32(spatial)
         let count = checkedElementCount(channels: channels, spatial: spatial)
         precondition(data.count == count)
         if count == 0 { return }
@@ -91,43 +93,35 @@ public enum SurfaceIO {
             preconditionFailure("Input base address is nil for non-empty buffer")
         }
 
-        let channels32 = Int32(clamping: channels)
-        let spatial32 = Int32(clamping: spatial)
-        precondition(Int(channels32) == channels && Int(spatial32) == spatial)
         let ok = ane_interop_io_write_fp16(surface, src, channels32, spatial32)
-        precondition(ok)
+        guard ok else { throw .interopCallFailed }
     }
 
     public static func readFP16(from surface: IOSurfaceRef,
                                into dst: UnsafeMutableBufferPointer<Float>,
                                channelOffset: Int,
                                channels: Int,
-                               spatial: Int) {
+                               spatial: Int) throws(SurfaceIOError) {
+        let channelOffset32 = try checkedNonNegativeInt32(channelOffset)
+        let channels32 = try checkedNonNegativeInt32(channels)
+        let spatial32 = try checkedNonNegativeInt32(spatial)
         let count = checkedElementCount(channels: channels, spatial: spatial)
-        precondition(channelOffset >= 0)
         precondition(dst.count == count)
         if count == 0 { return }
         guard let out = dst.baseAddress else {
             preconditionFailure("Destination base address is nil for non-empty buffer")
         }
 
-        let channelOffset32 = Int32(clamping: channelOffset)
-        let channels32 = Int32(clamping: channels)
-        let spatial32 = Int32(clamping: spatial)
-        precondition(Int(channelOffset32) == channelOffset)
-        precondition(Int(channels32) == channels && Int(spatial32) == spatial)
         let ok = ane_interop_io_read_fp16(surface, channelOffset32, out, channels32, spatial32)
-        precondition(ok)
+        guard ok else { throw .interopCallFailed }
     }
 
     /// Read multiple FP16 channel slices from one surface under a single lock.
     ///
     /// Each region destination must point to writable storage of at least `channels * spatial` floats.
-    public static func readFP16Batched(from surface: IOSurfaceRef, spatial: Int, regions: [FP16ReadRegion]) {
-        precondition(spatial >= 0)
+    public static func readFP16Batched(from surface: IOSurfaceRef, spatial: Int, regions: [FP16ReadRegion]) throws(SurfaceIOError) {
+        let spatial32 = try checkedNonNegativeInt32(spatial)
         if regions.isEmpty || spatial == 0 { return }
-        let spatial32 = Int32(clamping: spatial)
-        precondition(Int(spatial32) == spatial)
 
         var destinations = [UnsafeMutablePointer<Float>?]()
         var channelOffsets = [Int32]()
@@ -137,12 +131,8 @@ public enum SurfaceIO {
         channelCounts.reserveCapacity(regions.count)
 
         for region in regions {
-            precondition(region.channelOffset >= 0)
-            precondition(region.channels >= 0)
-            let offset32 = Int32(clamping: region.channelOffset)
-            let channels32 = Int32(clamping: region.channels)
-            precondition(Int(offset32) == region.channelOffset)
-            precondition(Int(channels32) == region.channels)
+            let offset32 = try checkedNonNegativeInt32(region.channelOffset)
+            let channels32 = try checkedNonNegativeInt32(region.channels)
             destinations.append(region.destination)
             channelOffsets.append(offset32)
             channelCounts.append(channels32)
@@ -164,7 +154,7 @@ public enum SurfaceIO {
                 }
             }
         }
-        precondition(ok)
+        guard ok else { throw .interopCallFailed }
     }
 
     public static func writeFP16At(to surface: IOSurfaceRef,

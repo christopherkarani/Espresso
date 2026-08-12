@@ -69,7 +69,7 @@ public enum GenericMIL {
         program(1.3)
         [buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, {"coremlc-version", "3505.4.1"}, {"coremltools-component-milinternal", ""}, {"coremltools-version", "9.0"}})]
         {
-            \(MILText.functionLine(deploymentTarget: MILText.currentDeploymentTarget(), parameters: "tensor<fp32, [1, \(inCh), \(spatial)]> x, tensor<fp32, [1, \(outCh), \(inCh)]> W"))
+        \(MILText.functionLine(deploymentTarget: MILText.currentDeploymentTarget(), parameters: "tensor<fp32, [1, \(inCh), \(spatial)]> x, tensor<fp32, [1, \(outCh), \(inCh)]> W"))
                 string to_fp16 = const()[name = string("to_fp16"), val = string("fp16")];
                 tensor<fp16, [1, \(inCh), \(spatial)]> x16 = cast(dtype = to_fp16, x = x)[name = string("cast_x")];
                 tensor<fp16, [1, \(outCh), \(inCh)]> W16 = cast(dtype = to_fp16, x = W)[name = string("cast_W")];
@@ -89,7 +89,7 @@ public enum GenericMIL {
         program(1.3)
         [buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, {"coremlc-version", "3505.4.1"}, {"coremltools-component-milinternal", ""}, {"coremltools-version", "9.0"}})]
         {
-            \(MILText.functionLine(deploymentTarget: MILText.currentDeploymentTarget(), parameters: "tensor<fp32, [1, \(inCh), 1, \(spatial)]> x"))
+        \(MILText.functionLine(deploymentTarget: MILText.currentDeploymentTarget(), parameters: "tensor<fp32, [1, \(inCh), 1, \(spatial)]> x"))
                 string c_pad_type = const()[name = string("c_pad_type"), val = string("valid")];
                 tensor<int32, [2]> c_strides = const()[name = string("c_strides"), val = tensor<int32, [2]>([1, 1])];
                 tensor<int32, [4]> c_pad = const()[name = string("c_pad"), val = tensor<int32, [4]>([0, 0, 0, 0])];
@@ -113,7 +113,7 @@ public enum GenericMIL {
         program(1.3)
         [buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, {"coremlc-version", "3505.4.1"}, {"coremltools-component-milinternal", ""}, {"coremltools-version", "9.0"}})]
         {
-            \(MILText.functionLine(deploymentTarget: MILText.currentDeploymentTarget(), parameters: "tensor<fp32, [1, \(dim), 1, \(spatial)]> x"))
+        \(MILText.functionLine(deploymentTarget: MILText.currentDeploymentTarget(), parameters: "tensor<fp32, [1, \(dim), 1, \(spatial)]> x"))
                 string c_pad_type = const()[name = string("c_pad_type"), val = string("valid")];
                 tensor<int32, [2]> c_strides = const()[name = string("c_strides"), val = tensor<int32, [2]>([1, 1])];
                 tensor<int32, [4]> c_pad = const()[name = string("c_pad"), val = tensor<int32, [4]>([0, 0, 0, 0])];
@@ -143,7 +143,7 @@ public enum GenericMIL {
         program(1.3)
         [buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, {"coremlc-version", "3505.4.1"}, {"coremltools-component-milinternal", ""}, {"coremltools-version", "9.0"}})]
         {
-            \(MILText.functionLine(deploymentTarget: MILText.currentDeploymentTarget(), parameters: "tensor<fp32, [1, \(dim), 1, \(spatial)]> x"))
+        \(MILText.functionLine(deploymentTarget: MILText.currentDeploymentTarget(), parameters: "tensor<fp32, [1, \(dim), 1, \(spatial)]> x"))
                 string c_pad_type = const()[name = string("c_pad_type"), val = string("valid")];
                 tensor<int32, [2]> c_strides = const()[name = string("c_strides"), val = tensor<int32, [2]>([1, 1])];
                 tensor<int32, [4]> c_pad = const()[name = string("c_pad"), val = tensor<int32, [4]>([0, 0, 0, 0])];

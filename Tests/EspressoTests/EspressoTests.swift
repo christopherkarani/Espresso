@@ -961,8 +961,8 @@ final class EspressoTests: XCTestCase {
 
         var xCur = [Float](repeating: 0, count: dim * seq)
         for i in xCur.indices { xCur[i] = Float(i % 128 + 1) * 0.005 }
-        xCur.withUnsafeBufferPointer { buf in
-            SurfaceIO.writeFP16(to: fwdAttnIn, data: buf, channels: dim, spatial: seq)
+        try xCur.withUnsafeBufferPointer { buf in
+            try SurfaceIO.writeFP16(to: fwdAttnIn, data: buf, channels: dim, spatial: seq)
         }
         try kernels.fwdAttn.eval()
 
@@ -977,11 +977,11 @@ final class EspressoTests: XCTestCase {
         )
         var srcQKV = [Float](repeating: 0, count: 3 * dim * seq)
         var dstQKV = [Float](repeating: 0, count: 3 * dim * seq)
-        srcQKV.withUnsafeMutableBufferPointer { out in
-            SurfaceIO.readFP16(from: fwdAttnOut, into: out, channelOffset: dim, channels: 3 * dim, spatial: seq)
+        try srcQKV.withUnsafeMutableBufferPointer { out in
+            try SurfaceIO.readFP16(from: fwdAttnOut, into: out, channelOffset: dim, channels: 3 * dim, spatial: seq)
         }
-        dstQKV.withUnsafeMutableBufferPointer { out in
-            SurfaceIO.readFP16(from: sdpa1In, into: out, channelOffset: 0, channels: 3 * dim, spatial: seq)
+        try dstQKV.withUnsafeMutableBufferPointer { out in
+            try SurfaceIO.readFP16(from: sdpa1In, into: out, channelOffset: 0, channels: 3 * dim, spatial: seq)
         }
         XCTAssertLessThan(maxAbsDiff(srcQKV, dstQKV), 1e-2)
         XCTAssertTrue(dstQKV.contains(where: { $0 != 0 }))
@@ -999,8 +999,8 @@ final class EspressoTests: XCTestCase {
             )
         }
         var roundtripDy = [Float](repeating: 0, count: dim * seq)
-        roundtripDy.withUnsafeMutableBufferPointer { out in
-            SurfaceIO.readFP16(from: sdpa1In, into: out, channelOffset: 3 * dim, channels: dim, spatial: seq)
+        try roundtripDy.withUnsafeMutableBufferPointer { out in
+            try SurfaceIO.readFP16(from: sdpa1In, into: out, channelOffset: 3 * dim, channels: dim, spatial: seq)
         }
         XCTAssertLessThan(maxAbsDiff(dy, roundtripDy), 1e-2)
 
@@ -1018,11 +1018,11 @@ final class EspressoTests: XCTestCase {
         )
         var dscoresSrc = [Float](repeating: 0, count: 2 * scoreCh * seq)
         var dscoresDst = [Float](repeating: 0, count: 2 * scoreCh * seq)
-        dscoresSrc.withUnsafeMutableBufferPointer { out in
-            SurfaceIO.readFP16(from: sdpa1Out, into: out, channelOffset: dim, channels: 2 * scoreCh, spatial: seq)
+        try dscoresSrc.withUnsafeMutableBufferPointer { out in
+            try SurfaceIO.readFP16(from: sdpa1Out, into: out, channelOffset: dim, channels: 2 * scoreCh, spatial: seq)
         }
-        dscoresDst.withUnsafeMutableBufferPointer { out in
-            SurfaceIO.readFP16(from: sdpa2In, into: out, channelOffset: 0, channels: 2 * scoreCh, spatial: seq)
+        try dscoresDst.withUnsafeMutableBufferPointer { out in
+            try SurfaceIO.readFP16(from: sdpa2In, into: out, channelOffset: 0, channels: 2 * scoreCh, spatial: seq)
         }
         XCTAssertLessThan(maxAbsDiff(dscoresSrc, dscoresDst), 1e-2)
         XCTAssertTrue(dscoresDst.contains(where: { $0 != 0 }))
@@ -1038,11 +1038,11 @@ final class EspressoTests: XCTestCase {
         )
         var qkSrc = [Float](repeating: 0, count: 2 * dim * seq)
         var qkDst = [Float](repeating: 0, count: 2 * dim * seq)
-        qkSrc.withUnsafeMutableBufferPointer { out in
-            SurfaceIO.readFP16(from: fwdAttnOut, into: out, channelOffset: dim, channels: 2 * dim, spatial: seq)
+        try qkSrc.withUnsafeMutableBufferPointer { out in
+            try SurfaceIO.readFP16(from: fwdAttnOut, into: out, channelOffset: dim, channels: 2 * dim, spatial: seq)
         }
-        qkDst.withUnsafeMutableBufferPointer { out in
-            SurfaceIO.readFP16(from: sdpa2In, into: out, channelOffset: 2 * scoreCh, channels: 2 * dim, spatial: seq)
+        try qkDst.withUnsafeMutableBufferPointer { out in
+            try SurfaceIO.readFP16(from: sdpa2In, into: out, channelOffset: 2 * scoreCh, channels: 2 * dim, spatial: seq)
         }
         XCTAssertLessThan(maxAbsDiff(qkSrc, qkDst), 1e-2)
 
@@ -1051,16 +1051,16 @@ final class EspressoTests: XCTestCase {
 
         // 7) dv from sdpaBwd1 output @0
         var dv = [Float](repeating: 0, count: dim * seq)
-        dv.withUnsafeMutableBufferPointer { out in
-            SurfaceIO.readFP16(from: sdpa1Out, into: out, channelOffset: 0, channels: dim, spatial: seq)
+        try dv.withUnsafeMutableBufferPointer { out in
+            try SurfaceIO.readFP16(from: sdpa1Out, into: out, channelOffset: 0, channels: dim, spatial: seq)
         }
         XCTAssertTrue(dv.allSatisfy(\.isFinite))
         XCTAssertTrue(dv.contains(where: { $0 != 0 }))
 
         // 8) dq|dk from sdpaBwd2 output @0
         var dqdk = [Float](repeating: 0, count: 2 * dim * seq)
-        dqdk.withUnsafeMutableBufferPointer { out in
-            SurfaceIO.readFP16(from: sdpa2Out, into: out, channelOffset: 0, channels: 2 * dim, spatial: seq)
+        try dqdk.withUnsafeMutableBufferPointer { out in
+            try SurfaceIO.readFP16(from: sdpa2Out, into: out, channelOffset: 0, channels: 2 * dim, spatial: seq)
         }
         XCTAssertTrue(dqdk.allSatisfy(\.isFinite))
         XCTAssertTrue(dqdk.contains(where: { $0 != 0 }))
@@ -1084,15 +1084,15 @@ final class EspressoTests: XCTestCase {
         )
 
         var qkvDv = [Float](repeating: 0, count: dim * seq)
-        qkvDv.withUnsafeMutableBufferPointer { out in
-            SurfaceIO.readFP16(from: qkvIn, into: out, channelOffset: 2 * dim, channels: dim, spatial: seq)
+        try qkvDv.withUnsafeMutableBufferPointer { out in
+            try SurfaceIO.readFP16(from: qkvIn, into: out, channelOffset: 2 * dim, channels: dim, spatial: seq)
         }
         XCTAssertLessThan(maxAbsDiff(dv, qkvDv), 1e-2, "dv must come from sdpaBwd1 output")
 
         try kernels.qkvBwd.eval()
         var dxAttn = [Float](repeating: 0, count: dim * seq)
-        dxAttn.withUnsafeMutableBufferPointer { out in
-            SurfaceIO.readFP16(from: qkvOut, into: out, channelOffset: 0, channels: dim, spatial: seq)
+        try dxAttn.withUnsafeMutableBufferPointer { out in
+            try SurfaceIO.readFP16(from: qkvOut, into: out, channelOffset: 0, channels: dim, spatial: seq)
         }
         XCTAssertTrue(dxAttn.allSatisfy(\.isFinite))
         XCTAssertTrue(dxAttn.contains(where: { $0 != 0 }))

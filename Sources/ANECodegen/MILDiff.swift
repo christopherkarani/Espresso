@@ -48,7 +48,10 @@ public struct MILDiff: Sendable {
             }
 
             let op = String(line[opRange])
-            return op == "const" ? nil : op
+            // `const` binds literals; `identity` is a pure rename inserted to bind
+            // graph output names. Neither performs compute, so both are
+            // transparent for structural parity.
+            return (op == "const" || op == "identity") ? nil : op
         }
     }
 

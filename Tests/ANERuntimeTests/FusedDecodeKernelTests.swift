@@ -322,7 +322,7 @@ final class FusedDecodeKernelSetTests: XCTestCase {
         let surfaceHandles = try (0..<1).map { i in
             try FusedDecodeSurfaceHandles(kernels: kernels[i])
         }
-        ForwardPass.initializeFusedDecodeCachesAndMask(surfaceHandles: surfaceHandles)
+        try ForwardPass.initializeFusedDecodeCachesAndMask(surfaceHandles: surfaceHandles)
 
         var state = try DecodeState(maxSeq: 32)
         var timings = StepTimingBreakdown()
@@ -360,7 +360,7 @@ final class FusedDecodeKernelSetTests: XCTestCase {
         let fusedHandles = try (0..<nLayers).map { i in
             try FusedDecodeSurfaceHandles(kernels: fusedKernels[i])
         }
-        ForwardPass.initializeFusedDecodeCachesAndMask(surfaceHandles: fusedHandles)
+        try ForwardPass.initializeFusedDecodeCachesAndMask(surfaceHandles: fusedHandles)
 
         // Compile unfused kernels
         let unfusedKernels = try LayerStorage<DecodeKernelSet>(count: nLayers) { _ in
@@ -369,7 +369,7 @@ final class FusedDecodeKernelSetTests: XCTestCase {
         let unfusedHandles = try (0..<nLayers).map { i in
             try DecodeSurfaceHandles(kernels: unfusedKernels[i])
         }
-        ForwardPass.initializeDecodeCachesAndMask(surfaceHandles: unfusedHandles)
+        try ForwardPass.initializeDecodeCachesAndMask(surfaceHandles: unfusedHandles)
 
         let xCur = TensorBuffer(count: ModelConfig.dim, zeroed: true)
         xCur.withUnsafeMutableBufferPointer { ptr in

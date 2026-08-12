@@ -62,7 +62,8 @@ extension ANEGraph {
             spatial: spatial,
             weightPath: w1Path
         )
-        let gate = try silu("\(prefix)_gate_act", input: gateLinear)
+        // Emit the up projection before the activation to preserve op-order
+        // parity with the retained reference fixtures.
         let up = try linear(
             "\(prefix)_up",
             input: input,
@@ -71,6 +72,7 @@ extension ANEGraph {
             spatial: spatial,
             weightPath: w3Path
         )
+        let gate = try silu("\(prefix)_gate_act", input: gateLinear)
         let gated = try mul("\(prefix)_gated", x: gate, y: up)
         return try linear(
             "\(prefix)_down",

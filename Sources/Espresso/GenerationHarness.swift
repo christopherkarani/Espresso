@@ -2403,7 +2403,7 @@ public struct ANEDirectGenerationModel: ~Copyable, DirectTokenSelectingLanguageM
     }
 
     public mutating func reset() throws(GenerationError) {
-        ForwardPass.initializeDecodeCachesAndMask(surfaceHandles: decodeHandles)
+        try mapSurfaceIOToGenerationError { try ForwardPass.initializeDecodeCachesAndMask(surfaceHandles: decodeHandles) }
         decodeState.reset()
         xCur.zero()
         trunkLatencyMs = 0

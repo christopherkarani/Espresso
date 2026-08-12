@@ -260,7 +260,7 @@ final class HybridDecodeForwardPassTests: XCTestCase {
             }
         }
 
-        ForwardPass.initializeHybridDecodeCaches(surfaceHandles: handles)
+        try ForwardPass.initializeHybridDecodeCaches(surfaceHandles: handles)
         try ForwardPass.runHybridDecodeTimed(
             xCur: xCur,
             kernels: kernels,
@@ -342,7 +342,7 @@ final class HybridDecodeForwardPassTests: XCTestCase {
         }
 
         for _ in 0..<warmup {
-            ForwardPass.initializeDecodeCachesAndMask(surfaceHandles: handles)
+            try ForwardPass.initializeDecodeCachesAndMask(surfaceHandles: handles)
             var state = try DecodeState(maxSeq: maxSeq)
             for step in 0..<decodeSteps {
                 loadToken(step: step)
@@ -360,7 +360,7 @@ final class HybridDecodeForwardPassTests: XCTestCase {
         var latencies: [Double] = []
         latencies.reserveCapacity(iterations * decodeSteps)
         for _ in 0..<iterations {
-            ForwardPass.initializeDecodeCachesAndMask(surfaceHandles: handles)
+            try ForwardPass.initializeDecodeCachesAndMask(surfaceHandles: handles)
             var state = try DecodeState(maxSeq: maxSeq)
             for step in 0..<decodeSteps {
                 loadToken(step: step)
@@ -419,7 +419,7 @@ final class HybridDecodeForwardPassTests: XCTestCase {
         }
 
         for _ in 0..<warmup {
-            ForwardPass.initializeHybridDecodeCaches(surfaceHandles: handles)
+            try ForwardPass.initializeHybridDecodeCaches(surfaceHandles: handles)
             var state = try DecodeState(maxSeq: maxSeq)
             for step in 0..<decodeSteps {
                 loadToken(step: step)
@@ -446,7 +446,7 @@ final class HybridDecodeForwardPassTests: XCTestCase {
         ffnLatencies.reserveCapacity(iterations * decodeSteps)
         ioLatencies.reserveCapacity(iterations * decodeSteps)
         for _ in 0..<iterations {
-            ForwardPass.initializeHybridDecodeCaches(surfaceHandles: handles)
+            try ForwardPass.initializeHybridDecodeCaches(surfaceHandles: handles)
             var state = try DecodeState(maxSeq: maxSeq)
             for step in 0..<decodeSteps {
                 loadToken(step: step)

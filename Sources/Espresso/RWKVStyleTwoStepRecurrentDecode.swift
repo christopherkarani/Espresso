@@ -11,9 +11,9 @@ func makeRWKVTwoStepZeroLaneSurface(laneSpatial: Int) throws(ANEError) -> IOSurf
     }
 
     let zeroValues = Array(repeating: Float(0), count: ModelConfig.dim * laneSpatial)
-    zeroValues.withUnsafeBufferPointer { src in
-        SurfaceIO.writeFP16(to: zeroLane, data: src, channels: ModelConfig.dim, spatial: laneSpatial)
-    }
+    try mapSurfaceIOToANEError { try zeroValues.withUnsafeBufferPointer { src in
+        try SurfaceIO.writeFP16(to: zeroLane, data: src, channels: ModelConfig.dim, spatial: laneSpatial)
+    } }
     return zeroLane
 }
 
@@ -122,7 +122,7 @@ public struct RWKVStyleTwoStepRecurrentSession: ~Copyable {
                 channels: ModelConfig.dim,
                 spatial: handles.laneSpatial
             )
-            try tokenInput0.withUnsafeBufferPointer { tokenBuf in
+            try mapSurfaceIOToANEError { try tokenInput0.withUnsafeBufferPointer { tokenBuf in
                 try SurfaceIO.writeFP16SpatialSlice(
                     to: handles.x0In,
                     channelOffset: 0,
@@ -131,8 +131,8 @@ public struct RWKVStyleTwoStepRecurrentSession: ~Copyable {
                     data: tokenBuf,
                     channels: ModelConfig.dim
                 )
-            }
-            try tokenInput1.withUnsafeBufferPointer { tokenBuf in
+            } }
+            try mapSurfaceIOToANEError { try tokenInput1.withUnsafeBufferPointer { tokenBuf in
                 try SurfaceIO.writeFP16SpatialSlice(
                     to: handles.x1In,
                     channelOffset: 0,
@@ -141,7 +141,7 @@ public struct RWKVStyleTwoStepRecurrentSession: ~Copyable {
                     data: tokenBuf,
                     channels: ModelConfig.dim
                 )
-            }
+            } }
         } catch {
             throw .invalidArguments("two-step recurrent input write failed: \(error)")
         }
@@ -157,7 +157,7 @@ public struct RWKVStyleTwoStepRecurrentSession: ~Copyable {
 
         t0 = RuntimeClock.now()
         do {
-            try output0.withUnsafeMutableBufferPointer { outBuf in
+            try mapSurfaceIOToANEError { try output0.withUnsafeMutableBufferPointer { outBuf in
                 try SurfaceIO.readFP16SpatialSlice(
                     from: handles.x0Out,
                     channelOffset: 0,
@@ -166,8 +166,8 @@ public struct RWKVStyleTwoStepRecurrentSession: ~Copyable {
                     into: outBuf,
                     channels: ModelConfig.dim
                 )
-            }
-            try output1.withUnsafeMutableBufferPointer { outBuf in
+            } }
+            try mapSurfaceIOToANEError { try output1.withUnsafeMutableBufferPointer { outBuf in
                 try SurfaceIO.readFP16SpatialSlice(
                     from: handles.x1Out,
                     channelOffset: 0,
@@ -176,7 +176,7 @@ public struct RWKVStyleTwoStepRecurrentSession: ~Copyable {
                     into: outBuf,
                     channels: ModelConfig.dim
                 )
-            }
+            } }
         } catch {
             throw .invalidArguments("two-step recurrent output readback failed: \(error)")
         }

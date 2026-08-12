@@ -602,35 +602,35 @@ final class MILGeneratorTests: XCTestCase {
     }
 
     func test_decode_ffn_generator_can_promote_norm_to_fp32_before_ffn() {
-        let previous = ProcessInfo.processInfo.environment["ESPRESSO_DECODE_FFN_FP32_RMSNORM"]
-        setenv("ESPRESSO_DECODE_FFN_FP32_RMSNORM", "1", 1)
+        let previous = ProcessInfo.processInfo.environment["ESPRESSO_RMSNORM_USE_FP32"]
+        setenv("ESPRESSO_RMSNORM_USE_FP32", "1", 1)
         defer {
             if let previous {
-                setenv("ESPRESSO_DECODE_FFN_FP32_RMSNORM", previous, 1)
+                setenv("ESPRESSO_RMSNORM_USE_FP32", previous, 1)
             } else {
-                unsetenv("ESPRESSO_DECODE_FFN_FP32_RMSNORM")
+                unsetenv("ESPRESSO_RMSNORM_USE_FP32")
             }
         }
 
         let mil = DecodeFFNGenerator(architecture: .rmsNormSwiGLU).milText
-        XCTAssertTrue(mil.contains("x32"))
-        XCTAssertTrue(mil.contains("norm16"))
+        XCTAssertTrue(mil.contains("norm_input32_out"))
+        XCTAssertTrue(mil.contains("norm_xr16_out"))
     }
 
     func test_decode_projection_ffn_generator_can_promote_norm_to_fp32_before_ffn() {
-        let previous = ProcessInfo.processInfo.environment["ESPRESSO_DECODE_FFN_FP32_RMSNORM"]
-        setenv("ESPRESSO_DECODE_FFN_FP32_RMSNORM", "1", 1)
+        let previous = ProcessInfo.processInfo.environment["ESPRESSO_RMSNORM_USE_FP32"]
+        setenv("ESPRESSO_RMSNORM_USE_FP32", "1", 1)
         defer {
             if let previous {
-                setenv("ESPRESSO_DECODE_FFN_FP32_RMSNORM", previous, 1)
+                setenv("ESPRESSO_RMSNORM_USE_FP32", previous, 1)
             } else {
-                unsetenv("ESPRESSO_DECODE_FFN_FP32_RMSNORM")
+                unsetenv("ESPRESSO_RMSNORM_USE_FP32")
             }
         }
 
         let mil = DecodeProjectionFFNGenerator(architecture: .rmsNormSwiGLU).milText
-        XCTAssertTrue(mil.contains("x_for_norm32"))
-        XCTAssertTrue(mil.contains("norm16"))
+        XCTAssertTrue(mil.contains("norm_input32_out"))
+        XCTAssertTrue(mil.contains("norm_xr16_out"))
     }
 
     func test_mil_builder_append_fp16_uses_fixed_posix_format() {
