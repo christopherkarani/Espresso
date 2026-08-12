@@ -34,9 +34,13 @@ A clean clone must resolve and build with **no** external package dependencies (
 **Run the demo**
 
 ```bash
-./espresso          # builds, downloads GPT-2 weights, launches TUI
-./espresso doctor   # check host readiness
+./espresso doctor   # check host readiness (must report scripts OK)
+./espresso prepare  # bootstrap GPT-2 demo weights + tokenizer
+./espresso          # builds if needed, launches TUI
 ```
+
+The demo helpers `scripts/bootstrap_gpt2_demo.py`, `export_gpt2_coreml.py`, and
+`run_gpt2_coreml_reference.py` must remain tracked — CI runs `scripts/assert_demo_helpers.py`.
 
 **Hardware tests** (requires Apple Silicon ANE)
 

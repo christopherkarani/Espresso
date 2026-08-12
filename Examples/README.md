@@ -12,7 +12,9 @@ ESPRESSO_WEIGHTS_DIR=~/.espresso/models/gpt2 swift run
 ESPRESSO_WEIGHTS_DIR=~/.espresso/models/gpt2 swift run SimpleInference "The sky is"
 ```
 
-Requires GPT-2 weights. Run `./espresso install` from the Espresso repo to download them.
+Requires GPT-2 weights. From the Espresso repo run `./espresso prepare` (or a first
+`./espresso` demo launch) to bootstrap weights + tokenizer into the managed cache.
+`./espresso install` only adds a PATH shim to this checkout — it does not download models.
 
 ## BenchmarkSuite
 
@@ -24,7 +26,8 @@ swift run
 swift run BenchmarkSuite "The Neural Engine is"
 ```
 
-Requires the `espresso` script to be in your PATH (run `./espresso install`).
+Requires the `espresso` launcher on your PATH (`./espresso install` writes
+`~/.local/bin/espresso` → this checkout) and demo assets from `./espresso prepare`.
 
 ## TrainingLoop
 

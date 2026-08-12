@@ -37,9 +37,11 @@ Examples:
 Notes:
   - No arguments launches the managed GPT-2 TUI demo.
   - A plain prompt without a subcommand also launches the TUI demo.
-  - First run may build Swift targets and bootstrap demo assets automatically.
+  - First run may build Swift targets and bootstrap demo assets automatically
+    (requires network + Python with torch/transformers, or a prior ./espresso prepare).
   - If startup fails, run ./espresso doctor.
-  - ./espresso install writes a shim that points at this checkout.
+  - ./espresso prepare only bootstraps demo weights/tokenizer.
+  - ./espresso install writes a PATH shim to this checkout (does not download weights).
 EOF
 }
 

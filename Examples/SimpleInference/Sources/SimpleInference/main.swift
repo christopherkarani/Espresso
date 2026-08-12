@@ -4,7 +4,7 @@
 ///   ESPRESSO_WEIGHTS_DIR=~/.espresso/models/gpt2 swift run SimpleInference
 ///   ESPRESSO_WEIGHTS_DIR=~/.espresso/models/gpt2 swift run SimpleInference "The sky is"
 ///
-/// Run `./espresso install` from the Espresso repo first to download GPT-2 weights.
+/// Run `./espresso prepare` from the Espresso repo first to bootstrap GPT-2 weights.
 
 import Foundation
 import RealModelInference
@@ -41,6 +41,6 @@ do {
 
 } catch {
     fputs("\nError: \(error)\n", stderr)
-    fputs("Tip: run `./espresso install` from the Espresso repo to download GPT-2 weights.\n", stderr)
+    fputs("Tip: run `./espresso prepare` from the Espresso repo to bootstrap GPT-2 weights.\n", stderr)
     exit(1)
 }

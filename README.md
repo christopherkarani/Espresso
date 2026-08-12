@@ -38,9 +38,13 @@ Pick one path. Everything else is optional or research.
 ```bash
 git clone https://github.com/christopherkarani/Espresso.git
 cd Espresso
-./espresso          # builds, downloads demo weights, launches TUI
-./espresso doctor   # host readiness check
+./espresso doctor   # host readiness check (scripts, ANE, Python)
+./espresso prepare  # bootstrap GPT-2 demo weights + tokenizer (network; torch/transformers)
+./espresso          # builds if needed, launches the GPT-2 TUI demo
 ```
+
+First demo run also bootstraps assets automatically when they are missing. That step needs
+network access and a Python with `torch` + `transformers` (Espresso can create a managed venv).
 
 ### 2. Serve a model (`.esp` bundles)
 
@@ -90,7 +94,8 @@ For end-to-end text generation from prepared weights, use `RealModelInference` o
 <summary>Optional tooling (bench, install, training)</summary>
 
 ```bash
-./espresso install                            # shim → ~/.local/bin
+./espresso install                            # PATH shim → this checkout (does not download weights)
+./espresso prepare                            # download/convert GPT-2 demo assets
 ./espresso compare --no-power "Hello"         # side-by-side vs CoreML (demo weights)
 swift run espresso-bench --ane-only --inference --layers 6
 swift run espresso-train                      # experimental ANE training loop

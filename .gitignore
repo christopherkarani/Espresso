@@ -85,10 +85,15 @@ scripts/internal/**
 !scripts/export_llama_coreml.py
 !scripts/convert_weights_gpt2.py
 !scripts/convert_weights_llama.py
+!scripts/bootstrap_gpt2_demo.py
+!scripts/export_gpt2_coreml.py
+!scripts/run_gpt2_coreml_reference.py
+!scripts/assert_demo_helpers.py
 !scripts/stories_prompt_suite.txt
 !scripts/tests/
 !scripts/tests/test_stories_model_identity.py
 !scripts/tests/test_espresso_llama_weights.py
+!scripts/tests/test_gpt2_demo_helpers.py
 !scripts/README.md
 tasks/
 AGENTS.md

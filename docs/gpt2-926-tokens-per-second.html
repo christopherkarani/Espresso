@@ -314,21 +314,23 @@ targets: [
     ])
 ]</code></pre>
 
-  <pre><code>import Espresso
+  <pre><code>import RealModelInference
+import ModelSupport
 
-// Load the full generation pipeline
-let model = try await ANEDirectGenerationModel.load(
-    config: ModelConfig.default,  // 768-dim, 12-layer
-    weightsPath: URL(fileURLWithPath: "path/to/weights")
+// End-to-end generation from prepared Espresso weights (GPT-2 example)
+var engine = try RealModelInferenceEngine.build(
+    config: ModelRegistry.gpt2_124m,
+    weightDir: "/path/to/gpt2_124m",
+    tokenizerDir: "/path/to/gpt2_tokenizer"
 )
 
-// Autoregressive generation
-var tokens: [Int] = tokenizer.encode("Once upon a time")
-for _ in 0..&lt;200 {
-    let next = try model.nextToken(tokens: tokens)
-    tokens.append(next)
-    print(tokenizer.decode([next]), terminator: "")
-}</code></pre>
+let result = try engine.generate(prompt: "Once upon a time", maxTokens: 64) { step in
+    print(step.text, terminator: "")
+}
+print("\n\(result.tokensPerSecond) tok/s")</code></pre>
+
+  <p>For the lower-level direct ANE kernel API, see <code>ANEKernel</code> in <code>ANERuntime</code>.
+  For a copy-paste sample package, see <code>Examples/SimpleInference</code>.</p>
 
   <h2>Caveats and Limitations</h2>
 

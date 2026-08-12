@@ -67,6 +67,11 @@ assert not deps, f"package graph must have zero dependencies, found: {deps}"'
       - name: Assert README claims match latest.json
         run: python3 scripts/assert_readme_claims.py
 
+      - name: Assert GPT-2 demo helper scripts are present
+        run: |
+          python3 scripts/assert_demo_helpers.py
+          python3 scripts/tests/test_gpt2_demo_helpers.py -v
+
       - name: Build (release)
         run: swift build -c release
 
