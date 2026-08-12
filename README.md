@@ -74,7 +74,7 @@ swift run espresso-generate generate --bundle /tmp/model.esp --max-tokens 32 "He
 
 ```swift
 // Package.swift
-.package(url: "https://github.com/christopherkarani/Espresso.git", from: "1.0.0")
+.package(url: "https://github.com/christopherkarani/Espresso.git", from: "0.9.0")
 
 import ANERuntime
 
@@ -213,7 +213,7 @@ ANEInterop (ObjC/C — private API bridge)
 ```swift
 // Package.swift
 dependencies: [
-    .package(url: "https://github.com/christopherkarani/Espresso.git", from: "1.0.0")
+    .package(url: "https://github.com/christopherkarani/Espresso.git", from: "0.9.0")
 ],
 targets: [
     .target(name: "MyApp", dependencies: [
