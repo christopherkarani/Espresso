@@ -68,6 +68,8 @@ docs/*
 !docs/gpt2-926-tokens-per-second.html
 !docs/reverse-engineering-apple-neural-engine.html
 !docs/qwen-parity.md
+!docs/qwen-parity-layers.md
+!docs/qwen-logit-parity.json
 prompts/
 scripts/
 !scripts/
