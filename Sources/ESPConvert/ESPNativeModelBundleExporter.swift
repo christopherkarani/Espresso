@@ -247,6 +247,12 @@ public enum ESPNativeModelBundleExporter {
         let stagingDirectory = fileManager.temporaryDirectory
             .appendingPathComponent("esp-native-tokenizer-\(UUID().uuidString)", isDirectory: true)
         try fileManager.createDirectory(at: stagingDirectory, withIntermediateDirectories: true)
+        var keep = false
+        defer {
+            if !keep {
+                try? fileManager.removeItem(at: stagingDirectory)
+            }
+        }
 
         for name in recognizedTokenizerFiles.sorted() {
             let sourceURL = tokenizerDirectory.appendingPathComponent(name)
@@ -254,6 +260,7 @@ public enum ESPNativeModelBundleExporter {
             try fileManager.copyItem(at: sourceURL, to: stagingDirectory.appendingPathComponent(name))
         }
 
+        keep = true
         return stagingDirectory
     }
 

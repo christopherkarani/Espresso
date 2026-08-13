@@ -59,6 +59,8 @@ struct Options {
     var probeGPT2AttentionCompile = false
     var milDeploymentTarget: String?
     var gpt2NormMode: String?
+    var rawPrompt = false
+    var disableHybridFallback = false
 
     static func parse(_ argv: [String]) throws -> Options {
         var options = Options()
@@ -173,6 +175,10 @@ struct Options {
                 options.gpt2NormMode = try parseGPT2NormMode(
                     try value(for: flag, inlineValue: inlineValue, argv: argv, index: &index)
                 )
+            case "--raw-prompt":
+                options.rawPrompt = true
+            case "--no-hybrid-fallback":
+                options.disableHybridFallback = true
             case "-h", "--help":
                 options.showHelp = true
             default:
@@ -326,17 +332,8 @@ struct MetadataConfigFile: Decodable {
         default:
             throw CLIError.runtime("Unsupported architecture in metadata.json: \(architecture)")
         }
-        var parsedDecodePath: MultiModelConfig.PreferredDecodePath?
-        if let preferredDecodePath {
-            let normalized = preferredDecodePath
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-                .lowercased()
-            guard let value = MultiModelConfig.PreferredDecodePath(rawValue: normalized) else {
-                throw CLIError.runtime(
-                    "Unsupported preferredDecodePath in metadata.json: \(preferredDecodePath) (expected \"hybrid\" or \"exact_cpu\")"
-                )
-            }
-            parsedDecodePath = value
+        let parsedDecodePath = try preferredDecodePath.map {
+            try MultiModelConfig.PreferredDecodePath.parse($0)
         }
         return MultiModelConfig(
             name: name,
@@ -375,6 +372,7 @@ struct ResolvedInvocation {
     let allowBootstrap: Bool
     let seed: Int
     let outputDir: String?
+    let rawPrompt: Bool
 
     init(
         config: MultiModelConfig,
@@ -393,7 +391,8 @@ struct ResolvedInvocation {
         coreMLComputeUnits: String,
         allowBootstrap: Bool,
         seed: Int,
-        outputDir: String?
+        outputDir: String?,
+        rawPrompt: Bool = false
     ) {
         self.config = config
         self.bundlePath = bundlePath
@@ -412,6 +411,7 @@ struct ResolvedInvocation {
         self.allowBootstrap = allowBootstrap
         self.seed = seed
         self.outputDir = outputDir
+        self.rawPrompt = rawPrompt
     }
 }
 
@@ -439,7 +439,8 @@ extension ResolvedInvocation {
             coreMLComputeUnits: coreMLComputeUnits,
             allowBootstrap: allowBootstrap,
             seed: seed,
-            outputDir: outputDir ?? self.outputDir
+            outputDir: outputDir ?? self.outputDir,
+            rawPrompt: rawPrompt
         )
     }
 }
@@ -463,6 +464,7 @@ struct BackendRunMetrics: Sendable {
     let cachedBindingsEnabled: Bool?
     let committedExactTokensPerPass: Double?
     let acceptedFutureTokensPerPass: Double?
+    let decodePath: String?
 
     init(
         backend: String,
@@ -482,7 +484,8 @@ struct BackendRunMetrics: Sendable {
         exactHeadBackend: String? = nil,
         cachedBindingsEnabled: Bool? = nil,
         committedExactTokensPerPass: Double? = nil,
-        acceptedFutureTokensPerPass: Double? = nil
+        acceptedFutureTokensPerPass: Double? = nil,
+        decodePath: String? = nil
     ) {
         self.backend = backend
         self.text = text
@@ -502,6 +505,7 @@ struct BackendRunMetrics: Sendable {
         self.cachedBindingsEnabled = cachedBindingsEnabled
         self.committedExactTokensPerPass = committedExactTokensPerPass
         self.acceptedFutureTokensPerPass = acceptedFutureTokensPerPass
+        self.decodePath = decodePath
     }
 }
 
@@ -571,6 +575,13 @@ private final class LockedValueBox<Value>: @unchecked Sendable {
 }
 
 private func applyCLIExperimentEnvironment(_ options: Options) {
+    if options.disableHybridFallback {
+        setenv("ESPRESSO_REALMODEL_DISABLE_HYBRID_FALLBACK", "1", 1)
+    }
+    if options.rawPrompt {
+        setenv("ESPRESSO_RAW_PROMPT", "1", 1)
+    }
+
     if let deploymentTarget = options.milDeploymentTarget?.trimmingCharacters(in: .whitespacesAndNewlines),
        !deploymentTarget.isEmpty {
         setenv("ESPRESSO_MIL_DEPLOYMENT_TARGET", deploymentTarget, 1)
@@ -700,6 +711,8 @@ private func printUsage() {
           --no-bootstrap       Do not auto-install/download demo dependencies or assets
           --no-stats           Suppress timing stats on stderr
           --benchmark-generate Reuse one Espresso engine and report warm generate metrics using --compare-warmup/--compare-iterations
+          --raw-prompt         Encode the prompt verbatim (skip the Qwen2.5-Instruct chat wrap)
+          --no-hybrid-fallback Fail instead of falling back from the ANE hybrid decode path
       -h, --help               Show this help
 
     Environment:
@@ -723,6 +736,7 @@ private func printUsage() {
       ESPRESSO_MIL_DEPLOYMENT_TARGET
       ESPRESSO_GPT2_NORM
       ESPRESSO_GPT2_USE_RMS_NORM
+      ESPRESSO_REALMODEL_DISABLE_HYBRID_FALLBACK
 
     Examples:
       ./espresso
@@ -1108,7 +1122,8 @@ func resolveInvocation(from options: Options, demoDefaults: DemoDefaults, comman
             coreMLComputeUnits: options.coreMLComputeUnits,
             allowBootstrap: options.allowBootstrap,
             seed: options.seed,
-            outputDir: options.outputDir
+            outputDir: options.outputDir,
+            rawPrompt: options.rawPrompt
         )
     }
 
@@ -1153,7 +1168,8 @@ func resolveInvocation(from options: Options, demoDefaults: DemoDefaults, comman
         coreMLComputeUnits: options.coreMLComputeUnits,
         allowBootstrap: options.allowBootstrap,
         seed: options.seed,
-        outputDir: options.outputDir
+        outputDir: options.outputDir,
+        rawPrompt: options.rawPrompt
     )
 }
 
@@ -1170,7 +1186,11 @@ private func makeBundleRuntimeMetrics(bundle: ESPRuntimeBundle, invocation: Reso
     let started = DispatchTime.now().uptimeNanoseconds
     let result = try ESPRuntimeRunner.generate(
         bundle: bundle,
-        prompt: invocation.prompt,
+        prompt: preparedGeneratePrompt(
+            invocation.prompt,
+            config: invocation.config,
+            rawPrompt: invocation.rawPrompt
+        ),
         maxTokens: invocation.maxTokens,
         temperature: invocation.temperature
     )
@@ -1196,7 +1216,8 @@ private func makeBundleRuntimeMetrics(bundle: ESPRuntimeBundle, invocation: Reso
         exactHeadBackend: result.exactHeadBackend,
         cachedBindingsEnabled: result.cachedBindingsEnabled,
         committedExactTokensPerPass: result.committedExactTokensPerPass,
-        acceptedFutureTokensPerPass: result.acceptedFutureTokensPerPass
+        acceptedFutureTokensPerPass: result.acceptedFutureTokensPerPass,
+        decodePath: result.decodePath
     )
 }
 
@@ -1244,7 +1265,11 @@ private func runEspressoGeneration(
     var totalTimeMs = 0.0
     let compileStatsBefore = ANECompileStats.snapshot()
     let result = try engine.generate(
-        prompt: invocation.prompt,
+        prompt: preparedGeneratePrompt(
+            invocation.prompt,
+            config: invocation.config,
+            rawPrompt: invocation.rawPrompt
+        ),
         maxTokens: invocation.maxTokens,
         temperature: invocation.temperature,
         onStep: { step in
@@ -1273,7 +1298,8 @@ private func runEspressoGeneration(
         exactHeadBackend: result.exactHeadBackend,
         cachedBindingsEnabled: result.cachedBindingsEnabled,
         committedExactTokensPerPass: result.committedExactTokensPerPass,
-        acceptedFutureTokensPerPass: result.acceptedFutureTokensPerPass
+        acceptedFutureTokensPerPass: result.acceptedFutureTokensPerPass,
+        decodePath: result.decodePath
     )
 }
 
@@ -1341,7 +1367,8 @@ func aggregateBenchmarkRuns(
         exactHeadBackend: exactHeadBackend ?? lastMeasured.exactHeadBackend,
         cachedBindingsEnabled: cachedBindingsEnabled ?? lastMeasured.cachedBindingsEnabled,
         committedExactTokensPerPass: committedExactTokensPerPass ?? lastMeasured.committedExactTokensPerPass,
-        acceptedFutureTokensPerPass: acceptedFutureTokensPerPass ?? lastMeasured.acceptedFutureTokensPerPass
+        acceptedFutureTokensPerPass: acceptedFutureTokensPerPass ?? lastMeasured.acceptedFutureTokensPerPass,
+        decodePath: lastMeasured.decodePath
     )
 }
 
@@ -1534,6 +1561,9 @@ private func printGenerateStats(_ invocation: ResolvedInvocation, result: Backen
     }
     if let compileBreakdown = result.compileBreakdown, !compileBreakdown.isEmpty {
         stderrLine("compile_breakdown=\(formatCompileBreakdown(compileBreakdown))")
+    }
+    if let decodePath = result.decodePath {
+        stderrLine("decode_path=\(decodePath)")
     }
     if let bundlePath = invocation.bundlePath {
         stderrLine("bundle=\(bundlePath)")
@@ -1757,6 +1787,7 @@ private func backendPayload(_ backend: BackendRunMetrics) -> [String: Any] {
         } ?? NSNull(),
         "exact_head_backend": backend.exactHeadBackend ?? NSNull(),
         "cached_bindings_enabled": backend.cachedBindingsEnabled ?? NSNull(),
+        "decode_path": backend.decodePath ?? NSNull(),
     ]
 }
 
@@ -1943,7 +1974,11 @@ private func runLiveCompare(invocation: ResolvedInvocation, defaults: DemoDefaul
     let espressoCalibration = try maybeMeasurePower(enabled: powerEnabled) {
         var engine = try makeEspressoEngine(invocation: invocation)
         return try engine.generate(
-            prompt: invocation.prompt,
+            prompt: preparedGeneratePrompt(
+                invocation.prompt,
+                config: invocation.config,
+                rawPrompt: invocation.rawPrompt
+            ),
             maxTokens: min(invocation.maxTokens, 4),
             temperature: invocation.temperature
         )
@@ -1954,7 +1989,12 @@ private func runLiveCompare(invocation: ResolvedInvocation, defaults: DemoDefaul
             defaults: defaults,
             coreMLModelPath: coreMLModelPath,
             weightsDir: invocation.weightsDir,
-            promptTokens: try encodePromptTokens(invocation.prompt, config: invocation.config, tokenizerDir: invocation.tokenizerDir),
+            promptTokens: try encodePromptTokens(
+                invocation.prompt,
+                config: invocation.config,
+                tokenizerDir: invocation.tokenizerDir,
+                rawPrompt: invocation.rawPrompt
+            ),
             sequenceLength: sequenceLength,
             maxTokens: min(invocation.maxTokens, 4),
             temperature: invocation.temperature,
@@ -2011,7 +2051,12 @@ private func runLiveCompare(invocation: ResolvedInvocation, defaults: DemoDefaul
     }
 
     let started = DispatchTime.now().uptimeNanoseconds
-    let promptTokens = try encodePromptTokens(invocation.prompt, config: invocation.config, tokenizerDir: invocation.tokenizerDir)
+    let promptTokens = try encodePromptTokens(
+        invocation.prompt,
+        config: invocation.config,
+        tokenizerDir: invocation.tokenizerDir,
+        rawPrompt: invocation.rawPrompt
+    )
 
     let coreMLMetricsBox = LockedValueBox<BackendRunMetrics>()
     let espressoMetricsBox = LockedValueBox<BackendRunMetrics>()
@@ -2250,9 +2295,21 @@ private func millisecondsSince(_ started: UInt64) -> Double {
     Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000.0
 }
 
-private func encodePromptTokens(_ prompt: String, config: MultiModelConfig, tokenizerDir: String) throws -> [TokenID] {
+func preparedGeneratePrompt(_ prompt: String, config: MultiModelConfig, rawPrompt: Bool) -> String {
+    if !rawPrompt, QwenInstructPrompt.shouldWrap(config: config) {
+        return QwenInstructPrompt.wrapUserTurn(prompt)
+    }
+    return prompt
+}
+
+private func encodePromptTokens(
+    _ prompt: String,
+    config: MultiModelConfig,
+    tokenizerDir: String,
+    rawPrompt: Bool = false
+) throws -> [TokenID] {
     let tokenizer = try loadTokenizer(config: config, tokenizerDir: tokenizerDir)
-    return try tokenizer.encode(prompt).map(validateToken)
+    return try tokenizer.encode(preparedGeneratePrompt(prompt, config: config, rawPrompt: rawPrompt)).map(validateToken)
 }
 
 private func metricsOrZero(_ value: Double, fallback: Double) -> Double {

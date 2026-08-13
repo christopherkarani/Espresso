@@ -42,23 +42,8 @@ public enum ESPModelConfigIO {
 
             // Dropping this silently would route an artifact that declares the ANE hybrid
             // path back to the pure-CPU oracle once it is packed into a bundle.
-            var parsedDecodePath: MultiModelConfig.PreferredDecodePath?
-            if let preferredDecodePath {
-                let normalized = preferredDecodePath
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                    .lowercased()
-                guard let value = MultiModelConfig.PreferredDecodePath(rawValue: normalized) else {
-                    throw NSError(
-                        domain: "ESPModelConfigIO",
-                        code: 2,
-                        userInfo: [
-                            NSLocalizedDescriptionKey:
-                                "Unsupported metadata preferredDecodePath: \(preferredDecodePath) "
-                                + "(expected \"hybrid\" or \"exact_cpu\")",
-                        ]
-                    )
-                }
-                parsedDecodePath = value
+            let parsedDecodePath = try preferredDecodePath.map {
+                try MultiModelConfig.PreferredDecodePath.parse($0)
             }
 
             return MultiModelConfig(

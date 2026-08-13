@@ -1,4 +1,5 @@
 import ANETypes
+import Foundation
 
 public struct MultiModelConfig: Sendable, Equatable {
     public let name: String
@@ -33,6 +34,28 @@ public struct MultiModelConfig: Sendable, Equatable {
     public enum PreferredDecodePath: String, Sendable, Equatable {
         case hybrid
         case exactCPU = "exact_cpu"
+
+        public enum ParseError: Error, Sendable, Equatable, LocalizedError {
+            case unsupported(String)
+
+            public var errorDescription: String? {
+                switch self {
+                case let .unsupported(raw):
+                    return "Unsupported preferredDecodePath: \(raw) (expected \"hybrid\" or \"exact_cpu\")"
+                }
+            }
+        }
+
+        /// Trims and lowercases `raw`, then maps it onto the declared decode path.
+        public static func parse(_ raw: String) throws -> PreferredDecodePath {
+            let normalized = raw
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+            guard let value = PreferredDecodePath(rawValue: normalized) else {
+                throw ParseError.unsupported(raw)
+            }
+            return value
+        }
     }
 
     public init(

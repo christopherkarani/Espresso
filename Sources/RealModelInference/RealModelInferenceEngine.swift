@@ -26,7 +26,7 @@ public struct GenerationResult: Sendable {
     public let cachedBindingsEnabled: Bool
     public let committedExactTokensPerPass: Double?
     public let acceptedFutureTokensPerPass: Double?
-    /// `"hybrid"` or `"exact_cpu"` when the caller recorded the serving path; `"unknown"` otherwise.
+    /// `"hybrid"` or `"exact_cpu"` for llama generate paths; `"unknown"` otherwise.
     public let decodePath: String
 
     public init(
@@ -301,7 +301,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         guard config.architecture == .llama else {
             return false
         }
-        return config.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased().contains("qwen")
+        return ModelFamily.isQwenVariant(config)
     }
 
     static func prefersCPUExactQKV(
@@ -350,7 +350,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         }
         // Legacy routing: early Qwen artifacts predate a working ANE path at these widths
         // and are kept on the CPU oracle so old bundles do not change behaviour.
-        return config.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased().contains("qwen")
+        return ModelFamily.isQwenVariant(config)
     }
 
     static func isHybridFallbackDisabled(environment: [String: String]) -> Bool {
@@ -1509,15 +1509,25 @@ public struct RealModelInferenceEngine: ~Copyable {
 
         let remainingContext = config.maxSeq - promptTokens.count
         let effectiveMaxTokens = min(maxTokens, max(remainingContext, 0))
+        let environment = ProcessInfo.processInfo.environment
         if effectiveMaxTokens == 0 {
             let text = tokenizer.decode(promptTokens.map(Int.init))
+            let decodePath: String
+            if config.architecture == .llama {
+                decodePath = Self.llamaGenerationPath(config: config, environment: environment) == .exactCPU
+                    ? "exact_cpu"
+                    : "hybrid"
+            } else {
+                decodePath = "unknown"
+            }
             return GenerationResult(
                 text: text,
                 tokens: [],
                 promptTokens: promptTokens,
                 tokensPerSecond: 0,
                 compileTimeMs: 0,
-                firstTokenLatencyMs: 0
+                firstTokenLatencyMs: 0,
+                decodePath: decodePath
             )
         }
 
@@ -1527,7 +1537,6 @@ public struct RealModelInferenceEngine: ~Copyable {
             channels: config.dModel,
             maxSeq: config.maxSeq
         )
-        let environment = ProcessInfo.processInfo.environment
 
         if config.architecture == .llama {
             if temperature == 0,
@@ -1797,39 +1806,16 @@ public struct RealModelInferenceEngine: ~Copyable {
         weightDir: String,
         promptTokens: [TokenID]
     ) throws -> TokenID {
-        let result = try generateFromTokensForTesting(
-            config: config,
-            weightDir: weightDir,
-            promptTokens: promptTokens,
-            maxTokens: 1
-        )
-        guard let token = result.tokens.first else {
-            throw RealModelInferenceError.runtimeFailure("Testing helper did not emit a next token")
-        }
-        return token
-    }
-
-    /// Greedy-decodes `maxTokens` from explicit prompt token IDs on the artifact's own
-    /// decode path.
-    ///
-    /// Driving generation from token IDs keeps a parity test measuring the model rather
-    /// than the tokenizer; tokenizer agreement is worth asserting, but separately.
-    public static func generateFromTokensForTesting(
-        config: MultiModelConfig,
-        weightDir: String,
-        promptTokens: [TokenID],
-        maxTokens: Int
-    ) throws -> GenerationResult {
         let results = try generateFromTokenSuiteForTesting(
             config: config,
             weightDir: weightDir,
             promptTokenSuite: [promptTokens],
-            maxTokens: maxTokens
+            maxTokens: 1
         )
-        guard let result = results.first else {
-            throw RealModelInferenceError.runtimeFailure("Testing helper did not emit a generation result")
+        guard let token = results.first?.tokens.first else {
+            throw RealModelInferenceError.runtimeFailure("Testing helper did not emit a next token")
         }
-        return result
+        return token
     }
 
     /// Greedy-decodes every prompt in `promptTokenSuite` through a single engine instance.
@@ -1962,7 +1948,7 @@ public struct RealModelInferenceEngine: ~Copyable {
                         compileTimeMs: 0,
                         maxSeq: bucket,
                         onStep: nil
-                    ).withDecodePath("exact_cpu")
+                    )
                 )
             case .hybrid:
                 guard let attention = metalAttention else {
@@ -1977,7 +1963,7 @@ public struct RealModelInferenceEngine: ~Copyable {
                         maxSeq: bucket,
                         metalAttention: attention,
                         onStep: nil
-                    ).withDecodePath("hybrid")
+                    )
                 )
             }
         }
@@ -5493,14 +5479,20 @@ public struct RealModelInferenceEngine: ~Copyable {
         }
 
         let preferredDecodePath: MultiModelConfig.PreferredDecodePath?
-        if let raw = metadata["preferredDecodePath"] as? String {
-            let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            guard let parsed = MultiModelConfig.PreferredDecodePath(rawValue: normalized) else {
+        if let value = metadata["preferredDecodePath"] {
+            let raw: String
+            if let string = value as? String {
+                raw = string
+            } else {
+                raw = String(describing: value)
+            }
+            do {
+                preferredDecodePath = try MultiModelConfig.PreferredDecodePath.parse(raw)
+            } catch {
                 throw RealModelInferenceError.runtimeFailure(
                     "metadata.json has unsupported preferredDecodePath \"\(raw)\" (expected \"hybrid\" or \"exact_cpu\")"
                 )
             }
-            preferredDecodePath = parsed
         } else {
             preferredDecodePath = nil
         }
@@ -5604,7 +5596,17 @@ public struct RealModelInferenceEngine: ~Copyable {
     }
 
     private func encodePrompt(_ prompt: String) throws -> [TokenID] {
-        let rawTokens = tokenizer.encode(prompt)
+        let environment = ProcessInfo.processInfo.environment
+        let textToEncode: String
+        // CLI `preparedGeneratePrompt` may already apply the same wrap.
+        if environment["ESPRESSO_RAW_PROMPT"] == "1" || prompt.hasPrefix("<|im_start|>") {
+            textToEncode = prompt
+        } else if QwenInstructPrompt.shouldWrap(config: config) {
+            textToEncode = QwenInstructPrompt.wrapUserTurn(prompt)
+        } else {
+            textToEncode = prompt
+        }
+        let rawTokens = tokenizer.encode(textToEncode)
         guard !rawTokens.isEmpty else {
             throw RealModelInferenceError.invalidPrompt("Prompt produced no tokens")
         }
@@ -6170,7 +6172,8 @@ public struct RealModelInferenceEngine: ~Copyable {
             exactHeadBackend: greedyHeadMode == .classifierOnlyFactored && useANEGreedyHead
                 ? "ane_factored_classifier"
                 : classifierStrategy.exactHeadBackendLabel,
-            cachedBindingsEnabled: cachedBindings != nil
+            cachedBindingsEnabled: cachedBindings != nil,
+            decodePath: "hybrid"
         )
     }
 
@@ -6287,7 +6290,8 @@ public struct RealModelInferenceEngine: ~Copyable {
                 exactHeadBackend: "cpu_exact_two_token_draft",
                 cachedBindingsEnabled: false,
                 committedExactTokensPerPass: nil,
-                acceptedFutureTokensPerPass: nil
+                acceptedFutureTokensPerPass: nil,
+                decodePath: "exact_cpu"
             )
         }
         let firstEmission = DispatchTime.now().uptimeNanoseconds
@@ -6306,7 +6310,8 @@ public struct RealModelInferenceEngine: ~Copyable {
                 exactHeadBackend: "cpu_exact_two_token_draft",
                 cachedBindingsEnabled: false,
                 committedExactTokensPerPass: nil,
-                acceptedFutureTokensPerPass: nil
+                acceptedFutureTokensPerPass: nil,
+                decodePath: "exact_cpu"
             )
         }
 
@@ -6392,7 +6397,8 @@ public struct RealModelInferenceEngine: ~Copyable {
             exactHeadBackend: "cpu_exact_two_token_draft",
             cachedBindingsEnabled: false,
             committedExactTokensPerPass: committedExactTokensPerPass,
-            acceptedFutureTokensPerPass: acceptedFutureTokensPerPass
+            acceptedFutureTokensPerPass: acceptedFutureTokensPerPass,
+            decodePath: "exact_cpu"
         )
     }
 
@@ -6423,7 +6429,14 @@ public struct RealModelInferenceEngine: ~Copyable {
         )
 
         func forwardToken(_ token: TokenID, position: Int) throws -> [Float] {
-            var hidden = Array(tokenEmbedding[Int(token) * config.dModel..<(Int(token) + 1) * config.dModel])
+            let tokenIndex = Int(token)
+            let tokenEnd = (tokenIndex + 1) * config.dModel
+            guard tokenIndex < config.vocab, tokenEnd <= tokenEmbedding.count else {
+                throw RealModelInferenceError.runtimeFailure(
+                    "Llama embedding OOB: token=\(token), base=\(tokenIndex * config.dModel), embeddingCount=\(tokenEmbedding.count), dModel=\(config.dModel)"
+                )
+            }
+            var hidden = Array(tokenEmbedding[tokenIndex * config.dModel..<tokenEnd])
             for layerIndex in 0..<config.nLayer {
                 hidden = Self.exactCPULlamaLayerForward(
                     hidden: hidden,
@@ -6519,7 +6532,8 @@ public struct RealModelInferenceEngine: ~Copyable {
             tokensPerSecond: tokensPerSecond,
             compileTimeMs: compileTimeMs,
             firstTokenLatencyMs: firstTokenLatencyMs,
-            exactHeadBackend: classifierStrategy.exactHeadBackendLabel
+            exactHeadBackend: classifierStrategy.exactHeadBackendLabel,
+            decodePath: "exact_cpu"
         )
     }
 

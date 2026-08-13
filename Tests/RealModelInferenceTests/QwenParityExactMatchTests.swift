@@ -11,7 +11,9 @@ import Testing
 // The fixture is produced by:
 //   scripts/qwen25_pytorch_reference.py fixtures \
 //     --output Tests/RealModelInferenceTests/Fixtures/qwen25-05b-greedy-reference.json \
-//     --max-new-tokens 32 --forbid-early-stop
+//     --max-new-tokens 32
+// Real fixtures flags: --source-dir, --prompts, --output, --max-new-tokens,
+// --min-prompts, --raw-prompt, --eos-token-ids.
 //
 // The converted artifact is produced by:
 //   scripts/convert_qwen25_05b_to_esp.py
@@ -61,15 +63,9 @@ private func qwenANEIsAvailable() -> Bool {
         .allSatisfy { NSClassFromString($0) != nil }
 }
 
-/// Locates the converted Qwen2.5-0.5B artifact. The packed `.esp` is the shipped
-/// surface; the native staging directory is only a fallback for unpackaged trees.
+/// Locates the converted Qwen2.5-0.5B packed `.esp` artifact (the shipped surface).
+/// Override the bundle path with `ESPRESSO_QWEN_BUNDLE`.
 struct QwenParityArtifact {
-    enum Kind: Equatable {
-        case espBundle
-        case nativeDirectory
-    }
-
-    let kind: Kind
     let rootURL: URL
     let weightDirectory: URL
 
@@ -91,20 +87,11 @@ struct QwenParityArtifact {
         if let override = environment["ESPRESSO_QWEN_BUNDLE"], !override.isEmpty {
             return bundleArtifact(at: URL(fileURLWithPath: override, isDirectory: true), fileManager: fileManager)
         }
-        if let override = environment["ESPRESSO_QWEN_NATIVE_DIR"], !override.isEmpty {
-            return nativeArtifact(at: URL(fileURLWithPath: override, isDirectory: true), fileManager: fileManager)
-        }
 
         let cache = cacheRoot(environment: environment, homeDirectory: homeDirectory)
             .appendingPathComponent("qwen25-05b", isDirectory: true)
-        if let bundle = bundleArtifact(
+        return bundleArtifact(
             at: cache.appendingPathComponent("Qwen2.5-0.5B-Instruct.esp", isDirectory: true),
-            fileManager: fileManager
-        ) {
-            return bundle
-        }
-        return nativeArtifact(
-            at: cache.appendingPathComponent("Qwen2.5-0.5B-Instruct-native", isDirectory: true),
             fileManager: fileManager
         )
     }
@@ -118,17 +105,9 @@ struct QwenParityArtifact {
             return nil
         }
         return QwenParityArtifact(
-            kind: .espBundle,
             rootURL: url,
             weightDirectory: url.appendingPathComponent("weights", isDirectory: true)
         )
-    }
-
-    private static func nativeArtifact(at url: URL, fileManager: FileManager) -> QwenParityArtifact? {
-        guard fileManager.fileExists(atPath: url.appendingPathComponent("metadata.json").path) else {
-            return nil
-        }
-        return QwenParityArtifact(kind: .nativeDirectory, rootURL: url, weightDirectory: url)
     }
 }
 
@@ -195,7 +174,6 @@ private func loadQwenGreedyFixture() throws -> QwenGreedyReferenceFixture? {
         fileManager: fileManager,
         homeDirectory: root
     )
-    #expect(resolved?.kind == .espBundle)
     #expect(resolved?.rootURL.path == bundle.path)
     #expect(resolved?.weightDirectory.lastPathComponent == "weights")
 }
@@ -215,23 +193,6 @@ private func loadQwenGreedyFixture() throws -> QwenGreedyReferenceFixture? {
     #expect(labeled.decodePath == "hybrid")
     #expect(labeled.tokens == original.tokens)
     #expect(labeled.exactHeadBackend == "cpu_fp16_tiled")
-}
-
-@Test func test_qwenParityArtifactHonorsNativeDirectoryOverride() throws {
-    let fileManager = FileManager.default
-    let root = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
-    defer { try? fileManager.removeItem(at: root) }
-    let native = root.appendingPathComponent("native", isDirectory: true)
-    try fileManager.createDirectory(at: native, withIntermediateDirectories: true)
-    try Data("{}".utf8).write(to: native.appendingPathComponent("metadata.json"))
-
-    let resolved = QwenParityArtifact.resolve(
-        environment: ["ESPRESSO_QWEN_NATIVE_DIR": native.path],
-        fileManager: fileManager,
-        homeDirectory: root
-    )
-    #expect(resolved?.kind == .nativeDirectory)
-    #expect(resolved?.weightDirectory.path == native.path)
 }
 
 /// Greedy decoding on the ANE hybrid path must reproduce the PyTorch reference token IDs.
@@ -255,16 +216,9 @@ private func loadQwenGreedyFixture() throws -> QwenGreedyReferenceFixture? {
         return
     }
 
-    let config: MultiModelConfig
-    let weightDir: String
-    if artifact.kind == .espBundle {
-        let bundle = try ESPRuntimeBundle.open(at: artifact.rootURL)
-        config = bundle.config
-        weightDir = bundle.archive.weightsURL.path
-    } else {
-        config = try QwenLayerParityProbe.loadConfig(nativeDir: artifact.weightDirectory.path)
-        weightDir = artifact.weightDirectory.path
-    }
+    let bundle = try ESPRuntimeBundle.open(at: artifact.rootURL)
+    let config = bundle.config
+    let weightDir = bundle.archive.weightsURL.path
     #expect(config.preferredDecodePath == .hybrid)
     // With fallback disabled this artifact must resolve to the ANE hybrid path, never CPU.
     #expect(
@@ -283,7 +237,6 @@ private func loadQwenGreedyFixture() throws -> QwenGreedyReferenceFixture? {
     )
     #expect(results.count == cases.count)
     #expect(results.allSatisfy { $0.decodePath == "hybrid" })
-    #expect(artifact.kind == .espBundle)
 
     var matchingPrefixLengths: [Int] = []
     var exactMatches = 0
@@ -341,7 +294,7 @@ private func loadQwenGreedyFixture() throws -> QwenGreedyReferenceFixture? {
         [qwen-greedy-parity] exact cases \(exactMatches)/\(cases.count) \
         matching-prefix tokens \(totalMatching)/\(totalExpected) \
         path=\(results.first?.decodePath ?? "?") \
-        artifact=\(artifact.kind == .espBundle ? "esp" : "native") \
+        artifact=esp \
         head=\(results.first?.exactHeadBackend ?? "?")
 
         """,
@@ -355,8 +308,28 @@ private func loadQwenGreedyFixture() throws -> QwenGreedyReferenceFixture? {
     )
     // fp16 arithmetic on the ANE flips only near-ties, so the overwhelming majority of
     // sequences still reproduce exactly. A collapse here means a real regression.
+    #expect(exactMatches >= 10)
     #expect(Double(exactMatches) / Double(cases.count) >= minimumExactSequenceRatio)
     #expect(Double(totalMatching) / Double(totalExpected) >= minimumTokenAgreementRatio)
+
+    // Two short greedy runs of the first fixture prompt must emit identical tokens.
+    let determinismPrompt = [cases[0].promptTokens.map(TokenID.init)]
+    let firstRun = try RealModelInferenceEngine.generateFromTokenSuiteForTesting(
+        config: config,
+        weightDir: weightDir,
+        promptTokenSuite: determinismPrompt,
+        maxTokens: 8
+    )
+    let secondRun = try RealModelInferenceEngine.generateFromTokenSuiteForTesting(
+        config: config,
+        weightDir: weightDir,
+        promptTokenSuite: determinismPrompt,
+        maxTokens: 8
+    )
+    #expect(firstRun.count == 1)
+    #expect(secondRun.count == 1)
+    #expect(!firstRun[0].tokens.isEmpty)
+    #expect(firstRun[0].tokens == secondRun[0].tokens)
 }
 
 /// Largest end-to-end logit error measured for the ANE hybrid stack against PyTorch fp32:
@@ -366,8 +339,8 @@ private func loadQwenGreedyFixture() throws -> QwenGreedyReferenceFixture? {
 /// divergence at a wider gap is a bug rather than rounding.
 private let maxObservedANELogitError = 0.96
 
-/// Measured on Apple M-series: 10/12 sequences reproduce exactly.
-private let minimumExactSequenceRatio = 0.75
+/// Published floor: 10/12 sequences must reproduce exactly.
+private let minimumExactSequenceRatio = 10.0 / 12
 
-/// Measured on Apple M-series: 341/384 tokens agree, and full agreement before any flip.
-private let minimumTokenAgreementRatio = 0.85
+/// Published floor: 341/384 tokens must agree, and full agreement before any flip.
+private let minimumTokenAgreementRatio = 341.0 / 384

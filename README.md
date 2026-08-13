@@ -84,11 +84,14 @@ ESPRESSO_REALMODEL_DISABLE_HYBRID_FALLBACK=1 \
 Qwen2.5-0.5B-Instruct decodes through Espresso's ANE hybrid path — Q/K/V and the SwiGLU FFN
 on the Neural Engine, RoPE/attention/LM head on the CPU by design — and reproduces a
 PyTorch fp32 reference on a fixed 12-prompt greedy suite: **10 of 12 sequences match
-token-for-token, 341 of 384 tokens agree**. Espresso's own fp32 path agrees with PyTorch to
-**9.3e-5 in logits** through all 24 layers, so the implementation is exact; the two greedy
-divergences come from fp16 execution on the ANE (up to ~1 logit of error) and both land on
-precisely the reference's runner-up token at top-1/top-2 gaps of 0.027 and 0.069. That is
-one model, greedy, fp16, measured — not a general-model claim, and not a speed claim.
+token-for-token, 341 of 384 tokens agree**. That 10/12 is generate-path evidence
+(`cpu_fp16_tiled` LM head). A separate probe — chained per-layer hidden states plus a
+NumPy/Python LM head, not the served tiled classifier — agrees with PyTorch to **9.3e-5
+in logits** on the fp32 CPU stack through all 24 layers, and to **~0.96** on the ANE
+hybrid stack. The two greedy divergences come from fp16 execution on the ANE (up to ~1
+logit of error) and both land on precisely the reference's runner-up token at top-1/top-2
+gaps of 0.027 and 0.069. That is one model, greedy, fp16, measured — not a general-model
+claim, and not a speed claim.
 See [`docs/qwen-parity.md`](docs/qwen-parity.md) for the per-layer report, the exact
 commands, and every ANE limitation hit along the way.
 

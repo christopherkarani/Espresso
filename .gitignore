@@ -90,7 +90,6 @@ scripts/internal/**
 !scripts/convert_weights_llama.py
 !scripts/convert_qwen25_05b_to_esp.py
 !scripts/qwen25_pytorch_reference.py
-!scripts/qwen25_parity.sh
 !scripts/qwen25_prompts.txt
 !scripts/bootstrap_gpt2_demo.py
 !scripts/export_gpt2_coreml.py
@@ -101,6 +100,7 @@ scripts/internal/**
 !scripts/tests/test_stories_model_identity.py
 !scripts/tests/test_espresso_llama_weights.py
 !scripts/tests/test_gpt2_demo_helpers.py
+!scripts/tests/test_qwen25_convert.py
 !scripts/README.md
 tasks/
 AGENTS.md

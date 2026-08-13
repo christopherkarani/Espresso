@@ -107,6 +107,23 @@ import ModelSupport
     #expect(options.compareIterations == 4)
     #expect(options.jsonOutput)
     #expect(options.positionalPrompt == ["Hello"])
+    #expect(!options.rawPrompt)
+    #expect(!options.disableHybridFallback)
+}
+
+@Test func test_optionsParseRawPromptAndNoHybridFallback() throws {
+    let options = try Options.parse([
+        "espresso-generate",
+        "generate",
+        "--raw-prompt",
+        "--no-hybrid-fallback",
+        "--prompt", "Hello",
+    ])
+
+    #expect(options.command == .generate)
+    #expect(options.rawPrompt)
+    #expect(options.disableHybridFallback)
+    #expect(options.prompt == "Hello")
 }
 
 @Test func test_optionsParseAttentionCompileProbeFlags() throws {
@@ -159,6 +176,24 @@ import ModelSupport
     #expect(fingerprint.metrics[.tokensPerSecond] == 80)
 }
 
+@Test func test_backendRunMetricsCarriesDecodePath() {
+    let metrics = BackendRunMetrics(
+        backend: "espresso",
+        text: "Paris",
+        generatedTokens: [11],
+        promptTokens: [1],
+        compileTimeMs: 10,
+        firstTokenLatencyMs: 5,
+        tokensPerSecond: 20,
+        medianTokenMs: 5,
+        p95TokenMs: 5,
+        totalTimeMs: 20,
+        tokenLatenciesMs: [5],
+        decodePath: "hybrid"
+    )
+    #expect(metrics.decodePath == "hybrid")
+}
+
 @Test func test_metadataConfigFilePreservesOptionalRopeThetaAndEOSToken() throws {
     let metadata = MetadataConfigFile(
         name: "qwen3",
@@ -181,6 +216,86 @@ import ModelSupport
     #expect(config.ropeTheta == 1_000_000)
     #expect(config.eosToken == 151645)
     #expect(config.preferredDecodePath == nil)
+}
+
+@Test func test_metadataConfigFileParsesPreferredDecodePath() throws {
+    let hybrid = MetadataConfigFile(
+        name: "Qwen2.5-0.5B-Instruct",
+        nLayer: 24,
+        nHead: 14,
+        nKVHead: 2,
+        dModel: 896,
+        headDim: 64,
+        hiddenDim: 4864,
+        vocab: 151936,
+        maxSeq: 4096,
+        normEps: 1e-6,
+        ropeTheta: 1_000_000,
+        eosToken: 151645,
+        architecture: "llama",
+        preferredDecodePath: " Hybrid "
+    )
+    #expect(try hybrid.asConfig().preferredDecodePath == .hybrid)
+
+    let exact = MetadataConfigFile(
+        name: "Qwen2.5-0.5B-Instruct",
+        nLayer: 24,
+        nHead: 14,
+        nKVHead: 2,
+        dModel: 896,
+        headDim: 64,
+        hiddenDim: 4864,
+        vocab: 151936,
+        maxSeq: 4096,
+        normEps: 1e-6,
+        ropeTheta: 1_000_000,
+        eosToken: 151645,
+        architecture: "llama",
+        preferredDecodePath: "EXACT_CPU"
+    )
+    #expect(try exact.asConfig().preferredDecodePath == .exactCPU)
+
+    let invalid = MetadataConfigFile(
+        name: "Qwen2.5-0.5B-Instruct",
+        nLayer: 24,
+        nHead: 14,
+        nKVHead: 2,
+        dModel: 896,
+        headDim: 64,
+        hiddenDim: 4864,
+        vocab: 151936,
+        maxSeq: 4096,
+        normEps: 1e-6,
+        ropeTheta: 1_000_000,
+        eosToken: 151645,
+        architecture: "llama",
+        preferredDecodePath: "metal"
+    )
+    #expect(throws: MultiModelConfig.PreferredDecodePath.ParseError.unsupported("metal")) {
+        try invalid.asConfig()
+    }
+}
+
+@Test func test_preparedGeneratePromptWrapsQwenUnlessRawPrompt() {
+    let qwen = MultiModelConfig(
+        name: "Qwen2.5-0.5B-Instruct",
+        nLayer: 24,
+        nHead: 14,
+        nKVHead: 2,
+        dModel: 896,
+        headDim: 64,
+        hiddenDim: 4864,
+        vocab: 151_936,
+        maxSeq: 4096,
+        normEps: 1e-6,
+        architecture: .llama
+    )
+    #expect(
+        preparedGeneratePrompt("Hello", config: qwen, rawPrompt: false)
+            == QwenInstructPrompt.wrapUserTurn("Hello")
+    )
+    #expect(preparedGeneratePrompt("Hello", config: qwen, rawPrompt: true) == "Hello")
+    #expect(preparedGeneratePrompt("Hello", config: ModelRegistry.stories110m, rawPrompt: false) == "Hello")
 }
 
 @Test func test_resolveCoreMLModelPathUsesExplicitPathForLlama() throws {

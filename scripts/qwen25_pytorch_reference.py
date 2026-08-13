@@ -15,9 +15,10 @@ Both subcommands read the safetensors checkpoint cached by
 `scripts/convert_qwen25_05b_to_esp.py`, so no second download happens.
 
 The reference deliberately uses HuggingFace `transformers` rather than a hand-written
-Qwen2 forward pass: the point of an oracle is that it is independently trustworthy, and
-`output_hidden_states=True` already exposes exactly the per-layer boundaries we need
-(`hidden_states[L]` enters layer `L`, `hidden_states[L + 1]` leaves it).
+Qwen2 forward pass: the point of an oracle is that it is independently trustworthy.
+Per-layer states are captured with forward hooks at decoder layer boundaries
+(pre-final-norm). HuggingFace `output_hidden_states=True` is not used: its last entry
+is emitted after the model's final norm, which is not a layer boundary.
 """
 
 from __future__ import annotations
@@ -26,10 +27,13 @@ import argparse
 import json
 import os
 import shutil
-import struct
 import subprocess
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VENV_TAG = "qwen25-parity"
@@ -171,7 +175,7 @@ def encode_prompt(tokenizer, prompt: str, use_chat_template: bool) -> list[int]:
 # ---------------------------------------------------------------------------
 
 
-def write_float32(path: Path, values) -> None:
+def write_float32(path: Path, values: np.ndarray) -> None:
     import numpy as np
 
     array = np.ascontiguousarray(np.asarray(values, dtype="<f4"))
@@ -179,7 +183,7 @@ def write_float32(path: Path, values) -> None:
     path.write_bytes(array.tobytes())
 
 
-def read_float32(path: Path, shape) -> "object":
+def read_float32(path: Path, shape: tuple[int, ...]) -> np.ndarray:
     import numpy as np
 
     expected = 1
@@ -289,7 +293,6 @@ def capture_layer_boundaries(model, token_ids: list[int], n_layer: int):
 
 def command_layer_parity(args: argparse.Namespace) -> int:
     import numpy as np
-    import torch
 
     source_dir = Path(args.source_dir).expanduser()
     native_dir = Path(args.native_dir).expanduser()
@@ -364,7 +367,7 @@ def command_layer_parity(args: argparse.Namespace) -> int:
         "promptTokens": token_ids,
         "prompt": args.prompt,
         "chatTemplate": not args.raw_prompt,
-        "reference": "pytorch fp32 (transformers, output_hidden_states)",
+        "reference": "pytorch fp32 (transformers, forward hooks at decoder layer boundaries, pre-final-norm)",
         "weights": "fp16 blobs converted from bf16 (lossless for this checkpoint)",
         "backends": measurements,
     }
@@ -466,14 +469,14 @@ def greedy_generate(model, prompt_tokens: list[int], max_new_tokens: int, eos_id
     return produced, top_gaps, runner_ups
 
 
-def rms_norm(values, gamma, eps: float):
+def rms_norm(values: np.ndarray, gamma: np.ndarray, eps: float) -> np.ndarray:
     import numpy as np
 
     scale = np.sqrt((values.astype(np.float64) ** 2).mean() + eps)
     return (values / scale).astype(np.float32) * gamma
 
 
-def read_blob_fp16(path: Path, expected_count: int):
+def read_blob_fp16(path: Path, expected_count: int) -> np.ndarray:
     """Reads an Espresso BLOBFILE (128-byte header + fp16 payload) as float32."""
     import numpy as np
 
@@ -487,11 +490,11 @@ def read_blob_fp16(path: Path, expected_count: int):
 
 
 def command_logit_parity(args: argparse.Namespace) -> int:
-    """Compares Espresso's final logits against PyTorch fp32 through the whole stack.
+    """Compares chained probe hidden states + a NumPy LM head against PyTorch fp32.
 
-    Per-layer parity proves each layer in isolation; this proves the error the full stack
-    accumulates, which is what actually decides a greedy token. The Swift driver runs in
-    `--chain` mode so layer N+1 consumes layer N's output, exactly as decoding does.
+    This is not the served `cpu_fp16_tiled` generate classifier. The Swift driver runs
+    in `--chain` mode so layer N+1 consumes layer N's output; logits are then
+    `lm_head @ rms_norm(final_hidden)` in NumPy.
     """
     import numpy as np
     import torch

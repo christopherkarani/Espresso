@@ -31,6 +31,10 @@ import sys
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -177,7 +181,7 @@ class SafetensorsFile:
     def tensor_names(self) -> list[str]:
         return sorted(self.header.keys())
 
-    def read(self, name: str):
+    def read(self, name: str) -> np.ndarray:
         """Return a float32 numpy array for `name`, widening bf16 losslessly."""
         import numpy as np
 
@@ -255,7 +259,7 @@ class ConversionStats:
 
 
 def write_blob(
-    values,
+    values: np.ndarray,
     path: Path,
     *,
     source: str,
@@ -385,7 +389,35 @@ def read_shape(source_dir: Path) -> QwenShape:
     )
 
 
+# Official Qwen2.5-0.5B-Instruct table. This converter stamps that identity;
+# any other 64-aligned Qwen2 config is a different model.
+OFFICIAL_QWEN25_05B_INSTRUCT = {
+    "n_layer": 24,
+    "n_head": 14,
+    "n_kv_head": 2,
+    "d_model": 896,
+    "head_dim": 64,
+    "hidden_dim": 4864,
+    "vocab": 151936,
+}
+OFFICIAL_QWEN25_05B_ROPE_THETA = 1_000_000.0
+
+
 def validate_shape(shape: QwenShape) -> None:
+    mismatches: list[str] = []
+    for field, expected in OFFICIAL_QWEN25_05B_INSTRUCT.items():
+        got = getattr(shape, field)
+        if got != expected:
+            mismatches.append(f"{field}={got} (expected {expected})")
+    if float(shape.rope_theta) != OFFICIAL_QWEN25_05B_ROPE_THETA:
+        mismatches.append(
+            f"rope_theta={shape.rope_theta} (expected {OFFICIAL_QWEN25_05B_ROPE_THETA:g} / 1000000.0)"
+        )
+    if mismatches:
+        raise ConversionError(
+            "this converter only accepts Qwen2.5-0.5B-Instruct; checkpoint shape mismatch: "
+            + ", ".join(mismatches)
+        )
     if shape.d_model != shape.attention_dim:
         raise ConversionError(
             f"Espresso requires dModel == nHead * headDim; got {shape.d_model} != {shape.attention_dim}"

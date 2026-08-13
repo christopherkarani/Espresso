@@ -106,19 +106,21 @@ Measured 1.95e-2 relative against a 1.46e-2 prediction from fp16 accumulation ov
 
 ## End-to-end logit parity
 
-Per-layer parity proves each layer in isolation; the logit measurement proves the error the
-whole stack accumulates, which is what actually decides a greedy token. The Swift driver
-chains layers (layer N+1 consumes layer N's output) so this is the served computation.
-Recorded in [`qwen-logit-parity.json`](qwen-logit-parity.json):
+Per-layer parity proves each layer in isolation. The table below is **not** the served
+`cpu_fp16_tiled` generate classifier. It is the Swift layer probe in `--chain` mode
+(layer N+1 consumes layer N's output) plus a NumPy/Python LM head on the last hidden
+state. Recorded in [`qwen-logit-parity.json`](qwen-logit-parity.json):
 
 | Backend | worst max abs logit diff | argmax agreement with PyTorch |
 | --- | --- | --- |
 | `cpu-fp32` | **9.3e-5** | 12/12 |
 | `ane` | **0.955** | 12/12 |
 
-The fp32 result is the important one for correctness: through 24 layers, the final norm,
-and a 151936-wide tied LM head, Espresso agrees with PyTorch to 1e-4 in logits. The
-implementation is right. The ANE column is the price of fp16: **up to ~1 logit of error**.
+The fp32 result is the architecture check: through 24 chained layers, the final norm,
+and a 151936-wide Python LM head, Espresso agrees with PyTorch to 1e-4 in logits. The
+layers are right. The ANE column is the price of fp16: **up to ~1 logit of error**.
+Generate-path evidence is the greedy suite below (`head=cpu_fp16_tiled`): **10/12**
+sequences, **341/384** tokens.
 
 ## Greedy token parity, and the two flips
 
@@ -139,17 +141,18 @@ both the runtime landed on **precisely the reference's runner-up token**:
 | 5 | token 14/32 | 8059 / 7015 | **0.027** | 7015 (the runner-up) |
 | 6 | token 7/32 | 2530 / 264 | **0.069** | 264 (the runner-up) |
 
-Gaps of 0.027 and 0.069 sit far inside the ~0.955 logit error fp16 imposes, so these flips
-are the expected consequence of the measured precision, not wrong answers. The test encodes
-exactly that contract rather than a bare tolerance: every divergence must (a) be the
-reference's own runner-up and (b) occur at a top-1/top-2 gap within the measured logit
-error. A divergence at a wider gap, or to any other token, fails the test. The fixture
+Gaps of 0.027 and 0.069 sit far inside the ~0.955 logit error that same probe measures
+on ANE fp16, so these flips are the expected consequence of the measured precision, not
+wrong answers. The test encodes exactly that contract rather than a bare tolerance:
+every divergence must (a) be the reference's own runner-up and (b) occur at a top-1/top-2
+gap within the measured logit error. A divergence at a wider gap, or to any other token, fails the test. The fixture
 therefore commits the per-step top-2 gap and runner-up token alongside the expected IDs.
 
 Exact match across all 12 sequences is not reachable on this hardware. It would require
 fp32 accumulation in the residual stream, and the ANE is an fp16 datapath. The honest
-statement is the one above: the implementation agrees with PyTorch to 1e-4 in fp32, and
-fp16 execution flips greedy choices only where the model itself was within 0.07 of a tie.
+statement is the one above: the chained probe + Python LM head agrees with PyTorch to
+1e-4 in fp32, and generate-path fp16 execution flips greedy choices only where the model
+itself was within 0.07 of a tie.
 
 ## Reference oracle: two traps worth knowing
 

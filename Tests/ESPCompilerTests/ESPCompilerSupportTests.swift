@@ -93,8 +93,11 @@ import ModelSupport
     try metadata(decodePath: "exact_cpu").write(to: url, atomically: true, encoding: .utf8)
     #expect(try ESPModelConfigIO.load(fromMetadataFile: url).preferredDecodePath == .exactCPU)
 
+    try metadata(decodePath: " Hybrid ").write(to: url, atomically: true, encoding: .utf8)
+    #expect(try ESPModelConfigIO.load(fromMetadataFile: url).preferredDecodePath == .hybrid)
+
     try metadata(decodePath: "metal").write(to: url, atomically: true, encoding: .utf8)
-    #expect(throws: (any Error).self) {
+    #expect(throws: MultiModelConfig.PreferredDecodePath.ParseError.unsupported("metal")) {
         try ESPModelConfigIO.load(fromMetadataFile: url)
     }
 }

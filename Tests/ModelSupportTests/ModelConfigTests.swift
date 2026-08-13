@@ -100,3 +100,39 @@ import ANETypes
     #expect(!ModelFamily.isStories110MVariant(name: "qwen3-0.6b"))
     #expect(ModelFamily.isStories110MVariant(ModelRegistry.stories110m))
 }
+
+@Test func modelFamilyRecognizesQwenVariants() {
+    #expect(ModelFamily.isQwenVariant(name: "qwen2.5"))
+    #expect(ModelFamily.isQwenVariant(name: "Qwen2.5-0.5B-Instruct"))
+    #expect(ModelFamily.isQwenVariant(name: "  Qwen2.5-0.5B-Instruct  "))
+    #expect(!ModelFamily.isQwenVariant(name: "llama3"))
+    #expect(!ModelFamily.isQwenVariant(name: "stories110m"))
+    #expect(!ModelFamily.isQwenVariant(name: "gpt2_124m"))
+    #expect(ModelFamily.isQwenVariant(
+        MultiModelConfig(
+            name: "Qwen2.5-0.5B-Instruct",
+            nLayer: 24,
+            nHead: 14,
+            nKVHead: 2,
+            dModel: 896,
+            headDim: 64,
+            hiddenDim: 4864,
+            vocab: 151_936,
+            maxSeq: 4096,
+            normEps: 1e-6,
+            architecture: .llama
+        )
+    ))
+}
+
+@Test func preferredDecodePathParseTrimsAndLowercases() throws {
+    #expect(try MultiModelConfig.PreferredDecodePath.parse("hybrid") == .hybrid)
+    #expect(try MultiModelConfig.PreferredDecodePath.parse(" EXACT_CPU ") == .exactCPU)
+    #expect(try MultiModelConfig.PreferredDecodePath.parse("Hybrid") == .hybrid)
+    #expect(throws: MultiModelConfig.PreferredDecodePath.ParseError.unsupported("metal")) {
+        try MultiModelConfig.PreferredDecodePath.parse("metal")
+    }
+    #expect(throws: MultiModelConfig.PreferredDecodePath.ParseError.unsupported("  ")) {
+        try MultiModelConfig.PreferredDecodePath.parse("  ")
+    }
+}

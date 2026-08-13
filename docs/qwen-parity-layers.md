@@ -1,6 +1,6 @@
 # Per-layer parity: Qwen2.5-0.5B-Instruct
 
-- Reference: pytorch fp32 (transformers, output_hidden_states)
+- Reference: pytorch fp32 (transformers, forward hooks at decoder layer boundaries, pre-final-norm)
 - Espresso weights: fp16 blobs converted from bf16 (lossless for this checkpoint)
 - Prompt positions: 32 (chat template: True)
 

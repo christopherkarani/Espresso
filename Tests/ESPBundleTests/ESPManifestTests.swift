@@ -543,3 +543,120 @@ import Foundation
         #expect(Bool(false), "Unexpected error: \(error)")
     }
 }
+
+@Test func bundleOpenRejectsExtraUnsignedFile() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+    let weights = root.appendingPathComponent("weights-src", isDirectory: true)
+    let tokenizer = root.appendingPathComponent("tokenizer-src", isDirectory: true)
+    let bundle = root.appendingPathComponent("model.esp", isDirectory: true)
+
+    try FileManager.default.createDirectory(at: weights, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: tokenizer, withIntermediateDirectories: true)
+    try Data("{}".utf8).write(to: weights.appendingPathComponent("metadata.json"))
+    try Data("weights".utf8).write(to: weights.appendingPathComponent("lm_head.bin"))
+    try Data("tokenizer".utf8).write(to: tokenizer.appendingPathComponent("tokenizer.json"))
+
+    let manifest = ESPManifest(
+        formatVersion: "1.1.0",
+        modelID: "espresso.llama.test",
+        modelFamily: .llama,
+        architectureVersion: "decoder-v1",
+        tokenizerContract: "sentencepiece-v1",
+        supportedBackends: [.anePrivate, .cpuSafe],
+        supportedProfiles: [.prefill256, .decode1],
+        maxContext: 2048,
+        contextTargetTokens: 1024,
+        compressionPolicy: .init(name: "fp16", weightBits: 16, activationBits: nil),
+        modelTier: .optimized,
+        behaviorClass: .exact,
+        adapterSlots: 0,
+        optimization: .init(
+            recipe: "stories-ctx1024",
+            qualityGate: "short-long-prompt-parity",
+            teacherModel: nil,
+            draftModel: nil,
+            performanceTarget: "105 tok/s"
+        ),
+        accuracyBaselineRef: "benchmarks/accuracy.json",
+        performanceBaselineRef: "benchmarks/perf.json",
+        signatureRef: "signatures/content-hashes.json"
+    )
+
+    let archive = try ESPBundleArchive.create(
+        at: bundle,
+        manifest: manifest,
+        weightsDirectory: weights,
+        tokenizerDirectory: tokenizer
+    )
+    try Data("unsigned".utf8).write(to: archive.weightsURL.appendingPathComponent("lm_head.float32.bin"))
+
+    do {
+        _ = try ESPBundleArchive.open(at: bundle)
+        #expect(Bool(false), "Expected signature verification to fail")
+    } catch let error as ESPBundleValidationError {
+        #expect(error == .signatureMismatch(path: "weights/lm_head.float32.bin"))
+    } catch {
+        #expect(Bool(false), "Unexpected error: \(error)")
+    }
+}
+
+@Test func bundleOpenRejectsExtraUnsignedSymlink() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+    let weights = root.appendingPathComponent("weights-src", isDirectory: true)
+    let tokenizer = root.appendingPathComponent("tokenizer-src", isDirectory: true)
+    let bundle = root.appendingPathComponent("model.esp", isDirectory: true)
+
+    try FileManager.default.createDirectory(at: weights, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: tokenizer, withIntermediateDirectories: true)
+    try Data("{}".utf8).write(to: weights.appendingPathComponent("metadata.json"))
+    try Data("weights".utf8).write(to: weights.appendingPathComponent("lm_head.bin"))
+    try Data("tokenizer".utf8).write(to: tokenizer.appendingPathComponent("tokenizer.json"))
+
+    let manifest = ESPManifest(
+        formatVersion: "1.1.0",
+        modelID: "espresso.llama.test",
+        modelFamily: .llama,
+        architectureVersion: "decoder-v1",
+        tokenizerContract: "sentencepiece-v1",
+        supportedBackends: [.anePrivate, .cpuSafe],
+        supportedProfiles: [.prefill256, .decode1],
+        maxContext: 2048,
+        contextTargetTokens: 1024,
+        compressionPolicy: .init(name: "fp16", weightBits: 16, activationBits: nil),
+        modelTier: .optimized,
+        behaviorClass: .exact,
+        adapterSlots: 0,
+        optimization: .init(
+            recipe: "stories-ctx1024",
+            qualityGate: "short-long-prompt-parity",
+            teacherModel: nil,
+            draftModel: nil,
+            performanceTarget: "105 tok/s"
+        ),
+        accuracyBaselineRef: "benchmarks/accuracy.json",
+        performanceBaselineRef: "benchmarks/perf.json",
+        signatureRef: "signatures/content-hashes.json"
+    )
+
+    let archive = try ESPBundleArchive.create(
+        at: bundle,
+        manifest: manifest,
+        weightsDirectory: weights,
+        tokenizerDirectory: tokenizer
+    )
+    let payload = root.appendingPathComponent("evil.float32.bin")
+    try Data("evil".utf8).write(to: payload)
+    try FileManager.default.createSymbolicLink(
+        at: archive.weightsURL.appendingPathComponent("lm_head.float32.bin"),
+        withDestinationURL: payload
+    )
+
+    do {
+        _ = try ESPBundleArchive.open(at: bundle)
+        #expect(Bool(false), "Expected signature verification to fail")
+    } catch let error as ESPBundleValidationError {
+        #expect(error == .signatureMismatch(path: "weights/lm_head.float32.bin"))
+    } catch {
+        #expect(Bool(false), "Unexpected error: \(error)")
+    }
+}

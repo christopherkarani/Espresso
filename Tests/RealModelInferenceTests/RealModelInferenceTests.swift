@@ -873,6 +873,44 @@ private func makeDecodePathRoutingConfig(
     )
 }
 
+@Test func test_preferredDecodePathMetadataRejectsNonStringAndUnknown() throws {
+    let directory = try makeTempDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let url = directory.appendingPathComponent("metadata.json")
+
+    func writeMetadata(_ decodePathJSON: String) throws {
+        try """
+        {
+          "name": "Qwen2.5-0.5B-Instruct",
+          "nLayer": 24,
+          "nHead": 14,
+          "nKVHead": 2,
+          "dModel": 896,
+          "headDim": 64,
+          "hiddenDim": 4864,
+          "vocab": 151936,
+          "maxSeq": 4096,
+          "normEps": 0.000001,
+          "architecture": "llama",
+          "preferredDecodePath": \(decodePathJSON)
+        }
+        """.write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    try writeMetadata("\"hybrid\"")
+    #expect(try RealModelInferenceEngine.loadConfigFromMetadataFile(at: url).preferredDecodePath == .hybrid)
+
+    try writeMetadata("\"metal\"")
+    try expectRealModelInferenceError(containing: "preferredDecodePath") {
+        _ = try RealModelInferenceEngine.loadConfigFromMetadataFile(at: url)
+    }
+
+    try writeMetadata("1")
+    try expectRealModelInferenceError(containing: "preferredDecodePath") {
+        _ = try RealModelInferenceEngine.loadConfigFromMetadataFile(at: url)
+    }
+}
+
 @Test func test_resolvedLlamaGenerationPathThrowsWhenFallbackDisabledWouldLeaveANE() throws {
     let disabled = ["ESPRESSO_REALMODEL_DISABLE_HYBRID_FALLBACK": "1"]
 
