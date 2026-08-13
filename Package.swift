@@ -237,6 +237,7 @@ let package = Package(
                 "RealModelInference", "ModelSupport", "ANEGraphIR", "ANETypes", "Espresso",
             ],
             path: "Tests/RealModelInferenceTests",
+            resources: [.copy("Fixtures")],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         .target(
