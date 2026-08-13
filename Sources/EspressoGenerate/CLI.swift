@@ -3,6 +3,7 @@ import Darwin
 import ANERuntime
 import ANETypes
 import ESPBenchSupport
+import ESPBundle
 import ESPRuntime
 import ModelSupport
 import RealModelInference
@@ -662,7 +663,7 @@ private func printUsage() {
       doctor     Validate hardware, scripts, caches, demo assets, Python tooling, and power telemetry support.
 
     Common options:
-      -m, --model NAME         ModelRegistry key or alias
+      -m, --model NAME|PATH    ModelRegistry key or alias, or a path to an `.esp` bundle
       -b, --bundle PATH        `.esp` bundle directory (preferred runtime input)
       -w, --weights DIR        Weights directory
       -t, --tokenizer DIR      Tokenizer directory or tokenizer asset path
@@ -1046,8 +1047,43 @@ private func shouldUseTUI(command: CommandName, options: Options) -> Bool {
     }
 }
 
+/// Treats a `--model` value as a bundle path when it names an `.esp` directory on disk.
+///
+/// Registry keys never contain a path separator and never end in `.esp`, so a value that
+/// does is unambiguously a filesystem argument. Reporting a missing manifest here is more
+/// useful than the registry's "Unknown model" error.
+func bundlePathFromModelArgument(_ value: String, fileManager: FileManager = .default) throws -> String? {
+    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return nil }
+    let expanded = (trimmed as NSString).expandingTildeInPath
+    let looksLikePath = expanded.hasSuffix(".esp") || expanded.contains("/")
+    guard looksLikePath else { return nil }
+
+    var isDirectory = ObjCBool(false)
+    guard fileManager.fileExists(atPath: expanded, isDirectory: &isDirectory), isDirectory.boolValue else {
+        throw CLIError.usage("Model bundle not found: \(trimmed)")
+    }
+    let manifest = URL(fileURLWithPath: expanded, isDirectory: true)
+        .appendingPathComponent(ESPBundleLayout.manifestFileName)
+    guard fileManager.fileExists(atPath: manifest.path) else {
+        throw CLIError.usage(
+            "\(trimmed) is not an .esp bundle: missing \(ESPBundleLayout.manifestFileName)."
+        )
+    }
+    return expanded
+}
+
 func resolveInvocation(from options: Options, demoDefaults: DemoDefaults, command: CommandName) throws -> ResolvedInvocation {
-    if let bundleArgument = options.bundlePath, !bundleArgument.isEmpty {
+    var bundleArgument = options.bundlePath
+    if let modelArgument = options.modelName,
+       let modelBundle = try bundlePathFromModelArgument(modelArgument) {
+        if let bundleArgument, !bundleArgument.isEmpty, bundleArgument != modelBundle {
+            throw CLIError.usage("--model names an .esp bundle that conflicts with --bundle.")
+        }
+        bundleArgument = modelBundle
+    }
+
+    if let bundleArgument, !bundleArgument.isEmpty {
         if options.weightsDir != nil || options.tokenizerDir != nil {
             throw CLIError.usage("Pass either --bundle or --weights/--tokenizer, not both.")
         }

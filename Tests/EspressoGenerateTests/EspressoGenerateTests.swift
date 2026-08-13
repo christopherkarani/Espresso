@@ -402,14 +402,19 @@ import ModelSupport
     #expect(implicitPrompt(command: .demo, options: explicit) == nil)
 }
 
-@Test func test_resolveInvocationUsesBundlePathsWhenBundleProvided() throws {
+/// Writes a minimal but structurally valid `.esp` bundle and returns its URL.
+private func makeStubBundle(
+    at root: URL,
+    named name: String = "stories.esp",
+    preferredDecodePath: String? = nil
+) throws -> URL {
     let fileManager = FileManager.default
-    let root = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
-    let weightsDir = root.appendingPathComponent("weights-src", isDirectory: true)
-    let tokenizerDir = root.appendingPathComponent("tokenizer-src", isDirectory: true)
-    let bundleURL = root.appendingPathComponent("stories.esp", isDirectory: true)
+    let weightsDir = root.appendingPathComponent("weights-src-\(name)", isDirectory: true)
+    let tokenizerDir = root.appendingPathComponent("tokenizer-src-\(name)", isDirectory: true)
+    let bundleURL = root.appendingPathComponent(name, isDirectory: true)
     try fileManager.createDirectory(at: weightsDir, withIntermediateDirectories: true)
     try fileManager.createDirectory(at: tokenizerDir, withIntermediateDirectories: true)
+    let decodePathEntry = preferredDecodePath.map { ",\n  \"preferredDecodePath\": \"\($0)\"" } ?? ""
     try """
     {
       "name": "llama2.c-stories110M",
@@ -422,7 +427,7 @@ import ModelSupport
       "vocab": 32000,
       "maxSeq": 256,
       "normEps": 0.00001,
-      "architecture": "llama"
+      "architecture": "llama"\(decodePathEntry)
     }
     """.write(to: weightsDir.appendingPathComponent("metadata.json"), atomically: true, encoding: .utf8)
     try Data("weights".utf8).write(to: weightsDir.appendingPathComponent("lm_head.bin"))
@@ -449,6 +454,31 @@ import ModelSupport
         weightsDirectory: weightsDir,
         tokenizerDirectory: tokenizerDir
     )
+    return bundleURL
+}
+
+private func makeStubDemoDefaults(root: URL) -> DemoDefaults {
+    DemoDefaults(
+        repoRoot: root,
+        workingDirectory: root,
+        stateRoot: root,
+        cacheRoot: root,
+        reportsRoot: root,
+        hfCacheRoot: root,
+        weightsDir: root,
+        tokenizerDir: root,
+        coreMLDir: root,
+        toolsVenvDir: root,
+        scriptsDir: nil,
+        legacyArtifactsRoot: nil
+    )
+}
+
+@Test func test_resolveInvocationUsesBundlePathsWhenBundleProvided() throws {
+    let fileManager = FileManager.default
+    let root = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+    let bundleURL = try makeStubBundle(at: root)
 
     let defaults = DemoDefaults(
         repoRoot: root,
@@ -473,6 +503,66 @@ import ModelSupport
     #expect(invocation.weightsDir == bundleURL.appendingPathComponent("weights", isDirectory: true).path)
     #expect(invocation.tokenizerDir == bundleURL.appendingPathComponent("tokenizer", isDirectory: true).path)
     #expect(invocation.config.name == "llama2.c-stories110M")
+}
+
+/// `--model <path-to.esp>` is the documented README command, so it must resolve the same
+/// way `--bundle` does rather than being looked up as a registry key.
+@Test func test_resolveInvocationTreatsModelPathEndingInESPAsBundle() throws {
+    let fileManager = FileManager.default
+    let root = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+    let bundleURL = try makeStubBundle(at: root, named: "qwen.esp", preferredDecodePath: "hybrid")
+
+    var options = Options()
+    options.modelName = bundleURL.path
+    options.prompt = "Hello"
+
+    let invocation = try resolveInvocation(
+        from: options,
+        demoDefaults: makeStubDemoDefaults(root: root),
+        command: .generate
+    )
+    #expect(invocation.bundlePath == bundleURL.path)
+    #expect(invocation.weightsDir == bundleURL.appendingPathComponent("weights", isDirectory: true).path)
+    // A packed bundle must not lose the artifact's declared decode path, otherwise the
+    // runtime would silently route it to the pure-CPU oracle.
+    #expect(invocation.config.preferredDecodePath == .hybrid)
+}
+
+@Test func test_bundlePathFromModelArgumentLeavesRegistryNamesAlone() throws {
+    #expect(try bundlePathFromModelArgument("gpt2") == nil)
+    #expect(try bundlePathFromModelArgument("") == nil)
+}
+
+@Test func test_bundlePathFromModelArgumentReportsMissingAndMalformedBundles() throws {
+    let fileManager = FileManager.default
+    let root = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+
+    let missing = root.appendingPathComponent("absent.esp", isDirectory: true)
+    do {
+        _ = try bundlePathFromModelArgument(missing.path)
+        Issue.record("Expected a missing bundle to be rejected")
+    } catch let error as CLIError {
+        guard case let .usage(message) = error else {
+            Issue.record("Expected usage error, got \(error)")
+            return
+        }
+        #expect(message.contains("not found"))
+    }
+
+    let empty = root.appendingPathComponent("empty.esp", isDirectory: true)
+    try fileManager.createDirectory(at: empty, withIntermediateDirectories: true)
+    do {
+        _ = try bundlePathFromModelArgument(empty.path)
+        Issue.record("Expected a bundle without a manifest to be rejected")
+    } catch let error as CLIError {
+        guard case let .usage(message) = error else {
+            Issue.record("Expected usage error, got \(error)")
+            return
+        }
+        #expect(message.contains("manifest.toml"))
+    }
 }
 
 @Test func test_resolveInvocationRejectsBundleMixedWithWeights() throws {

@@ -212,7 +212,10 @@ let package = Package(
         ),
         .executableTarget(
             name: "EspressoGenerate",
-            dependencies: ["RealModelInference", "ModelSupport", "ANETypes", "ANERuntime", "ESPRuntime", "ESPBenchSupport"],
+            dependencies: [
+                "RealModelInference", "ModelSupport", "ANETypes", "ANERuntime", "ESPBundle", "ESPRuntime",
+                "ESPBenchSupport",
+            ],
             path: "Sources/EspressoGenerate",
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
