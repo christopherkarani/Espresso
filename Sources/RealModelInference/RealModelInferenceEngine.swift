@@ -5271,7 +5271,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         return (order, evictedKey)
     }
 
-    private static func loadConfigFromMetadataFile(at metadataURL: URL) throws -> MultiModelConfig {
+    static func loadConfigFromMetadataFile(at metadataURL: URL) throws -> MultiModelConfig {
         let data: Data
         do {
             data = try Data(contentsOf: metadataURL)
@@ -6219,9 +6219,6 @@ public struct RealModelInferenceEngine: ~Copyable {
             throw RealModelInferenceError.invalidGenerationParameters("Prompt tokens must not be empty")
         }
         let roundIntermediatesToFP16 = Self.shouldRoundCPUExactDecodeIntermediatesToFP16()
-        let maybeRound: ([Float]) -> [Float] = { values in
-            roundIntermediatesToFP16 ? Self.roundFloat16Vector(values) : values
-        }
         let exactWeights = try loadCachedExactCPULlamaWeights()
         let tokenEmbedding = exactWeights.tokenEmbedding
         let finalNormGamma = exactWeights.finalNormGamma
@@ -6239,130 +6236,16 @@ public struct RealModelInferenceEngine: ~Copyable {
         func forwardToken(_ token: TokenID, position: Int) throws -> [Float] {
             var hidden = Array(tokenEmbedding[Int(token) * config.dModel..<(Int(token) + 1) * config.dModel])
             for layerIndex in 0..<config.nLayer {
-                let layer = layers[layerIndex]
-                let attnNormed = Self.rmsNorm(hidden, weight: layer.rmsAtt, eps: Float(config.normEps))
-                var q = maybeRound(
-                    Self.projectRowMajorMatrix(
-                        matrix: layer.wq,
-                        rows: config.attentionDim,
-                        cols: config.dModel,
-                        vector: attnNormed,
-                        bias: layer.qkvBias?.q
-                    )
+                hidden = Self.exactCPULlamaLayerForward(
+                    hidden: hidden,
+                    layer: layers[layerIndex],
+                    config: config,
+                    position: position,
+                    kCache: &kCaches[layerIndex],
+                    vCache: &vCaches[layerIndex],
+                    cacheStride: maxSeq,
+                    roundIntermediatesToFP16: roundIntermediatesToFP16
                 )
-                var k = maybeRound(
-                    Self.projectRowMajorMatrix(
-                        matrix: layer.wk,
-                        rows: config.kvDim,
-                        cols: config.dModel,
-                        vector: attnNormed,
-                        bias: layer.qkvBias?.k
-                    )
-                )
-                let vRounded = maybeRound(
-                    Self.projectRowMajorMatrix(
-                        matrix: layer.wv,
-                        rows: config.kvDim,
-                        cols: config.dModel,
-                        vector: attnNormed,
-                        bias: layer.qkvBias?.v
-                    )
-                )
-
-                if let qNorm = layer.qNorm {
-                    q.withUnsafeMutableBufferPointer { values in
-                        qNorm.withUnsafeBufferPointer { weights in
-                            Self.applyPerHeadRMSNormInPlace(
-                                values: values,
-                                weights: weights,
-                                headCount: config.nHead,
-                                headDim: config.headDim,
-                                epsilon: Float(config.normEps)
-                            )
-                        }
-                    }
-                }
-                if let kNorm = layer.kNorm {
-                    k.withUnsafeMutableBufferPointer { values in
-                        kNorm.withUnsafeBufferPointer { weights in
-                            Self.applyPerHeadRMSNormInPlace(
-                                values: values,
-                                weights: weights,
-                                headCount: config.nKVHead,
-                                headDim: config.headDim,
-                                epsilon: Float(config.normEps)
-                            )
-                        }
-                    }
-                }
-
-                q = maybeRound(
-                    Self.applyHalfSplitRoPEPerHead(
-                        q,
-                        heads: config.nHead,
-                        headDim: config.headDim,
-                        position: position,
-                        theta: config.ropeTheta
-                    )
-                )
-                k = maybeRound(
-                    Self.applyHalfSplitRoPEPerHead(
-                        k,
-                        heads: config.nKVHead,
-                        headDim: config.headDim,
-                        position: position,
-                        theta: config.ropeTheta
-                    )
-                )
-
-                for channel in 0..<config.kvDim {
-                    kCaches[layerIndex][channel * maxSeq + position] = k[channel]
-                    vCaches[layerIndex][channel * maxSeq + position] = vRounded[channel]
-                }
-
-                let context = Self.decodeContextFromCaches(
-                    qOut: q,
-                    kCache: kCaches[layerIndex],
-                    vCache: vCaches[layerIndex],
-                    heads: config.nHead,
-                    kvHeads: config.nKVHead,
-                    headDim: config.headDim,
-                    visibleTokenCount: position + 1,
-                    cacheStride: maxSeq
-                )
-
-                let projected = maybeRound(
-                    zip(
-                        hidden,
-                        Self.multiplyRowMajorMatrix(
-                            matrix: layer.wo,
-                            rows: config.dModel,
-                            cols: config.attentionDim,
-                            vector: context
-                        )
-                    ).map(+)
-                )
-                let ffnNormed = Self.rmsNorm(projected, weight: layer.rmsFfn, eps: Float(config.normEps))
-                let gate = Self.multiplyRowMajorMatrix(
-                    matrix: layer.w1,
-                    rows: config.hiddenDim,
-                    cols: config.dModel,
-                    vector: ffnNormed
-                )
-                let up = Self.multiplyRowMajorMatrix(
-                    matrix: layer.w3,
-                    rows: config.hiddenDim,
-                    cols: config.dModel,
-                    vector: ffnNormed
-                )
-                let activated = zip(gate, up).map { Self.silu($0) * $1 }
-                let down = Self.multiplyRowMajorMatrix(
-                    matrix: layer.w2,
-                    rows: config.dModel,
-                    cols: config.hiddenDim,
-                    vector: activated
-                )
-                hidden = maybeRound(zip(projected, down).map(+))
             }
             return hidden
         }
@@ -6683,7 +6566,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         )
     }
 
-    private static func loadExactCPULlamaLayerWeights(
+    static func loadExactCPULlamaLayerWeights(
         config: MultiModelConfig,
         paths: LayerWeightPaths
     ) throws -> ExactCPULlamaLayerWeights {
@@ -6815,6 +6698,152 @@ public struct RealModelInferenceEngine: ~Copyable {
 
     private static func roundFloat16Vector(_ values: [Float]) -> [Float] {
         values.map { Float(Float16($0)) }
+    }
+
+    /// Runs one Llama-family transformer layer on the CPU for a single token position.
+    ///
+    /// This is the single definition of the exact-CPU layer math: the incremental decode
+    /// path and the per-layer parity probe both call it, so a parity measurement cannot
+    /// drift away from what is actually served.
+    ///
+    /// `kCache`/`vCache` are channel-major (`channel * cacheStride + position`) and are
+    /// updated in place for `position`.
+    static func exactCPULlamaLayerForward(
+        hidden: [Float],
+        layer: ExactCPULlamaLayerWeights,
+        config: MultiModelConfig,
+        position: Int,
+        kCache: inout [Float],
+        vCache: inout [Float],
+        cacheStride: Int,
+        roundIntermediatesToFP16: Bool
+    ) -> [Float] {
+        let maybeRound: ([Float]) -> [Float] = { values in
+            roundIntermediatesToFP16 ? Self.roundFloat16Vector(values) : values
+        }
+        let attnNormed = Self.rmsNorm(hidden, weight: layer.rmsAtt, eps: Float(config.normEps))
+        var q = maybeRound(
+            Self.projectRowMajorMatrix(
+                matrix: layer.wq,
+                rows: config.attentionDim,
+                cols: config.dModel,
+                vector: attnNormed,
+                bias: layer.qkvBias?.q
+            )
+        )
+        var k = maybeRound(
+            Self.projectRowMajorMatrix(
+                matrix: layer.wk,
+                rows: config.kvDim,
+                cols: config.dModel,
+                vector: attnNormed,
+                bias: layer.qkvBias?.k
+            )
+        )
+        let vRounded = maybeRound(
+            Self.projectRowMajorMatrix(
+                matrix: layer.wv,
+                rows: config.kvDim,
+                cols: config.dModel,
+                vector: attnNormed,
+                bias: layer.qkvBias?.v
+            )
+        )
+
+        if let qNorm = layer.qNorm {
+            q.withUnsafeMutableBufferPointer { values in
+                qNorm.withUnsafeBufferPointer { weights in
+                    Self.applyPerHeadRMSNormInPlace(
+                        values: values,
+                        weights: weights,
+                        headCount: config.nHead,
+                        headDim: config.headDim,
+                        epsilon: Float(config.normEps)
+                    )
+                }
+            }
+        }
+        if let kNorm = layer.kNorm {
+            k.withUnsafeMutableBufferPointer { values in
+                kNorm.withUnsafeBufferPointer { weights in
+                    Self.applyPerHeadRMSNormInPlace(
+                        values: values,
+                        weights: weights,
+                        headCount: config.nKVHead,
+                        headDim: config.headDim,
+                        epsilon: Float(config.normEps)
+                    )
+                }
+            }
+        }
+
+        q = maybeRound(
+            Self.applyHalfSplitRoPEPerHead(
+                q,
+                heads: config.nHead,
+                headDim: config.headDim,
+                position: position,
+                theta: config.ropeTheta
+            )
+        )
+        k = maybeRound(
+            Self.applyHalfSplitRoPEPerHead(
+                k,
+                heads: config.nKVHead,
+                headDim: config.headDim,
+                position: position,
+                theta: config.ropeTheta
+            )
+        )
+
+        for channel in 0..<config.kvDim {
+            kCache[channel * cacheStride + position] = k[channel]
+            vCache[channel * cacheStride + position] = vRounded[channel]
+        }
+
+        let context = Self.decodeContextFromCaches(
+            qOut: q,
+            kCache: kCache,
+            vCache: vCache,
+            heads: config.nHead,
+            kvHeads: config.nKVHead,
+            headDim: config.headDim,
+            visibleTokenCount: position + 1,
+            cacheStride: cacheStride
+        )
+
+        let projected = maybeRound(
+            zip(
+                hidden,
+                Self.multiplyRowMajorMatrix(
+                    matrix: layer.wo,
+                    rows: config.dModel,
+                    cols: config.attentionDim,
+                    vector: context
+                )
+            ).map(+)
+        )
+        let ffnNormed = Self.rmsNorm(projected, weight: layer.rmsFfn, eps: Float(config.normEps))
+        let gate = Self.multiplyRowMajorMatrix(
+            matrix: layer.w1,
+            rows: config.hiddenDim,
+            cols: config.dModel,
+            vector: ffnNormed
+        )
+        let up = Self.multiplyRowMajorMatrix(
+            matrix: layer.w3,
+            rows: config.hiddenDim,
+            cols: config.dModel,
+            vector: ffnNormed
+        )
+        let activated = zip(gate, up).map { Self.silu($0) * $1 }
+        let down = Self.multiplyRowMajorMatrix(
+            matrix: layer.w2,
+            rows: config.dModel,
+            cols: config.hiddenDim,
+            vector: activated
+        )
+        return maybeRound(zip(projected, down).map(+))
     }
 
     private static func rmsNorm(_ input: [Float], weight: [Float], eps: Float) -> [Float] {

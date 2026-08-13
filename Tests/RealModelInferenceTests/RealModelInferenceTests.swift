@@ -4115,6 +4115,189 @@ private func maxAbsoluteDifference(_ lhs: [Float], _ rhs: [Float]) -> Float {
     return maxValue
 }
 
+// MARK: - Per-layer parity probe
+
+/// Deterministic small weights in a range fp16 represents without drama.
+private func syntheticWeightValues(count: Int, seed: Int) -> [Float] {
+    (0..<count).map { index in
+        let mixed = Float((index * 31 + seed * 17) % 97) / 96.0
+        return (mixed - 0.5) * 0.25
+    }
+}
+
+private func makeSyntheticLlamaArtifact(config: MultiModelConfig) throws -> URL {
+    let root = try makeTempDirectory()
+    try writeBlob(
+        values: syntheticWeightValues(count: config.vocab * config.dModel, seed: 1),
+        to: root.appendingPathComponent("embeddings/token.bin")
+    )
+    for layerIndex in 0..<config.nLayer {
+        let layerDir = root
+            .appendingPathComponent("layers", isDirectory: true)
+            .appendingPathComponent("\(layerIndex)", isDirectory: true)
+        try FileManager.default.createDirectory(at: layerDir, withIntermediateDirectories: true)
+        let seed = layerIndex + 2
+        // Norm gammas sit near 1 so the RMS scale stays representative of a real model.
+        try writeBlob(
+            values: syntheticWeightValues(count: config.dModel, seed: seed).map { 1.0 + $0 },
+            to: layerDir.appendingPathComponent("rms_att.bin")
+        )
+        try writeBlob(
+            values: syntheticWeightValues(count: config.dModel, seed: seed + 100).map { 1.0 + $0 },
+            to: layerDir.appendingPathComponent("rms_ffn.bin")
+        )
+        try writeBlob(
+            values: syntheticWeightValues(count: config.attentionDim * config.dModel, seed: seed + 200),
+            to: layerDir.appendingPathComponent("wq.bin")
+        )
+        try writeBlob(
+            values: syntheticWeightValues(count: config.kvDim * config.dModel, seed: seed + 300),
+            to: layerDir.appendingPathComponent("wk.bin")
+        )
+        try writeBlob(
+            values: syntheticWeightValues(count: config.kvDim * config.dModel, seed: seed + 400),
+            to: layerDir.appendingPathComponent("wv.bin")
+        )
+        try writeBlob(
+            values: syntheticWeightValues(count: config.dModel * config.attentionDim, seed: seed + 500),
+            to: layerDir.appendingPathComponent("wo.bin")
+        )
+        try writeBlob(
+            values: syntheticWeightValues(count: config.hiddenDim * config.dModel, seed: seed + 600),
+            to: layerDir.appendingPathComponent("w1.bin")
+        )
+        try writeBlob(
+            values: syntheticWeightValues(count: config.dModel * config.hiddenDim, seed: seed + 700),
+            to: layerDir.appendingPathComponent("w2.bin")
+        )
+        try writeBlob(
+            values: syntheticWeightValues(count: config.hiddenDim * config.dModel, seed: seed + 800),
+            to: layerDir.appendingPathComponent("w3.bin")
+        )
+    }
+    return root
+}
+
+private func makeSyntheticLlamaProbeConfig() -> MultiModelConfig {
+    MultiModelConfig(
+        name: "synthetic-llama-probe",
+        nLayer: 3,
+        nHead: 4,
+        nKVHead: 2,
+        dModel: 32,
+        headDim: 8,
+        hiddenDim: 64,
+        vocab: 16,
+        maxSeq: 8,
+        normEps: 1e-6,
+        ropeTheta: 1_000_000,
+        architecture: .llama
+    )
+}
+
+/// The parity probe must agree with an independently written CPU implementation of the
+/// llama layer, otherwise a "parity report" would only prove the engine agrees with
+/// itself. `cpuArtifactLlamaLayerHiddenLineage` reads the blobs directly and does not
+/// share code with `RealModelInferenceEngine`.
+@Test func test_qwenLayerParityProbeAgreesWithIndependentCPUOracle() throws {
+    let config = makeSyntheticLlamaProbeConfig()
+    let root = try makeSyntheticLlamaArtifact(config: config)
+    let tokens = [3, 7, 1, 5]
+
+    let oracleLastPositionPerLayer = try cpuArtifactLlamaLayerHiddenLineage(
+        weightDir: root,
+        config: config,
+        tokens: tokens
+    )
+
+    let tokenEmbedding = try readBlobFloat16File(
+        at: root.appendingPathComponent("embeddings/token.bin"),
+        expectedCount: config.vocab * config.dModel
+    )
+    var states = tokens.map { token in
+        Array(tokenEmbedding[token * config.dModel..<(token + 1) * config.dModel])
+    }
+
+    for layerIndex in 0..<config.nLayer {
+        let probed = try QwenLayerParityProbe.evalCPULayer(
+            config: config,
+            nativeDir: root.path,
+            layer: layerIndex,
+            inputs: states,
+            roundIntermediatesToFP16: true
+        )
+        #expect(probed.backend == "cpu_exact_fp16_rounded")
+        #expect(probed.outputs.count == tokens.count)
+        states = probed.outputs
+
+        guard let lastPosition = states.last else {
+            Issue.record("probe returned no outputs for layer \(layerIndex)")
+            return
+        }
+        let difference = maxAbsoluteDifference(lastPosition, oracleLastPositionPerLayer[layerIndex])
+        #expect(
+            difference < 1e-3,
+            "layer \(layerIndex) probe output diverged from the independent oracle by \(difference)"
+        )
+    }
+}
+
+/// The probe composed layer-by-layer must reproduce the token the exact-CPU decode path
+/// actually serves. This is what stops the probe and the served path from drifting apart.
+@Test func test_qwenLayerParityProbeReproducesExactCPUDecodeToken() throws {
+    let config = makeSyntheticLlamaProbeConfig()
+    let root = try makeSyntheticLlamaArtifact(config: config)
+    try writeBlob(
+        values: syntheticWeightValues(count: config.dModel, seed: 9).map { 1.0 + $0 },
+        to: root.appendingPathComponent("rms_final.bin")
+    )
+    try writeBlob(
+        values: syntheticWeightValues(count: config.vocab * config.dModel, seed: 11),
+        to: root.appendingPathComponent("lm_head.bin")
+    )
+    let promptTokens: [TokenID] = [3, 7, 1, 5]
+
+    let servedTokens = try RealModelInferenceEngine.generateTokensExactCPUForTesting(
+        config: config,
+        weightDir: root.path,
+        promptTokens: promptTokens,
+        maxTokens: 1
+    )
+    guard let servedToken = servedTokens.first else {
+        Issue.record("exact-CPU decode produced no tokens")
+        return
+    }
+
+    let tokenEmbedding = try readBlobFloat16File(
+        at: root.appendingPathComponent("embeddings/token.bin"),
+        expectedCount: config.vocab * config.dModel
+    )
+    var states = promptTokens.map { token in
+        Array(tokenEmbedding[Int(token) * config.dModel..<(Int(token) + 1) * config.dModel])
+    }
+    for layerIndex in 0..<config.nLayer {
+        states = try QwenLayerParityProbe.evalCPULayer(
+            config: config,
+            nativeDir: root.path,
+            layer: layerIndex,
+            inputs: states,
+            roundIntermediatesToFP16: RealModelInferenceEngine
+                .shouldRoundCPUExactDecodeIntermediatesToFP16()
+        ).outputs
+    }
+    guard let finalHidden = states.last else {
+        Issue.record("probe produced no final hidden state")
+        return
+    }
+    let probeToken = try cpuArtifactLlamaNextTokenFromFinalHidden(
+        finalHidden,
+        weightDir: root,
+        config: config
+    )
+
+    #expect(TokenID(probeToken) == servedToken)
+}
+
 private func shouldRunANEHardwareTests() -> Bool {
     ProcessInfo.processInfo.environment["ANE_HARDWARE_TESTS"] == "1" && aneIsAvailable()
 }

@@ -1,0 +1,18 @@
+# Fixed prompt suite for Qwen2.5-0.5B-Instruct parity.
+#
+# Blank lines and lines starting with '#' are ignored. Each remaining line is one user
+# turn, wrapped in Qwen's instruct chat template unless --raw-prompt is passed.
+#
+# Prompts are deliberately short, deterministic in intent, and varied across factual
+# recall, arithmetic, code, and list formatting so a parity failure is more likely to
+# surface as a token mismatch than to be masked by a generic refusal.
+What is the capital of France?
+Write a Python function that reverses a string.
+Explain what a neural engine is in two sentences.
+List three primary colors.
+What is 17 multiplied by 23?
+Name the largest planet in the solar system.
+Translate "good morning" into Spanish.
+Summarize why unit tests are useful in one sentence.
+Who wrote the novel Pride and Prejudice?
+What does the acronym GPU stand for?

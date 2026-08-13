@@ -216,6 +216,12 @@ let package = Package(
             path: "Sources/EspressoGenerate",
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
+        .executableTarget(
+            name: "EspressoQwenParity",
+            dependencies: ["RealModelInference", "ModelSupport"],
+            path: "Sources/EspressoQwenParity",
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
         .testTarget(
             name: "EspressoGenerateTests",
             dependencies: ["EspressoGenerate", "ModelSupport", "ANETypes", "ESPBundle", "ESPBenchSupport"],
