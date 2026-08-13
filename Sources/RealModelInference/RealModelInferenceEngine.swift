@@ -26,6 +26,8 @@ public struct GenerationResult: Sendable {
     public let cachedBindingsEnabled: Bool
     public let committedExactTokensPerPass: Double?
     public let acceptedFutureTokensPerPass: Double?
+    /// `"hybrid"` or `"exact_cpu"` when the caller recorded the serving path; `"unknown"` otherwise.
+    public let decodePath: String
 
     public init(
         text: String,
@@ -38,7 +40,8 @@ public struct GenerationResult: Sendable {
         exactHeadBackend: String = "unknown",
         cachedBindingsEnabled: Bool = false,
         committedExactTokensPerPass: Double? = nil,
-        acceptedFutureTokensPerPass: Double? = nil
+        acceptedFutureTokensPerPass: Double? = nil,
+        decodePath: String = "unknown"
     ) {
         self.text = text
         self.tokens = tokens
@@ -51,6 +54,24 @@ public struct GenerationResult: Sendable {
         self.cachedBindingsEnabled = cachedBindingsEnabled
         self.committedExactTokensPerPass = committedExactTokensPerPass
         self.acceptedFutureTokensPerPass = acceptedFutureTokensPerPass
+        self.decodePath = decodePath
+    }
+
+    public func withDecodePath(_ path: String) -> GenerationResult {
+        GenerationResult(
+            text: text,
+            tokens: tokens,
+            promptTokens: promptTokens,
+            tokenLatenciesMs: tokenLatenciesMs,
+            tokensPerSecond: tokensPerSecond,
+            compileTimeMs: compileTimeMs,
+            firstTokenLatencyMs: firstTokenLatencyMs,
+            exactHeadBackend: exactHeadBackend,
+            cachedBindingsEnabled: cachedBindingsEnabled,
+            committedExactTokensPerPass: committedExactTokensPerPass,
+            acceptedFutureTokensPerPass: acceptedFutureTokensPerPass,
+            decodePath: path
+        )
     }
 }
 
@@ -1941,7 +1962,7 @@ public struct RealModelInferenceEngine: ~Copyable {
                         compileTimeMs: 0,
                         maxSeq: bucket,
                         onStep: nil
-                    )
+                    ).withDecodePath("exact_cpu")
                 )
             case .hybrid:
                 guard let attention = metalAttention else {
@@ -1956,7 +1977,7 @@ public struct RealModelInferenceEngine: ~Copyable {
                         maxSeq: bucket,
                         metalAttention: attention,
                         onStep: nil
-                    )
+                    ).withDecodePath("hybrid")
                 )
             }
         }

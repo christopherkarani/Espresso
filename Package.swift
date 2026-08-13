@@ -235,6 +235,7 @@ let package = Package(
             name: "RealModelInferenceTests",
             dependencies: [
                 "RealModelInference", "ModelSupport", "ANEGraphIR", "ANETypes", "Espresso",
+                "ESPRuntime", "ESPBundle",
             ],
             path: "Tests/RealModelInferenceTests",
             resources: [.copy("Fixtures")],

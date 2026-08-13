@@ -122,9 +122,10 @@ implementation is right. The ANE column is the price of fp16: **up to ~1 logit o
 
 ## Greedy token parity, and the two flips
 
-`Tests/RealModelInferenceTests/QwenParityExactMatchTests.swift` drives generation from the
-fixture's prompt token IDs (so this measures the model, not the tokenizer) over 12 prompts
-x 32 tokens:
+`Tests/RealModelInferenceTests/QwenParityExactMatchTests.swift` opens the packed `.esp`
+through `ESPRuntimeBundle` (the same artifact `./espresso generate --model` serves) and
+drives generation from the fixture's prompt token IDs (so this measures the model, not the
+tokenizer) over 12 prompts x 32 tokens:
 
 ```
 exact cases 10/12   matching-prefix tokens 341/384   head=cpu_fp16_tiled

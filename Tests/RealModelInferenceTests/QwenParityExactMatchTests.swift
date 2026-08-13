@@ -1,5 +1,6 @@
 import ANETypes
 import Darwin
+import ESPRuntime
 import Foundation
 import ModelSupport
 import Testing
@@ -60,32 +61,94 @@ private func qwenANEIsAvailable() -> Bool {
         .allSatisfy { NSClassFromString($0) != nil }
 }
 
-/// The converted native directory. Defaults to the converter's cache location.
-private func qwenNativeDirectory() -> URL? {
-    if let override = ProcessInfo.processInfo.environment["ESPRESSO_QWEN_NATIVE_DIR"], !override.isEmpty {
-        return URL(fileURLWithPath: override, isDirectory: true)
+/// Locates the converted Qwen2.5-0.5B artifact. The packed `.esp` is the shipped
+/// surface; the native staging directory is only a fallback for unpackaged trees.
+struct QwenParityArtifact {
+    enum Kind: Equatable {
+        case espBundle
+        case nativeDirectory
     }
-    let cacheRoot: URL
-    if let override = ProcessInfo.processInfo.environment["ESPRESSO_CACHE_HOME"], !override.isEmpty {
-        cacheRoot = URL(fileURLWithPath: override, isDirectory: true)
-    } else {
-        cacheRoot = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Caches/Espresso", isDirectory: true)
+
+    let kind: Kind
+    let rootURL: URL
+    let weightDirectory: URL
+
+    static func cacheRoot(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) -> URL {
+        if let override = environment["ESPRESSO_CACHE_HOME"], !override.isEmpty {
+            return URL(fileURLWithPath: override, isDirectory: true)
+        }
+        return homeDirectory.appendingPathComponent("Library/Caches/Espresso", isDirectory: true)
     }
-    let candidate = cacheRoot
-        .appendingPathComponent("qwen25-05b", isDirectory: true)
-        .appendingPathComponent("Qwen2.5-0.5B-Instruct-native", isDirectory: true)
-    return FileManager.default.fileExists(atPath: candidate.appendingPathComponent("metadata.json").path)
-        ? candidate
-        : nil
+
+    static func resolve(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        fileManager: FileManager = .default,
+        homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) -> QwenParityArtifact? {
+        if let override = environment["ESPRESSO_QWEN_BUNDLE"], !override.isEmpty {
+            return bundleArtifact(at: URL(fileURLWithPath: override, isDirectory: true), fileManager: fileManager)
+        }
+        if let override = environment["ESPRESSO_QWEN_NATIVE_DIR"], !override.isEmpty {
+            return nativeArtifact(at: URL(fileURLWithPath: override, isDirectory: true), fileManager: fileManager)
+        }
+
+        let cache = cacheRoot(environment: environment, homeDirectory: homeDirectory)
+            .appendingPathComponent("qwen25-05b", isDirectory: true)
+        if let bundle = bundleArtifact(
+            at: cache.appendingPathComponent("Qwen2.5-0.5B-Instruct.esp", isDirectory: true),
+            fileManager: fileManager
+        ) {
+            return bundle
+        }
+        return nativeArtifact(
+            at: cache.appendingPathComponent("Qwen2.5-0.5B-Instruct-native", isDirectory: true),
+            fileManager: fileManager
+        )
+    }
+
+    private static func bundleArtifact(at url: URL, fileManager: FileManager) -> QwenParityArtifact? {
+        let manifest = url.appendingPathComponent("manifest.toml")
+        let metadata = url.appendingPathComponent("weights/metadata.json")
+        guard fileManager.fileExists(atPath: manifest.path),
+              fileManager.fileExists(atPath: metadata.path)
+        else {
+            return nil
+        }
+        return QwenParityArtifact(
+            kind: .espBundle,
+            rootURL: url,
+            weightDirectory: url.appendingPathComponent("weights", isDirectory: true)
+        )
+    }
+
+    private static func nativeArtifact(at url: URL, fileManager: FileManager) -> QwenParityArtifact? {
+        guard fileManager.fileExists(atPath: url.appendingPathComponent("metadata.json").path) else {
+            return nil
+        }
+        return QwenParityArtifact(kind: .nativeDirectory, rootURL: url, weightDirectory: url)
+    }
 }
 
 private func loadQwenGreedyFixture() throws -> QwenGreedyReferenceFixture? {
-    let url = URL(fileURLWithPath: #filePath)
-        .deletingLastPathComponent()
-        .appendingPathComponent("Fixtures/qwen25-05b-greedy-reference.json")
-    guard FileManager.default.fileExists(atPath: url.path) else { return nil }
-    return try JSONDecoder().decode(QwenGreedyReferenceFixture.self, from: Data(contentsOf: url))
+    var candidates: [URL] = [
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .appendingPathComponent("Fixtures/qwen25-05b-greedy-reference.json"),
+    ]
+    if let resource = Bundle.module.url(
+        forResource: "qwen25-05b-greedy-reference",
+        withExtension: "json",
+        subdirectory: "Fixtures"
+    ) {
+        candidates.append(resource)
+    }
+    for url in candidates where FileManager.default.fileExists(atPath: url.path) {
+        return try JSONDecoder().decode(QwenGreedyReferenceFixture.self, from: Data(contentsOf: url))
+    }
+    return nil
 }
 
 @Test func test_qwenGreedyParityFixtureCoversTheRequiredSuite() throws {
@@ -106,17 +169,83 @@ private func loadQwenGreedyFixture() throws -> QwenGreedyReferenceFixture? {
     }
 }
 
+@Test func test_qwenParityArtifactPrefersPackedESPBundleOverNativeDir() throws {
+    let fileManager = FileManager.default
+    let root = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+    defer { try? fileManager.removeItem(at: root) }
+
+    let cache = root.appendingPathComponent("Caches/Espresso", isDirectory: true)
+    let native = cache
+        .appendingPathComponent("qwen25-05b", isDirectory: true)
+        .appendingPathComponent("Qwen2.5-0.5B-Instruct-native", isDirectory: true)
+    let bundle = cache
+        .appendingPathComponent("qwen25-05b", isDirectory: true)
+        .appendingPathComponent("Qwen2.5-0.5B-Instruct.esp", isDirectory: true)
+    try fileManager.createDirectory(at: native, withIntermediateDirectories: true)
+    try fileManager.createDirectory(
+        at: bundle.appendingPathComponent("weights", isDirectory: true),
+        withIntermediateDirectories: true
+    )
+    try Data("{}".utf8).write(to: native.appendingPathComponent("metadata.json"))
+    try Data("format_version = \"1.1.0\"\n".utf8).write(to: bundle.appendingPathComponent("manifest.toml"))
+    try Data("{}".utf8).write(to: bundle.appendingPathComponent("weights/metadata.json"))
+
+    let resolved = QwenParityArtifact.resolve(
+        environment: ["ESPRESSO_CACHE_HOME": cache.path],
+        fileManager: fileManager,
+        homeDirectory: root
+    )
+    #expect(resolved?.kind == .espBundle)
+    #expect(resolved?.rootURL.path == bundle.path)
+    #expect(resolved?.weightDirectory.lastPathComponent == "weights")
+}
+
+@Test func test_generationResultWithDecodePathPreservesTokens() {
+    let original = GenerationResult(
+        text: "hi",
+        tokens: [1, 2],
+        promptTokens: [9],
+        tokensPerSecond: 0,
+        compileTimeMs: 1,
+        firstTokenLatencyMs: 1,
+        exactHeadBackend: "cpu_fp16_tiled"
+    )
+    #expect(original.decodePath == "unknown")
+    let labeled = original.withDecodePath("hybrid")
+    #expect(labeled.decodePath == "hybrid")
+    #expect(labeled.tokens == original.tokens)
+    #expect(labeled.exactHeadBackend == "cpu_fp16_tiled")
+}
+
+@Test func test_qwenParityArtifactHonorsNativeDirectoryOverride() throws {
+    let fileManager = FileManager.default
+    let root = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+    defer { try? fileManager.removeItem(at: root) }
+    let native = root.appendingPathComponent("native", isDirectory: true)
+    try fileManager.createDirectory(at: native, withIntermediateDirectories: true)
+    try Data("{}".utf8).write(to: native.appendingPathComponent("metadata.json"))
+
+    let resolved = QwenParityArtifact.resolve(
+        environment: ["ESPRESSO_QWEN_NATIVE_DIR": native.path],
+        fileManager: fileManager,
+        homeDirectory: root
+    )
+    #expect(resolved?.kind == .nativeDirectory)
+    #expect(resolved?.weightDirectory.path == native.path)
+}
+
 /// Greedy decoding on the ANE hybrid path must reproduce the PyTorch reference token IDs.
 ///
 /// Generation is driven from the fixture's prompt token IDs so this measures the model, not
-/// the tokenizer. Tokenizer agreement is covered separately.
+/// the tokenizer. The converted `.esp` is the artifact under test (same path `./espresso
+/// generate --model` uses). Tokenizer agreement is covered separately.
 @Test func test_qwenGreedyParityMatchesPyTorchReferenceOnANE() throws {
     guard qwenHardwareTestsEnabled() else { return }
-    guard let nativeDir = qwenNativeDirectory() else {
+    guard let artifact = QwenParityArtifact.resolve() else {
         Issue.record(
             """
-            Converted Qwen native directory not found. Run scripts/convert_qwen25_05b_to_esp.py \
-            or set ESPRESSO_QWEN_NATIVE_DIR.
+            Converted Qwen .esp bundle not found. Run scripts/convert_qwen25_05b_to_esp.py \
+            or set ESPRESSO_QWEN_BUNDLE.
             """
         )
         return
@@ -126,7 +255,17 @@ private func loadQwenGreedyFixture() throws -> QwenGreedyReferenceFixture? {
         return
     }
 
-    let config = try QwenLayerParityProbe.loadConfig(nativeDir: nativeDir.path)
+    let config: MultiModelConfig
+    let weightDir: String
+    if artifact.kind == .espBundle {
+        let bundle = try ESPRuntimeBundle.open(at: artifact.rootURL)
+        config = bundle.config
+        weightDir = bundle.archive.weightsURL.path
+    } else {
+        config = try QwenLayerParityProbe.loadConfig(nativeDir: artifact.weightDirectory.path)
+        weightDir = artifact.weightDirectory.path
+    }
+    #expect(config.preferredDecodePath == .hybrid)
     // With fallback disabled this artifact must resolve to the ANE hybrid path, never CPU.
     #expect(
         try RealModelInferenceEngine.resolvedLlamaGenerationPath(
@@ -138,11 +277,13 @@ private func loadQwenGreedyFixture() throws -> QwenGreedyReferenceFixture? {
     let cases = fixture.cases
     let results = try RealModelInferenceEngine.generateFromTokenSuiteForTesting(
         config: config,
-        weightDir: nativeDir.path,
+        weightDir: weightDir,
         promptTokenSuite: cases.map { $0.promptTokens.map(TokenID.init) },
         maxTokens: fixture.maxNewTokens
     )
     #expect(results.count == cases.count)
+    #expect(results.allSatisfy { $0.decodePath == "hybrid" })
+    #expect(artifact.kind == .espBundle)
 
     var matchingPrefixLengths: [Int] = []
     var exactMatches = 0
@@ -199,6 +340,8 @@ private func loadQwenGreedyFixture() throws -> QwenGreedyReferenceFixture? {
         """
         [qwen-greedy-parity] exact cases \(exactMatches)/\(cases.count) \
         matching-prefix tokens \(totalMatching)/\(totalExpected) \
+        path=\(results.first?.decodePath ?? "?") \
+        artifact=\(artifact.kind == .espBundle ? "esp" : "native") \
         head=\(results.first?.exactHeadBackend ?? "?")
 
         """,
