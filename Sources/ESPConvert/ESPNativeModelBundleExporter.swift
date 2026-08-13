@@ -72,11 +72,23 @@ public enum ESPNativeModelBundleExporter {
         )
         defer { try? fileManager.removeItem(at: stagingWeightsDirectory) }
 
+        // When the tokenizer lives inside the model directory, copying that directory
+        // verbatim would duplicate every weight blob under tokenizer/ and double the
+        // bundle. Stage just the tokenizer assets instead.
+        let stagingTokenizerDirectory: URL? = modelDirectory.path == tokenizerDirectory.path
+            ? try makeTokenizerStagingDirectory(tokenizerDirectory: tokenizerDirectory, fileManager: fileManager)
+            : nil
+        defer {
+            if let stagingTokenizerDirectory {
+                try? fileManager.removeItem(at: stagingTokenizerDirectory)
+            }
+        }
+
         return try ESPBundleArchive.create(
             at: outputBundleURL,
             manifest: manifest,
             weightsDirectory: stagingWeightsDirectory,
-            tokenizerDirectory: tokenizerDirectory,
+            tokenizerDirectory: stagingTokenizerDirectory ?? tokenizerDirectory,
             overwriteExisting: overwriteExisting,
             fileManager: fileManager
         )
@@ -225,6 +237,30 @@ public enum ESPNativeModelBundleExporter {
             }
         }
 
+        return stagingDirectory
+    }
+
+    private static func makeTokenizerStagingDirectory(
+        tokenizerDirectory: URL,
+        fileManager: FileManager
+    ) throws -> URL {
+        let stagingDirectory = fileManager.temporaryDirectory
+            .appendingPathComponent("esp-native-tokenizer-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: stagingDirectory, withIntermediateDirectories: true)
+        var keep = false
+        defer {
+            if !keep {
+                try? fileManager.removeItem(at: stagingDirectory)
+            }
+        }
+
+        for name in recognizedTokenizerFiles.sorted() {
+            let sourceURL = tokenizerDirectory.appendingPathComponent(name)
+            guard fileManager.fileExists(atPath: sourceURL.path) else { continue }
+            try fileManager.copyItem(at: sourceURL, to: stagingDirectory.appendingPathComponent(name))
+        }
+
+        keep = true
         return stagingDirectory
     }
 

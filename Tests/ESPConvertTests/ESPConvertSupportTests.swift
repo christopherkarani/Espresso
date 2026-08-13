@@ -180,6 +180,10 @@ import Testing
     #expect(FileManager.default.fileExists(atPath: archive.weightsURL.appendingPathComponent("metadata.json").path))
     #expect(FileManager.default.fileExists(atPath: archive.tokenizerURL.appendingPathComponent("tokenizer.model").path))
     #expect(!FileManager.default.fileExists(atPath: archive.weightsURL.appendingPathComponent("tokenizer.model").path))
+    // Copying the co-located model directory verbatim would duplicate every weight blob
+    // under tokenizer/ and double the bundle on disk.
+    #expect(!FileManager.default.fileExists(atPath: archive.tokenizerURL.appendingPathComponent("lm_head.bin").path))
+    #expect(!FileManager.default.fileExists(atPath: archive.tokenizerURL.appendingPathComponent("metadata.json").path))
 }
 
 @Test func nativeExporterBuildsBundleWithExternalTokenizerDirectory() throws {

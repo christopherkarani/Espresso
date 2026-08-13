@@ -39,9 +39,34 @@ import ANEPasses
     #expect(graph.nodes.contains { $0.name == "layer0_rms1_weight" && $0.op == .const })
     #expect(graph.nodes.contains { $0.name == "layer0_ffn_gate_act_sigmoid" && $0.op == .sigmoid })
     #expect(graph.nodes.contains { $0.name == "layer0_ffn_gated" && $0.op == .mul })
-    #expect(!graph.nodes.contains { $0.name.contains("bias") })
+    // Llama-family paths always offer q/k/v bias; the graph emits those consts when
+    // the strings are non-nil. o_proj and the MLP stay bias-free.
+    #expect(paths.bq != nil && paths.bk != nil && paths.bv != nil)
+    #expect(paths.bo == nil && paths.b1 == nil && paths.b2 == nil)
+    #expect(graph.nodes.contains { $0.name == "layer0_q_bias" && $0.op == .const })
+    #expect(graph.nodes.contains { $0.name == "layer0_k_bias" && $0.op == .const })
+    #expect(graph.nodes.contains { $0.name == "layer0_v_bias" && $0.op == .const })
+    #expect(!graph.nodes.contains { $0.name == "layer0_attn_proj_bias" })
+    #expect(!graph.nodes.contains { $0.name.contains("ffn") && $0.name.contains("bias") })
     #expect(allWeightOffsets(in: graph).allSatisfy { $0 == 64 })
     #expect(!ANEOptimizationPipeline.validate(graph).contains { $0.severity == .error })
+}
+
+@Test func llamaLayerGraphIncludesQKVBiasWhenBiasPathsOffered() throws {
+    let config = ModelRegistry.stories110m
+    let offered = LayerWeightPaths.forLayer(0, config: config, blobDir: "/tmp/qwen-qkv-bias")
+    #expect(offered.bq != nil)
+    let graph = TransformerLayerGraphBuilder.forwardLayer(
+        layer: 0,
+        config: config,
+        paths: offered,
+        spatial: config.maxSeq
+    )
+
+    #expect(graph.nodes.contains { $0.name == "layer0_q_bias" && $0.op == .const })
+    #expect(graph.nodes.contains { $0.name == "layer0_k_bias" && $0.op == .const })
+    #expect(graph.nodes.contains { $0.name == "layer0_v_bias" && $0.op == .const })
+    #expect(!graph.nodes.contains { $0.name == "layer0_attn_proj_bias" })
 }
 
 @Test func llamaLayerPathsExposeOptionalQKNormArtifacts() {
@@ -50,8 +75,15 @@ import ANEPasses
 
     #expect(paths.qNorm == "/tmp/qwen/layers/3/q_norm.bin")
     #expect(paths.kNorm == "/tmp/qwen/layers/3/k_norm.bin")
-    #expect(paths.bq == nil)
+    // Q/K/V bias paths are always offered on the llama family; on-disk presence decides
+    // whether they are used, because Qwen2 biases q/k/v and plain llama does not.
+    #expect(paths.bq == "/tmp/qwen/layers/3/bq.bin")
+    #expect(paths.bk == "/tmp/qwen/layers/3/bk.bin")
+    #expect(paths.bv == "/tmp/qwen/layers/3/bv.bin")
+    // o_proj and the MLP are bias-free in every llama-family checkpoint we serve.
     #expect(paths.bo == nil)
+    #expect(paths.b1 == nil)
+    #expect(paths.b2 == nil)
 }
 
 @Test func supportedMaskBucketsMatchConverterContract() {

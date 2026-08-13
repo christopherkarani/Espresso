@@ -212,8 +212,17 @@ let package = Package(
         ),
         .executableTarget(
             name: "EspressoGenerate",
-            dependencies: ["RealModelInference", "ModelSupport", "ANETypes", "ANERuntime", "ESPRuntime", "ESPBenchSupport"],
+            dependencies: [
+                "RealModelInference", "ModelSupport", "ANETypes", "ANERuntime", "ESPBundle", "ESPRuntime",
+                "ESPBenchSupport",
+            ],
             path: "Sources/EspressoGenerate",
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .executableTarget(
+            name: "EspressoQwenParity",
+            dependencies: ["RealModelInference", "ModelSupport"],
+            path: "Sources/EspressoQwenParity",
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         .testTarget(
@@ -226,8 +235,10 @@ let package = Package(
             name: "RealModelInferenceTests",
             dependencies: [
                 "RealModelInference", "ModelSupport", "ANEGraphIR", "ANETypes", "Espresso",
+                "ESPRuntime", "ESPBundle",
             ],
             path: "Tests/RealModelInferenceTests",
+            resources: [.copy("Fixtures")],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         .target(

@@ -1,4 +1,5 @@
 import ANETypes
+import Foundation
 
 public struct MultiModelConfig: Sendable, Equatable {
     public let name: String
@@ -15,12 +16,46 @@ public struct MultiModelConfig: Sendable, Equatable {
     public let eosToken: TokenID?
     public let architecture: Architecture
 
+    /// What the artifact itself declares about where it should decode.
+    ///
+    /// When an artifact states this, the runtime honours it instead of guessing from the
+    /// model name. `nil` means the artifact is silent and legacy name-based routing
+    /// applies, which keeps older bundles behaving exactly as before.
+    public let preferredDecodePath: PreferredDecodePath?
+
     public var attentionDim: Int { nHead * headDim }
     public var kvDim: Int { nKVHead * headDim }
 
     public enum Architecture: Sendable, Equatable {
         case gpt2
         case llama
+    }
+
+    public enum PreferredDecodePath: String, Sendable, Equatable {
+        case hybrid
+        case exactCPU = "exact_cpu"
+
+        public enum ParseError: Error, Sendable, Equatable, LocalizedError {
+            case unsupported(String)
+
+            public var errorDescription: String? {
+                switch self {
+                case let .unsupported(raw):
+                    return "Unsupported preferredDecodePath: \(raw) (expected \"hybrid\" or \"exact_cpu\")"
+                }
+            }
+        }
+
+        /// Trims and lowercases `raw`, then maps it onto the declared decode path.
+        public static func parse(_ raw: String) throws -> PreferredDecodePath {
+            let normalized = raw
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+            guard let value = PreferredDecodePath(rawValue: normalized) else {
+                throw ParseError.unsupported(raw)
+            }
+            return value
+        }
     }
 
     public init(
@@ -36,7 +71,8 @@ public struct MultiModelConfig: Sendable, Equatable {
         normEps: Float,
         ropeTheta: Float = 10_000.0,
         eosToken: TokenID? = nil,
-        architecture: Architecture
+        architecture: Architecture,
+        preferredDecodePath: PreferredDecodePath? = nil
     ) {
         self.name = name
         self.nLayer = nLayer
@@ -51,5 +87,6 @@ public struct MultiModelConfig: Sendable, Equatable {
         self.ropeTheta = ropeTheta
         self.eosToken = eosToken
         self.architecture = architecture
+        self.preferredDecodePath = preferredDecodePath
     }
 }

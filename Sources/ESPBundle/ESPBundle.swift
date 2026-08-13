@@ -603,6 +603,17 @@ public struct ESPBundleArchive: Sendable, Equatable {
             throw ESPBundleValidationError.signatureMismatch(path: ESPBundleLayout.manifestFileName)
         }
 
+        let catalogKeys = Set(catalog.fileHashes.keys)
+        let computedKeys = Set(computed.fileHashes.keys)
+        if catalogKeys != computedKeys {
+            if let extra = computedKeys.subtracting(catalogKeys).sorted().first {
+                throw ESPBundleValidationError.signatureMismatch(path: extra)
+            }
+            if let missing = catalogKeys.subtracting(computedKeys).sorted().first {
+                throw ESPBundleValidationError.signatureMismatch(path: missing)
+            }
+        }
+
         for (path, expectedHash) in catalog.fileHashes.sorted(by: { $0.key < $1.key }) {
             guard computed.fileHashes[path] == expectedHash else {
                 throw ESPBundleValidationError.signatureMismatch(path: path)
@@ -621,19 +632,27 @@ public struct ESPBundleArchive: Sendable, Equatable {
     }
 
     private func enumeratedFiles(fileManager: FileManager) throws -> [URL] {
-        guard let enumerator = fileManager.enumerator(at: bundleURL, includingPropertiesForKeys: [.isRegularFileKey]) else {
+        guard let enumerator = fileManager.enumerator(
+            at: bundleURL,
+            includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+        ) else {
             return []
         }
 
+        let catalogRelativePath = "signatures/\(ESPBundleLayout.signatureCatalogFileName)"
         var urls: [URL] = []
         for case let url as URL in enumerator {
+            let path = relativePath(from: bundleURL, to: url)
             if url.lastPathComponent == ESPBundleLayout.manifestFileName ||
-                url.path == signatureCatalogURL.path {
+                path == catalogRelativePath {
                 continue
             }
 
-            let values = try url.resourceValues(forKeys: [.isRegularFileKey])
-            if values.isRegularFile == true {
+            let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+            // Count regular files and extra symlinks. A post-pack symlink sidecar
+            // would otherwise skip the closed catalog and still be served via
+            // FileManager.fileExists / Data(contentsOf:).
+            if values.isRegularFile == true || values.isSymbolicLink == true {
                 urls.append(url)
             }
         }
@@ -847,7 +866,10 @@ private func sha256(of url: URL) throws -> String {
 
 private func relativePath(from baseURL: URL, to fileURL: URL) -> String {
     let baseComponents = baseURL.resolvingSymlinksInPath().standardizedFileURL.pathComponents
-    let fileComponents = fileURL.resolvingSymlinksInPath().standardizedFileURL.pathComponents
+    // Resolve only the parent so /var vs /private/var still matches, but a
+    // planted file symlink is keyed at its in-bundle path rather than its target.
+    let parent = fileURL.deletingLastPathComponent().resolvingSymlinksInPath().standardizedFileURL
+    let fileComponents = parent.appendingPathComponent(fileURL.lastPathComponent).pathComponents
     let relativeComponents = fileComponents.dropFirst(baseComponents.count)
     return relativeComponents.joined(separator: "/")
 }

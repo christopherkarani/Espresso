@@ -107,6 +107,23 @@ import ModelSupport
     #expect(options.compareIterations == 4)
     #expect(options.jsonOutput)
     #expect(options.positionalPrompt == ["Hello"])
+    #expect(!options.rawPrompt)
+    #expect(!options.disableHybridFallback)
+}
+
+@Test func test_optionsParseRawPromptAndNoHybridFallback() throws {
+    let options = try Options.parse([
+        "espresso-generate",
+        "generate",
+        "--raw-prompt",
+        "--no-hybrid-fallback",
+        "--prompt", "Hello",
+    ])
+
+    #expect(options.command == .generate)
+    #expect(options.rawPrompt)
+    #expect(options.disableHybridFallback)
+    #expect(options.prompt == "Hello")
 }
 
 @Test func test_optionsParseAttentionCompileProbeFlags() throws {
@@ -159,6 +176,24 @@ import ModelSupport
     #expect(fingerprint.metrics[.tokensPerSecond] == 80)
 }
 
+@Test func test_backendRunMetricsCarriesDecodePath() {
+    let metrics = BackendRunMetrics(
+        backend: "espresso",
+        text: "Paris",
+        generatedTokens: [11],
+        promptTokens: [1],
+        compileTimeMs: 10,
+        firstTokenLatencyMs: 5,
+        tokensPerSecond: 20,
+        medianTokenMs: 5,
+        p95TokenMs: 5,
+        totalTimeMs: 20,
+        tokenLatenciesMs: [5],
+        decodePath: "hybrid"
+    )
+    #expect(metrics.decodePath == "hybrid")
+}
+
 @Test func test_metadataConfigFilePreservesOptionalRopeThetaAndEOSToken() throws {
     let metadata = MetadataConfigFile(
         name: "qwen3",
@@ -173,12 +208,94 @@ import ModelSupport
         normEps: 1e-6,
         ropeTheta: 1_000_000,
         eosToken: 151645,
-        architecture: "llama"
+        architecture: "llama",
+        preferredDecodePath: nil
     )
 
     let config = try metadata.asConfig()
     #expect(config.ropeTheta == 1_000_000)
     #expect(config.eosToken == 151645)
+    #expect(config.preferredDecodePath == nil)
+}
+
+@Test func test_metadataConfigFileParsesPreferredDecodePath() throws {
+    let hybrid = MetadataConfigFile(
+        name: "Qwen2.5-0.5B-Instruct",
+        nLayer: 24,
+        nHead: 14,
+        nKVHead: 2,
+        dModel: 896,
+        headDim: 64,
+        hiddenDim: 4864,
+        vocab: 151936,
+        maxSeq: 4096,
+        normEps: 1e-6,
+        ropeTheta: 1_000_000,
+        eosToken: 151645,
+        architecture: "llama",
+        preferredDecodePath: " Hybrid "
+    )
+    #expect(try hybrid.asConfig().preferredDecodePath == .hybrid)
+
+    let exact = MetadataConfigFile(
+        name: "Qwen2.5-0.5B-Instruct",
+        nLayer: 24,
+        nHead: 14,
+        nKVHead: 2,
+        dModel: 896,
+        headDim: 64,
+        hiddenDim: 4864,
+        vocab: 151936,
+        maxSeq: 4096,
+        normEps: 1e-6,
+        ropeTheta: 1_000_000,
+        eosToken: 151645,
+        architecture: "llama",
+        preferredDecodePath: "EXACT_CPU"
+    )
+    #expect(try exact.asConfig().preferredDecodePath == .exactCPU)
+
+    let invalid = MetadataConfigFile(
+        name: "Qwen2.5-0.5B-Instruct",
+        nLayer: 24,
+        nHead: 14,
+        nKVHead: 2,
+        dModel: 896,
+        headDim: 64,
+        hiddenDim: 4864,
+        vocab: 151936,
+        maxSeq: 4096,
+        normEps: 1e-6,
+        ropeTheta: 1_000_000,
+        eosToken: 151645,
+        architecture: "llama",
+        preferredDecodePath: "metal"
+    )
+    #expect(throws: MultiModelConfig.PreferredDecodePath.ParseError.unsupported("metal")) {
+        try invalid.asConfig()
+    }
+}
+
+@Test func test_preparedGeneratePromptWrapsQwenUnlessRawPrompt() {
+    let qwen = MultiModelConfig(
+        name: "Qwen2.5-0.5B-Instruct",
+        nLayer: 24,
+        nHead: 14,
+        nKVHead: 2,
+        dModel: 896,
+        headDim: 64,
+        hiddenDim: 4864,
+        vocab: 151_936,
+        maxSeq: 4096,
+        normEps: 1e-6,
+        architecture: .llama
+    )
+    #expect(
+        preparedGeneratePrompt("Hello", config: qwen, rawPrompt: false)
+            == QwenInstructPrompt.wrapUserTurn("Hello")
+    )
+    #expect(preparedGeneratePrompt("Hello", config: qwen, rawPrompt: true) == "Hello")
+    #expect(preparedGeneratePrompt("Hello", config: ModelRegistry.stories110m, rawPrompt: false) == "Hello")
 }
 
 @Test func test_resolveCoreMLModelPathUsesExplicitPathForLlama() throws {
@@ -400,14 +517,19 @@ import ModelSupport
     #expect(implicitPrompt(command: .demo, options: explicit) == nil)
 }
 
-@Test func test_resolveInvocationUsesBundlePathsWhenBundleProvided() throws {
+/// Writes a minimal but structurally valid `.esp` bundle and returns its URL.
+private func makeStubBundle(
+    at root: URL,
+    named name: String = "stories.esp",
+    preferredDecodePath: String? = nil
+) throws -> URL {
     let fileManager = FileManager.default
-    let root = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
-    let weightsDir = root.appendingPathComponent("weights-src", isDirectory: true)
-    let tokenizerDir = root.appendingPathComponent("tokenizer-src", isDirectory: true)
-    let bundleURL = root.appendingPathComponent("stories.esp", isDirectory: true)
+    let weightsDir = root.appendingPathComponent("weights-src-\(name)", isDirectory: true)
+    let tokenizerDir = root.appendingPathComponent("tokenizer-src-\(name)", isDirectory: true)
+    let bundleURL = root.appendingPathComponent(name, isDirectory: true)
     try fileManager.createDirectory(at: weightsDir, withIntermediateDirectories: true)
     try fileManager.createDirectory(at: tokenizerDir, withIntermediateDirectories: true)
+    let decodePathEntry = preferredDecodePath.map { ",\n  \"preferredDecodePath\": \"\($0)\"" } ?? ""
     try """
     {
       "name": "llama2.c-stories110M",
@@ -420,7 +542,7 @@ import ModelSupport
       "vocab": 32000,
       "maxSeq": 256,
       "normEps": 0.00001,
-      "architecture": "llama"
+      "architecture": "llama"\(decodePathEntry)
     }
     """.write(to: weightsDir.appendingPathComponent("metadata.json"), atomically: true, encoding: .utf8)
     try Data("weights".utf8).write(to: weightsDir.appendingPathComponent("lm_head.bin"))
@@ -447,6 +569,31 @@ import ModelSupport
         weightsDirectory: weightsDir,
         tokenizerDirectory: tokenizerDir
     )
+    return bundleURL
+}
+
+private func makeStubDemoDefaults(root: URL) -> DemoDefaults {
+    DemoDefaults(
+        repoRoot: root,
+        workingDirectory: root,
+        stateRoot: root,
+        cacheRoot: root,
+        reportsRoot: root,
+        hfCacheRoot: root,
+        weightsDir: root,
+        tokenizerDir: root,
+        coreMLDir: root,
+        toolsVenvDir: root,
+        scriptsDir: nil,
+        legacyArtifactsRoot: nil
+    )
+}
+
+@Test func test_resolveInvocationUsesBundlePathsWhenBundleProvided() throws {
+    let fileManager = FileManager.default
+    let root = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+    let bundleURL = try makeStubBundle(at: root)
 
     let defaults = DemoDefaults(
         repoRoot: root,
@@ -471,6 +618,66 @@ import ModelSupport
     #expect(invocation.weightsDir == bundleURL.appendingPathComponent("weights", isDirectory: true).path)
     #expect(invocation.tokenizerDir == bundleURL.appendingPathComponent("tokenizer", isDirectory: true).path)
     #expect(invocation.config.name == "llama2.c-stories110M")
+}
+
+/// `--model <path-to.esp>` is the documented README command, so it must resolve the same
+/// way `--bundle` does rather than being looked up as a registry key.
+@Test func test_resolveInvocationTreatsModelPathEndingInESPAsBundle() throws {
+    let fileManager = FileManager.default
+    let root = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+    let bundleURL = try makeStubBundle(at: root, named: "qwen.esp", preferredDecodePath: "hybrid")
+
+    var options = Options()
+    options.modelName = bundleURL.path
+    options.prompt = "Hello"
+
+    let invocation = try resolveInvocation(
+        from: options,
+        demoDefaults: makeStubDemoDefaults(root: root),
+        command: .generate
+    )
+    #expect(invocation.bundlePath == bundleURL.path)
+    #expect(invocation.weightsDir == bundleURL.appendingPathComponent("weights", isDirectory: true).path)
+    // A packed bundle must not lose the artifact's declared decode path, otherwise the
+    // runtime would silently route it to the pure-CPU oracle.
+    #expect(invocation.config.preferredDecodePath == .hybrid)
+}
+
+@Test func test_bundlePathFromModelArgumentLeavesRegistryNamesAlone() throws {
+    #expect(try bundlePathFromModelArgument("gpt2") == nil)
+    #expect(try bundlePathFromModelArgument("") == nil)
+}
+
+@Test func test_bundlePathFromModelArgumentReportsMissingAndMalformedBundles() throws {
+    let fileManager = FileManager.default
+    let root = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+
+    let missing = root.appendingPathComponent("absent.esp", isDirectory: true)
+    do {
+        _ = try bundlePathFromModelArgument(missing.path)
+        Issue.record("Expected a missing bundle to be rejected")
+    } catch let error as CLIError {
+        guard case let .usage(message) = error else {
+            Issue.record("Expected usage error, got \(error)")
+            return
+        }
+        #expect(message.contains("not found"))
+    }
+
+    let empty = root.appendingPathComponent("empty.esp", isDirectory: true)
+    try fileManager.createDirectory(at: empty, withIntermediateDirectories: true)
+    do {
+        _ = try bundlePathFromModelArgument(empty.path)
+        Issue.record("Expected a bundle without a manifest to be rejected")
+    } catch let error as CLIError {
+        guard case let .usage(message) = error else {
+            Issue.record("Expected usage error, got \(error)")
+            return
+        }
+        #expect(message.contains("manifest.toml"))
+    }
 }
 
 @Test func test_resolveInvocationRejectsBundleMixedWithWeights() throws {

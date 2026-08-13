@@ -68,9 +68,13 @@ import ANEPasses
         spatial: config.maxSeq
     )
 
-    // Should use RMSNorm (has _weight, no _beta)
+    // Should use RMSNorm (has _weight, no _beta). Llama-family paths offer
+    // q/k/v bias, so those consts are present; there is still no LayerNorm beta.
     #expect(graph.nodes.contains { $0.name == "layer0_rms1_weight" && $0.op == .const })
-    #expect(!graph.nodes.contains { $0.name.contains("bias") || $0.name.contains("beta") })
+    #expect(graph.nodes.contains { $0.name == "layer0_q_bias" && $0.op == .const })
+    #expect(graph.nodes.contains { $0.name == "layer0_k_bias" && $0.op == .const })
+    #expect(graph.nodes.contains { $0.name == "layer0_v_bias" && $0.op == .const })
+    #expect(!graph.nodes.contains { $0.name.contains("beta") })
 }
 
 @Test func postRoPEGraphInputsAreAlphabetical() throws {

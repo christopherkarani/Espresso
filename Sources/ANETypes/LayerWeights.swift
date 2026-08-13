@@ -23,6 +23,10 @@ public struct LayerWeights: ~Copyable {
     public let kNorm: TensorBuffer
     public let hasQNorm: Bool
     public let hasKNorm: Bool
+    /// True when `bq`/`bk`/`bv` carry real projection biases on a non-GPT-2 layer.
+    /// GPT-2 layers always bias QKV; Qwen2-family llama layers bias q/k/v only, and
+    /// plain llama layers have no QKV bias at all.
+    public let hasQKVBias: Bool
     public let attentionNormBeta: TensorBuffer
     public let ffnNormBeta: TensorBuffer
     public let bq: TensorBuffer
@@ -44,7 +48,8 @@ public struct LayerWeights: ~Copyable {
         kvDim: Int? = nil,
         normEps: Float = 1e-5,
         qNormDim: Int? = nil,
-        kNormDim: Int? = nil
+        kNormDim: Int? = nil,
+        hasQKVBias: Bool = false
     ) {
         let resolvedQDim = qDim ?? dim
         let resolvedKVDim = kvDim ?? dim
@@ -65,6 +70,7 @@ public struct LayerWeights: ~Copyable {
         self.rmsFfn = TensorBuffer(count: dim, zeroed: false)
         self.hasQNorm = qNormDim != nil
         self.hasKNorm = kNormDim != nil
+        self.hasQKVBias = hasQKVBias || architecture == .gpt2
         self.qNorm = TensorBuffer(count: qNormDim ?? 0, zeroed: false)
         self.kNorm = TensorBuffer(count: kNormDim ?? 0, zeroed: false)
         self.attentionNormBeta = TensorBuffer(count: dim, zeroed: false)

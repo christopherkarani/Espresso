@@ -24,6 +24,9 @@ public struct DecodeQKVOnlyGenerator: MILProgramGenerator {
     public let laneSpatial: Int
     public let architecture: LayerWeightsArchitecture
     public let normEps: Float
+    /// Emit `bq`/`bk`/`bv` adds after the projections. Always on for GPT-2; opt-in for
+    /// RMSNorm/SwiGLU layers because Qwen2 biases q/k/v while plain llama does not.
+    public let hasQKVBias: Bool
 
     public init(
         dim: Int = ModelConfig.dim,
@@ -31,7 +34,8 @@ public struct DecodeQKVOnlyGenerator: MILProgramGenerator {
         kvDim: Int? = nil,
         laneSpatial: Int = 32,
         architecture: LayerWeightsArchitecture = .rmsNormSwiGLU,
-        normEps: Float = 1e-5
+        normEps: Float = 1e-5,
+        hasQKVBias: Bool = false
     ) {
         precondition(dim > 0)
         precondition(laneSpatial > 0)
@@ -41,6 +45,7 @@ public struct DecodeQKVOnlyGenerator: MILProgramGenerator {
         self.laneSpatial = laneSpatial
         self.architecture = architecture
         self.normEps = normEps
+        self.hasQKVBias = hasQKVBias || architecture == .gpt2
     }
 
     public var inputBytes: Int { dim * laneSpatial * 2 }
@@ -92,7 +97,7 @@ public struct DecodeQKVOnlyGenerator: MILProgramGenerator {
                 outDim: qDim,
                 spatial: laneSpatial,
                 weightPath: "@model_path/weights/wq.bin",
-                biasPath: architecture == .gpt2 ? "@model_path/weights/bq.bin" : nil
+                biasPath: hasQKVBias ? "@model_path/weights/bq.bin" : nil
             )
             let kNew = try graph.linear(
                 "k",
@@ -101,7 +106,7 @@ public struct DecodeQKVOnlyGenerator: MILProgramGenerator {
                 outDim: kvDim,
                 spatial: laneSpatial,
                 weightPath: "@model_path/weights/wk.bin",
-                biasPath: architecture == .gpt2 ? "@model_path/weights/bk.bin" : nil
+                biasPath: hasQKVBias ? "@model_path/weights/bk.bin" : nil
             )
             let vNew = try graph.linear(
                 "v",
@@ -110,7 +115,7 @@ public struct DecodeQKVOnlyGenerator: MILProgramGenerator {
                 outDim: kvDim,
                 spatial: laneSpatial,
                 weightPath: "@model_path/weights/wv.bin",
-                biasPath: architecture == .gpt2 ? "@model_path/weights/bv.bin" : nil
+                biasPath: hasQKVBias ? "@model_path/weights/bv.bin" : nil
             )
             try LegacyGraphSupport.setOutputs(&graph, [("qOut", qOut), ("kNew", kNew), ("vNew", vNew)])
         }

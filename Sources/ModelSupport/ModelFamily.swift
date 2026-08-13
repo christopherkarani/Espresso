@@ -27,4 +27,24 @@ public enum ModelFamily: Sendable {
     public static func isStories110MVariant(_ config: MultiModelConfig) -> Bool {
         isStories110MVariant(name: config.name)
     }
+
+    /// Stable substring used for Qwen-family artifacts (Qwen2, Qwen2.5, Qwen3, …).
+    public static let qwenToken = "qwen"
+
+    /// Returns true when `name` identifies a Qwen-family artifact.
+    ///
+    /// Matches after trim + lowercase substring, for example:
+    /// - `qwen2.5`
+    /// - `Qwen2.5-0.5B-Instruct`
+    public static func isQwenVariant(name: String) -> Bool {
+        let normalized = name
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        return normalized.contains(qwenToken)
+    }
+
+    /// Convenience overload for `MultiModelConfig`.
+    public static func isQwenVariant(_ config: MultiModelConfig) -> Bool {
+        isQwenVariant(name: config.name)
+    }
 }

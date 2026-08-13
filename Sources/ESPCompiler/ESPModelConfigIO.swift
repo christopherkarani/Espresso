@@ -23,6 +23,7 @@ public enum ESPModelConfigIO {
         let ropeTheta: Float?
         let eosToken: Int?
         let architecture: String
+        let preferredDecodePath: String?
 
         func asConfig() throws -> MultiModelConfig {
             let parsedArchitecture: MultiModelConfig.Architecture
@@ -39,6 +40,12 @@ public enum ESPModelConfigIO {
                 )
             }
 
+            // Dropping this silently would route an artifact that declares the ANE hybrid
+            // path back to the pure-CPU oracle once it is packed into a bundle.
+            let parsedDecodePath = try preferredDecodePath.map {
+                try MultiModelConfig.PreferredDecodePath.parse($0)
+            }
+
             return MultiModelConfig(
                 name: name,
                 nLayer: nLayer,
@@ -52,7 +59,8 @@ public enum ESPModelConfigIO {
                 normEps: normEps,
                 ropeTheta: ropeTheta ?? 10_000.0,
                 eosToken: eosToken.map { TokenID($0) },
-                architecture: parsedArchitecture
+                architecture: parsedArchitecture,
+                preferredDecodePath: parsedDecodePath
             )
         }
     }

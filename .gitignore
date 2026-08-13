@@ -67,6 +67,9 @@ docs/*
 !docs/coreml-vs-espresso-benchmarks.html
 !docs/gpt2-926-tokens-per-second.html
 !docs/reverse-engineering-apple-neural-engine.html
+!docs/qwen-parity.md
+!docs/qwen-parity-layers.md
+!docs/qwen-logit-parity.json
 prompts/
 scripts/
 !scripts/
@@ -85,6 +88,9 @@ scripts/internal/**
 !scripts/export_llama_coreml.py
 !scripts/convert_weights_gpt2.py
 !scripts/convert_weights_llama.py
+!scripts/convert_qwen25_05b_to_esp.py
+!scripts/qwen25_pytorch_reference.py
+!scripts/qwen25_prompts.txt
 !scripts/bootstrap_gpt2_demo.py
 !scripts/export_gpt2_coreml.py
 !scripts/run_gpt2_coreml_reference.py
@@ -94,6 +100,7 @@ scripts/internal/**
 !scripts/tests/test_stories_model_identity.py
 !scripts/tests/test_espresso_llama_weights.py
 !scripts/tests/test_gpt2_demo_helpers.py
+!scripts/tests/test_qwen25_convert.py
 !scripts/README.md
 tasks/
 AGENTS.md

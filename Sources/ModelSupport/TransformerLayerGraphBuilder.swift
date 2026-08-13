@@ -124,7 +124,8 @@ public struct TransformerLayerGraphBuilder {
                 inDim: config.dModel,
                 outDim: config.dModel,
                 spatial: spatial,
-                weightPath: paths.wq
+                weightPath: paths.wq,
+                biasPath: paths.bq
             )
             // GQA is handled offline by repeating KV head blocks in the converter.
             let k = try! graph.linear128(
@@ -133,7 +134,8 @@ public struct TransformerLayerGraphBuilder {
                 inDim: config.dModel,
                 outDim: config.dModel,
                 spatial: spatial,
-                weightPath: paths.wk
+                weightPath: paths.wk,
+                biasPath: paths.bk
             )
             let v = try! graph.linear128(
                 "\(prefix)_v",
@@ -141,7 +143,8 @@ public struct TransformerLayerGraphBuilder {
                 inDim: config.dModel,
                 outDim: config.dModel,
                 spatial: spatial,
-                weightPath: paths.wv
+                weightPath: paths.wv,
+                biasPath: paths.bv
             )
             let attn = try! graph.causalAttention128(
                 "\(prefix)_attn",
@@ -224,7 +227,8 @@ public struct TransformerLayerGraphBuilder {
             inDim: config.dModel,
             outDim: config.dModel,
             spatial: spatial,
-            weightPath: paths.wq
+            weightPath: paths.wq,
+            biasPath: paths.bq
         )
         let k = try! graph.linear128(
             "\(prefix)_k",
@@ -232,7 +236,8 @@ public struct TransformerLayerGraphBuilder {
             inDim: config.dModel,
             outDim: config.dModel,
             spatial: spatial,
-            weightPath: paths.wk
+            weightPath: paths.wk,
+            biasPath: paths.bk
         )
         let v = try! graph.linear128(
             "\(prefix)_v",
@@ -240,7 +245,8 @@ public struct TransformerLayerGraphBuilder {
             inDim: config.dModel,
             outDim: config.dModel,
             spatial: spatial,
-            weightPath: paths.wv
+            weightPath: paths.wv,
+            biasPath: paths.bv
         )
 
         // Outputs in alphabetical order: k, q, v
