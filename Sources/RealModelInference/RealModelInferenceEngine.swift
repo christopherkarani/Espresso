@@ -91,6 +91,10 @@ public enum RealModelInferenceError: Error, Sendable, Equatable, LocalizedError 
     case invalidPrompt(String)
     case invalidGenerationParameters(String)
     case runtimeFailure(String)
+    /// Raised when `ESPRESSO_REALMODEL_DISABLE_HYBRID_FALLBACK=1` and work would otherwise
+    /// leave the ANE hybrid decode path. `stage` names where the fallback was about to
+    /// happen and `reason` names the op, kernel, or policy responsible.
+    case hybridFallbackDisabled(stage: String, reason: String)
 
     public var errorDescription: String? {
         switch self {
@@ -110,6 +114,12 @@ public enum RealModelInferenceError: Error, Sendable, Equatable, LocalizedError 
             return message
         case let .runtimeFailure(message):
             return message
+        case let .hybridFallbackDisabled(stage, reason):
+            return """
+                ANE hybrid fallback is disabled \
+                (ESPRESSO_REALMODEL_DISABLE_HYBRID_FALLBACK=1) but \(stage) would fall back \
+                off the ANE: \(reason)
+                """
         }
     }
 }
@@ -313,7 +323,48 @@ public struct RealModelInferenceEngine: ~Copyable {
         guard config.architecture == .llama else {
             return false
         }
+        // An artifact that states where it decodes is trusted over the name heuristic below.
+        if let declared = config.preferredDecodePath {
+            return declared == .exactCPU
+        }
+        // Legacy routing: early Qwen artifacts predate a working ANE path at these widths
+        // and are kept on the CPU oracle so old bundles do not change behaviour.
         return config.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased().contains("qwen")
+    }
+
+    static func isHybridFallbackDisabled(environment: [String: String]) -> Bool {
+        environment["ESPRESSO_REALMODEL_DISABLE_HYBRID_FALLBACK"] == "1"
+    }
+
+    /// Resolves the llama decode path, refusing to leave the ANE silently.
+    ///
+    /// With `ESPRESSO_REALMODEL_DISABLE_HYBRID_FALLBACK=1`, landing on the pure-CPU path is
+    /// a failure rather than a quiet downgrade, and the thrown error names which policy
+    /// chose CPU so the cause is actionable instead of mysterious.
+    static func resolvedLlamaGenerationPath(
+        config: MultiModelConfig,
+        environment: [String: String]
+    ) throws -> LlamaGenerationPath {
+        let path = llamaGenerationPath(config: config, environment: environment)
+        guard path == .exactCPU, isHybridFallbackDisabled(environment: environment) else {
+            return path
+        }
+        let reason: String
+        if environment["ESPRESSO_USE_CPU_EXACT_DECODE"] == "1" {
+            reason = "ESPRESSO_USE_CPU_EXACT_DECODE=1 explicitly requests the pure-CPU decode path"
+        } else if config.preferredDecodePath == .exactCPU {
+            reason = "the artifact declares preferredDecodePath=exact_cpu in metadata.json"
+        } else {
+            reason = """
+                model name "\(config.name)" matches the legacy Qwen CPU-exact routing policy \
+                and metadata.json does not declare preferredDecodePath; set \
+                preferredDecodePath=hybrid or ESPRESSO_FORCE_HYBRID_DECODE=1 to decode on the ANE
+                """
+        }
+        throw RealModelInferenceError.hybridFallbackDisabled(
+            stage: "llama decode path selection",
+            reason: reason
+        )
     }
 
     static func milDeploymentTarget(
@@ -1472,7 +1523,7 @@ public struct RealModelInferenceEngine: ~Copyable {
                     onStep: onStep
                 )
             }
-            switch Self.llamaGenerationPath(
+            switch try Self.resolvedLlamaGenerationPath(
                 config: config,
                 environment: environment
             ) {
@@ -1517,7 +1568,36 @@ public struct RealModelInferenceEngine: ~Copyable {
                 compiledHybridSurfaceHandles.count == config.nLayer &&
                 compiledHybridHead.count == 1 &&
                 hybridMetalAttention != nil
+            if !useHybridFastPath, Self.isHybridFallbackDisabled(environment: environment) {
+                throw RealModelInferenceError.hybridFallbackDisabled(
+                    stage: "hybrid decode compile",
+                    reason: """
+                        hybrid decode state is incomplete: layers=\(compiledHybridLayers.count)/\(config.nLayer) \
+                        surfaces=\(compiledHybridSurfaceHandles.count)/\(config.nLayer) \
+                        head=\(compiledHybridHead.count)/1 \
+                        metalAttention=\(hybridMetalAttention != nil)
+                        """
+                )
+            }
+        } catch let error as RealModelInferenceError {
+            // A disabled-fallback error is the answer, not something to recover from.
+            if case .hybridFallbackDisabled = error {
+                throw error
+            }
+            if Self.isHybridFallbackDisabled(environment: environment) {
+                throw RealModelInferenceError.hybridFallbackDisabled(
+                    stage: "hybrid decode compile",
+                    reason: "\(error.errorDescription ?? "\(error)")"
+                )
+            }
+            useHybridFastPath = false
         } catch {
+            if Self.isHybridFallbackDisabled(environment: environment) {
+                throw RealModelInferenceError.hybridFallbackDisabled(
+                    stage: "hybrid decode compile",
+                    reason: "\(error)"
+                )
+            }
             useHybridFastPath = false
         }
 
@@ -1696,9 +1776,62 @@ public struct RealModelInferenceEngine: ~Copyable {
         weightDir: String,
         promptTokens: [TokenID]
     ) throws -> TokenID {
-        guard !promptTokens.isEmpty else {
+        let result = try generateFromTokensForTesting(
+            config: config,
+            weightDir: weightDir,
+            promptTokens: promptTokens,
+            maxTokens: 1
+        )
+        guard let token = result.tokens.first else {
+            throw RealModelInferenceError.runtimeFailure("Testing helper did not emit a next token")
+        }
+        return token
+    }
+
+    /// Greedy-decodes `maxTokens` from explicit prompt token IDs on the artifact's own
+    /// decode path.
+    ///
+    /// Driving generation from token IDs keeps a parity test measuring the model rather
+    /// than the tokenizer; tokenizer agreement is worth asserting, but separately.
+    public static func generateFromTokensForTesting(
+        config: MultiModelConfig,
+        weightDir: String,
+        promptTokens: [TokenID],
+        maxTokens: Int
+    ) throws -> GenerationResult {
+        let results = try generateFromTokenSuiteForTesting(
+            config: config,
+            weightDir: weightDir,
+            promptTokenSuite: [promptTokens],
+            maxTokens: maxTokens
+        )
+        guard let result = results.first else {
+            throw RealModelInferenceError.runtimeFailure("Testing helper did not emit a generation result")
+        }
+        return result
+    }
+
+    /// Greedy-decodes every prompt in `promptTokenSuite` through a single engine instance.
+    ///
+    /// One engine means one ANE compile for the whole suite. Compiling per prompt would
+    /// exhaust the finite per-process ANE compile budget long before a multi-prompt parity
+    /// suite finished.
+    public static func generateFromTokenSuiteForTesting(
+        config: MultiModelConfig,
+        weightDir: String,
+        promptTokenSuite: [[TokenID]],
+        maxTokens: Int
+    ) throws -> [GenerationResult] {
+        guard !promptTokenSuite.isEmpty else {
+            throw RealModelInferenceError.invalidGenerationParameters("Testing prompt suite must not be empty")
+        }
+        for promptTokens in promptTokenSuite where promptTokens.isEmpty {
             throw RealModelInferenceError.invalidGenerationParameters("Testing prompt token list must not be empty")
         }
+        guard maxTokens > 0 else {
+            throw RealModelInferenceError.invalidGenerationParameters("Testing max token count must be positive")
+        }
+        let promptTokens = promptTokenSuite[0]
 
         try validateConfig(config)
         let weightDirURL = URL(fileURLWithPath: weightDir, isDirectory: true)
@@ -1758,55 +1891,76 @@ public struct RealModelInferenceEngine: ~Copyable {
             assets: topLevelAssets
         )
 
-        let targetTokenCount = min(config.maxSeq, promptTokens.count + 1)
+        guard config.architecture == .llama else {
+            throw RealModelInferenceError.unsupportedArchitecture(
+                "generateFromTokenSuiteForTesting currently supports llama-family artifacts only"
+            )
+        }
+
+        // Compile once for the longest prompt so no prompt triggers a second compile.
+        let longestPromptCount = promptTokenSuite.map(\.count).max() ?? promptTokens.count
         let bucket = try compileBucket(
-            for: targetTokenCount,
+            for: min(config.maxSeq, longestPromptCount + maxTokens),
             channels: config.dModel,
             maxSeq: config.maxSeq
         )
 
-        guard config.architecture == .llama else {
-            throw RealModelInferenceError.unsupportedArchitecture(
-                "generateNextTokenForTesting currently supports llama-family artifacts only"
-            )
-        }
-
-        let result: GenerationResult
-        switch llamaGenerationPath(
+        let path = try resolvedLlamaGenerationPath(
             config: config,
             environment: ProcessInfo.processInfo.environment
-        ) {
-        case .exactCPU:
-            result = try engine.generateIncrementalExactCPULlama(
-                promptTokens: promptTokens,
-                effectiveMaxTokens: 1,
-                temperature: 0,
-                compileTimeMs: 0,
-                maxSeq: bucket,
-                onStep: nil
-            )
-        case .hybrid:
+        )
+        var compileTimeMs = 0.0
+        var metalAttention: MetalAttentionKernel?
+        if path == .hybrid {
             let compileStart = DispatchTime.now().uptimeNanoseconds
             let compileDidRun = try engine.ensureHybridCompiledLlama(bucket: bucket)
-            guard let metalAttention = engine.hybridMetalAttention else {
+            guard let attention = engine.hybridMetalAttention else {
                 throw RealModelInferenceError.runtimeFailure("Hybrid Metal attention unavailable for llama testing helper")
             }
+            metalAttention = attention
             let compileEnd = DispatchTime.now().uptimeNanoseconds
-            let compileTimeMs = compileDidRun ? milliseconds(from: compileEnd - compileStart) : 0
-            result = try engine.generateIncrementalHybridLlama(
-                promptTokens: promptTokens,
-                effectiveMaxTokens: 1,
-                temperature: 0,
-                compileTimeMs: compileTimeMs,
-                maxSeq: bucket,
-                metalAttention: metalAttention,
-                onStep: nil
-            )
+            compileTimeMs = compileDidRun ? milliseconds(from: compileEnd - compileStart) : 0
         }
-        guard let token = result.tokens.first else {
-            throw RealModelInferenceError.runtimeFailure("Testing helper did not emit a next token")
+
+        var results: [GenerationResult] = []
+        results.reserveCapacity(promptTokenSuite.count)
+        for prompt in promptTokenSuite {
+            let effectiveMaxTokens = min(maxTokens, max(config.maxSeq - prompt.count, 0))
+            guard effectiveMaxTokens > 0 else {
+                throw RealModelInferenceError.invalidGenerationParameters(
+                    "Prompt of \(prompt.count) tokens leaves no room to generate within context \(config.maxSeq)"
+                )
+            }
+            switch path {
+            case .exactCPU:
+                results.append(
+                    try engine.generateIncrementalExactCPULlama(
+                        promptTokens: prompt,
+                        effectiveMaxTokens: effectiveMaxTokens,
+                        temperature: 0,
+                        compileTimeMs: 0,
+                        maxSeq: bucket,
+                        onStep: nil
+                    )
+                )
+            case .hybrid:
+                guard let attention = metalAttention else {
+                    throw RealModelInferenceError.runtimeFailure("Hybrid Metal attention unavailable for llama testing helper")
+                }
+                results.append(
+                    try engine.generateIncrementalHybridLlama(
+                        promptTokens: prompt,
+                        effectiveMaxTokens: effectiveMaxTokens,
+                        temperature: 0,
+                        compileTimeMs: results.isEmpty ? compileTimeMs : 0,
+                        maxSeq: bucket,
+                        metalAttention: attention,
+                        onStep: nil
+                    )
+                )
+            }
         }
-        return token
+        return results
     }
 
     public static func generateNextTokenExactCPUForTesting(
@@ -5317,6 +5471,19 @@ public struct RealModelInferenceEngine: ~Copyable {
             throw RealModelInferenceError.runtimeFailure("metadata.json missing supported architecture")
         }
 
+        let preferredDecodePath: MultiModelConfig.PreferredDecodePath?
+        if let raw = metadata["preferredDecodePath"] as? String {
+            let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard let parsed = MultiModelConfig.PreferredDecodePath(rawValue: normalized) else {
+                throw RealModelInferenceError.runtimeFailure(
+                    "metadata.json has unsupported preferredDecodePath \"\(raw)\" (expected \"hybrid\" or \"exact_cpu\")"
+                )
+            }
+            preferredDecodePath = parsed
+        } else {
+            preferredDecodePath = nil
+        }
+
         return MultiModelConfig(
             name: name,
             nLayer: try requiredInt("nLayer"),
@@ -5330,7 +5497,8 @@ public struct RealModelInferenceEngine: ~Copyable {
             normEps: Float(try requiredDouble("normEps")),
             ropeTheta: Float((metadata["ropeTheta"] as? NSNumber)?.doubleValue ?? 10_000),
             eosToken: (metadata["eosToken"] as? NSNumber)?.uint32Value,
-            architecture: architecture
+            architecture: architecture,
+            preferredDecodePath: preferredDecodePath
         )
     }
 
@@ -5501,7 +5669,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             )
         }
 
-        if Self.llamaGenerationPath(
+        if try Self.resolvedLlamaGenerationPath(
             config: config,
             environment: ProcessInfo.processInfo.environment
         ) == .exactCPU {

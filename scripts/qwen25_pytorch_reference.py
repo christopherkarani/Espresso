@@ -205,6 +205,7 @@ def run_swift_driver(
     positions: int,
     backend: str,
     layers: list[int],
+    chain: bool = False,
     extra_env: dict[str, str] | None = None,
 ) -> None:
     command = [
@@ -226,6 +227,8 @@ def run_swift_driver(
         "--layers",
         ",".join(str(layer) for layer in layers),
     ]
+    if chain:
+        command.append("--chain")
     env = dict(os.environ)
     if extra_env:
         env.update(extra_env)
@@ -431,9 +434,158 @@ def render_markdown(report: dict) -> str:
 # ---------------------------------------------------------------------------
 
 
-def command_fixtures(args: argparse.Namespace) -> int:
+def greedy_generate(model, prompt_tokens: list[int], max_new_tokens: int, eos_ids: set[int]):
+    """Pure greedy decoding: argmax over raw logits, no logits processors.
+
+    `model.generate` is deliberately avoided. Qwen2.5 ships `repetition_penalty: 1.1` in
+    `generation_config.json`, which `generate` applies even with `do_sample=False`, so its
+    output is not the greedy argmax sequence an inference runtime reproduces. Getting this
+    wrong makes a correct runtime look broken.
+
+    The full sequence is re-run each step instead of using a KV cache: 32 steps on a 0.5B
+    model is cheap, and it removes any chance of a cache-API subtlety corrupting the oracle.
+    """
     import torch
 
+    tokens = list(prompt_tokens)
+    produced: list[int] = []
+    top_gaps: list[float] = []
+    runner_ups: list[int] = []
+    for _ in range(max_new_tokens):
+        with torch.no_grad():
+            logits = model(input_ids=torch.tensor([tokens], dtype=torch.long), use_cache=False).logits
+        final = logits[0, -1]
+        top2 = torch.topk(final, 2)
+        next_token = int(top2.indices[0])
+        top_gaps.append(float(top2.values[0] - top2.values[1]))
+        runner_ups.append(int(top2.indices[1]))
+        produced.append(next_token)
+        tokens.append(next_token)
+        if next_token in eos_ids:
+            break
+    return produced, top_gaps, runner_ups
+
+
+def rms_norm(values, gamma, eps: float):
+    import numpy as np
+
+    scale = np.sqrt((values.astype(np.float64) ** 2).mean() + eps)
+    return (values / scale).astype(np.float32) * gamma
+
+
+def read_blob_fp16(path: Path, expected_count: int):
+    """Reads an Espresso BLOBFILE (128-byte header + fp16 payload) as float32."""
+    import numpy as np
+
+    raw = path.read_bytes()
+    values = np.frombuffer(raw[128:], dtype="<f2").astype(np.float32)
+    if values.size != expected_count:
+        raise ReferenceError(
+            f"{path} holds {values.size} fp16 values, expected {expected_count}"
+        )
+    return values
+
+
+def command_logit_parity(args: argparse.Namespace) -> int:
+    """Compares Espresso's final logits against PyTorch fp32 through the whole stack.
+
+    Per-layer parity proves each layer in isolation; this proves the error the full stack
+    accumulates, which is what actually decides a greedy token. The Swift driver runs in
+    `--chain` mode so layer N+1 consumes layer N's output, exactly as decoding does.
+    """
+    import numpy as np
+    import torch
+
+    source_dir = Path(args.source_dir).expanduser()
+    native_dir = Path(args.native_dir).expanduser()
+    metadata = json.loads((native_dir / "metadata.json").read_text(encoding="utf-8"))
+    d_model = int(metadata["dModel"])
+    vocab = int(metadata["vocab"])
+    norm_eps = float(metadata["normEps"])
+
+    fixture = json.loads(Path(args.fixture).expanduser().read_text(encoding="utf-8"))
+    cases = fixture["cases"]
+    if args.cases:
+        cases = [case for case in cases if case["index"] in set(args.cases)]
+    if not cases:
+        raise ReferenceError("no fixture cases selected")
+
+    _, model = load_reference_model(source_dir)
+    embeddings = model.model.embed_tokens.weight.detach().numpy()
+    gamma = read_blob_fp16(native_dir / "final_norm.bin", d_model)
+    lm_head = read_blob_fp16(native_dir / "lm_head.bin", vocab * d_model).reshape(vocab, d_model)
+
+    work_dir = Path(args.work_dir).expanduser() if args.work_dir else native_dir.parent / "parity-work"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    inputs_path = work_dir / "chain_inputs.f32"
+
+    rows = []
+    for case in cases:
+        token_ids = case["promptTokens"]
+        positions = len(token_ids)
+        write_float32(inputs_path, embeddings[token_ids])
+        with torch.no_grad():
+            reference_logits = (
+                model(input_ids=torch.tensor([token_ids], dtype=torch.long), use_cache=False)
+                .logits[0, -1]
+                .numpy()
+            )
+        order = np.argsort(-reference_logits)
+        reference_gap = float(reference_logits[order[0]] - reference_logits[order[1]])
+
+        for backend in args.backends:
+            output_path = work_dir / f"chain_outputs_{backend.replace('-', '_')}.f32"
+            run_swift_driver(
+                native_dir=native_dir,
+                inputs_path=inputs_path,
+                output_path=output_path,
+                positions=positions,
+                backend=backend,
+                layers=list(range(int(metadata["nLayer"]))),
+                chain=True,
+                extra_env={"ESPRESSO_REALMODEL_DISABLE_HYBRID_FALLBACK": "1"} if backend == "ane" else None,
+            )
+            final_hidden = read_float32(output_path, (positions, d_model))[-1]
+            logits = lm_head @ rms_norm(final_hidden, gamma, norm_eps)
+            rows.append(
+                {
+                    "case": case["index"],
+                    "backend": backend,
+                    "max_abs_logit_diff": float(np.abs(logits - reference_logits).max()),
+                    "argmax": int(logits.argmax()),
+                    "reference_argmax": int(reference_logits.argmax()),
+                    "reference_top_gap": reference_gap,
+                }
+            )
+            print(
+                f"[logit-parity] case {case['index']} {backend}: "
+                f"max|dlogit|={rows[-1]['max_abs_logit_diff']:.4f} "
+                f"argmax={rows[-1]['argmax']} ref={rows[-1]['reference_argmax']} "
+                f"ref_gap={reference_gap:.4f}",
+                flush=True,
+            )
+
+    summary = {
+        backend: max(row["max_abs_logit_diff"] for row in rows if row["backend"] == backend)
+        for backend in args.backends
+    }
+    for backend, worst in summary.items():
+        print(f"[logit-parity] {backend}: worst max|dlogit| = {worst:.4f}", flush=True)
+    argmax_agreement = sum(1 for row in rows if row["argmax"] == row["reference_argmax"])
+    print(f"[logit-parity] argmax agreement {argmax_agreement}/{len(rows)}", flush=True)
+
+    if args.report_json:
+        path = Path(args.report_json).expanduser()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"rows": rows, "worstMaxAbsLogitDiff": summary}, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        print(f"[logit-parity] wrote {path}", flush=True)
+    return 0
+
+
+def command_fixtures(args: argparse.Namespace) -> int:
     source_dir = Path(args.source_dir).expanduser()
     tokenizer, model = load_reference_model(source_dir)
     prompts = load_prompts(Path(args.prompts).expanduser())
@@ -442,28 +594,17 @@ def command_fixtures(args: argparse.Namespace) -> int:
             f"prompt suite has {len(prompts)} prompts, need at least {args.min_prompts}"
         )
 
-    eos_ids = set()
-    if model.generation_config.eos_token_id is not None:
-        raw_eos = model.generation_config.eos_token_id
-        eos_ids = set(raw_eos) if isinstance(raw_eos, (list, tuple)) else {int(raw_eos)}
+    # Match the runtime's stop condition exactly. The artifact declares a single EOS in
+    # metadata.json, so stopping on Qwen's wider generation-config EOS set would make the
+    # reference stop somewhere the runtime does not.
+    eos_ids = {int(token) for token in args.eos_token_ids} if args.eos_token_ids else set()
 
     cases = []
     for index, prompt in enumerate(prompts):
         prompt_tokens = encode_prompt(tokenizer, prompt, use_chat_template=not args.raw_prompt)
-        with torch.no_grad():
-            generated = model.generate(
-                input_ids=torch.tensor([prompt_tokens], dtype=torch.long),
-                max_new_tokens=args.max_new_tokens,
-                min_new_tokens=args.max_new_tokens if args.forbid_early_stop else None,
-                do_sample=False,
-                num_beams=1,
-                temperature=None,
-                top_p=None,
-                top_k=None,
-                pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
-            )
-        completion = generated[0][len(prompt_tokens):].tolist()
-        stopped_on_eos = bool(completion) and completion[-1] in eos_ids
+        completion, top_gaps, runner_ups = greedy_generate(
+            model, prompt_tokens, args.max_new_tokens, eos_ids
+        )
         cases.append(
             {
                 "index": index,
@@ -471,20 +612,26 @@ def command_fixtures(args: argparse.Namespace) -> int:
                 "promptTokens": prompt_tokens,
                 "expectedTokens": completion,
                 "expectedText": tokenizer.decode(completion, skip_special_tokens=True),
-                "stoppedOnEOS": stopped_on_eos,
+                "stoppedOnEOS": bool(completion) and completion[-1] in eos_ids,
+                # Per-step top-1/top-2 logit gap and runner-up token. A flip at a step whose
+                # gap is below the runtime's logit error, and whose replacement is exactly the
+                # reference runner-up, is arithmetic precision rather than a wrong result.
+                "topLogitGaps": top_gaps,
+                "runnerUpTokens": runner_ups,
+                "minTopLogitGap": min(top_gaps) if top_gaps else None,
             }
         )
         print(
-            f"[fixtures] {index}: {len(prompt_tokens)} prompt + {len(completion)} generated tokens",
+            f"[fixtures] {index}: {len(prompt_tokens)} prompt + {len(completion)} generated "
+            f"tokens, min top-1/top-2 gap {min(top_gaps):.4f}",
             flush=True,
         )
 
     fixture = {
         "model": "Qwen2.5-0.5B-Instruct",
-        "reference": "pytorch fp32 greedy (transformers generate, do_sample=False, num_beams=1)",
+        "reference": "pytorch fp32 pure greedy argmax over raw logits (no logits processors)",
         "chatTemplate": not args.raw_prompt,
         "maxNewTokens": args.max_new_tokens,
-        "forbidEarlyStop": args.forbid_early_stop,
         "eosTokenIds": sorted(eos_ids),
         "cases": cases,
     }
@@ -551,6 +698,27 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parity.set_defaults(func=command_layer_parity)
 
+    logits = subparsers.add_parser(
+        "logit-parity", help="Compare final logits through the whole stack against PyTorch fp32"
+    )
+    logits.add_argument("--source-dir", default=str(default_source_dir()))
+    logits.add_argument("--native-dir", default=str(default_native_dir()))
+    logits.add_argument("--work-dir", default=None)
+    logits.add_argument(
+        "--fixture",
+        default=str(
+            REPO_ROOT / "Tests/RealModelInferenceTests/Fixtures/qwen25-05b-greedy-reference.json"
+        ),
+    )
+    logits.add_argument(
+        "--cases", type=int, nargs="*", default=None, help="Fixture case indices (default: all)"
+    )
+    logits.add_argument(
+        "--backends", nargs="+", default=["cpu-fp32", "ane"], choices=["cpu-fp32", "cpu-fp16", "ane"]
+    )
+    logits.add_argument("--report-json", default=None)
+    logits.set_defaults(func=command_logit_parity)
+
     fixtures = subparsers.add_parser("fixtures", help="Write greedy reference token fixtures")
     fixtures.add_argument("--source-dir", default=str(default_source_dir()))
     fixtures.add_argument("--prompts", default=str(REPO_ROOT / "scripts" / "qwen25_prompts.txt"))
@@ -563,9 +731,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Tokenize prompts verbatim instead of through the instruct chat template",
     )
     fixtures.add_argument(
-        "--forbid-early-stop",
-        action="store_true",
-        help="Force exactly --max-new-tokens tokens so every case exercises the full horizon",
+        "--eos-token-ids",
+        type=int,
+        nargs="*",
+        default=[151645],
+        help=(
+            "Token IDs that stop generation. Must match the artifact's metadata.json eosToken "
+            "so the reference stops exactly where the runtime does (default: 151645)"
+        ),
     )
     fixtures.set_defaults(func=command_fixtures)
 

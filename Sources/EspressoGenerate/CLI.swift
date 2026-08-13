@@ -313,6 +313,7 @@ struct MetadataConfigFile: Decodable {
     let ropeTheta: Float?
     let eosToken: Int?
     let architecture: String
+    let preferredDecodePath: String?
 
     func asConfig() throws -> MultiModelConfig {
         let parsedArchitecture: MultiModelConfig.Architecture
@@ -323,6 +324,18 @@ struct MetadataConfigFile: Decodable {
             parsedArchitecture = .llama
         default:
             throw CLIError.runtime("Unsupported architecture in metadata.json: \(architecture)")
+        }
+        var parsedDecodePath: MultiModelConfig.PreferredDecodePath?
+        if let preferredDecodePath {
+            let normalized = preferredDecodePath
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+            guard let value = MultiModelConfig.PreferredDecodePath(rawValue: normalized) else {
+                throw CLIError.runtime(
+                    "Unsupported preferredDecodePath in metadata.json: \(preferredDecodePath) (expected \"hybrid\" or \"exact_cpu\")"
+                )
+            }
+            parsedDecodePath = value
         }
         return MultiModelConfig(
             name: name,
@@ -337,7 +350,8 @@ struct MetadataConfigFile: Decodable {
             normEps: normEps,
             ropeTheta: ropeTheta ?? 10_000.0,
             eosToken: eosToken.flatMap(TokenID.init),
-            architecture: parsedArchitecture
+            architecture: parsedArchitecture,
+            preferredDecodePath: parsedDecodePath
         )
     }
 }

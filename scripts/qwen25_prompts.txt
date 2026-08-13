@@ -1,18 +1,21 @@
-# Fixed prompt suite for Qwen2.5-0.5B-Instruct parity.
+# Fixed prompt suite for Qwen2.5-0.5B-Instruct greedy parity.
 #
 # Blank lines and lines starting with '#' are ignored. Each remaining line is one user
 # turn, wrapped in Qwen's instruct chat template unless --raw-prompt is passed.
 #
-# Prompts are deliberately short, deterministic in intent, and varied across factual
-# recall, arithmetic, code, and list formatting so a parity failure is more likely to
-# surface as a token mismatch than to be masked by a generic refusal.
-What is the capital of France?
-Write a Python function that reverses a string.
-Explain what a neural engine is in two sentences.
-List three primary colors.
-What is 17 multiplied by 23?
-Name the largest planet in the solar system.
-Translate "good morning" into Spanish.
-Summarize why unit tests are useful in one sentence.
-Who wrote the novel Pride and Prejudice?
-What does the acronym GPU stand for?
+# Prompts are open-ended on purpose: the parity suite must exercise at least 32 decode
+# steps per prompt, and short factual questions make the model emit EOS well before that.
+# They still span distinct behaviours (exposition, code, enumeration, arithmetic
+# reasoning, translation) so a numerical fault is unlikely to hide behind one output style.
+Explain how a neural network learns from data.
+Write a Python function that reverses a string and explain how it works.
+Describe the differences between a CPU and a GPU.
+Explain why unit tests are useful when refactoring code.
+Walk through how to compute 17 multiplied by 23 step by step.
+Describe the planets of the solar system in order from the sun.
+Explain what a compiler does and list its main stages.
+Summarize the plot of Pride and Prejudice.
+Explain the difference between a list and a tuple in Python.
+Describe how photosynthesis works in plants.
+Explain what an API is to someone new to programming.
+Describe three common sorting algorithms and their trade-offs.

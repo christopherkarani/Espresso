@@ -173,12 +173,14 @@ import ModelSupport
         normEps: 1e-6,
         ropeTheta: 1_000_000,
         eosToken: 151645,
-        architecture: "llama"
+        architecture: "llama",
+        preferredDecodePath: nil
     )
 
     let config = try metadata.asConfig()
     #expect(config.ropeTheta == 1_000_000)
     #expect(config.eosToken == 151645)
+    #expect(config.preferredDecodePath == nil)
 }
 
 @Test func test_resolveCoreMLModelPathUsesExplicitPathForLlama() throws {

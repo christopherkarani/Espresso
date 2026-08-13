@@ -427,6 +427,9 @@ def write_metadata(output_dir: Path, shape: QwenShape, max_seq: int) -> dict:
         "eosToken": shape.eos_token,
         # MultiModelConfig has no `qwen` case; qwen is served by the llama layer family.
         "architecture": "llama",
+        # Declared explicitly because the runtime otherwise routes anything named "qwen" to
+        # the pure-CPU oracle, which would mean this bundle never touched the ANE.
+        "preferredDecodePath": "hybrid",
     }
     (output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
     return metadata

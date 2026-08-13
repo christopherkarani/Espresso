@@ -829,6 +829,119 @@ private func shouldRunLegacyQwenExperimentTests(
     )
 }
 
+private func makeDecodePathRoutingConfig(
+    name: String,
+    preferredDecodePath: MultiModelConfig.PreferredDecodePath? = nil
+) -> MultiModelConfig {
+    MultiModelConfig(
+        name: name,
+        nLayer: 1,
+        nHead: 2,
+        nKVHead: 2,
+        dModel: 8,
+        headDim: 4,
+        hiddenDim: 16,
+        vocab: 64,
+        maxSeq: 8,
+        normEps: 1e-5,
+        architecture: .llama,
+        preferredDecodePath: preferredDecodePath
+    )
+}
+
+@Test func test_preferredDecodePathOverridesLegacyQwenNameRouting() {
+    // A Qwen-named artifact that declares the hybrid path must reach the ANE, otherwise
+    // "runs on the ANE" would silently mean "runs on the CPU".
+    #expect(
+        RealModelInferenceEngine.llamaGenerationPath(
+            config: makeDecodePathRoutingConfig(name: "Qwen2.5-0.5B-Instruct", preferredDecodePath: .hybrid),
+            environment: [:]
+        ) == .hybrid
+    )
+    #expect(
+        RealModelInferenceEngine.llamaGenerationPath(
+            config: makeDecodePathRoutingConfig(name: "llama3", preferredDecodePath: .exactCPU),
+            environment: [:]
+        ) == .exactCPU
+    )
+    // An artifact declaring hybrid still yields to an explicit operator override.
+    #expect(
+        RealModelInferenceEngine.llamaGenerationPath(
+            config: makeDecodePathRoutingConfig(name: "Qwen2.5-0.5B-Instruct", preferredDecodePath: .hybrid),
+            environment: ["ESPRESSO_USE_CPU_EXACT_DECODE": "1"]
+        ) == .exactCPU
+    )
+}
+
+@Test func test_resolvedLlamaGenerationPathThrowsWhenFallbackDisabledWouldLeaveANE() throws {
+    let disabled = ["ESPRESSO_REALMODEL_DISABLE_HYBRID_FALLBACK": "1"]
+
+    // Legacy name-based CPU routing must be loud, naming the policy responsible.
+    do {
+        _ = try RealModelInferenceEngine.resolvedLlamaGenerationPath(
+            config: makeDecodePathRoutingConfig(name: "Qwen2.5-0.5B-Instruct"),
+            environment: disabled
+        )
+        Issue.record("expected legacy Qwen CPU routing to throw when fallback is disabled")
+    } catch let error as RealModelInferenceError {
+        guard case let .hybridFallbackDisabled(stage, reason) = error else {
+            Issue.record("expected hybridFallbackDisabled, got \(error)")
+            return
+        }
+        #expect(stage.contains("decode path"))
+        #expect(reason.contains("legacy Qwen"))
+    }
+
+    // An explicit CPU request must also be loud rather than quietly honoured.
+    do {
+        _ = try RealModelInferenceEngine.resolvedLlamaGenerationPath(
+            config: makeDecodePathRoutingConfig(name: "llama3"),
+            environment: disabled.merging(["ESPRESSO_USE_CPU_EXACT_DECODE": "1"]) { current, _ in current }
+        )
+        Issue.record("expected explicit CPU decode request to throw when fallback is disabled")
+    } catch let error as RealModelInferenceError {
+        guard case let .hybridFallbackDisabled(_, reason) = error else {
+            Issue.record("expected hybridFallbackDisabled, got \(error)")
+            return
+        }
+        #expect(reason.contains("ESPRESSO_USE_CPU_EXACT_DECODE"))
+    }
+
+    // An artifact that declares exact_cpu is still a fallback when the flag forbids one.
+    do {
+        _ = try RealModelInferenceEngine.resolvedLlamaGenerationPath(
+            config: makeDecodePathRoutingConfig(name: "llama3", preferredDecodePath: .exactCPU),
+            environment: disabled
+        )
+        Issue.record("expected declared exact_cpu routing to throw when fallback is disabled")
+    } catch let error as RealModelInferenceError {
+        guard case let .hybridFallbackDisabled(_, reason) = error else {
+            Issue.record("expected hybridFallbackDisabled, got \(error)")
+            return
+        }
+        #expect(reason.contains("preferredDecodePath"))
+    }
+
+    // The hybrid path is unaffected by the flag.
+    #expect(
+        try RealModelInferenceEngine.resolvedLlamaGenerationPath(
+            config: makeDecodePathRoutingConfig(name: "Qwen2.5-0.5B-Instruct", preferredDecodePath: .hybrid),
+            environment: disabled
+        ) == .hybrid
+    )
+}
+
+@Test func test_hybridFallbackDisabledErrorNamesStageAndReason() {
+    let error = RealModelInferenceError.hybridFallbackDisabled(
+        stage: "hybrid decode compile",
+        reason: "unsupported op: fancy_new_activation"
+    )
+    let description = error.errorDescription ?? ""
+    #expect(description.contains("ESPRESSO_REALMODEL_DISABLE_HYBRID_FALLBACK=1"))
+    #expect(description.contains("hybrid decode compile"))
+    #expect(description.contains("fancy_new_activation"))
+}
+
 @Test func test_decodeContextFromCaches_respectsVisibleTokenCount() {
     let qOut: [Float] = [1, 0]
     let kCache: [Float] = [

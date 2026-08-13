@@ -28,6 +28,11 @@ private struct Options {
     var positions: Int
     var backend: Backend
     var layers: [Int]?
+    /// Feed each layer's output into the next layer instead of using reference inputs.
+    ///
+    /// Isolated mode measures one layer's error; chained mode measures the error the whole
+    /// stack actually accumulates, which is what determines the final logits.
+    var chain: Bool = false
 }
 
 private func fail(_ message: String) -> Never {
@@ -47,6 +52,7 @@ private func parseOptions(_ argv: [String]) -> Options {
     var positions: Int?
     var backend: Backend?
     var layers: [Int]?
+    var chain = false
 
     var index = 1
     while index < argv.count {
@@ -78,6 +84,8 @@ private func parseOptions(_ argv: [String]) -> Options {
             }
             guard !parsed.isEmpty else { fail("--layers must name at least one layer") }
             layers = parsed
+        case "--chain":
+            chain = true
         case "-h", "--help":
             print(usage)
             exit(0)
@@ -99,7 +107,8 @@ private func parseOptions(_ argv: [String]) -> Options {
         outputPath: outputPath,
         positions: positions,
         backend: backend,
-        layers: layers
+        layers: layers,
+        chain: chain
     )
 }
 
@@ -143,10 +152,12 @@ for layer in requestedLayers where layer < 0 || layer >= config.nLayer {
     fail("layer \(layer) out of range for nLayer \(config.nLayer)")
 }
 
-let perLayerCount = options.positions * config.dModel
-let flatInputs = readFloat32File(
+private let perLayerCount = options.positions * config.dModel
+// Chained mode consumes only the first layer's inputs and produces only the final hidden
+// states, so the file holds one layer's worth in each direction.
+private let flatInputs = readFloat32File(
     at: options.inputsPath,
-    expectedCount: requestedLayers.count * perLayerCount
+    expectedCount: (options.chain ? 1 : requestedLayers.count) * perLayerCount
 )
 
 FileHandle.standardError.write(
@@ -160,15 +171,20 @@ FileHandle.standardError.write(
 )
 
 var flatOutputs = [Float]()
-flatOutputs.reserveCapacity(requestedLayers.count * perLayerCount)
+flatOutputs.reserveCapacity((options.chain ? 1 : requestedLayers.count) * perLayerCount)
+var chainedStates: [[Float]] = []
 
 for (slot, layer) in requestedLayers.enumerated() {
-    let base = slot * perLayerCount
     var inputs: [[Float]] = []
-    inputs.reserveCapacity(options.positions)
-    for position in 0..<options.positions {
-        let start = base + position * config.dModel
-        inputs.append(Array(flatInputs[start..<(start + config.dModel)]))
+    if options.chain, slot > 0 {
+        inputs = chainedStates
+    } else {
+        let base = options.chain ? 0 : slot * perLayerCount
+        inputs.reserveCapacity(options.positions)
+        for position in 0..<options.positions {
+            let start = base + position * config.dModel
+            inputs.append(Array(flatInputs[start..<(start + config.dModel)]))
+        }
     }
 
     let result: QwenLayerParityProbe.LayerOutputs
@@ -205,13 +221,23 @@ for (slot, layer) in requestedLayers.enumerated() {
     guard result.outputs.count == options.positions else {
         fail("layer \(layer) returned \(result.outputs.count) positions, expected \(options.positions)")
     }
-    for (position, output) in result.outputs.enumerated() {
-        guard output.count == config.dModel else {
-            fail("layer \(layer) position \(position) returned \(output.count) values, expected \(config.dModel)")
+    for (position, output) in result.outputs.enumerated() where output.count != config.dModel {
+        fail("layer \(layer) position \(position) returned \(output.count) values, expected \(config.dModel)")
+    }
+    if options.chain {
+        chainedStates = result.outputs
+    } else {
+        for output in result.outputs {
+            flatOutputs.append(contentsOf: output)
         }
-        flatOutputs.append(contentsOf: output)
     }
     FileHandle.standardError.write(Data("  layer \(layer): ok (\(result.backend))\n".utf8))
+}
+
+if options.chain {
+    for output in chainedStates {
+        flatOutputs.append(contentsOf: output)
+    }
 }
 
 writeFloat32File(flatOutputs, to: options.outputPath)
