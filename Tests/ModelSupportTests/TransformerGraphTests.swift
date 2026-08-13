@@ -50,8 +50,15 @@ import ANEPasses
 
     #expect(paths.qNorm == "/tmp/qwen/layers/3/q_norm.bin")
     #expect(paths.kNorm == "/tmp/qwen/layers/3/k_norm.bin")
-    #expect(paths.bq == nil)
+    // Q/K/V bias paths are always offered on the llama family; on-disk presence decides
+    // whether they are used, because Qwen2 biases q/k/v and plain llama does not.
+    #expect(paths.bq == "/tmp/qwen/layers/3/bq.bin")
+    #expect(paths.bk == "/tmp/qwen/layers/3/bk.bin")
+    #expect(paths.bv == "/tmp/qwen/layers/3/bv.bin")
+    // o_proj and the MLP are bias-free in every llama-family checkpoint we serve.
     #expect(paths.bo == nil)
+    #expect(paths.b1 == nil)
+    #expect(paths.b2 == nil)
 }
 
 @Test func supportedMaskBucketsMatchConverterContract() {

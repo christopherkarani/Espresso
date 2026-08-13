@@ -67,6 +67,7 @@ docs/*
 !docs/coreml-vs-espresso-benchmarks.html
 !docs/gpt2-926-tokens-per-second.html
 !docs/reverse-engineering-apple-neural-engine.html
+!docs/qwen-parity.md
 prompts/
 scripts/
 !scripts/
@@ -85,6 +86,10 @@ scripts/internal/**
 !scripts/export_llama_coreml.py
 !scripts/convert_weights_gpt2.py
 !scripts/convert_weights_llama.py
+!scripts/convert_qwen25_05b_to_esp.py
+!scripts/qwen25_pytorch_reference.py
+!scripts/qwen25_parity.sh
+!scripts/qwen25_prompts.txt
 !scripts/bootstrap_gpt2_demo.py
 !scripts/export_gpt2_coreml.py
 !scripts/run_gpt2_coreml_reference.py

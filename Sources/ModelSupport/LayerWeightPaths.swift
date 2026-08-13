@@ -62,9 +62,12 @@ public struct LayerWeightPaths: Sendable, Equatable {
                 wk: path("wk.bin"),
                 wv: path("wv.bin"),
                 wo: path("wo.bin"),
-                bq: nil,
-                bk: nil,
-                bv: nil,
+                // Qwen2-family checkpoints bias q/k/v (and only q/k/v). Plain llama
+                // checkpoints have no bias files, so presence decides: loaders treat
+                // bq/bk/bv as an all-or-nothing group, like q_norm/k_norm.
+                bq: path("bq.bin"),
+                bk: path("bk.bin"),
+                bv: path("bv.bin"),
                 bo: nil,
                 rmsFfn: path("rms_ffn.bin"),
                 w1: path("w1.bin"),

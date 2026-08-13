@@ -189,7 +189,8 @@ public struct HybridDecodeKernelSet: ~Copyable {
             kvDim: kvDim,
             laneSpatial: laneSpatial,
             architecture: weights.architecture,
-            normEps: weights.normEps
+            normEps: weights.normEps,
+            hasQKVBias: weights.hasQKVBias
         )
 
         let rms1Blob = buildBlob(from: weights.rmsAtt, rows: 1, cols: dim)
@@ -201,7 +202,7 @@ public struct HybridDecodeKernelSet: ~Copyable {
         let bkBlob = buildBlob(from: weights.bk, rows: 1, cols: kvDim)
         let bvBlob = buildBlob(from: weights.bv, rows: 1, cols: kvDim)
 
-        let qkvWeights: [(path: String, data: Data)]
+        var qkvWeights: [(path: String, data: Data)]
         switch weights.architecture {
         case .rmsNormSwiGLU:
             qkvWeights = [
@@ -210,6 +211,13 @@ public struct HybridDecodeKernelSet: ~Copyable {
                 (path: "@model_path/weights/wk.bin", data: wkBlob),
                 (path: "@model_path/weights/wv.bin", data: wvBlob),
             ]
+            if weights.hasQKVBias {
+                qkvWeights += [
+                    (path: "@model_path/weights/bq.bin", data: bqBlob),
+                    (path: "@model_path/weights/bk.bin", data: bkBlob),
+                    (path: "@model_path/weights/bv.bin", data: bvBlob),
+                ]
+            }
         case .gpt2:
             qkvWeights = [
                 (path: "@model_path/weights/rms1.bin", data: rms1Blob),

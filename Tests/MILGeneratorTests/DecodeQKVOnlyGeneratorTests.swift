@@ -98,6 +98,50 @@ final class DecodeQKVOnlyGeneratorTests: XCTestCase {
         XCTAssertFalse(mil.contains("wo.bin"))
     }
 
+    func test_decode_qkv_only_generator_rmsnorm_omits_qkv_bias_by_default() {
+        let mil = DecodeQKVOnlyGenerator(laneSpatial: 32, architecture: .rmsNormSwiGLU).milText
+
+        XCTAssertFalse(mil.contains("bq.bin"))
+        XCTAssertFalse(mil.contains("bk.bin"))
+        XCTAssertFalse(mil.contains("bv.bin"))
+        XCTAssertFalse(mil.contains("rms1_beta.bin"))
+    }
+
+    /// Qwen2-family layers keep RMSNorm/SwiGLU but bias q/k/v. Dropping those biases is a
+    /// silent accuracy bug, so pin the opt-in.
+    func test_decode_qkv_only_generator_rmsnorm_emits_qkv_bias_when_requested() {
+        let dim = 896
+        let kvDim = 128
+        let mil = DecodeQKVOnlyGenerator(
+            dim: dim,
+            qDim: dim,
+            kvDim: kvDim,
+            laneSpatial: 32,
+            architecture: .rmsNormSwiGLU,
+            normEps: 1e-6,
+            hasQKVBias: true
+        ).milText
+
+        XCTAssertTrue(mil.contains("bq.bin"))
+        XCTAssertTrue(mil.contains("bk.bin"))
+        XCTAssertTrue(mil.contains("bv.bin"))
+        // Bias is an add on the conv output, not a LayerNorm beta.
+        XCTAssertFalse(mil.contains("rms1_beta.bin"))
+        // Bias blobs are broadcast channel vectors added to the conv output.
+        XCTAssertTrue(mil.contains("tensor<fp16, [1, \(dim), 1, 1]>"))
+        XCTAssertTrue(mil.contains("tensor<fp16, [1, \(kvDim), 1, 1]>"))
+        XCTAssertTrue(mil.contains("q_out"))
+        XCTAssertTrue(mil.contains("k_out"))
+        XCTAssertTrue(mil.contains("v_out"))
+    }
+
+    func test_decode_qkv_only_generator_gpt2_always_biases_qkv() {
+        let generator = DecodeQKVOnlyGenerator(laneSpatial: 32, architecture: .gpt2, hasQKVBias: false)
+
+        XCTAssertTrue(generator.hasQKVBias)
+        XCTAssertTrue(generator.milText.contains("bq.bin"))
+    }
+
     func test_decode_qkv_only_generator_uses_custom_norm_epsilon() {
         let mil = DecodeQKVOnlyGenerator(
             dim: 1024,

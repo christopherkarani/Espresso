@@ -488,6 +488,14 @@ public struct RealModelInferenceEngine: ~Copyable {
         let k: [Float]
     }
 
+    /// Q/K/V projection biases for llama-family layers that have them (Qwen2 does; plain
+    /// llama does not). Always all three or none.
+    struct LlamaQKVBiasWeights: Sendable {
+        let q: [Float]
+        let k: [Float]
+        let v: [Float]
+    }
+
     struct LlamaCPUQKVWeights: Sendable {
         let rmsAtt: [Float]
         let wq: [Float]
@@ -495,6 +503,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         let wv: [Float]
         let qNorm: [Float]?
         let kNorm: [Float]?
+        let qkvBias: LlamaQKVBiasWeights?
     }
 
     struct ExactCPULlamaLayerWeights: Sendable {
@@ -509,6 +518,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         let w3: [Float]
         let qNorm: [Float]?
         let kNorm: [Float]?
+        let qkvBias: LlamaQKVBiasWeights?
     }
 
     private struct CachedExactCPULlamaWeights: Sendable {
@@ -696,27 +706,30 @@ public struct RealModelInferenceEngine: ~Copyable {
                     eps: Float(config.normEps)
                 )
                 var q = maybeRound(
-                    RealModelInferenceEngine.multiplyRowMajorMatrix(
+                    RealModelInferenceEngine.projectRowMajorMatrix(
                         matrix: layer.wq,
                         rows: config.attentionDim,
                         cols: config.dModel,
-                        vector: attnNormed
+                        vector: attnNormed,
+                        bias: layer.qkvBias?.q
                     )
                 )
                 var k = maybeRound(
-                    RealModelInferenceEngine.multiplyRowMajorMatrix(
+                    RealModelInferenceEngine.projectRowMajorMatrix(
                         matrix: layer.wk,
                         rows: config.kvDim,
                         cols: config.dModel,
-                        vector: attnNormed
+                        vector: attnNormed,
+                        bias: layer.qkvBias?.k
                     )
                 )
                 let vRounded = maybeRound(
-                    RealModelInferenceEngine.multiplyRowMajorMatrix(
+                    RealModelInferenceEngine.projectRowMajorMatrix(
                         matrix: layer.wv,
                         rows: config.kvDim,
                         cols: config.dModel,
-                        vector: attnNormed
+                        vector: attnNormed,
+                        bias: layer.qkvBias?.v
                     )
                 )
 
@@ -5742,6 +5755,11 @@ public struct RealModelInferenceEngine: ~Copyable {
                     vector: UnsafeBufferPointer(attnNormedBuf),
                     into: vBuf
                 )
+                if let qkvBias = weights.qkvBias {
+                    Self.addBiasInPlace(qkvBias.q, into: qBuf)
+                    Self.addBiasInPlace(qkvBias.k, into: kBuf)
+                    Self.addBiasInPlace(qkvBias.v, into: vBuf)
+                }
 
                 do {
                     try SurfaceIO.writeFP16SpatialSlice(
@@ -6224,27 +6242,30 @@ public struct RealModelInferenceEngine: ~Copyable {
                 let layer = layers[layerIndex]
                 let attnNormed = Self.rmsNorm(hidden, weight: layer.rmsAtt, eps: Float(config.normEps))
                 var q = maybeRound(
-                    Self.multiplyRowMajorMatrix(
+                    Self.projectRowMajorMatrix(
                         matrix: layer.wq,
                         rows: config.attentionDim,
                         cols: config.dModel,
-                        vector: attnNormed
+                        vector: attnNormed,
+                        bias: layer.qkvBias?.q
                     )
                 )
                 var k = maybeRound(
-                    Self.multiplyRowMajorMatrix(
+                    Self.projectRowMajorMatrix(
                         matrix: layer.wk,
                         rows: config.kvDim,
                         cols: config.dModel,
-                        vector: attnNormed
+                        vector: attnNormed,
+                        bias: layer.qkvBias?.k
                     )
                 )
                 let vRounded = maybeRound(
-                    Self.multiplyRowMajorMatrix(
+                    Self.projectRowMajorMatrix(
                         matrix: layer.wv,
                         rows: config.kvDim,
                         cols: config.dModel,
-                        vector: attnNormed
+                        vector: attnNormed,
+                        bias: layer.qkvBias?.v
                     )
                 )
 
@@ -6535,6 +6556,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         paths: LayerWeightPaths
     ) throws -> LayerWeights {
         let qkNormWeights = try loadLlamaQKNormWeights(config: config, paths: paths)
+        let qkvBias = try loadLlamaQKVBiasWeights(config: config, paths: paths)
         let qDim = config.attentionDim
         let kvDim = config.kvDim
         let weights = LayerWeights(
@@ -6545,7 +6567,8 @@ public struct RealModelInferenceEngine: ~Copyable {
             kvDim: kvDim,
             normEps: config.normEps,
             qNormDim: qkNormWeights == nil ? nil : config.headDim,
-            kNormDim: qkNormWeights == nil ? nil : config.headDim
+            kNormDim: qkNormWeights == nil ? nil : config.headDim,
+            hasQKVBias: qkvBias != nil
         )
 
         try loadTensor(weights.rmsAtt, from: paths.rmsAtt, expectedCount: config.dModel)
@@ -6553,6 +6576,17 @@ public struct RealModelInferenceEngine: ~Copyable {
         try loadTensor(weights.Wk, from: paths.wk, expectedCount: config.dModel * kvDim)
         try loadTensor(weights.Wv, from: paths.wv, expectedCount: config.dModel * kvDim)
         try loadTensor(weights.Wo, from: paths.wo, expectedCount: config.dModel * qDim)
+        if let qkvBias {
+            weights.bq.withUnsafeMutableBufferPointer { dst in
+                _ = dst.initialize(from: qkvBias.q)
+            }
+            weights.bk.withUnsafeMutableBufferPointer { dst in
+                _ = dst.initialize(from: qkvBias.k)
+            }
+            weights.bv.withUnsafeMutableBufferPointer { dst in
+                _ = dst.initialize(from: qkvBias.v)
+            }
+        }
         if let qkNormWeights {
             weights.qNorm.withUnsafeMutableBufferPointer { dst in
                 _ = dst.initialize(from: qkNormWeights.q)
@@ -6606,6 +6640,33 @@ public struct RealModelInferenceEngine: ~Copyable {
         )
     }
 
+    /// Load `bq`/`bk`/`bv` when the layer has them. Qwen2-family checkpoints bias q/k/v;
+    /// plain llama checkpoints ship no bias files. A partial set is a converter bug and
+    /// must fail loudly rather than silently drop a bias term.
+    static func loadLlamaQKVBiasWeights(
+        config: MultiModelConfig,
+        paths: LayerWeightPaths
+    ) throws -> LlamaQKVBiasWeights? {
+        let presence = [paths.bq, paths.bk, paths.bv].map { fileExists(at: $0) }
+        guard presence.contains(true) else {
+            return nil
+        }
+        guard !presence.contains(false),
+              let bqPath = paths.bq,
+              let bkPath = paths.bk,
+              let bvPath = paths.bv else {
+            let layerDirectory = URL(fileURLWithPath: paths.wq).deletingLastPathComponent()
+            throw RealModelInferenceError.runtimeFailure(
+                "Incomplete llama Q/K/V bias weights for \(layerDirectory.path); expected all of bq.bin, bk.bin, bv.bin"
+            )
+        }
+        return LlamaQKVBiasWeights(
+            q: try loadWeightTablePreferringFloat32Sidecar(at: bqPath, expectedCount: config.attentionDim),
+            k: try loadWeightTablePreferringFloat32Sidecar(at: bkPath, expectedCount: config.kvDim),
+            v: try loadWeightTablePreferringFloat32Sidecar(at: bvPath, expectedCount: config.kvDim)
+        )
+    }
+
     private static func loadLlamaCPUQKVWeights(
         config: MultiModelConfig,
         paths: LayerWeightPaths
@@ -6617,7 +6678,8 @@ public struct RealModelInferenceEngine: ~Copyable {
             wk: try loadWeightTablePreferringFloat32Sidecar(at: paths.wk, expectedCount: config.dModel * config.kvDim),
             wv: try loadWeightTablePreferringFloat32Sidecar(at: paths.wv, expectedCount: config.dModel * config.kvDim),
             qNorm: qkNormWeights?.q,
-            kNorm: qkNormWeights?.k
+            kNorm: qkNormWeights?.k,
+            qkvBias: try loadLlamaQKVBiasWeights(config: config, paths: paths)
         )
     }
 
@@ -6641,7 +6703,8 @@ public struct RealModelInferenceEngine: ~Copyable {
             w2: try loadWeightTablePreferringFloat32Sidecar(at: paths.w2, expectedCount: config.dModel * config.hiddenDim),
             w3: try loadWeightTablePreferringFloat32Sidecar(at: w3Path, expectedCount: config.hiddenDim * config.dModel),
             qNorm: qkNormWeights?.q,
-            kNorm: qkNormWeights?.k
+            kNorm: qkNormWeights?.k,
+            qkvBias: try loadLlamaQKVBiasWeights(config: config, paths: paths)
         )
     }
 
@@ -6713,6 +6776,39 @@ public struct RealModelInferenceEngine: ~Copyable {
                     into: outputBuffer
                 )
             }
+        }
+        return output
+    }
+
+    private static func addBiasInPlace(_ bias: [Float], into output: UnsafeMutableBufferPointer<Float>) {
+        precondition(bias.count == output.count)
+        bias.withUnsafeBufferPointer { biasBuffer in
+            vDSP_vadd(
+                output.baseAddress!,
+                1,
+                biasBuffer.baseAddress!,
+                1,
+                output.baseAddress!,
+                1,
+                vDSP_Length(output.count)
+            )
+        }
+    }
+
+    /// Row-major `(out, in)` projection with an optional additive bias, matching a single
+    /// `nn.Linear` on the PyTorch side and the conv+add pair the ANE kernel emits.
+    private static func projectRowMajorMatrix(
+        matrix: [Float],
+        rows: Int,
+        cols: Int,
+        vector: [Float],
+        bias: [Float]?
+    ) -> [Float] {
+        var output = multiplyRowMajorMatrix(matrix: matrix, rows: rows, cols: cols, vector: vector)
+        guard let bias else { return output }
+        precondition(bias.count == rows)
+        for index in 0..<rows {
+            output[index] += bias[index]
         }
         return output
     }

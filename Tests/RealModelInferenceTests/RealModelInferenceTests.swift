@@ -899,7 +899,10 @@ private func shouldRunLegacyQwenExperimentTests(
     #expect(llamaPaths.rmsAtt == "\(root)/layers/5/rms_att.bin")
     #expect(llamaPaths.qNorm == "\(root)/layers/5/q_norm.bin")
     #expect(llamaPaths.kNorm == "\(root)/layers/5/k_norm.bin")
-    #expect(llamaPaths.bq == nil)
+    #expect(llamaPaths.bq == "\(root)/layers/5/bq.bin")
+    #expect(llamaPaths.bk == "\(root)/layers/5/bk.bin")
+    #expect(llamaPaths.bv == "\(root)/layers/5/bv.bin")
+    #expect(llamaPaths.bo == nil)
     #expect(llamaPaths.rmsFfn == "\(root)/layers/5/rms_ffn.bin")
     #expect(llamaPaths.w3 == "\(root)/layers/5/w3.bin")
 
@@ -984,6 +987,69 @@ private func shouldRunLegacyQwenExperimentTests(
     )
 
     try expectRealModelInferenceError(containing: "Mismatched llama Q/K norm weights") {
+        _ = try RealModelInferenceEngine.loadHybridLayerWeightsLlamaForTesting(
+            config: config,
+            weightDir: weightDir.path,
+            layer: 0
+        )
+    }
+}
+
+/// Qwen2-family checkpoints bias q/k/v. The llama hybrid loader must pick those up and
+/// tell the ANE kernel to emit the bias adds, otherwise decode is silently wrong.
+@Test func test_loadHybridLayerWeightsLlamaLoadsQKVBiasWhenPresent() throws {
+    let config = makeTinyLlamaConfig()
+    let bq: [Float] = [0.5, -0.25, 1.0, 0.125, -0.75, 0.375, 0.625, -0.5]
+    let bk: [Float] = [0.25, -0.125, 0.75, 0.0625]
+    let bv: [Float] = [-0.375, 0.5, 0.125, -0.25]
+    let weightDir = try makeMinimalLlamaLayerWeightDirectory(
+        config: config,
+        bq: bq,
+        bk: bk,
+        bv: bv
+    )
+
+    let weights = try RealModelInferenceEngine.loadHybridLayerWeightsLlamaForTesting(
+        config: config,
+        weightDir: weightDir.path,
+        layer: 0
+    )
+
+    let hasQKVBias = weights.hasQKVBias
+    let loadedBq = weights.bq.withUnsafeBufferPointer { Array($0) }
+    let loadedBk = weights.bk.withUnsafeBufferPointer { Array($0) }
+    let loadedBv = weights.bv.withUnsafeBufferPointer { Array($0) }
+    #expect(hasQKVBias)
+    #expect(loadedBq == bq)
+    #expect(loadedBk == bk)
+    #expect(loadedBv == bv)
+}
+
+@Test func test_loadHybridLayerWeightsLlamaLeavesQKVBiasAbsentWhenFilesMissing() throws {
+    let config = makeTinyLlamaConfig()
+    let weightDir = try makeMinimalLlamaLayerWeightDirectory(config: config)
+
+    let weights = try RealModelInferenceEngine.loadHybridLayerWeightsLlamaForTesting(
+        config: config,
+        weightDir: weightDir.path,
+        layer: 0
+    )
+
+    let hasQKVBias = weights.hasQKVBias
+    #expect(hasQKVBias == false)
+}
+
+/// A partial bias set means the converter dropped a tensor. Fail loudly instead of
+/// serving two biased projections and one unbiased one.
+@Test func test_loadHybridLayerWeightsLlamaRejectsPartialQKVBias() throws {
+    let config = makeTinyLlamaConfig()
+    let weightDir = try makeMinimalLlamaLayerWeightDirectory(
+        config: config,
+        bq: [0.5, -0.25, 1.0, 0.125, -0.75, 0.375, 0.625, -0.5],
+        bk: [0.25, -0.125, 0.75, 0.0625]
+    )
+
+    try expectRealModelInferenceError(containing: "Incomplete llama Q/K/V bias weights") {
         _ = try RealModelInferenceEngine.loadHybridLayerWeightsLlamaForTesting(
             config: config,
             weightDir: weightDir.path,
@@ -3099,7 +3165,10 @@ private func makeTinyLlamaConfig() -> MultiModelConfig {
 private func makeMinimalLlamaLayerWeightDirectory(
     config: MultiModelConfig,
     qNorm: [Float]? = nil,
-    kNorm: [Float]? = nil
+    kNorm: [Float]? = nil,
+    bq: [Float]? = nil,
+    bk: [Float]? = nil,
+    bv: [Float]? = nil
 ) throws -> URL {
     let root = try makeTempDirectory()
     let layerDir = root
@@ -3123,6 +3192,15 @@ private func makeMinimalLlamaLayerWeightDirectory(
     }
     if let kNorm {
         try writeBlob(values: kNorm, to: layerDir.appendingPathComponent("k_norm.bin"))
+    }
+    if let bq {
+        try writeBlob(values: bq, to: layerDir.appendingPathComponent("bq.bin"))
+    }
+    if let bk {
+        try writeBlob(values: bk, to: layerDir.appendingPathComponent("bk.bin"))
+    }
+    if let bv {
+        try writeBlob(values: bv, to: layerDir.appendingPathComponent("bv.bin"))
     }
 
     return root
