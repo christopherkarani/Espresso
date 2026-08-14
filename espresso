@@ -22,6 +22,8 @@ Usage:
   ./espresso bench [options] [prompt...]
   ./espresso suite [options]
   ./espresso generate [options] [prompt...]
+  ./espresso chat [options]
+  ./espresso chat --vs mlx --greedy --model <path.esp>
   ./espresso doctor
   ./espresso prepare
   ./espresso install
@@ -32,6 +34,9 @@ Examples:
   ./espresso compare --no-power "Hello"
   ./espresso bench --output-dir ./reports "Hello"
   ./espresso suite --prompts ./scripts/benchmark-prompts.txt --no-power
+  ./espresso chat --model ~/Library/Caches/Espresso/qwen25-15b/Qwen2.5-1.5B-Instruct.esp
+  ./espresso chat --model <model.esp> --plain --greedy
+  ./espresso chat --vs mlx --greedy --model ~/Library/Caches/Espresso/qwen25-15b/Qwen2.5-1.5B-Instruct.esp
   ./espresso doctor
 
 Notes:
@@ -63,7 +68,7 @@ if [[ $# -eq 0 ]]; then
 fi
 
 case "$1" in
-  demo|compare|bench|suite|generate|doctor)
+  demo|compare|bench|suite|generate|chat|doctor)
     run_generate "$@"
     ;;
   prepare)

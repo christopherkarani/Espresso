@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Convert Qwen2.5-0.5B-Instruct safetensors into an Espresso `.esp` bundle.
+"""Convert Qwen2.5 Instruct safetensors into an Espresso `.esp` bundle.
 
-Qwen2.5-0.5B-Instruct is Apache-2.0 and ungated, so the source weights are
-fetched over plain HTTPS without any HuggingFace token.
+Supported checkpoints (Apache-2.0, ungated):
+
+  * Qwen/Qwen2.5-0.5B-Instruct  (default)
+  * Qwen/Qwen2.5-1.5B-Instruct
 
 The model maps onto Espresso's llama-family layer layout with one addition that
 plain llama does not have: Qwen2 carries a bias on q/k/v (and only on q/k/v).
@@ -10,7 +12,8 @@ Those land as `bq.bin` / `bk.bin` / `bv.bin` next to the projections.
 
 One-command usage (bootstraps its own Python env when numpy is missing):
 
-    ./scripts/convert_qwen25_05b_to_esp.py --output /tmp/qwen25-05b.esp
+    ./scripts/convert_qwen25_05b_to_esp.py
+    ./scripts/convert_qwen25_05b_to_esp.py --model Qwen/Qwen2.5-1.5B-Instruct
 
 Outputs:
   * a native model directory (fp16 BLOBFILE tensors + metadata.json + tokenizer)
@@ -38,13 +41,16 @@ if TYPE_CHECKING:
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-HF_REPO = "Qwen/Qwen2.5-0.5B-Instruct"
-HF_BASE_URL = f"https://huggingface.co/{HF_REPO}/resolve/main"
+DEFAULT_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
+HF_REPO = DEFAULT_MODEL
 
 # Files copied verbatim into the bundle's tokenizer/ directory. `espc pack-native`
 # recognizes these names and splits them out of weights/ automatically.
 TOKENIZER_FILES = ("tokenizer.json", "tokenizer_config.json", "vocab.json", "merges.txt")
-SOURCE_FILES = ("config.json", "generation_config.json", "model.safetensors", "LICENSE") + TOKENIZER_FILES
+OPTIONAL_SOURCE_FILES = ("generation_config.json", "LICENSE")
+REQUIRED_META_FILES = ("config.json",) + TOKENIZER_FILES
+WEIGHT_INDEX_NAME = "model.safetensors.index.json"
+WEIGHT_SINGLE_NAME = "model.safetensors"
 
 # BLOBFILE payload size is a UInt32, which caps a square causal mask.
 MAX_BLOBFILE_DATA_SIZE = 0xFFFF_FFFF
@@ -54,6 +60,82 @@ BOOTSTRAP_GUARD_ENV = "ESPRESSO_QWEN_CONVERT_BOOTSTRAPPED"
 
 class ConversionError(RuntimeError):
     """Raised for every failure this script can explain to the caller."""
+
+
+@dataclass(frozen=True)
+class ModelProfile:
+    repo: str
+    cache_slug: str
+    source_slug: str
+    official: dict[str, int]
+    rope_theta: float
+
+    @property
+    def short_name(self) -> str:
+        return self.repo.split("/")[-1]
+
+
+OFFICIAL_QWEN25_05B_INSTRUCT = {
+    "n_layer": 24,
+    "n_head": 14,
+    "n_kv_head": 2,
+    "d_model": 896,
+    "head_dim": 64,
+    "hidden_dim": 4864,
+    "vocab": 151936,
+}
+OFFICIAL_QWEN25_15B_INSTRUCT = {
+    "n_layer": 28,
+    "n_head": 12,
+    "n_kv_head": 2,
+    "d_model": 1536,
+    "head_dim": 128,
+    "hidden_dim": 8960,
+    "vocab": 151936,
+}
+OFFICIAL_QWEN25_05B_ROPE_THETA = 1_000_000.0
+OFFICIAL_QWEN25_15B_ROPE_THETA = 1_000_000.0
+
+SUPPORTED_MODELS: dict[str, ModelProfile] = {
+    "Qwen/Qwen2.5-0.5B-Instruct": ModelProfile(
+        repo="Qwen/Qwen2.5-0.5B-Instruct",
+        cache_slug="qwen25-05b",
+        source_slug="qwen25-05b-src",
+        official=OFFICIAL_QWEN25_05B_INSTRUCT,
+        rope_theta=OFFICIAL_QWEN25_05B_ROPE_THETA,
+    ),
+    "Qwen/Qwen2.5-1.5B-Instruct": ModelProfile(
+        repo="Qwen/Qwen2.5-1.5B-Instruct",
+        cache_slug="qwen25-15b",
+        source_slug="qwen25-15b-src",
+        official=OFFICIAL_QWEN25_15B_INSTRUCT,
+        rope_theta=OFFICIAL_QWEN25_15B_ROPE_THETA,
+    ),
+}
+
+
+@dataclass(frozen=True)
+class DefaultPaths:
+    bundle: Path
+    native: Path
+    source: Path
+
+
+def default_paths(profile: ModelProfile, cache_root: Path) -> DefaultPaths:
+    bundle = cache_root / profile.cache_slug / f"{profile.short_name}.esp"
+    return DefaultPaths(
+        bundle=bundle,
+        native=bundle.parent / f"{profile.short_name}-native",
+        source=cache_root / profile.source_slug,
+    )
+
+
+def profile_for_name(name: str) -> ModelProfile:
+    for profile in SUPPORTED_MODELS.values():
+        if profile.short_name == name or profile.repo == name:
+            return profile
+    accepted = ", ".join(SUPPORTED_MODELS)
+    raise ConversionError(f"unsupported model {name!r}; accepted: {accepted}")
 
 
 # ---------------------------------------------------------------------------
@@ -130,26 +212,116 @@ def ensure_runtime_dependencies(allow_bootstrap: bool) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Source download
+# Source resolution (Hugging Face snapshot first, then download)
 # ---------------------------------------------------------------------------
 
 
-def download_source(source_dir: Path, force: bool) -> Path:
-    source_dir.mkdir(parents=True, exist_ok=True)
-    for name in SOURCE_FILES:
-        target = source_dir / name
-        if target.exists() and target.stat().st_size > 0 and not force:
-            continue
-        url = f"{HF_BASE_URL}/{name}"
-        print(f"[download] {name}", flush=True)
-        tmp = target.with_suffix(target.suffix + ".partial")
+def huggingface_hub_root() -> Path:
+    for key in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE"):
+        value = os.environ.get(key, "").strip()
+        if value:
+            return Path(value).expanduser()
+    hf_home = os.environ.get("HF_HOME", "").strip()
+    if hf_home:
+        return Path(hf_home).expanduser() / "hub"
+    return Path.home() / ".cache" / "huggingface" / "hub"
+
+
+def huggingface_snapshot_dir(repo: str, revision: str = "main") -> Path | None:
+    slug = "models--" + repo.replace("/", "--")
+    repo_dir = huggingface_hub_root() / slug
+    ref_file = repo_dir / "refs" / revision
+    if ref_file.exists():
+        commit = ref_file.read_text(encoding="utf-8").strip()
+        snapshot = repo_dir / "snapshots" / commit
+        if snapshot.is_dir():
+            return snapshot
+    snapshot = repo_dir / "snapshots" / revision
+    if snapshot.is_dir():
+        return snapshot
+    return None
+
+
+def _weight_files_present(source_dir: Path) -> bool:
+    index_path = source_dir / WEIGHT_INDEX_NAME
+    if index_path.exists() and index_path.stat().st_size > 0:
         try:
-            with urllib.request.urlopen(url, timeout=120) as response, tmp.open("wb") as handle:
-                shutil.copyfileobj(response, handle, length=1 << 20)
-        except OSError as error:
-            tmp.unlink(missing_ok=True)
-            raise ConversionError(f"failed to download {url}: {error}") from error
-        tmp.replace(target)
+            weight_map = json.loads(index_path.read_text(encoding="utf-8"))["weight_map"]
+        except (OSError, KeyError, json.JSONDecodeError):
+            return False
+        return all(
+            (source_dir / name).exists() and (source_dir / name).stat().st_size > 0
+            for name in set(weight_map.values())
+        )
+    single = source_dir / WEIGHT_SINGLE_NAME
+    return single.exists() and single.stat().st_size > 0
+
+
+def snapshot_is_complete(source_dir: Path) -> bool:
+    for name in ("config.json", "tokenizer.json"):
+        candidate = source_dir / name
+        if not candidate.exists() or candidate.stat().st_size == 0:
+            return False
+    return _weight_files_present(source_dir)
+
+
+def resolve_source_dir(
+    repo: str,
+    explicit: Path | None,
+    cache_root: Path,
+    source_slug: str,
+    force_download: bool,
+) -> Path:
+    if explicit is not None:
+        return explicit
+    fallback = cache_root / source_slug
+    if not force_download:
+        snapshot = huggingface_snapshot_dir(repo)
+        if snapshot is not None and snapshot_is_complete(snapshot):
+            return snapshot
+        if snapshot_is_complete(fallback):
+            return fallback
+    return fallback
+
+
+def _download_file(base_url: str, source_dir: Path, name: str, force: bool, required: bool) -> bool:
+    target = source_dir / name
+    if target.exists() and target.stat().st_size > 0 and not force:
+        return True
+    url = f"{base_url}/{name}"
+    print(f"[download] {name}", flush=True)
+    tmp = target.with_suffix(target.suffix + ".partial")
+    try:
+        with urllib.request.urlopen(url, timeout=120) as response, tmp.open("wb") as handle:
+            shutil.copyfileobj(response, handle, length=1 << 20)
+    except OSError as error:
+        tmp.unlink(missing_ok=True)
+        if not required:
+            print(f"[download] optional {name} unavailable ({error})", flush=True)
+            return False
+        raise ConversionError(f"failed to download {url}: {error}") from error
+    tmp.replace(target)
+    return True
+
+
+def download_source(repo: str, source_dir: Path, force: bool) -> Path:
+    source_dir.mkdir(parents=True, exist_ok=True)
+    base_url = f"https://huggingface.co/{repo}/resolve/main"
+    for name in REQUIRED_META_FILES:
+        _download_file(base_url, source_dir, name, force, required=True)
+    for name in OPTIONAL_SOURCE_FILES:
+        _download_file(base_url, source_dir, name, force, required=False)
+
+    if not force and _weight_files_present(source_dir):
+        return source_dir
+
+    if _download_file(base_url, source_dir, WEIGHT_INDEX_NAME, force, required=False):
+        weight_map = json.loads((source_dir / WEIGHT_INDEX_NAME).read_text(encoding="utf-8"))["weight_map"]
+        for shard in sorted(set(weight_map.values())):
+            _download_file(base_url, source_dir, shard, force, required=True)
+        return source_dir
+
+    _download_file(base_url, source_dir, WEIGHT_SINGLE_NAME, force, required=True)
     return source_dir
 
 
@@ -214,6 +386,45 @@ class SafetensorsFile:
                 f"tensor {name!r} has {values.size} elements but shape {shape} implies {expected}"
             )
         return values.reshape(shape)
+
+
+@dataclass
+class SafetensorsStore:
+    files: list[SafetensorsFile]
+    owners: dict[str, SafetensorsFile]
+
+    @classmethod
+    def open_source(cls, source_dir: Path) -> "SafetensorsStore":
+        index_path = source_dir / WEIGHT_INDEX_NAME
+        if index_path.exists() and index_path.stat().st_size > 0:
+            try:
+                weight_map = json.loads(index_path.read_text(encoding="utf-8"))["weight_map"]
+            except (OSError, KeyError, json.JSONDecodeError) as error:
+                raise ConversionError(f"{index_path} is not a valid safetensors index: {error}") from error
+            opened: dict[str, SafetensorsFile] = {}
+            owners: dict[str, SafetensorsFile] = {}
+            for tensor_name, filename in weight_map.items():
+                if filename not in opened:
+                    opened[filename] = SafetensorsFile.open(source_dir / filename)
+                owners[tensor_name] = opened[filename]
+            return cls(files=list(opened.values()), owners=owners)
+
+        single = source_dir / WEIGHT_SINGLE_NAME
+        if not single.exists() or single.stat().st_size == 0:
+            raise ConversionError(
+                f"{source_dir} has neither {WEIGHT_SINGLE_NAME} nor {WEIGHT_INDEX_NAME}"
+            )
+        store_file = SafetensorsFile.open(single)
+        return cls(files=[store_file], owners={name: store_file for name in store_file.tensor_names()})
+
+    def tensor_names(self) -> list[str]:
+        return sorted(self.owners)
+
+    def read(self, name: str) -> np.ndarray:
+        owner = self.owners.get(name)
+        if owner is None:
+            raise ConversionError(f"tensor {name!r} is missing from the checkpoint")
+        return owner.read(name)
 
 
 # ---------------------------------------------------------------------------
@@ -351,7 +562,7 @@ class QwenShape:
         return self.n_kv_head * self.head_dim
 
 
-def read_shape(source_dir: Path) -> QwenShape:
+def read_shape(source_dir: Path, name: str) -> QwenShape:
     config = json.loads((source_dir / "config.json").read_text(encoding="utf-8"))
     generation = {}
     generation_path = source_dir / "generation_config.json"
@@ -373,7 +584,7 @@ def read_shape(source_dir: Path) -> QwenShape:
         eos = eos[0]
 
     return QwenShape(
-        name=HF_REPO.split("/")[-1],
+        name=name,
         n_layer=int(config["num_hidden_layers"]),
         n_head=n_head,
         n_kv_head=int(config.get("num_key_value_heads", n_head)),
@@ -389,35 +600,7 @@ def read_shape(source_dir: Path) -> QwenShape:
     )
 
 
-# Official Qwen2.5-0.5B-Instruct table. This converter stamps that identity;
-# any other 64-aligned Qwen2 config is a different model.
-OFFICIAL_QWEN25_05B_INSTRUCT = {
-    "n_layer": 24,
-    "n_head": 14,
-    "n_kv_head": 2,
-    "d_model": 896,
-    "head_dim": 64,
-    "hidden_dim": 4864,
-    "vocab": 151936,
-}
-OFFICIAL_QWEN25_05B_ROPE_THETA = 1_000_000.0
-
-
-def validate_shape(shape: QwenShape) -> None:
-    mismatches: list[str] = []
-    for field, expected in OFFICIAL_QWEN25_05B_INSTRUCT.items():
-        got = getattr(shape, field)
-        if got != expected:
-            mismatches.append(f"{field}={got} (expected {expected})")
-    if float(shape.rope_theta) != OFFICIAL_QWEN25_05B_ROPE_THETA:
-        mismatches.append(
-            f"rope_theta={shape.rope_theta} (expected {OFFICIAL_QWEN25_05B_ROPE_THETA:g} / 1000000.0)"
-        )
-    if mismatches:
-        raise ConversionError(
-            "this converter only accepts Qwen2.5-0.5B-Instruct; checkpoint shape mismatch: "
-            + ", ".join(mismatches)
-        )
+def validate_layout(shape: QwenShape) -> None:
     if shape.d_model != shape.attention_dim:
         raise ConversionError(
             f"Espresso requires dModel == nHead * headDim; got {shape.d_model} != {shape.attention_dim}"
@@ -426,8 +609,8 @@ def validate_shape(shape: QwenShape) -> None:
         raise ConversionError(
             f"Espresso requires nHead % nKVHead == 0; got {shape.n_head} % {shape.n_kv_head}"
         )
-    # The ANE wants channel counts aligned to 64. Every Qwen2.5-0.5B dim already is;
-    # fail loudly rather than discover it as a compile error with no diagnostics.
+    # The ANE wants channel counts aligned to 64. Fail loudly rather than
+    # discover it as a compile error with no diagnostics.
     for label, value in (
         ("dModel", shape.d_model),
         ("kvDim", shape.kv_dim),
@@ -437,6 +620,25 @@ def validate_shape(shape: QwenShape) -> None:
             raise ConversionError(
                 f"{label}={value} is not a multiple of 64; ANE kernels require 64-aligned channels"
             )
+
+
+def validate_shape(shape: QwenShape, profile: ModelProfile | None = None) -> None:
+    resolved = profile if profile is not None else profile_for_name(shape.name)
+    mismatches: list[str] = []
+    for field_name, expected in resolved.official.items():
+        got = getattr(shape, field_name)
+        if got != expected:
+            mismatches.append(f"{field_name}={got} (expected {expected})")
+    if float(shape.rope_theta) != float(resolved.rope_theta):
+        mismatches.append(
+            f"rope_theta={shape.rope_theta} (expected {resolved.rope_theta:g} / 1000000.0)"
+        )
+    if mismatches:
+        raise ConversionError(
+            f"this converter only accepts {resolved.repo}; checkpoint shape mismatch: "
+            + ", ".join(mismatches)
+        )
+    validate_layout(shape)
 
 
 def write_metadata(output_dir: Path, shape: QwenShape, max_seq: int) -> dict:
@@ -474,7 +676,7 @@ def convert(
     max_seq: int,
     write_fp32_sidecars: bool,
 ) -> ConversionStats:
-    tensors = SafetensorsFile.open(source_dir / "model.safetensors")
+    tensors = SafetensorsStore.open_source(source_dir)
     available = set(tensors.tensor_names())
     stats = ConversionStats()
 
@@ -639,9 +841,22 @@ def pack_bundle(native_dir: Path, bundle_path: Path, context_target: int | None)
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
+        "--model",
+        default=DEFAULT_MODEL,
+        choices=list(SUPPORTED_MODELS),
+        help=(
+            "Hugging Face repo to convert "
+            f"(default: {DEFAULT_MODEL})"
+        ),
+    )
+    parser.add_argument(
         "--output",
         default=None,
-        help="Path of the .esp bundle to write (default: <cache>/qwen25-05b/Qwen2.5-0.5B-Instruct.esp)",
+        help=(
+            "Path of the .esp bundle to write (default: "
+            "<cache>/qwen25-05b/Qwen2.5-0.5B-Instruct.esp for the default --model; "
+            "<cache>/qwen25-15b/Qwen2.5-1.5B-Instruct.esp for 1.5B)"
+        ),
     )
     parser.add_argument(
         "--native-dir",
@@ -651,7 +866,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--source-dir",
         default=None,
-        help="Where to cache downloaded safetensors (default: <cache>/qwen25-05b-src)",
+        help=(
+            "Where to cache downloaded safetensors if no complete Hugging Face snapshot "
+            "is present (default: <cache>/qwen25-05b-src or <cache>/qwen25-15b-src)"
+        ),
     )
     parser.add_argument(
         "--max-seq",
@@ -682,18 +900,19 @@ def main(argv: list[str]) -> int:
     args = parse_args(argv)
     ensure_runtime_dependencies(allow_bootstrap=not args.no_bootstrap)
 
+    profile = SUPPORTED_MODELS[args.model]
     cache_root = espresso_cache_root()
-    source_dir = Path(args.source_dir).expanduser() if args.source_dir else cache_root / "qwen25-05b-src"
-    bundle_path = (
-        Path(args.output).expanduser()
-        if args.output
-        else cache_root / "qwen25-05b" / "Qwen2.5-0.5B-Instruct.esp"
+    paths = default_paths(profile, cache_root)
+    explicit_source = Path(args.source_dir).expanduser() if args.source_dir else None
+    source_dir = resolve_source_dir(
+        repo=profile.repo,
+        explicit=explicit_source,
+        cache_root=cache_root,
+        source_slug=profile.source_slug,
+        force_download=args.force_download,
     )
-    native_dir = (
-        Path(args.native_dir).expanduser()
-        if args.native_dir
-        else bundle_path.parent / "Qwen2.5-0.5B-Instruct-native"
-    )
+    bundle_path = Path(args.output).expanduser() if args.output else paths.bundle
+    native_dir = Path(args.native_dir).expanduser() if args.native_dir else paths.native
 
     if args.max_seq <= 0:
         raise ConversionError("--max-seq must be > 0")
@@ -701,9 +920,13 @@ def main(argv: list[str]) -> int:
     if args.max_seq > mask_limit:
         raise ConversionError(f"--max-seq {args.max_seq} exceeds the BLOBFILE mask limit {mask_limit}")
 
-    download_source(source_dir, force=args.force_download)
-    shape = read_shape(source_dir)
-    validate_shape(shape)
+    if args.force_download or not snapshot_is_complete(source_dir):
+        print(f"[source] downloading {profile.repo} into {source_dir}", flush=True)
+        download_source(profile.repo, source_dir, force=args.force_download)
+    else:
+        print(f"[source] {profile.repo} from {source_dir}", flush=True)
+    shape = read_shape(source_dir, profile.short_name)
+    validate_shape(shape, profile)
     if args.max_seq > shape.max_position_embeddings:
         raise ConversionError(
             f"--max-seq {args.max_seq} exceeds the model context {shape.max_position_embeddings}"
@@ -738,7 +961,7 @@ def main(argv: list[str]) -> int:
 
     worst = stats.worst_fp16_error()
     report = {
-        "model": HF_REPO,
+        "model": profile.repo,
         "metadata": metadata,
         "nativeDirectory": str(native_dir),
         "bundle": str(bundle_path),

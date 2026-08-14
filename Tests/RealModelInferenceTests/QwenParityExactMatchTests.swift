@@ -6,21 +6,26 @@ import ModelSupport
 import Testing
 @testable import RealModelInference
 
-// Hardware-gated greedy parity for Qwen2.5-0.5B-Instruct against a PyTorch fp32 reference.
+// Hardware-gated greedy parity for Qwen2.5-0.5B-Instruct and Qwen2.5-1.5B-Instruct
+// against a PyTorch fp32 reference.
 //
-// The fixture is produced by:
+// Fixtures are produced by:
 //   scripts/qwen25_pytorch_reference.py fixtures \
 //     --output Tests/RealModelInferenceTests/Fixtures/qwen25-05b-greedy-reference.json \
 //     --max-new-tokens 32
-// Real fixtures flags: --source-dir, --prompts, --output, --max-new-tokens,
+//   scripts/qwen25_pytorch_reference.py --model Qwen/Qwen2.5-1.5B-Instruct fixtures \
+//     --output Tests/RealModelInferenceTests/Fixtures/qwen25-15b-greedy-reference.json \
+//     --max-new-tokens 32
+// Real fixtures flags: --model, --source-dir, --prompts, --output, --max-new-tokens,
 // --min-prompts, --raw-prompt, --eos-token-ids.
 //
-// The converted artifact is produced by:
+// Converted artifacts:
 //   scripts/convert_qwen25_05b_to_esp.py
+//   scripts/convert_qwen25_05b_to_esp.py --model Qwen/Qwen2.5-1.5B-Instruct
 //
 // Run with:
 //   ANE_HARDWARE_TESTS=1 ESPRESSO_REALMODEL_DISABLE_HYBRID_FALLBACK=1 \
-//     swift test --filter QwenGreedyParity
+//     swift test --filter qwenGreedyParity
 
 struct QwenGreedyReferenceFixture: Decodable {
     struct Case: Decodable {
@@ -63,7 +68,49 @@ private func qwenANEIsAvailable() -> Bool {
         .allSatisfy { NSClassFromString($0) != nil }
 }
 
-/// Locates the converted Qwen2.5-0.5B packed `.esp` artifact (the shipped surface).
+/// Cache layout and greedy-contract constants for one Qwen2.5 Instruct size.
+struct QwenParityProfile: Equatable, Sendable {
+    let displayName: String
+    let cacheSlug: String
+    let bundleFileName: String
+    let fixtureFileName: String
+    /// Largest end-to-end ANE logit error measured against PyTorch fp32 for this size.
+    let maxObservedANELogitError: Double
+    let minimumExactMatches: Int
+    let minimumExactSequenceRatio: Double
+    let minimumTokenAgreementRatio: Double
+
+    var fixtureResourceName: String {
+        URL(fileURLWithPath: fixtureFileName).deletingPathExtension().lastPathComponent
+    }
+
+    static let qwen25_05b = QwenParityProfile(
+        displayName: "Qwen2.5-0.5B-Instruct",
+        cacheSlug: "qwen25-05b",
+        bundleFileName: "Qwen2.5-0.5B-Instruct.esp",
+        fixtureFileName: "qwen25-05b-greedy-reference.json",
+        maxObservedANELogitError: 0.96,
+        minimumExactMatches: 10,
+        minimumExactSequenceRatio: 10.0 / 12,
+        minimumTokenAgreementRatio: 341.0 / 384
+    )
+
+    /// Floors from the first hybrid suite (2026-08-14): 9/12 exact, 328/384 prefix
+    /// tokens. `maxObservedANELogitError` is the worst ANE `|dlogit|` in
+    /// `docs/qwen15b-logit-parity.json` (cases 0 and 5; chained hybrid + Python LM head).
+    static let qwen25_15b = QwenParityProfile(
+        displayName: "Qwen2.5-1.5B-Instruct",
+        cacheSlug: "qwen25-15b",
+        bundleFileName: "Qwen2.5-1.5B-Instruct.esp",
+        fixtureFileName: "qwen25-15b-greedy-reference.json",
+        maxObservedANELogitError: 0.24,
+        minimumExactMatches: 9,
+        minimumExactSequenceRatio: 9.0 / 12,
+        minimumTokenAgreementRatio: 328.0 / 384
+    )
+}
+
+/// Locates a converted Qwen2.5 packed `.esp` artifact (the shipped surface).
 /// Override the bundle path with `ESPRESSO_QWEN_BUNDLE`.
 struct QwenParityArtifact {
     let rootURL: URL
@@ -80,6 +127,7 @@ struct QwenParityArtifact {
     }
 
     static func resolve(
+        profile: QwenParityProfile = .qwen25_05b,
         environment: [String: String] = ProcessInfo.processInfo.environment,
         fileManager: FileManager = .default,
         homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
@@ -89,9 +137,9 @@ struct QwenParityArtifact {
         }
 
         let cache = cacheRoot(environment: environment, homeDirectory: homeDirectory)
-            .appendingPathComponent("qwen25-05b", isDirectory: true)
+            .appendingPathComponent(profile.cacheSlug, isDirectory: true)
         return bundleArtifact(
-            at: cache.appendingPathComponent("Qwen2.5-0.5B-Instruct.esp", isDirectory: true),
+            at: cache.appendingPathComponent(profile.bundleFileName, isDirectory: true),
             fileManager: fileManager
         )
     }
@@ -111,14 +159,16 @@ struct QwenParityArtifact {
     }
 }
 
-private func loadQwenGreedyFixture() throws -> QwenGreedyReferenceFixture? {
+private func loadQwenGreedyFixture(
+    profile: QwenParityProfile = .qwen25_05b
+) throws -> QwenGreedyReferenceFixture? {
     var candidates: [URL] = [
         URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
-            .appendingPathComponent("Fixtures/qwen25-05b-greedy-reference.json"),
+            .appendingPathComponent("Fixtures/\(profile.fixtureFileName)"),
     ]
     if let resource = Bundle.module.url(
-        forResource: "qwen25-05b-greedy-reference",
+        forResource: profile.fixtureResourceName,
         withExtension: "json",
         subdirectory: "Fixtures"
     ) {
@@ -130,14 +180,44 @@ private func loadQwenGreedyFixture() throws -> QwenGreedyReferenceFixture? {
     return nil
 }
 
+private func writeFakeQwenBundle(
+    profile: QwenParityProfile,
+    cache: URL,
+    fileManager: FileManager
+) throws -> (native: URL, bundle: URL) {
+    let native = cache
+        .appendingPathComponent(profile.cacheSlug, isDirectory: true)
+        .appendingPathComponent("\(profile.displayName)-native", isDirectory: true)
+    let bundle = cache
+        .appendingPathComponent(profile.cacheSlug, isDirectory: true)
+        .appendingPathComponent(profile.bundleFileName, isDirectory: true)
+    try fileManager.createDirectory(at: native, withIntermediateDirectories: true)
+    try fileManager.createDirectory(
+        at: bundle.appendingPathComponent("weights", isDirectory: true),
+        withIntermediateDirectories: true
+    )
+    try Data("{}".utf8).write(to: native.appendingPathComponent("metadata.json"))
+    try Data("format_version = \"1.1.0\"\n".utf8).write(to: bundle.appendingPathComponent("manifest.toml"))
+    try Data("{}".utf8).write(to: bundle.appendingPathComponent("weights/metadata.json"))
+    return (native, bundle)
+}
+
 @Test func test_qwenGreedyParityFixtureCoversTheRequiredSuite() throws {
-    guard let fixture = try loadQwenGreedyFixture() else {
+    try assertQwenGreedyFixtureCoversTheRequiredSuite(profile: .qwen25_05b)
+}
+
+@Test func test_qwenGreedyParity15bFixtureCoversTheRequiredSuite() throws {
+    try assertQwenGreedyFixtureCoversTheRequiredSuite(profile: .qwen25_15b)
+}
+
+private func assertQwenGreedyFixtureCoversTheRequiredSuite(profile: QwenParityProfile) throws {
+    guard let fixture = try loadQwenGreedyFixture(profile: profile) else {
         // The fixture is committed, so absence means a packaging problem worth surfacing
         // even on machines without an ANE.
-        Issue.record("qwen25-05b-greedy-reference.json fixture is missing")
+        Issue.record("\(profile.fixtureFileName) fixture is missing")
         return
     }
-    #expect(fixture.model == "Qwen2.5-0.5B-Instruct")
+    #expect(fixture.model == profile.displayName)
     #expect(fixture.cases.count >= 8)
     #expect(fixture.maxNewTokens >= 32)
     for testCase in fixture.cases {
@@ -154,28 +234,54 @@ private func loadQwenGreedyFixture() throws -> QwenGreedyReferenceFixture? {
     defer { try? fileManager.removeItem(at: root) }
 
     let cache = root.appendingPathComponent("Caches/Espresso", isDirectory: true)
-    let native = cache
-        .appendingPathComponent("qwen25-05b", isDirectory: true)
-        .appendingPathComponent("Qwen2.5-0.5B-Instruct-native", isDirectory: true)
-    let bundle = cache
-        .appendingPathComponent("qwen25-05b", isDirectory: true)
-        .appendingPathComponent("Qwen2.5-0.5B-Instruct.esp", isDirectory: true)
-    try fileManager.createDirectory(at: native, withIntermediateDirectories: true)
-    try fileManager.createDirectory(
-        at: bundle.appendingPathComponent("weights", isDirectory: true),
-        withIntermediateDirectories: true
-    )
-    try Data("{}".utf8).write(to: native.appendingPathComponent("metadata.json"))
-    try Data("format_version = \"1.1.0\"\n".utf8).write(to: bundle.appendingPathComponent("manifest.toml"))
-    try Data("{}".utf8).write(to: bundle.appendingPathComponent("weights/metadata.json"))
+    let bundle = try writeFakeQwenBundle(
+        profile: .qwen25_05b,
+        cache: cache,
+        fileManager: fileManager
+    ).bundle
 
     let resolved = QwenParityArtifact.resolve(
+        profile: .qwen25_05b,
         environment: ["ESPRESSO_CACHE_HOME": cache.path],
         fileManager: fileManager,
         homeDirectory: root
     )
     #expect(resolved?.rootURL.path == bundle.path)
     #expect(resolved?.weightDirectory.lastPathComponent == "weights")
+}
+
+@Test func test_qwenParityArtifactResolves15bPackedESPBundle() throws {
+    let fileManager = FileManager.default
+    let root = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+    defer { try? fileManager.removeItem(at: root) }
+
+    let cache = root.appendingPathComponent("Caches/Espresso", isDirectory: true)
+    let written = try writeFakeQwenBundle(
+        profile: .qwen25_15b,
+        cache: cache,
+        fileManager: fileManager
+    )
+    _ = try writeFakeQwenBundle(
+        profile: .qwen25_05b,
+        cache: cache,
+        fileManager: fileManager
+    )
+
+    let resolved05b = QwenParityArtifact.resolve(
+        profile: .qwen25_05b,
+        environment: ["ESPRESSO_CACHE_HOME": cache.path],
+        fileManager: fileManager,
+        homeDirectory: root
+    )
+    let resolved15b = QwenParityArtifact.resolve(
+        profile: .qwen25_15b,
+        environment: ["ESPRESSO_CACHE_HOME": cache.path],
+        fileManager: fileManager,
+        homeDirectory: root
+    )
+    #expect(resolved05b?.rootURL.lastPathComponent == QwenParityProfile.qwen25_05b.bundleFileName)
+    #expect(resolved15b?.rootURL.path == written.bundle.path)
+    #expect(resolved15b?.rootURL.path != resolved05b?.rootURL.path)
 }
 
 @Test func test_generationResultWithDecodePathPreservesTokens() {
@@ -201,25 +307,38 @@ private func loadQwenGreedyFixture() throws -> QwenGreedyReferenceFixture? {
 /// the tokenizer. The converted `.esp` is the artifact under test (same path `./espresso
 /// generate --model` uses). Tokenizer agreement is covered separately.
 @Test func test_qwenGreedyParityMatchesPyTorchReferenceOnANE() throws {
+    try assertQwenGreedyParityMatchesPyTorchReferenceOnANE(profile: .qwen25_05b)
+}
+
+@Test func test_qwenGreedyParity15bMatchesPyTorchReferenceOnANE() throws {
+    try assertQwenGreedyParityMatchesPyTorchReferenceOnANE(profile: .qwen25_15b)
+}
+
+private func assertQwenGreedyParityMatchesPyTorchReferenceOnANE(
+    profile: QwenParityProfile
+) throws {
     guard qwenHardwareTestsEnabled() else { return }
-    guard let artifact = QwenParityArtifact.resolve() else {
+    guard let artifact = QwenParityArtifact.resolve(profile: profile) else {
         Issue.record(
             """
-            Converted Qwen .esp bundle not found. Run scripts/convert_qwen25_05b_to_esp.py \
+            Converted \(profile.displayName) .esp bundle not found. Run \
+            scripts/convert_qwen25_05b_to_esp.py --model Qwen/\(profile.displayName) \
             or set ESPRESSO_QWEN_BUNDLE.
             """
         )
         return
     }
-    guard let fixture = try loadQwenGreedyFixture() else {
-        Issue.record("qwen25-05b-greedy-reference.json fixture is missing")
+    guard let fixture = try loadQwenGreedyFixture(profile: profile) else {
+        Issue.record("\(profile.fixtureFileName) fixture is missing")
         return
     }
+    #expect(fixture.model == profile.displayName)
 
     let bundle = try ESPRuntimeBundle.open(at: artifact.rootURL)
     let config = bundle.config
     let weightDir = bundle.archive.weightsURL.path
     #expect(config.preferredDecodePath == .hybrid)
+    #expect(config.name == profile.displayName)
     // With fallback disabled this artifact must resolve to the ANE hybrid path, never CPU.
     #expect(
         try RealModelInferenceEngine.resolvedLlamaGenerationPath(
@@ -229,14 +348,22 @@ private func loadQwenGreedyFixture() throws -> QwenGreedyReferenceFixture? {
     )
 
     let cases = fixture.cases
-    let results = try RealModelInferenceEngine.generateFromTokenSuiteForTesting(
+    // Determinism shares this engine. A second generateFromTokenSuiteForTesting
+    // call recompiles and exhausts the per-process ANE budget (0.5B died at
+    // layer 16 on the follow-up run after a cold RMSNorm-hash compile).
+    let determinismPrompt = cases[0].promptTokens.map(TokenID.init)
+    let allResults = try RealModelInferenceEngine.generateFromTokenSuiteForTesting(
         config: config,
         weightDir: weightDir,
-        promptTokenSuite: cases.map { $0.promptTokens.map(TokenID.init) },
+        promptTokenSuite: cases.map { $0.promptTokens.map(TokenID.init) } + [
+            determinismPrompt,
+            determinismPrompt,
+        ],
         maxTokens: fixture.maxNewTokens
     )
-    #expect(results.count == cases.count)
-    #expect(results.allSatisfy { $0.decodePath == "hybrid" })
+    #expect(allResults.count == cases.count + 2)
+    #expect(allResults.allSatisfy { $0.decodePath == "hybrid" })
+    let results = Array(allResults.prefix(cases.count))
 
     var matchingPrefixLengths: [Int] = []
     var exactMatches = 0
@@ -263,11 +390,12 @@ private func loadQwenGreedyFixture() throws -> QwenGreedyReferenceFixture? {
             : nil
         let chose = prefix < actual.count ? actual[prefix] : nil
         let choseRunnerUp = chose != nil && chose == runnerUp
-        let withinLogitError = gap <= maxObservedANELogitError
+        let withinLogitError = gap <= profile.maxObservedANELogitError
 
         fputs(
             """
-            [qwen-greedy-parity] case \(testCase.index) diverged at token \(prefix)/\(expected.count)
+            [qwen-greedy-parity] \(profile.displayName) case \(testCase.index) \
+            diverged at token \(prefix)/\(expected.count)
               prompt: \(testCase.prompt)
               reference top-1 \(expected[prefix]) runner-up \(runnerUp.map(String.init) ?? "?") \
             gap \(gap)
@@ -291,7 +419,7 @@ private func loadQwenGreedyFixture() throws -> QwenGreedyReferenceFixture? {
     let totalMatching = matchingPrefixLengths.reduce(0, +)
     fputs(
         """
-        [qwen-greedy-parity] exact cases \(exactMatches)/\(cases.count) \
+        [qwen-greedy-parity] \(profile.displayName) exact cases \(exactMatches)/\(cases.count) \
         matching-prefix tokens \(totalMatching)/\(totalExpected) \
         path=\(results.first?.decodePath ?? "?") \
         artifact=esp \
@@ -306,41 +434,15 @@ private func loadQwenGreedyFixture() throws -> QwenGreedyReferenceFixture? {
         unexplainedDivergences.isEmpty,
         "unexplained greedy divergences: \(unexplainedDivergences.joined(separator: "; "))"
     )
-    // fp16 arithmetic on the ANE flips only near-ties, so the overwhelming majority of
-    // sequences still reproduce exactly. A collapse here means a real regression.
-    #expect(exactMatches >= 10)
-    #expect(Double(exactMatches) / Double(cases.count) >= minimumExactSequenceRatio)
-    #expect(Double(totalMatching) / Double(totalExpected) >= minimumTokenAgreementRatio)
+    if profile.minimumExactMatches > 0 {
+        #expect(exactMatches >= profile.minimumExactMatches)
+        #expect(Double(exactMatches) / Double(cases.count) >= profile.minimumExactSequenceRatio)
+        #expect(Double(totalMatching) / Double(totalExpected) >= profile.minimumTokenAgreementRatio)
+    }
 
-    // Two short greedy runs of the first fixture prompt must emit identical tokens.
-    let determinismPrompt = [cases[0].promptTokens.map(TokenID.init)]
-    let firstRun = try RealModelInferenceEngine.generateFromTokenSuiteForTesting(
-        config: config,
-        weightDir: weightDir,
-        promptTokenSuite: determinismPrompt,
-        maxTokens: 8
-    )
-    let secondRun = try RealModelInferenceEngine.generateFromTokenSuiteForTesting(
-        config: config,
-        weightDir: weightDir,
-        promptTokenSuite: determinismPrompt,
-        maxTokens: 8
-    )
-    #expect(firstRun.count == 1)
-    #expect(secondRun.count == 1)
-    #expect(!firstRun[0].tokens.isEmpty)
-    #expect(firstRun[0].tokens == secondRun[0].tokens)
+    // Two greedy runs of the first fixture prompt must emit identical tokens.
+    let firstRun = allResults[cases.count]
+    let secondRun = allResults[cases.count + 1]
+    #expect(!firstRun.tokens.isEmpty)
+    #expect(firstRun.tokens == secondRun.tokens)
 }
-
-/// Largest end-to-end logit error measured for the ANE hybrid stack against PyTorch fp32:
-/// 0.955 over the 12 fixture prompts, recorded in `docs/qwen-logit-parity.json` and
-/// regenerated by `scripts/qwen25_pytorch_reference.py logit-parity`. Greedy choices can
-/// only flip where the reference's own top-1/top-2 gap is inside this band, so a
-/// divergence at a wider gap is a bug rather than rounding.
-private let maxObservedANELogitError = 0.96
-
-/// Published floor: 10/12 sequences must reproduce exactly.
-private let minimumExactSequenceRatio = 10.0 / 12
-
-/// Published floor: 341/384 tokens must agree, and full agreement before any flip.
-private let minimumTokenAgreementRatio = 341.0 / 384

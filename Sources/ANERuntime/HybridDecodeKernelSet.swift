@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import ANETypes
 import MILGenerator
@@ -258,6 +259,12 @@ public struct HybridDecodeKernelSet: ~Copyable {
         return try compile(spec: spec, donorHexId: donorHexId)
     }
 
+    private static let fusedPostAttentionLock = NSLock()
+    /// Process-lifetime: a fused miss disables fusion for every later compile in
+    /// this process so 28-wide 1.5B cannot burn the ~100 ANE compile budget.
+    /// Restart the process to retry fused (long-lived hosts must exec-restart).
+    nonisolated(unsafe) private static var skipFusedPostAttentionAfterFailure = false
+
     private static func compilePostAttention(
         weights: borrowing LayerWeights,
         laneSpatial: Int,
@@ -267,7 +274,12 @@ public struct HybridDecodeKernelSet: ~Copyable {
         // Fusion is enabled by default for rmsNormSwiGLU (LLaMA-family).
         // Set ESPRESSO_DISABLE_HYBRID_FUSED_POST_ATTENTION=1 to force the split path.
         let fusionDisabled = ProcessInfo.processInfo.environment["ESPRESSO_DISABLE_HYBRID_FUSED_POST_ATTENTION"] == "1"
-        let fusionEnabled = !fusionDisabled && (
+        let skipFused: Bool = {
+            fusedPostAttentionLock.lock()
+            defer { fusedPostAttentionLock.unlock() }
+            return skipFusedPostAttentionAfterFailure
+        }()
+        let fusionEnabled = !fusionDisabled && !skipFused && (
             weights.architecture == .rmsNormSwiGLU ||
             ProcessInfo.processInfo.environment["ESPRESSO_ENABLE_HYBRID_FUSED_POST_ATTENTION"] == "1"
         )
@@ -287,6 +299,15 @@ public struct HybridDecodeKernelSet: ~Copyable {
                     usesFusedPostAttention: true
                 )
             } catch {
+                // One fused miss is enough. Retrying on every remaining layer burns the
+                // per-process ANE compile budget (~100) before 28-wide 1.5B QKV+FFN finish.
+                fusedPostAttentionLock.lock()
+                skipFusedPostAttentionAfterFailure = true
+                fusedPostAttentionLock.unlock()
+                fputs(
+                    "[HybridDecode] fused-post-attention compile failed; remaining layers will use the split path. Error: \(error)\n",
+                    stderr
+                )
             }
         }
 
@@ -332,13 +353,32 @@ public struct HybridDecodeKernelSet: ~Copyable {
             }
         }
 
-        return try ANEKernel(
-            milText: spec.milText,
-            weights: spec.weights,
-            inputSizes: spec.inputSizes,
-            outputSizes: spec.outputSizes,
-            compileLabel: "\(compileLabelPrefix).cold"
-        )
+        do {
+            return try ANEKernel(
+                milText: spec.milText,
+                weights: spec.weights,
+                inputSizes: spec.inputSizes,
+                outputSizes: spec.outputSizes,
+                compileLabel: "\(compileLabelPrefix).cold"
+            )
+        } catch {
+            let milPath = dumpFailedMIL(spec)
+            fputs(
+                "[HybridDecode] hybrid.\(spec.kind.rawValue) compile failed. MIL dump: \(milPath)\n",
+                stderr
+            )
+            throw error
+        }
+    }
+
+    /// Keep the failing kernel's MIL so a 1.5B-width miss can be bisected
+    /// (QKV vs projection vs FFN) instead of disappearing into a CPU fallback.
+    private static func dumpFailedMIL(_ spec: CompileSpec) -> String {
+        let stamp = Int(Date().timeIntervalSince1970)
+        let filename = "espresso-hybrid-\(spec.kind.rawValue)-\(stamp).mil"
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(filename)
+        try? spec.milText.write(to: url, atomically: true, encoding: .utf8)
+        return url.path
     }
 
     private static func makeDecodeProjectionSpec(

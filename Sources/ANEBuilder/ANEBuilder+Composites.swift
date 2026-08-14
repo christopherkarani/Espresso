@@ -2,6 +2,11 @@ import Foundation
 import ANEGraphIR
 
 extension ANEGraph {
+    /// Reciprocal applied before fp16 RMSNorm squares. Unscaled mean(x^2) overflows
+    /// when RMS > ~256; 1.5B layer 3 is ~270. Scale 1/4 keeps that mean at ~4500
+    /// while layer-0 mean(~1e-4) stays representable.
+    public static let rmsNormFP16SafeScale: Float = 0.25
+
     public mutating func linear(
         _ prefix: String,
         input: Int,
@@ -44,6 +49,14 @@ extension ANEGraph {
         eps: Float,
         weightPath: String
     ) throws -> Int {
+        // Unscaled fp16 mean(x^2) overflows when RMS > ~256 (fp16 max 65504).
+        // Qwen2.5-1.5B residual RMS crosses that at layer 3 (~270) and stays
+        // there through layer 26, which collapsed hybrid generate to token 0
+        // ('!'). Scale the residual before squaring so the mean stays in range;
+        // xs * rrms == x / rms. ANE rejected an in-graph fp32 cast on ios18
+        // (InvalidMILProgram), so this stays on the compiling fp16 path.
+        // ESPRESSO_RMSNORM_USE_FP16=1 restores the overflowing unscaled path.
+        // ESPRESSO_RMSNORM_USE_FP32=1 keeps the experimental fp32-cast path.
         if ProcessInfo.processInfo.environment["ESPRESSO_RMSNORM_USE_FP32"] == "1" {
             let input32 = try castToFP32("\(prefix)_input32", input: input)
             let sq32 = try mul("\(prefix)_sq32", x: input32, y: input32)
@@ -63,15 +76,26 @@ extension ANEGraph {
             )
             return try mul("\(prefix)_out", x: xr16, y: weight)
         }
-        let sq = try mul("\(prefix)_sq", x: input, y: input)
+        let unscaled = ProcessInfo.processInfo.environment["ESPRESSO_RMSNORM_USE_FP16"] == "1"
+        let residual: Int
+        let squareEps: Float
+        if unscaled {
+            residual = input
+            squareEps = eps
+        } else {
+            let scale = try constScalar("\(prefix)_scale", Self.rmsNormFP16SafeScale)
+            residual = try mul("\(prefix)_xs", x: input, y: scale)
+            squareEps = eps * Self.rmsNormFP16SafeScale * Self.rmsNormFP16SafeScale
+        }
+        let sq = try mul("\(prefix)_sq", x: residual, y: residual)
         let ss = try reduceSum("\(prefix)_ss", input: sq, axis: 1, keepDims: true)
         let invd = try constScalar("\(prefix)_invd", 1.0 / Float(dim))
         let ms = try mul("\(prefix)_ms", x: ss, y: invd)
-        let epsNode = try constScalar("\(prefix)_eps", eps)
+        let epsNode = try constScalar("\(prefix)_eps", squareEps)
         let ss3 = try add("\(prefix)_ss3", x: ms, y: epsNode)
         let nhalf = try constScalar("\(prefix)_nhalf", -0.5)
         let rrms = try pow("\(prefix)_rrms", base: ss3, exp: nhalf)
-        let xr = try mul("\(prefix)_xr", x: input, y: rrms)
+        let xr = try mul("\(prefix)_xr", x: residual, y: rrms)
         let weight = try constWeight(
             "\(prefix)_weight",
             shape: try ANEShape(channels: dim, spatial: 1),

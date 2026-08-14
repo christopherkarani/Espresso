@@ -70,6 +70,11 @@ docs/*
 !docs/qwen-parity.md
 !docs/qwen-parity-layers.md
 !docs/qwen-logit-parity.json
+!docs/qwen15b-parity.md
+!docs/qwen15b-parity-layers.md
+!docs/qwen15b-logit-parity.json
+!docs/qwen15b-layer-parity.json
+!docs/qwen15b-chat-name-recall.txt
 prompts/
 scripts/
 !scripts/
@@ -90,6 +95,9 @@ scripts/internal/**
 !scripts/convert_weights_llama.py
 !scripts/convert_qwen25_05b_to_esp.py
 !scripts/qwen25_pytorch_reference.py
+!scripts/chat_plain_name_recall.py
+!scripts/mlx_qwen_stream.py
+!scripts/chat_vs_mlx_four_turn.py
 !scripts/qwen25_prompts.txt
 !scripts/bootstrap_gpt2_demo.py
 !scripts/export_gpt2_coreml.py
@@ -101,6 +109,9 @@ scripts/internal/**
 !scripts/tests/test_espresso_llama_weights.py
 !scripts/tests/test_gpt2_demo_helpers.py
 !scripts/tests/test_qwen25_convert.py
+!scripts/tests/test_qwen25_reference.py
+!scripts/tests/test_chat_plain_smoke.py
+!scripts/tests/test_chat_vs_mlx_four_turn.py
 !scripts/README.md
 tasks/
 AGENTS.md

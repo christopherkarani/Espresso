@@ -15,6 +15,7 @@ enum CommandName: String {
     case bench
     case suite
     case doctor
+    case chat
 }
 
 enum PowerMode: Equatable {
@@ -61,6 +62,15 @@ struct Options {
     var gpt2NormMode: String?
     var rawPrompt = false
     var disableHybridFallback = false
+    var plain = false
+    var greedy = false
+    var systemPrompt: String?
+    var topP: Float = Options.parseNonNegativeFloatEnv("ESPRESSO_TOP_P") ?? 1
+    var topPWasSet = Options.parseNonNegativeFloatEnv("ESPRESSO_TOP_P") != nil
+    var temperatureWasSet = Options.parseNonNegativeFloatEnv("ESPRESSO_TEMPERATURE") != nil
+    var compareOpponent: CompareOpponent?
+    var mlxQuant: String?
+    var mlxModel: String?
 
     static func parse(_ argv: [String]) throws -> Options {
         var options = Options()
@@ -102,6 +112,29 @@ struct Options {
                     try value(for: flag, inlineValue: inlineValue, argv: argv, index: &index),
                     flag: flag
                 )
+                options.temperatureWasSet = true
+            case "--top-p":
+                options.topP = try parseUnitInterval(
+                    try value(for: flag, inlineValue: inlineValue, argv: argv, index: &index),
+                    flag: flag
+                )
+                options.topPWasSet = true
+            case "--system":
+                options.systemPrompt = try value(for: flag, inlineValue: inlineValue, argv: argv, index: &index)
+            case "--plain":
+                options.plain = true
+                options.disableTUI = true
+                options.forceTUI = false
+            case "--greedy":
+                options.greedy = true
+            case "--vs":
+                options.compareOpponent = try parseCompareOpponent(
+                    try value(for: flag, inlineValue: inlineValue, argv: argv, index: &index)
+                )
+            case "--mlx-quant":
+                options.mlxQuant = try value(for: flag, inlineValue: inlineValue, argv: argv, index: &index)
+            case "--mlx-model":
+                options.mlxModel = try value(for: flag, inlineValue: inlineValue, argv: argv, index: &index)
             case "--coreml-seq-len":
                 options.coreMLSequenceLength = try parseNonNegativeInt(
                     try value(for: flag, inlineValue: inlineValue, argv: argv, index: &index),
@@ -229,6 +262,13 @@ struct Options {
     private static func parseNonNegativeFloat(_ raw: String, flag: String) throws -> Float {
         guard let value = Float(raw), value.isFinite, value >= 0 else {
             throw CLIError.usage("Expected a finite non-negative number for \(flag)")
+        }
+        return value
+    }
+
+    private static func parseUnitInterval(_ raw: String, flag: String) throws -> Float {
+        guard let value = Float(raw), value.isFinite, value > 0, value <= 1 else {
+            throw CLIError.usage("Expected a number in (0, 1] for \(flag)")
         }
         return value
     }
@@ -362,6 +402,7 @@ struct ResolvedInvocation {
     let prompt: String
     let maxTokens: Int
     let temperature: Float
+    let topP: Float
     let showStats: Bool
     let coreMLModelPath: String?
     let coreMLSequenceLength: Int?
@@ -382,6 +423,7 @@ struct ResolvedInvocation {
         prompt: String,
         maxTokens: Int,
         temperature: Float,
+        topP: Float = 1,
         showStats: Bool,
         coreMLModelPath: String?,
         coreMLSequenceLength: Int?,
@@ -401,6 +443,7 @@ struct ResolvedInvocation {
         self.prompt = prompt
         self.maxTokens = maxTokens
         self.temperature = temperature
+        self.topP = topP
         self.showStats = showStats
         self.coreMLModelPath = coreMLModelPath
         self.coreMLSequenceLength = coreMLSequenceLength
@@ -430,6 +473,7 @@ extension ResolvedInvocation {
             prompt: prompt ?? self.prompt,
             maxTokens: maxTokens,
             temperature: temperature,
+            topP: topP,
             showStats: showStats,
             coreMLModelPath: coreMLModelPath,
             coreMLSequenceLength: coreMLSequenceLength,
@@ -574,8 +618,8 @@ private final class LockedValueBox<Value>: @unchecked Sendable {
     }
 }
 
-private func applyCLIExperimentEnvironment(_ options: Options) {
-    if options.disableHybridFallback {
+func applyCLIExperimentEnvironment(_ options: Options) {
+    if options.disableHybridFallback || chatForcesHybridFallbackDisable(options) {
         setenv("ESPRESSO_REALMODEL_DISABLE_HYBRID_FALLBACK", "1", 1)
     }
     if options.rawPrompt {
@@ -654,11 +698,12 @@ func stderrLine(_ message: String) {
     }
 }
 
-private func printUsage() {
-    let usage = """
+func cliUsageText() -> String {
+    """
     Usage:
       espresso-generate demo [options] [prompt...]
       espresso-generate generate [options] [prompt...]
+      espresso-generate chat [options]
       espresso-generate compare [options] [prompt...]
       espresso-generate bench [options] [prompt...]
       espresso-generate suite [options]
@@ -668,6 +713,7 @@ private func printUsage() {
     Commands:
       demo       First-run GPT-2 experience. Boots assets if needed and runs live compare in a TTY.
       generate   Run Espresso ANE generation only.
+      chat       Multi-turn conversation. TTY default is a compact TUI; --plain or a non-TTY uses readline.
       compare    Compare Espresso against a Core ML baseline. Use --live or --bench.
       bench      Run a fair sequential benchmark, export JSON/CSV/Markdown, and capture power when available.
       suite      Run a multi-prompt compare suite in one process and reuse the Core ML baseline across prompts.
@@ -681,7 +727,22 @@ private func printUsage() {
           --coreml-model PATH  Override the exported Core ML baseline (required for non-GPT2 models)
       -p, --prompt TEXT        Prompt text; otherwise use trailing args or piped stdin
       -n, --max-tokens N       Max new tokens (default: 128)
-          --temperature FLOAT  Sampling temperature; 0 = greedy (default: 0)
+          --temperature FLOAT  Sampling temperature; 0 = greedy (generate default: 0; chat default: 0.7)
+          --top-p FLOAT        Nucleus sampling in (0, 1] (generate default: 1; chat default: 0.9)
+          --greedy             Force greedy decode (temperature=0, top-p=1). Required for chat parity.
+          --system TEXT        Optional system prompt for chat (Qwen Instruct default otherwise)
+          --plain              Chat: readline/stdio instead of the TTY conversation TUI
+          --vs mlx             Dual-pane Espresso vs MLX on Qwen/Qwen2.5-1.5B-Instruct.
+                               Requires --greedy. Opponent is MLX, not Core ML Stories.
+                               Both lanes use the same prompt, max new tokens, and argmax.
+                               Espresso: fp16 .esp hybrid, fallback disabled.
+                               MLX: native fp16/bf16. 4-bit is rejected unless --mlx-quant
+                               is set and both footers label it.
+                               tok/s is completion-only; compile ms is shown per lane.
+                               J/tok = package_watts / tok_s when telemetry is up.
+          --mlx-quant 4bit     Permit a labeled quantized MLX lane. Required to load 4-bit.
+          --mlx-model PATH|ID  Optional MLX path. Native runs must still be
+                               Qwen/Qwen2.5-1.5B-Instruct.
           --seed N             Sampling seed for compare/bench (default: 1234)
           --prepare-demo       Prepare the managed GPT-2 demo assets and exit when no prompt is provided
           --output-dir DIR     Report output directory for compare/bench exports
@@ -700,6 +761,12 @@ private func printUsage() {
           --bench              Prefer the fair sequential benchmark path
           --power              Require power telemetry; exits if unavailable
           --no-power           Disable power telemetry
+                               Chat: J/tok = package_watts / tok_s for that completion
+                               (generate window only; compile is excluded from tok/s and J/tok).
+                               Enable passwordless sudo for /usr/bin/powermetrics on the recording machine:
+                                 echo "$USER ALL=(root) NOPASSWD: /usr/bin/powermetrics" | sudo tee /etc/sudoers.d/espresso-powermetrics
+                                 sudo chmod 440 /etc/sudoers.d/espresso-powermetrics
+                               The TUI never prints these sudo instructions.
           --json               Emit JSON doctor/compare output to stdout
           --probe-gpt2-attention-compile
                                Doctor-only compile probe for GPT-2 attention MIL at spatial sizes 64, 128, and 256
@@ -713,6 +780,7 @@ private func printUsage() {
           --benchmark-generate Reuse one Espresso engine and report warm generate metrics using --compare-warmup/--compare-iterations
           --raw-prompt         Encode the prompt verbatim (skip the Qwen2.5-Instruct chat wrap)
           --no-hybrid-fallback Fail instead of falling back from the ANE hybrid decode path
+                           Chat always sets ESPRESSO_REALMODEL_DISABLE_HYBRID_FALLBACK=1
       -h, --help               Show this help
 
     Environment:
@@ -733,10 +801,12 @@ private func printUsage() {
       ESPRESSO_COMPARE_SEED
       ESPRESSO_MAX_TOKENS
       ESPRESSO_TEMPERATURE
+      ESPRESSO_TOP_P
       ESPRESSO_MIL_DEPLOYMENT_TARGET
       ESPRESSO_GPT2_NORM
       ESPRESSO_GPT2_USE_RMS_NORM
       ESPRESSO_REALMODEL_DISABLE_HYBRID_FALLBACK
+      ESPRESSO_MLX_PYTHON
 
     Examples:
       ./espresso
@@ -748,8 +818,15 @@ private func printUsage() {
       espresso-generate compare --live "Hello"
       espresso-generate bench --output-dir ./reports/gpt2 "Hello"
       espresso-generate suite --prompts ./scripts/benchmark-prompts.txt --no-power
+      ./espresso chat --model ~/Library/Caches/Espresso/qwen25-15b/Qwen2.5-1.5B-Instruct.esp
+      ./espresso chat --model <model.esp> --plain --greedy
+      ./espresso chat --model <model.esp> --power
+      ./espresso chat --vs mlx --greedy --model ~/Library/Caches/Espresso/qwen25-15b/Qwen2.5-1.5B-Instruct.esp
     """
-    print(usage)
+}
+
+private func printUsage() {
+    print(cliUsageText())
 }
 
 private func printAvailableModels() {
@@ -967,8 +1044,17 @@ func implicitPrompt(
     switch command {
     case .demo, .compare:
         return defaultDemoPrompt
-    case .generate, .bench, .suite, .doctor:
+    case .generate, .bench, .suite, .doctor, .chat:
         return nil
+    }
+}
+
+private func commandRequiresPrompt(_ command: CommandName) -> Bool {
+    switch command {
+    case .doctor, .suite, .chat:
+        return false
+    case .demo, .generate, .compare, .bench:
+        return true
     }
 }
 
@@ -1056,6 +1142,8 @@ private func shouldUseTUI(command: CommandName, options: Options) -> Bool {
         return true
     case .compare:
         return !options.preferBenchCompare
+    case .chat:
+        return !options.plain
     case .generate, .bench, .suite, .doctor:
         return false
     }
@@ -1104,7 +1192,8 @@ func resolveInvocation(from options: Options, demoDefaults: DemoDefaults, comman
 
         let bundlePath = try ensureDirectoryExists(bundleArgument, label: "Bundle")
         let bundle = try ESPRuntimeBundle.open(at: URL(fileURLWithPath: bundlePath, isDirectory: true))
-        let prompt = (command == .doctor || command == .suite) ? "" : try resolvePrompt(options, command: command)
+        let prompt = commandRequiresPrompt(command) ? try resolvePrompt(options, command: command) : ""
+        let sampling = resolvedSampling(command: command, options: options)
         return ResolvedInvocation(
             config: bundle.config,
             bundlePath: bundlePath,
@@ -1112,7 +1201,8 @@ func resolveInvocation(from options: Options, demoDefaults: DemoDefaults, comman
             tokenizerDir: bundle.archive.tokenizerURL.path,
             prompt: prompt,
             maxTokens: options.maxTokens,
-            temperature: options.temperature,
+            temperature: sampling.temperature,
+            topP: sampling.topP,
             showStats: options.showStats,
             coreMLModelPath: options.coreMLModelPath,
             coreMLSequenceLength: options.coreMLSequenceLength,
@@ -1140,6 +1230,9 @@ func resolveInvocation(from options: Options, demoDefaults: DemoDefaults, comman
     }
 
     guard let weightsArgument, !weightsArgument.isEmpty else {
+        if command == .chat {
+            throw CLIError.usage("chat requires --model <path.esp> (or --bundle / --weights).")
+        }
         throw CLIError.usage("Missing weights directory. Pass --weights or set ESPRESSO_WEIGHTS_DIR.")
     }
     let weightsDir = try ensureDirectoryExists(weightsArgument, label: "Weights")
@@ -1150,7 +1243,8 @@ func resolveInvocation(from options: Options, demoDefaults: DemoDefaults, comman
         weightsDirURL: weightsDirURL,
         config: config
     )
-    let prompt = (command == .doctor || command == .suite) ? "" : try resolvePrompt(options, command: command)
+    let prompt = commandRequiresPrompt(command) ? try resolvePrompt(options, command: command) : ""
+    let sampling = resolvedSampling(command: command, options: options)
     return ResolvedInvocation(
         config: config,
         bundlePath: nil,
@@ -1158,7 +1252,8 @@ func resolveInvocation(from options: Options, demoDefaults: DemoDefaults, comman
         tokenizerDir: tokenizerDir,
         prompt: prompt,
         maxTokens: options.maxTokens,
-        temperature: options.temperature,
+        temperature: sampling.temperature,
+        topP: sampling.topP,
         showStats: options.showStats,
         coreMLModelPath: options.coreMLModelPath,
         coreMLSequenceLength: options.coreMLSequenceLength,
@@ -1272,6 +1367,7 @@ private func runEspressoGeneration(
         ),
         maxTokens: invocation.maxTokens,
         temperature: invocation.temperature,
+        topP: invocation.topP,
         onStep: { step in
             tokenLatenciesMs.append(step.tokenLatencyMs)
             totalTimeMs = step.elapsedMs
@@ -1461,8 +1557,8 @@ func resolvePowerEnabled(
         }
         return true
     case .auto:
-        let enabledByDefault = command == .demo || command == .bench
-        if emitWarnings, enabledByDefault, !capability.available {
+        let enabledByDefault = command == .demo || command == .bench || command == .chat
+        if emitWarnings, enabledByDefault, command != .chat, !capability.available {
             stderrLine("espresso-generate warning: power telemetry unavailable: \(capability.message)")
         }
         return enabledByDefault && capability.available
@@ -1471,6 +1567,7 @@ func resolvePowerEnabled(
 
 private func maybeMeasurePower<T>(
     enabled: Bool,
+    sampleIntervalMs: Int = 1_000,
     body: () throws -> T
 ) throws -> (result: T, power: PowerSummary?) {
     guard enabled else {
@@ -1480,7 +1577,7 @@ private func maybeMeasurePower<T>(
     guard capability.available else {
         return (try body(), nil)
     }
-    let collector = PowerTelemetryCollector()
+    let collector = PowerTelemetryCollector(sampleIntervalMs: sampleIntervalMs)
     do {
         try collector.start { _ in }
         let result = try body()
@@ -2725,10 +2822,668 @@ private func runPromptSuite(
     return summary.verdict.allCorrectnessGatesPass ? 0 : 1
 }
 
+private func readChatLine() -> String? {
+    var buffer = [CChar](repeating: 0, count: 4096)
+    while true {
+        errno = 0
+        guard fgets(&buffer, Int32(buffer.count), stdin) != nil else {
+            if feof(stdin) != 0 {
+                return nil
+            }
+            if errno == EINTR {
+                continue
+            }
+            return nil
+        }
+        let end = buffer.firstIndex(of: 0) ?? buffer.endIndex
+        let bytes = buffer[..<end].map { UInt8(bitPattern: $0) }
+        return String(decoding: bytes, as: UTF8.self).trimmingCharacters(in: CharacterSet.newlines)
+    }
+}
+
+private func installChatSIGINT(_ cancel: ChatCancelState) -> DispatchSourceSignal {
+    signal(SIGINT, SIG_IGN)
+    let source = DispatchSource.makeSignalSource(signal: SIGINT, queue: .global())
+    source.setEventHandler {
+        _ = cancel.requestCancel(userInterrupt: true)
+    }
+    source.resume()
+    return source
+}
+
+private func runChatVsMLX(
+    invocation: ResolvedInvocation,
+    options: Options,
+    defaults: DemoDefaults,
+    powerEnabled: Bool
+) throws -> Int32 {
+    applyCLIExperimentEnvironment(options)
+    var fairness = try makeChatVsMLXFairness(
+        espressoModelName: invocation.config.name,
+        greedy: options.greedy,
+        maxNewTokens: invocation.maxTokens,
+        mlxQuantFlag: options.mlxQuant,
+        mlxModelOverride: options.mlxModel
+    )
+    let python = try requireMLXPython(defaults: defaults)
+    let script = try mlxStreamScriptURL(defaults: defaults)
+    let snapshot = huggingFaceHubSnapshot(
+        repo: fairness.huggingfaceRepo,
+        cacheRoot: defaultHuggingFaceCacheRoot()
+    )
+    let modelPath = options.mlxModel?.trimmingCharacters(in: .whitespacesAndNewlines)
+    let resolvedModelPath: String
+    if let modelPath, !modelPath.isEmpty {
+        resolvedModelPath = modelPath
+    } else if let snapshot {
+        resolvedModelPath = snapshot.path
+    } else {
+        resolvedModelPath = fairness.huggingfaceRepo
+    }
+
+    var environment = ProcessInfo.processInfo.environment
+    environment["PYTHONUNBUFFERED"] = "1"
+    if snapshot != nil, options.mlxModel == nil {
+        environment["HF_HUB_OFFLINE"] = "1"
+    }
+
+    let mlx = try MLXLaneSession.start(
+        python: python,
+        script: script,
+        fairness: fairness,
+        modelPath: resolvedModelPath,
+        workingDirectory: defaults.workingDirectory,
+        environment: environment
+    )
+    defer { mlx.close() }
+    fairness = fairness.applyingLoadedPrecision(mlx.loadedPrecision)
+
+    var engine = try makeEspressoEngine(invocation: invocation)
+    let compileStarted = DispatchTime.now().uptimeNanoseconds
+    try engine.precompileHybridDecode(covering: invocation.config.maxSeq)
+    let espressoCompileMs = millisecondsSince(compileStarted)
+    let tokenizer = try loadTokenizer(config: invocation.config, tokenizerDir: invocation.tokenizerDir)
+    var session = ChatSession(system: options.systemPrompt ?? QwenInstructPrompt.systemBanner)
+    let sampling = resolvedSampling(command: .chat, options: options)
+    let useTUI = shouldUseTUI(command: .chat, options: options)
+    let cancel = ChatCancelState()
+    let sigint = installChatSIGINT(cancel)
+    defer { sigint.cancel() }
+    let powerCapability = PowerTelemetryCollector.capability()
+
+    let display = TerminalDisplay()
+    let renderer = LiveCompareRenderer()
+    if useTUI {
+        display.start()
+    }
+    defer {
+        if useTUI {
+            display.stop()
+        }
+    }
+
+    var espressoLane = LiveLaneSnapshot(title: fairness.espressoLaneHeader(), maxTokens: invocation.maxTokens)
+    espressoLane.wattFocus = .ane
+    espressoLane.compileMs = espressoCompileMs
+    var mlxLane = LiveLaneSnapshot(title: fairness.mlxLaneHeader(), maxTokens: invocation.maxTokens)
+    mlxLane.wattFocus = .gpu
+    let store = LiveCompareStateStore(
+        snapshot: LiveCompareSnapshot(
+            modelName: invocation.config.name,
+            prompt: "",
+            maxTokens: invocation.maxTokens,
+            elapsedMs: 0,
+            espresso: espressoLane,
+            coreML: mlxLane,
+            livePower: nil,
+            matchCount: 0,
+            totalComparedTokens: 0,
+            events: [
+                "fairness \(fairness.huggingfaceRepo)  espresso=\(fairness.espressoPrecision)  mlx=\(fairness.mlxPrecisionLabel)  greedy  compile excluded from tok/s"
+            ],
+            display: .mlx(fairness)
+        )
+    )
+
+    var espressoTurns: [ChatVsMLXTurnMetrics] = []
+    var mlxTurns: [ChatVsMLXTurnMetrics] = []
+
+    func writePlain(_ text: String, terminator: String = "\n") {
+        guard !useTUI else { return }
+        FileHandle.standardOutput.write(Data((text + terminator).utf8))
+        fflush(stdout)
+    }
+
+    func renderFrame() {
+        guard useTUI else { return }
+        display.render(renderer.render(snapshot: store.read(), size: TerminalSize.current()))
+    }
+
+    if !useTUI {
+        writePlain(
+            "espresso chat --vs mlx  model=\(invocation.config.name)  repo=\(fairness.huggingfaceRepo)  precision=\(fairness.espressoPrecision) vs \(fairness.mlxPrecisionLabel)  greedy  fallback=disabled"
+        )
+        writePlain("commands: /reset /retry /exit   Ctrl-C cancels the current lane")
+    } else {
+        renderFrame()
+    }
+
+    while true {
+        if useTUI {
+            renderFrame()
+            FileHandle.standardOutput.write(Data("you> ".utf8))
+            fflush(stdout)
+        } else {
+            writePlain("you> ", terminator: "")
+        }
+        guard let line = readChatLine() else {
+            break
+        }
+        if !useTUI, isatty(STDIN_FILENO) == 0 {
+            writePlain(line)
+        }
+        let action = session.apply(ChatCommand.parse(line))
+        switch action {
+        case .exit:
+            printScoreboardAndReturn()
+            return 0
+        case let .noop(message):
+            if !message.isEmpty {
+                writePlain(message)
+            }
+            renderFrame()
+        case let .generate(prompt):
+            let userText = session.messages.last(where: { $0.role == .user })?.content ?? prompt
+            store.mutate { snapshot in
+                snapshot.prompt = userText
+                snapshot.espresso.status = .waiting
+                snapshot.espresso.text = ""
+                snapshot.espresso.lastToken = "—"
+                snapshot.espresso.generatedTokenCount = 0
+                snapshot.espresso.tokensPerSecond = 0
+                snapshot.espresso.ttftMs = 0
+                snapshot.espresso.power = nil
+                snapshot.coreML.status = .waiting
+                snapshot.coreML.text = ""
+                snapshot.coreML.lastToken = "—"
+                snapshot.coreML.generatedTokenCount = 0
+                snapshot.coreML.tokensPerSecond = 0
+                snapshot.coreML.ttftMs = 0
+                snapshot.coreML.power = nil
+                snapshot.events.append("[shared] \(userText)")
+                trimEvents(&snapshot.events)
+            }
+            renderFrame()
+
+            cancel.beginGeneration()
+            defer { cancel.endGeneration() }
+
+            do {
+                let espressoMetrics = try runChatVsMLXEspressoLane(
+                    engine: &engine,
+                    prompt: prompt,
+                    invocation: invocation,
+                    sampling: sampling,
+                    tokenizer: tokenizer,
+                    compileMs: espressoCompileMs,
+                    powerEnabled: powerEnabled,
+                    powerCapability: powerCapability,
+                    cancel: cancel,
+                    store: store,
+                    useTUI: useTUI,
+                    writePlain: writePlain,
+                    renderFrame: renderFrame
+                )
+                session.appendAssistant(store.read().espresso.text)
+
+                let mlxMetrics = try runChatVsMLXMLXLane(
+                    mlx: mlx,
+                    prompt: prompt,
+                    maxTokens: invocation.maxTokens,
+                    powerEnabled: powerEnabled,
+                    powerCapability: powerCapability,
+                    cancel: cancel,
+                    store: store,
+                    useTUI: useTUI,
+                    writePlain: writePlain,
+                    renderFrame: renderFrame
+                )
+                espressoTurns.append(espressoMetrics)
+                mlxTurns.append(mlxMetrics)
+            } catch let error as RealModelInferenceError {
+                if case .cancelled = error {
+                    writePlain("^C cancelled")
+                    store.mutate { snapshot in
+                        snapshot.events.append("[cancel] current lane stopped")
+                        trimEvents(&snapshot.events)
+                    }
+                    renderFrame()
+                    continue
+                }
+                throw error
+            } catch let error as CLIError {
+                if case let .runtime(message) = error, message.contains("cancelled") {
+                    writePlain("^C cancelled")
+                    continue
+                }
+                throw error
+            }
+        }
+    }
+
+    printScoreboardAndReturn()
+    return 0
+
+    func printScoreboardAndReturn() {
+        guard !espressoTurns.isEmpty || !mlxTurns.isEmpty else { return }
+        let paired = pairedChatVsMLXMetrics(espresso: espressoTurns, mlx: mlxTurns)
+        let espresso = paired.espresso
+        let mlx = paired.mlx
+        let table = formatChatVsMLXScoreboard(espresso: espresso, mlx: mlx)
+        if useTUI {
+            display.stop()
+        }
+        print(table)
+    }
+}
+
+private func runChatVsMLXEspressoLane(
+    engine: inout RealModelInferenceEngine,
+    prompt: String,
+    invocation: ResolvedInvocation,
+    sampling: ChatSampling,
+    tokenizer: CLITokenizer,
+    compileMs: Double,
+    powerEnabled: Bool,
+    powerCapability: PowerCapability,
+    cancel: ChatCancelState,
+    store: LiveCompareStateStore,
+    useTUI: Bool,
+    writePlain: @escaping (String, String) -> Void,
+    renderFrame: @escaping () -> Void
+) throws -> ChatVsMLXTurnMetrics {
+    store.mutate { snapshot in
+        snapshot.espresso.status = .compiling
+        snapshot.espresso.compileMs = compileMs
+        snapshot.events.append("[Espresso] generating")
+        trimEvents(&snapshot.events)
+    }
+    renderFrame()
+    if !useTUI {
+        writePlain("espresso> ", "")
+    }
+
+    let measured = try maybeMeasurePower(enabled: powerEnabled, sampleIntervalMs: 200) {
+        try engine.generate(
+            prompt: prompt,
+            maxTokens: invocation.maxTokens,
+            temperature: sampling.temperature,
+            topP: sampling.topP,
+            onStep: { step in
+                let text = ChatSession.sanitizeAssistantText(
+                    assistantTextFromGeneratedTokens(
+                        step.generatedTokens,
+                        decode: tokenizer.decodeImpl,
+                        eosToken: invocation.config.eosToken
+                    )
+                )
+                store.mutate { snapshot in
+                    snapshot.espresso.status = .generating
+                    snapshot.espresso.generatedTokenCount = step.generatedTokens.count
+                    snapshot.espresso.lastToken = tokenizer.decode([Int(step.token)])
+                    snapshot.espresso.text = text
+                    snapshot.espresso.ttftMs = step.firstTokenLatencyMs
+                    snapshot.espresso.tokensPerSecond = step.tokensPerSecond
+                    snapshot.espresso.totalMs = step.elapsedMs
+                    snapshot.espresso.compileMs = compileMs
+                }
+                if useTUI {
+                    renderFrame()
+                } else {
+                    writePlain(tokenizer.decode([Int(step.token)]), "")
+                }
+            },
+            isCancelled: { cancel.isCancelled }
+        )
+    }
+    try assertChatDecodePathIsHybrid(measured.result.decodePath)
+    store.mutate { snapshot in
+        snapshot.espresso.status = .completed
+        snapshot.espresso.tokensPerSecond = measured.result.tokensPerSecond
+        snapshot.espresso.ttftMs = measured.result.firstTokenLatencyMs
+        snapshot.espresso.compileMs = measured.result.compileTimeMs > 0 ? measured.result.compileTimeMs : compileMs
+        snapshot.espresso.power = measured.power
+        snapshot.espresso.text = ChatSession.sanitizeAssistantText(
+            assistantTextFromGeneratedTokens(
+                measured.result.tokens,
+                decode: tokenizer.decodeImpl,
+                eosToken: invocation.config.eosToken
+            )
+        )
+        snapshot.events.append("[Espresso] completed")
+        trimEvents(&snapshot.events)
+    }
+    renderFrame()
+    if !useTUI {
+        writePlain("", "\n")
+        writePlain(plainLaneFooter(lane: store.read().espresso, focus: .ane, capability: powerCapability), "\n")
+    }
+    return metricsFromLane(store.read().espresso)
+}
+
+private func runChatVsMLXMLXLane(
+    mlx: MLXLaneSession,
+    prompt: String,
+    maxTokens: Int,
+    powerEnabled: Bool,
+    powerCapability: PowerCapability,
+    cancel: ChatCancelState,
+    store: LiveCompareStateStore,
+    useTUI: Bool,
+    writePlain: @escaping (String, String) -> Void,
+    renderFrame: @escaping () -> Void
+) throws -> ChatVsMLXTurnMetrics {
+    store.mutate { snapshot in
+        snapshot.coreML.status = .compiling
+        snapshot.events.append("[MLX] generating")
+        trimEvents(&snapshot.events)
+    }
+    renderFrame()
+    if !useTUI {
+        writePlain("mlx> ", "")
+    }
+
+    var streamed = ""
+    let measured = try maybeMeasurePower(enabled: powerEnabled, sampleIntervalMs: 200) {
+        try mlx.generate(
+            prompt: prompt,
+            maxTokens: maxTokens,
+            isCancelled: { cancel.isCancelled },
+            onEvent: { event in
+                store.mutate { snapshot in
+                    switch event {
+                    case let .compile(ms):
+                        snapshot.coreML.compileMs = ms
+                        snapshot.coreML.status = .generating
+                    case let .token(text, tokenIndex, elapsedMs, tokenLatencyMs, tokensPerSecond):
+                        streamed += text
+                        snapshot.coreML.status = .generating
+                        snapshot.coreML.generatedTokenCount = tokenIndex
+                        snapshot.coreML.lastToken = text
+                        snapshot.coreML.text = ChatSession.sanitizeAssistantText(streamed)
+                        snapshot.coreML.tokensPerSecond = tokensPerSecond
+                        snapshot.coreML.totalMs = elapsedMs
+                        if tokenIndex == 1 {
+                            snapshot.coreML.ttftMs = tokenLatencyMs
+                        }
+                    case let .completed(text, compileMs, ttftMs, tokensPerSecond, tokenCount):
+                        streamed = text
+                        snapshot.coreML.status = .completed
+                        snapshot.coreML.text = ChatSession.sanitizeAssistantText(text)
+                        snapshot.coreML.compileMs = compileMs
+                        snapshot.coreML.ttftMs = ttftMs
+                        snapshot.coreML.tokensPerSecond = tokensPerSecond
+                        snapshot.coreML.generatedTokenCount = tokenCount
+                    default:
+                        break
+                    }
+                }
+                if useTUI {
+                    renderFrame()
+                } else if case let .token(text, _, _, _, _) = event {
+                    writePlain(text, "")
+                }
+            }
+        )
+    }
+    store.mutate { snapshot in
+        snapshot.coreML.status = .completed
+        snapshot.coreML.text = ChatSession.sanitizeAssistantText(measured.result.text)
+        snapshot.coreML.compileMs = measured.result.compileMs
+        snapshot.coreML.ttftMs = measured.result.ttftMs
+        snapshot.coreML.tokensPerSecond = measured.result.tokensPerSecond
+        snapshot.coreML.generatedTokenCount = measured.result.tokenCount
+        snapshot.coreML.power = measured.power
+        snapshot.events.append("[MLX] completed")
+        trimEvents(&snapshot.events)
+    }
+    renderFrame()
+    if !useTUI {
+        writePlain("", "\n")
+        writePlain(plainLaneFooter(lane: store.read().coreML, focus: .gpu, capability: powerCapability), "\n")
+    }
+    return metricsFromLane(store.read().coreML)
+}
+
+private func plainLaneFooter(lane: LiveLaneSnapshot, focus: LaneWattFocus, capability: PowerCapability) -> String {
+    let tok = String(format: "%.1f", lane.tokensPerSecond)
+    let ttft = String(format: "%.0f", lane.ttftMs)
+    let compile = String(format: "%.0f", lane.compileMs)
+    let metrics = "tok/s \(tok)  TTFT \(ttft)ms  compile \(compile)ms"
+    let power = chatPowerFooter(
+        capability: capability,
+        summary: lane.power,
+        tokensPerSecond: lane.tokensPerSecond
+    )
+    switch power {
+    case let .unavailable(message):
+        return metrics + "  " + message
+    case .pending:
+        return metrics + "  power: sampling"
+    case let .measured(packageW, cpuW, gpuW, aneW, joulesPerToken):
+        let watts: String
+        switch focus {
+        case .ane:
+            watts = String(format: "ANE %.2fW  CPU %.2fW  pkg %.2fW", aneW, cpuW, packageW)
+        case .gpu:
+            watts = String(format: "GPU %.2fW  CPU %.2fW  pkg %.2fW", gpuW, cpuW, packageW)
+        }
+        if let joulesPerToken {
+            return metrics + "  " + watts + String(format: "  %.3f J/tok", joulesPerToken)
+        }
+        return metrics + "  " + watts + "  J/tok unavailable"
+    }
+}
+
+private func runChat(invocation: ResolvedInvocation, options: Options, powerEnabled: Bool) throws -> Int32 {
+    applyCLIExperimentEnvironment(options)
+    var engine = try makeEspressoEngine(invocation: invocation)
+    try engine.precompileHybridDecode(covering: invocation.config.maxSeq)
+    let tokenizer = try loadTokenizer(config: invocation.config, tokenizerDir: invocation.tokenizerDir)
+    var session = ChatSession(system: options.systemPrompt ?? QwenInstructPrompt.systemBanner)
+    let sampling = resolvedSampling(command: .chat, options: options)
+    let useTUI = shouldUseTUI(command: .chat, options: options)
+    let cancel = ChatCancelState()
+    let sigint = installChatSIGINT(cancel)
+    defer { sigint.cancel() }
+    let powerCapability = PowerTelemetryCollector.capability()
+
+    let display = TerminalDisplay()
+    let renderer = ChatTUIRenderer()
+    if useTUI {
+        display.start()
+    }
+
+    var footer = ChatStatusFooter(
+        tokensPerSecond: 0,
+        ttftMs: 0,
+        decodePath: "hybrid",
+        contextUsed: 0,
+        contextMax: invocation.config.maxSeq,
+        power: chatPowerFooter(capability: powerCapability, summary: nil, tokensPerSecond: 0)
+    )
+    var streamingAssistant = ""
+
+    func currentSnapshot(status: ChatLaneStatus) -> ChatSnapshot {
+        ChatSnapshot(
+            modelName: invocation.config.name,
+            turns: session.messages,
+            streamingAssistant: streamingAssistant,
+            status: status,
+            footer: footer
+        )
+    }
+
+    func renderTUI(status: ChatLaneStatus) {
+        guard useTUI else { return }
+        display.render(renderer.render(snapshot: currentSnapshot(status: status), size: TerminalSize.current()))
+    }
+
+    func writePlain(_ text: String, terminator: String = "\n") {
+        guard !useTUI else { return }
+        FileHandle.standardOutput.write(Data((text + terminator).utf8))
+        fflush(stdout)
+    }
+
+    if !useTUI {
+        writePlain(
+            "espresso chat  model=\(invocation.config.name)  sampling=\(sampling.isGreedy ? "greedy" : "t=\(sampling.temperature) top-p=\(sampling.topP)")  fallback=disabled"
+        )
+        writePlain("commands: /reset /retry /exit   Ctrl-C cancels the current completion")
+    } else {
+        renderTUI(status: .idle)
+    }
+
+    while true {
+        if useTUI {
+            renderTUI(status: .idle)
+            FileHandle.standardOutput.write(Data("you> ".utf8))
+            fflush(stdout)
+        } else {
+            writePlain("you> ", terminator: "")
+        }
+
+        guard let line = readChatLine() else {
+            break
+        }
+        if !useTUI {
+            if isatty(STDIN_FILENO) == 0 {
+                writePlain(line)
+            }
+        }
+        let action = session.apply(ChatCommand.parse(line))
+        switch action {
+        case .exit:
+            if useTUI {
+                display.stop()
+            }
+            return 0
+        case let .noop(message):
+            if !message.isEmpty {
+                writePlain(message)
+            }
+            renderTUI(status: .idle)
+        case let .generate(prompt):
+            streamingAssistant = ""
+            cancel.beginGeneration()
+            defer { cancel.endGeneration() }
+            footer.power = powerEnabled && powerCapability.available
+                ? .pending
+                : chatPowerFooter(capability: powerCapability, summary: nil, tokensPerSecond: 0)
+            if !useTUI {
+                writePlain("qwen> ", terminator: "")
+            } else {
+                renderTUI(status: .generating)
+            }
+            do {
+                let promptTokenCount = (try? tokenizer.encode(prompt).count) ?? 0
+                footer.contextUsed = promptTokenCount
+                footer.contextMax = invocation.config.maxSeq
+                let measured = try maybeMeasurePower(enabled: powerEnabled, sampleIntervalMs: 200) {
+                    try engine.generate(
+                        prompt: prompt,
+                        maxTokens: invocation.maxTokens,
+                        temperature: sampling.temperature,
+                        topP: sampling.topP,
+                        onStep: { step in
+                            let rawAssistant = assistantTextFromGeneratedTokens(
+                                step.generatedTokens,
+                                decode: tokenizer.decodeImpl,
+                                eosToken: invocation.config.eosToken
+                            )
+                            streamingAssistant = ChatSession.sanitizeAssistantText(rawAssistant)
+                            if rawAssistant.contains("<|im_end|>") || rawAssistant.contains("<|endoftext|>") {
+                                cancel.requestCancel()
+                            }
+                            footer.tokensPerSecond = step.tokensPerSecond
+                            footer.ttftMs = step.firstTokenLatencyMs
+                            footer.contextUsed = promptTokenCount + step.generatedTokens.count
+                            if useTUI {
+                                renderTUI(status: .generating)
+                            } else {
+                                writePlain(tokenizer.decode([Int(step.token)]), terminator: "")
+                            }
+                        },
+                        isCancelled: { cancel.isCancelled }
+                    )
+                }
+                let result = measured.result
+                try assertChatDecodePathIsHybrid(result.decodePath)
+                footer.decodePath = result.decodePath
+                footer.tokensPerSecond = result.tokensPerSecond
+                footer.ttftMs = result.firstTokenLatencyMs
+                footer.contextUsed = result.promptTokens.count + result.tokens.count
+                footer.power = chatPowerFooter(
+                    capability: powerCapability,
+                    summary: measured.power,
+                    tokensPerSecond: result.tokensPerSecond
+                )
+                let text = assistantTextFromGeneratedTokens(
+                    result.tokens,
+                    decode: tokenizer.decodeImpl,
+                    eosToken: invocation.config.eosToken
+                )
+                session.appendAssistant(text)
+                streamingAssistant = ""
+                if !useTUI {
+                    writePlain("")
+                    writePlain(footer.render())
+                } else {
+                    renderTUI(status: .idle)
+                }
+            } catch let error as RealModelInferenceError {
+                if case .cancelled = error {
+                    let partial = ChatSession.sanitizeAssistantText(streamingAssistant)
+                    if !partial.isEmpty {
+                        session.appendAssistant(partial)
+                    }
+                    streamingAssistant = ""
+                    footer.power = chatPowerFooter(
+                        capability: powerCapability,
+                        summary: nil,
+                        tokensPerSecond: footer.tokensPerSecond
+                    )
+                    if cancel.wasUserInterrupt {
+                        if !useTUI {
+                            writePlain("")
+                            writePlain("^C cancelled")
+                        } else {
+                            renderTUI(status: .cancelled)
+                        }
+                    } else if !useTUI {
+                        writePlain("")
+                        writePlain(footer.render())
+                    } else {
+                        renderTUI(status: .idle)
+                    }
+                    continue
+                }
+                throw error
+            }
+        }
+    }
+
+    if useTUI {
+        display.stop()
+    }
+    return 0
+}
+
 enum EspressoGenerateCLI {
     static func main() -> Int32 {
         do {
             let options = try Options.parse(CommandLine.arguments)
+            try validateChatVsMLXFlags(options)
             let defaults = detectDemoDefaults()
 
             if options.showHelp {
@@ -2761,6 +3516,16 @@ enum EspressoGenerateCLI {
             let invocation = try resolveInvocation(from: options, demoDefaults: defaults, command: command)
 
             switch command {
+            case .chat:
+                if options.compareOpponent == .mlx {
+                    return try runChatVsMLX(
+                        invocation: invocation,
+                        options: options,
+                        defaults: defaults,
+                        powerEnabled: powerEnabled
+                    )
+                }
+                return try runChat(invocation: invocation, options: options, powerEnabled: powerEnabled)
             case .generate:
                 let result = try runGenerate(invocation: invocation)
                 let artifactDirectory = try writeGenerateArtifacts(

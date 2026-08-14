@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PyTorch reference oracle for Qwen2.5-0.5B-Instruct parity work.
+"""PyTorch reference oracle for Qwen2.5-0.5B-Instruct and Qwen2.5-1.5B-Instruct.
 
 Two subcommands:
 
@@ -11,8 +11,9 @@ Two subcommands:
   fixtures       Greedy-decode a fixed prompt suite and write the reference token IDs as
                  a JSON fixture for the hardware-gated exact-match test.
 
-Both subcommands read the safetensors checkpoint cached by
-`scripts/convert_qwen25_05b_to_esp.py`, so no second download happens.
+`--model` selects the checkpoint. Source and native directories default to the same
+cache slugs as `scripts/convert_qwen25_05b_to_esp.py` (and prefer a complete Hugging
+Face hub snapshot when one is present).
 
 The reference deliberately uses HuggingFace `transformers` rather than a hand-written
 Qwen2 forward pass: the point of an oracle is that it is independently trustworthy.
@@ -36,8 +37,14 @@ if TYPE_CHECKING:
     import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from scripts import convert_qwen25_05b_to_esp as convert
+
 VENV_TAG = "qwen25-parity"
 REQUIREMENTS = ("torch", "transformers", "safetensors", "numpy")
+DEFAULT_MODEL = convert.DEFAULT_MODEL
 
 
 class ReferenceError(RuntimeError):
@@ -61,6 +68,50 @@ def espresso_cache_root() -> Path:
     if override:
         return Path(override).expanduser()
     return Path.home() / "Library" / "Caches" / "Espresso"
+
+
+def model_short_name(model: str) -> str:
+    return convert.SUPPORTED_MODELS[model].short_name
+
+
+def parse_layer_list(raw: str | None) -> list[int] | None:
+    if raw is None:
+        return None
+    layers = [int(entry.strip()) for entry in raw.split(",") if entry.strip()]
+    if not layers:
+        raise ReferenceError("--layers must name at least one layer")
+    return layers
+
+
+def resolved_reference_paths(
+    model: str,
+    source_dir: str | None,
+    native_dir: str | None,
+    force_hub_lookup: bool = True,
+) -> tuple[Path, Path]:
+    """Resolve checkpoint and native-dir paths for `--model`.
+
+    Explicit `--source-dir` / `--native-dir` win. Otherwise native dir follows the
+    converter's cache slug, and the source prefers a complete Hugging Face snapshot
+    when `force_hub_lookup` is true.
+    """
+    profile = convert.SUPPORTED_MODELS[model]
+    cache_root = espresso_cache_root()
+    paths = convert.default_paths(profile, cache_root)
+    if source_dir:
+        resolved_source = Path(source_dir).expanduser()
+    elif force_hub_lookup:
+        resolved_source = convert.resolve_source_dir(
+            repo=profile.repo,
+            explicit=None,
+            cache_root=cache_root,
+            source_slug=profile.source_slug,
+            force_download=False,
+        )
+    else:
+        resolved_source = paths.source
+    resolved_native = Path(native_dir).expanduser() if native_dir else paths.native
+    return resolved_source, resolved_native
 
 
 def _missing_requirements() -> list[str]:
@@ -294,8 +345,9 @@ def capture_layer_boundaries(model, token_ids: list[int], n_layer: int):
 def command_layer_parity(args: argparse.Namespace) -> int:
     import numpy as np
 
-    source_dir = Path(args.source_dir).expanduser()
-    native_dir = Path(args.native_dir).expanduser()
+    source_dir, native_dir = resolved_reference_paths(
+        args.model, args.source_dir, args.native_dir
+    )
     metadata = json.loads((native_dir / "metadata.json").read_text(encoding="utf-8"))
     n_layer = int(metadata["nLayer"])
     d_model = int(metadata["dModel"])
@@ -320,7 +372,11 @@ def command_layer_parity(args: argparse.Namespace) -> int:
         model, token_ids, n_layer=n_layer
     )
 
-    layers = list(range(n_layer))
+    requested = parse_layer_list(args.layers)
+    layers = requested if requested is not None else list(range(n_layer))
+    for layer in layers:
+        if layer < 0 or layer >= n_layer:
+            raise ReferenceError(f"layer {layer} out of range for nLayer {n_layer}")
     work_dir = Path(args.work_dir).expanduser() if args.work_dir else native_dir.parent / "parity-work"
     work_dir.mkdir(parents=True, exist_ok=True)
 
@@ -386,13 +442,27 @@ def command_layer_parity(args: argparse.Namespace) -> int:
     for backend, value in worst.items():
         print(f"[parity] {backend}: worst layer max abs diff = {value:.6e}", flush=True)
 
-    if args.gate_layer0_max_abs is not None:
+    if args.gate_layer0_max_abs is not None or args.gate_layer0_max_rel is not None:
         for backend, rows in measurements.items():
-            layer0 = rows[0]["max_abs"]
-            if layer0 > args.gate_layer0_max_abs:
+            layer0_rows = [row for row in rows if row["layer"] == 0]
+            if not layer0_rows:
+                continue
+            layer0 = layer0_rows[0]
+            if args.gate_layer0_max_abs is not None and layer0["max_abs"] > args.gate_layer0_max_abs:
                 print(
-                    f"[parity] FAIL {backend}: layer 0 max abs diff {layer0:.6e} "
+                    f"[parity] FAIL {backend}: layer 0 max abs diff {layer0['max_abs']:.6e} "
                     f"exceeds gate {args.gate_layer0_max_abs:.6e}",
+                    file=sys.stderr,
+                )
+                return 1
+            if (
+                args.gate_layer0_max_rel is not None
+                and layer0["max_rel_to_layer_scale"] > args.gate_layer0_max_rel
+            ):
+                print(
+                    f"[parity] FAIL {backend}: layer 0 relative diff "
+                    f"{layer0['max_rel_to_layer_scale']:.6e} exceeds gate "
+                    f"{args.gate_layer0_max_rel:.6e}",
                     file=sys.stderr,
                 )
                 return 1
@@ -445,8 +515,9 @@ def greedy_generate(model, prompt_tokens: list[int], max_new_tokens: int, eos_id
     output is not the greedy argmax sequence an inference runtime reproduces. Getting this
     wrong makes a correct runtime look broken.
 
-    The full sequence is re-run each step instead of using a KV cache: 32 steps on a 0.5B
-    model is cheap, and it removes any chance of a cache-API subtlety corrupting the oracle.
+    HuggingFace's incremental `past_key_values` is used so 1.5B (28 layers) can emit a
+    32-token suite in minutes rather than hours. This is still an explicit argmax over
+    raw logits — not `model.generate`, which would apply repetition_penalty=1.1.
     """
     import torch
 
@@ -454,10 +525,17 @@ def greedy_generate(model, prompt_tokens: list[int], max_new_tokens: int, eos_id
     produced: list[int] = []
     top_gaps: list[float] = []
     runner_ups: list[int] = []
+    past = None
     for _ in range(max_new_tokens):
         with torch.no_grad():
-            logits = model(input_ids=torch.tensor([tokens], dtype=torch.long), use_cache=False).logits
-        final = logits[0, -1]
+            step_input = tokens if past is None else [tokens[-1]]
+            output = model(
+                input_ids=torch.tensor([step_input], dtype=torch.long),
+                past_key_values=past,
+                use_cache=True,
+            )
+        past = output.past_key_values
+        final = output.logits[0, -1]
         top2 = torch.topk(final, 2)
         next_token = int(top2.indices[0])
         top_gaps.append(float(top2.values[0] - top2.values[1]))
@@ -499,8 +577,9 @@ def command_logit_parity(args: argparse.Namespace) -> int:
     import numpy as np
     import torch
 
-    source_dir = Path(args.source_dir).expanduser()
-    native_dir = Path(args.native_dir).expanduser()
+    source_dir, native_dir = resolved_reference_paths(
+        args.model, args.source_dir, args.native_dir
+    )
     metadata = json.loads((native_dir / "metadata.json").read_text(encoding="utf-8"))
     d_model = int(metadata["dModel"])
     vocab = int(metadata["vocab"])
@@ -589,7 +668,9 @@ def command_logit_parity(args: argparse.Namespace) -> int:
 
 
 def command_fixtures(args: argparse.Namespace) -> int:
-    source_dir = Path(args.source_dir).expanduser()
+    source_dir, _native_dir = resolved_reference_paths(
+        args.model, args.source_dir, args.native_dir
+    )
     tokenizer, model = load_reference_model(source_dir)
     prompts = load_prompts(Path(args.prompts).expanduser())
     if len(prompts) < args.min_prompts:
@@ -631,7 +712,7 @@ def command_fixtures(args: argparse.Namespace) -> int:
         )
 
     fixture = {
-        "model": "Qwen2.5-0.5B-Instruct",
+        "model": model_short_name(args.model),
         "reference": "pytorch fp32 pure greedy argmax over raw logits (no logits processors)",
         "chatTemplate": not args.raw_prompt,
         "maxNewTokens": args.max_new_tokens,
@@ -650,17 +731,18 @@ def command_fixtures(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
-def default_source_dir() -> Path:
-    return espresso_cache_root() / "qwen25-05b-src"
-
-
-def default_native_dir() -> Path:
-    return espresso_cache_root() / "qwen25-05b" / "Qwen2.5-0.5B-Instruct-native"
-
-
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "--model",
+        default=DEFAULT_MODEL,
+        choices=list(convert.SUPPORTED_MODELS),
+        help=(
+            "Hugging Face repo whose cache slugs resolve source/native paths "
+            f"(default: {DEFAULT_MODEL})"
+        ),
     )
     parser.add_argument(
         "--no-bootstrap",
@@ -670,8 +752,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     parity = subparsers.add_parser("layer-parity", help="Write the per-layer parity report")
-    parity.add_argument("--source-dir", default=str(default_source_dir()))
-    parity.add_argument("--native-dir", default=str(default_native_dir()))
+    parity.add_argument(
+        "--source-dir",
+        default=None,
+        help="Override the resolved Hugging Face / cache source directory",
+    )
+    parity.add_argument(
+        "--native-dir",
+        default=None,
+        help="Override the resolved native weight directory",
+    )
     parity.add_argument("--work-dir", default=None, help="Where to stage .f32 intermediates")
     parity.add_argument(
         "--prompt",
@@ -694,18 +784,37 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parity.add_argument("--report-json", default=None)
     parity.add_argument("--report-markdown", default=None)
     parity.add_argument(
+        "--layers",
+        default=None,
+        help="Comma-separated layer indices to measure (default: all)",
+    )
+    parity.add_argument(
         "--gate-layer0-max-abs",
         type=float,
         default=None,
         help="Exit non-zero when layer 0 max abs diff exceeds this value",
+    )
+    parity.add_argument(
+        "--gate-layer0-max-rel",
+        type=float,
+        default=None,
+        help="Exit non-zero when layer 0 max diff / layer scale exceeds this value",
     )
     parity.set_defaults(func=command_layer_parity)
 
     logits = subparsers.add_parser(
         "logit-parity", help="Compare final logits through the whole stack against PyTorch fp32"
     )
-    logits.add_argument("--source-dir", default=str(default_source_dir()))
-    logits.add_argument("--native-dir", default=str(default_native_dir()))
+    logits.add_argument(
+        "--source-dir",
+        default=None,
+        help="Override the resolved Hugging Face / cache source directory",
+    )
+    logits.add_argument(
+        "--native-dir",
+        default=None,
+        help="Override the resolved native weight directory",
+    )
     logits.add_argument("--work-dir", default=None)
     logits.add_argument(
         "--fixture",
@@ -723,7 +832,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     logits.set_defaults(func=command_logit_parity)
 
     fixtures = subparsers.add_parser("fixtures", help="Write greedy reference token fixtures")
-    fixtures.add_argument("--source-dir", default=str(default_source_dir()))
+    fixtures.add_argument(
+        "--source-dir",
+        default=None,
+        help="Override the resolved Hugging Face / cache source directory",
+    )
+    fixtures.add_argument(
+        "--native-dir",
+        default=None,
+        help="Unused for fixtures; accepted so --model path resolution stays uniform",
+    )
     fixtures.add_argument("--prompts", default=str(REPO_ROOT / "scripts" / "qwen25_prompts.txt"))
     fixtures.add_argument("--output", default=None, required=True)
     fixtures.add_argument("--max-new-tokens", type=int, default=32)

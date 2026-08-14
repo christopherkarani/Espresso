@@ -860,6 +860,12 @@ private func makeDecodePathRoutingConfig(
     )
     #expect(
         RealModelInferenceEngine.llamaGenerationPath(
+            config: makeDecodePathRoutingConfig(name: "Qwen2.5-1.5B-Instruct", preferredDecodePath: .hybrid),
+            environment: [:]
+        ) == .hybrid
+    )
+    #expect(
+        RealModelInferenceEngine.llamaGenerationPath(
             config: makeDecodePathRoutingConfig(name: "llama3", preferredDecodePath: .exactCPU),
             environment: [:]
         ) == .exactCPU

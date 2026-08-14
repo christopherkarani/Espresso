@@ -396,11 +396,16 @@ public struct ANEKernel: ~Copyable {
             }
         }
 
-        let rawHandle = try Self.compileWithRetry(
-            checkBudget: false,
-            compileLabel: compileLabel,
-            compileAttempt: reloadHandle
-        )
+        // Donor reload is a best-effort fast path. A miss is not a transient
+        // compiler failure — retrying it 4 more times is what produced the
+        // 156-retry / 195-failure storm on Qwen2.5-1.5B. One attempt, then cold.
+        ANECompileStats.recordAttempt(label: compileLabel)
+        let rawHandle = reloadHandle()
+        if rawHandle != nil {
+            ANECompileStats.recordSuccess(label: compileLabel)
+        } else {
+            ANECompileStats.recordFailure(label: compileLabel, willRetry: false)
+        }
 
         guard let rawHandle else {
             throw Self.mapInteropCompileError()

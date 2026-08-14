@@ -30,6 +30,11 @@ import Testing
     let newlineEncoded = tokenizer.encode(newline)
     #expect(newlineEncoded == [5, 4])
     #expect(tokenizer.decode(newlineEncoded) == newline)
+
+    // Hugging Face splits special tokens before BPE. Without that, Qwen chat
+    // markers become ordinary pieces and greedy never emits eosToken 151645.
+    #expect(tokenizer.encode("<|begin_of_text|>") == [5, 5])
+    #expect(tokenizer.encode("Hello<|begin_of_text|>") == [5, 0, 5])
 }
 
 @Test func localLlama32TokenizerJSONMatchesKnownHFTokenIDs() throws {
