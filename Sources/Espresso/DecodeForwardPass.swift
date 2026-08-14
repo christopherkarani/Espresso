@@ -321,20 +321,114 @@ public final class DecodeKernelProfiler: @unchecked Sendable {
 
 public struct HybridDecodeTimingBreakdown: Sendable {
     public var tAneQKV: Double
+    /// CPU RoPE hook (Q/K read, rotate, write). Metal RoPE stays inside `tMetal`.
+    public var tRoPE: Double
+    /// Attention context: Metal SDPA or CPU decode attention.
     public var tMetal: Double
     public var tAneFFN: Double
+    /// Final norm + classifier. Filled by the generate path, not `runHybridDecodeTimed`.
+    public var tLMHead: Double
     public var tIO: Double
 
     public init(
         tAneQKV: Double = 0,
+        tRoPE: Double = 0,
         tMetal: Double = 0,
         tAneFFN: Double = 0,
+        tLMHead: Double = 0,
         tIO: Double = 0
     ) {
         self.tAneQKV = tAneQKV
+        self.tRoPE = tRoPE
         self.tMetal = tMetal
         self.tAneFFN = tAneFFN
+        self.tLMHead = tLMHead
         self.tIO = tIO
+    }
+
+    public var totalMs: Double {
+        tAneQKV + tRoPE + tMetal + tAneFFN + tLMHead + tIO
+    }
+
+    public mutating func reset() {
+        self = HybridDecodeTimingBreakdown()
+    }
+}
+
+/// Per-generated-token attribution of `HybridDecodeTimingBreakdown`.
+/// Token 0 is TTFT (LM head only after prefill). Later tokens own the previous
+/// decode step plus this token's LM head — the same wall clock as `median_token_ms`.
+public struct HybridDecodeTokenProfile: Sendable {
+    public let tokens: [HybridDecodeTimingBreakdown]
+
+    public init(tokens: [HybridDecodeTimingBreakdown]) {
+        self.tokens = tokens
+    }
+
+    public var meanAll: HybridDecodeTimingBreakdown {
+        Self.mean(of: tokens)
+    }
+
+    public var meanExcludingFirst: HybridDecodeTimingBreakdown {
+        guard tokens.count > 1 else { return meanAll }
+        return Self.mean(of: Array(tokens.dropFirst()))
+    }
+
+    public static func mean(of samples: [HybridDecodeTimingBreakdown]) -> HybridDecodeTimingBreakdown {
+        guard !samples.isEmpty else { return HybridDecodeTimingBreakdown() }
+        let n = Double(samples.count)
+        return HybridDecodeTimingBreakdown(
+            tAneQKV: samples.reduce(0) { $0 + $1.tAneQKV } / n,
+            tRoPE: samples.reduce(0) { $0 + $1.tRoPE } / n,
+            tMetal: samples.reduce(0) { $0 + $1.tMetal } / n,
+            tAneFFN: samples.reduce(0) { $0 + $1.tAneFFN } / n,
+            tLMHead: samples.reduce(0) { $0 + $1.tLMHead } / n,
+            tIO: samples.reduce(0) { $0 + $1.tIO } / n
+        )
+    }
+
+    public func formatReport() -> String {
+        let mean = meanExcludingFirst
+        let steadyCount = max(tokens.count - 1, tokens.isEmpty ? 0 : 1)
+        var lines: [String] = [
+            String(
+                format: "decode_profile_mean_ms/token qkv=%.2f rope=%.2f attn=%.2f ffn=%.2f lm_head=%.2f io=%.2f n=%d exclude_ttft=1",
+                locale: Locale(identifier: "en_US_POSIX"),
+                mean.tAneQKV,
+                mean.tRoPE,
+                mean.tMetal,
+                mean.tAneFFN,
+                mean.tLMHead,
+                mean.tIO,
+                steadyCount
+            )
+        ]
+        if let first = tokens.first {
+            lines.append(
+                String(
+                    format: "decode_profile_ttft_ms=%.2f lm_head=%.2f",
+                    locale: Locale(identifier: "en_US_POSIX"),
+                    first.totalMs,
+                    first.tLMHead
+                )
+            )
+        }
+        for (index, token) in tokens.enumerated() {
+            lines.append(
+                String(
+                    format: "decode_profile_token i=%d qkv=%.2f rope=%.2f attn=%.2f ffn=%.2f lm_head=%.2f io=%.2f",
+                    locale: Locale(identifier: "en_US_POSIX"),
+                    index,
+                    token.tAneQKV,
+                    token.tRoPE,
+                    token.tMetal,
+                    token.tAneFFN,
+                    token.tLMHead,
+                    token.tIO
+                )
+            )
+        }
+        return lines.joined(separator: "\n")
     }
 }
 
@@ -1274,7 +1368,7 @@ public extension ForwardPass {
                         } catch {
                             throw .invalidArguments("hybrid post-QKV hook failed at layer \(layerIndex), token \(tokenIndex): \(error)")
                         }
-                        timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
+                        timings.tRoPE += RuntimeClock.ms(RuntimeClock.now() - t0)
                     }
 
                     // KV cache update (CPU)
@@ -1356,7 +1450,7 @@ public extension ForwardPass {
                     } catch {
                         throw .invalidArguments("hybrid post-QKV hook failed at layer \(layerIndex), token \(tokenIndex): \(error)")
                     }
-                    timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
+                    timings.tRoPE += RuntimeClock.ms(RuntimeClock.now() - t0)
                 }
 
                 t0 = RuntimeClock.now()
@@ -1442,7 +1536,7 @@ public extension ForwardPass {
                     } catch {
                         throw .invalidArguments("hybrid post-QKV hook failed at layer \(layerIndex), token \(tokenIndex): \(error)")
                     }
-                    timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
+                    timings.tRoPE += RuntimeClock.ms(RuntimeClock.now() - t0)
                 }
 
                 t0 = RuntimeClock.now()

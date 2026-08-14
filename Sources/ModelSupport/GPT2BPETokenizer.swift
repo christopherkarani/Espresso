@@ -23,6 +23,7 @@ public final class GPT2BPETokenizer: Tokenizer, @unchecked Sendable {
     private let preTokenizer: NSRegularExpression
     private let prefixTokenIDs: [Int]
     private let skippedTokenIDs: Set<Int>
+    private let specialTokens: [(content: String, id: Int)]
     private let cacheLock = NSLock()
     private var cache: [String: [String]] = [:]
 
@@ -39,7 +40,8 @@ public final class GPT2BPETokenizer: Tokenizer, @unchecked Sendable {
             merges: merges.split(separator: "\n").map(String.init),
             preTokenizerPattern: Self.defaultPreTokenizerPattern,
             prefixTokenIDs: [],
-            skippedTokenIDs: []
+            skippedTokenIDs: [],
+            specialTokens: []
         )
     }
 
@@ -61,7 +63,7 @@ public final class GPT2BPETokenizer: Tokenizer, @unchecked Sendable {
         }
 
         var encoder = try Self.parseVocabulary(rawVocab)
-        let skippedTokenIDs = Self.mergeAddedTokens(from: root, into: &encoder)
+        let added = Self.mergeAddedTokens(from: root, into: &encoder)
         let merges = try Self.parseTokenizerJSONMerges(model["merges"])
         let preTokenizerPattern = Self.preTokenizerPattern(from: root) ?? Self.defaultPreTokenizerPattern
         let prefixTokenIDs = Self.prefixTokenIDs(from: root, encoder: encoder)
@@ -71,15 +73,40 @@ public final class GPT2BPETokenizer: Tokenizer, @unchecked Sendable {
             merges: merges,
             preTokenizerPattern: preTokenizerPattern,
             prefixTokenIDs: prefixTokenIDs,
-            skippedTokenIDs: skippedTokenIDs
+            skippedTokenIDs: added.skippedIDs,
+            specialTokens: added.specials
         )
     }
 
     public func encode(_ text: String) -> [Int] {
+        var tokens = prefixTokenIDs
+        if specialTokens.isEmpty {
+            tokens.append(contentsOf: encodeOrdinary(text))
+            return tokens
+        }
+
+        var start = text.startIndex
+        while start < text.endIndex {
+            if let match = specialPrefix(in: text, from: start) {
+                tokens.append(match.id)
+                start = match.end
+                continue
+            }
+            var cursor = text.index(after: start)
+            while cursor < text.endIndex, specialPrefix(in: text, from: cursor) == nil {
+                cursor = text.index(after: cursor)
+            }
+            tokens.append(contentsOf: encodeOrdinary(String(text[start..<cursor])))
+            start = cursor
+        }
+        return tokens
+    }
+
+    private func encodeOrdinary(_ text: String) -> [Int] {
+        guard !text.isEmpty else { return [] }
         let nsText = text as NSString
         let matches = preTokenizer.matches(in: text, range: NSRange(location: 0, length: nsText.length))
-        var tokens = prefixTokenIDs
-
+        var tokens: [Int] = []
         for match in matches {
             let chunk = nsText.substring(with: match.range)
             let encoded = encodeBytes(of: chunk)
@@ -88,8 +115,16 @@ public final class GPT2BPETokenizer: Tokenizer, @unchecked Sendable {
                 tokens.append(token)
             }
         }
-
         return tokens
+    }
+
+    private func specialPrefix(in text: String, from start: String.Index) -> (id: Int, end: String.Index)? {
+        for special in specialTokens {
+            if text[start...].hasPrefix(special.content) {
+                return (special.id, text.index(start, offsetBy: special.content.count))
+            }
+        }
+        return nil
     }
 
     public func decode(_ tokens: [Int]) -> String {
@@ -115,7 +150,8 @@ public final class GPT2BPETokenizer: Tokenizer, @unchecked Sendable {
         merges: [String],
         preTokenizerPattern: String,
         prefixTokenIDs: [Int],
-        skippedTokenIDs: Set<Int>
+        skippedTokenIDs: Set<Int>,
+        specialTokens: [(content: String, id: Int)]
     ) throws {
         guard !encoder.isEmpty else {
             throw GPT2BPETokenizerError.emptyVocabulary
@@ -141,6 +177,7 @@ public final class GPT2BPETokenizer: Tokenizer, @unchecked Sendable {
         self.vocabSize = decoder.count
         self.prefixTokenIDs = prefixTokenIDs
         self.skippedTokenIDs = skippedTokenIDs
+        self.specialTokens = specialTokens.sorted { $0.content.count > $1.content.count }
 
         var bpeRanks: [TokenPair: Int] = [:]
         var rank = 0
@@ -275,11 +312,15 @@ public final class GPT2BPETokenizer: Tokenizer, @unchecked Sendable {
         return encoder
     }
 
-    private static func mergeAddedTokens(from root: [String: Any], into encoder: inout [String: Int]) -> Set<Int> {
+    private static func mergeAddedTokens(
+        from root: [String: Any],
+        into encoder: inout [String: Int]
+    ) -> (skippedIDs: Set<Int>, specials: [(content: String, id: Int)]) {
         guard let addedTokens = root["added_tokens"] as? [[String: Any]] else {
-            return []
+            return ([], [])
         }
         var skippedTokenIDs = Set<Int>()
+        var specials: [(content: String, id: Int)] = []
         for token in addedTokens {
             guard let id = (token["id"] as? NSNumber)?.intValue,
                   let content = token["content"] as? String else {
@@ -288,9 +329,10 @@ public final class GPT2BPETokenizer: Tokenizer, @unchecked Sendable {
             encoder[content] = id
             if (token["special"] as? Bool) == true {
                 skippedTokenIDs.insert(id)
+                specials.append((content, id))
             }
         }
-        return skippedTokenIDs
+        return (skippedTokenIDs, specials)
     }
 
     private static func parseTokenizerJSONMerges(_ rawMerges: Any?) throws -> [String] {

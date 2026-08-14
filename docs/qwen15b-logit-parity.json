@@ -1,0 +1,40 @@
+{
+  "rows": [
+    {
+      "case": 0,
+      "backend": "cpu-fp32",
+      "max_abs_logit_diff": 0.00030791759490966797,
+      "argmax": 32,
+      "reference_argmax": 32,
+      "reference_top_gap": 0.5609188079833984
+    },
+    {
+      "case": 0,
+      "backend": "ane",
+      "max_abs_logit_diff": 0.20883679389953613,
+      "argmax": 32,
+      "reference_argmax": 32,
+      "reference_top_gap": 0.5609188079833984
+    },
+    {
+      "case": 5,
+      "backend": "cpu-fp32",
+      "max_abs_logit_diff": 0.00033652782440185547,
+      "argmax": 785,
+      "reference_argmax": 785,
+      "reference_top_gap": 0.829193115234375
+    },
+    {
+      "case": 5,
+      "backend": "ane",
+      "max_abs_logit_diff": 0.2392120361328125,
+      "argmax": 785,
+      "reference_argmax": 785,
+      "reference_top_gap": 0.829193115234375
+    }
+  ],
+  "worstMaxAbsLogitDiff": {
+    "cpu-fp32": 0.00033652782440185547,
+    "ane": 0.2392120361328125
+  }
+}

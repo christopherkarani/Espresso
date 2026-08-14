@@ -35,6 +35,8 @@ final class PowerTelemetryCollector: @unchecked Sendable {
         self.sampleIntervalMs = sampleIntervalMs
     }
 
+    static let capabilityProbeArguments = ["-n", "/usr/bin/powermetrics", "--help"]
+
     static func capability() -> PowerCapability {
         let fileManager = FileManager()
         guard fileManager.fileExists(atPath: "/usr/bin/powermetrics") else {
@@ -43,8 +45,12 @@ final class PowerTelemetryCollector: @unchecked Sendable {
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
-        process.arguments = ["-n", "/usr/bin/true"]
+        // Probe powermetrics itself. `sudo -n true` is the wrong check when
+        // sudoers is `NOPASSWD: /usr/bin/powermetrics` only.
+        process.arguments = capabilityProbeArguments
+        let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
+        process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
         do {
             try process.run()
@@ -72,7 +78,7 @@ final class PowerTelemetryCollector: @unchecked Sendable {
             "-n",
             "/usr/bin/powermetrics",
             "--samplers", "cpu_power,gpu_power,ane_power",
-            "--sample-interval", String(sampleIntervalMs),
+            "--sample-rate", String(sampleIntervalMs),
         ]
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
@@ -122,6 +128,15 @@ final class PowerTelemetryCollector: @unchecked Sendable {
     }
 }
 
+func joulesPerToken(packageWatts: Double, tokensPerSecond: Double) -> Double? {
+    guard packageWatts.isFinite, packageWatts >= 0,
+          tokensPerSecond.isFinite, tokensPerSecond > 0
+    else {
+        return nil
+    }
+    return packageWatts / tokensPerSecond
+}
+
 func parsePowermetricsSamples(from text: String) -> [PowerSample] {
     let parser = PowermetricsParser()
     var samples: [PowerSample] = []
@@ -166,7 +181,7 @@ private final class PowermetricsParser: @unchecked Sendable {
     private let lock = NSLock()
     private var buffer = ""
     private let powerPattern = try! NSRegularExpression(
-        pattern: #"(?im)^\s*(CPU Power|GPU Power|ANE Power|Package Power|Combined Power|SoC Power)\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*(mW|W)\s*$"#
+        pattern: #"(?im)^\s*(CPU Power|GPU Power|ANE Power|Package Power|Combined Power(?:\s*\([^)]*\))?|SoC Power)\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*(mW|W)\s*$"#
     )
 
     func append(_ data: Data, onSample: @escaping (PowerSample) -> Void) {
@@ -221,17 +236,14 @@ private final class PowermetricsParser: @unchecked Sendable {
             let name = String(text[nameRange]).lowercased()
             let unit = String(text[unitRange]).lowercased()
             let watts = unit == "mw" ? rawValue / 1_000.0 : rawValue
-            switch name {
-            case "cpu power":
+            if name == "cpu power" {
                 cpuW = watts
-            case "gpu power":
+            } else if name == "gpu power" {
                 gpuW = watts
-            case "ane power":
+            } else if name == "ane power" {
                 aneW = watts
-            case "package power", "combined power", "soc power":
+            } else if name.hasPrefix("package power") || name.hasPrefix("combined power") || name.hasPrefix("soc power") {
                 packageW = watts
-            default:
-                break
             }
         }
 

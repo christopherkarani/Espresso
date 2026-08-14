@@ -261,6 +261,51 @@ import ModelSupport
     )
 }
 
+@Test func test_hybridDonorDeltaDisabledAtQwen15BFFNWidth() {
+    let qwen15b = MultiModelConfig(
+        name: "Qwen2.5-1.5B-Instruct",
+        nLayer: 28,
+        nHead: 12,
+        nKVHead: 2,
+        dModel: 1536,
+        headDim: 128,
+        hiddenDim: 8960,
+        vocab: 151_936,
+        maxSeq: 1024,
+        normEps: 1e-6,
+        architecture: .llama,
+        preferredDecodePath: .hybrid
+    )
+    let qwen05b = MultiModelConfig(
+        name: "Qwen2.5-0.5B-Instruct",
+        nLayer: 24,
+        nHead: 14,
+        nKVHead: 2,
+        dModel: 896,
+        headDim: 64,
+        hiddenDim: 4864,
+        vocab: 151_936,
+        maxSeq: 1024,
+        normEps: 1e-6,
+        architecture: .llama,
+        preferredDecodePath: .hybrid
+    )
+    #expect(qwen15b.hiddenDim * qwen15b.dModel > RealModelInferenceEngine.hybridDonorDeltaFFNElementLimit)
+    #expect(qwen05b.hiddenDim * qwen05b.dModel <= RealModelInferenceEngine.hybridDonorDeltaFFNElementLimit)
+    #expect(
+        RealModelInferenceEngine.supportsHybridDonorDelta(config: qwen15b, environment: [:]) == false
+    )
+    #expect(
+        RealModelInferenceEngine.supportsHybridDonorDelta(config: qwen05b, environment: [:]) == true
+    )
+    #expect(
+        RealModelInferenceEngine.supportsHybridDonorDelta(
+            config: qwen15b,
+            environment: ["ESPRESSO_ENABLE_HYBRID_DONOR_DELTA": "1"]
+        ) == true
+    )
+}
+
 @Test func test_llamaHybridFusedExactHeadDefaultsOnForStoriesAndAllowsDisableOverride() {
     let gpt2Config = ModelRegistry.gpt2_124m
     let storiesConfig = ModelRegistry.stories110m

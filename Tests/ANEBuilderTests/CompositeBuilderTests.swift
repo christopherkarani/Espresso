@@ -44,7 +44,7 @@ struct CompositeBuilderTests {
     #expect(graph.nodes[3].attrs == .weight(blobPath: "@b", offset: 64))
 }
 
-@Test func rmsNormUsesReduceSumScalarMeanAndPowNegativeHalf() throws {
+@Test func rmsNormDefaultsToScaledFP16SquaresToAvoidMeanSquareOverflow() throws {
     var graph = ANEGraph()
     let x = try graph.input("x", dtype: .fp16, shape: try ANEShape(channels: 16, spatial: 8))
     let out = try graph.rmsNorm("rms", input: x, dim: 16, spatial: 8, eps: 1e-5, weightPath: "@gamma")
@@ -54,8 +54,25 @@ struct CompositeBuilderTests {
     #expect(!ops.contains(.reduceMean))
     #expect(!ops.contains(.rsqrt))
     #expect(graph.nodes[out].name == "rms_out")
+    #expect(graph.nodes.contains { $0.name == "rms_scale" && $0.attrs == .scalar(ANEGraph.rmsNormFP16SafeScale) })
+    #expect(graph.nodes.contains { $0.name == "rms_xs" && $0.op == .mul })
     #expect(graph.nodes.contains { $0.name == "rms_invd" && $0.attrs == .scalar(1.0 / 16.0) })
     #expect(graph.nodes.contains { $0.name == "rms_nhalf" && $0.attrs == .scalar(-0.5) })
+    #expect(!graph.nodes.contains { $0.name == "rms_input32_out" })
+}
+
+@Test func rmsNormCanForceUnscaledFP16SquaresForExperiments() throws {
+    setenv("ESPRESSO_RMSNORM_USE_FP16", "1", 1)
+    defer { unsetenv("ESPRESSO_RMSNORM_USE_FP16") }
+
+    var graph = ANEGraph()
+    let x = try graph.input("x", dtype: .fp16, shape: try ANEShape(channels: 16, spatial: 8))
+    let out = try graph.rmsNorm("rms", input: x, dim: 16, spatial: 8, eps: 1e-5, weightPath: "@gamma")
+
+    #expect(graph.nodes[out].name == "rms_out")
+    #expect(graph.nodes.contains { $0.name == "rms_invd" && $0.attrs == .scalar(1.0 / 16.0) })
+    #expect(!graph.nodes.contains { $0.name == "rms_scale" })
+    #expect(!graph.nodes.contains { $0.name == "rms_xs" })
 }
 
 @Test func rmsNormSupportsFP32Experiment() throws {

@@ -917,6 +917,9 @@ func detectDemoDefaults() -> DemoDefaults {
 }
 
 func shouldUseDefaultGPT2Demo(_ options: Options) -> Bool {
+    if options.command == .chat {
+        return false
+    }
     if options.prepareDemo {
         return true
     }

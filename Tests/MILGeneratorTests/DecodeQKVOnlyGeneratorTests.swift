@@ -142,6 +142,37 @@ final class DecodeQKVOnlyGeneratorTests: XCTestCase {
         XCTAssertTrue(generator.milText.contains("bq.bin"))
     }
 
+    func test_decode_qkv_only_generator_qwen15b_widths_emit_gqa_and_qkv_bias() {
+        let dim = 1536
+        let kvDim = 256
+        let lane = 32
+        let gen = DecodeQKVOnlyGenerator(
+            dim: dim,
+            qDim: dim,
+            kvDim: kvDim,
+            laneSpatial: lane,
+            architecture: .rmsNormSwiGLU,
+            normEps: 1e-6,
+            hasQKVBias: true
+        )
+        let mil = gen.milText
+
+        XCTAssertEqual(gen.inputByteSizes, [dim * lane * 2])
+        XCTAssertEqual(gen.outputByteSizes, [
+            kvDim * lane * 2,
+            dim * lane * 2,
+            kvDim * lane * 2,
+        ])
+        XCTAssertTrue(mil.contains("tensor<fp16, [1, \(dim), 1, \(lane)]> x"))
+        XCTAssertTrue(mil.contains("tensor<fp16, [\(dim), \(dim), 1, 1]>"))
+        XCTAssertTrue(mil.contains("tensor<fp16, [\(kvDim), \(dim), 1, 1]>"))
+        XCTAssertTrue(mil.contains("bq.bin"))
+        XCTAssertTrue(mil.contains("bk.bin"))
+        XCTAssertTrue(mil.contains("bv.bin"))
+        XCTAssertFalse(mil.contains("wo.bin"))
+        XCTAssertFalse(mil.contains("tanh("))
+    }
+
     func test_decode_qkv_only_generator_uses_custom_norm_epsilon() {
         let mil = DecodeQKVOnlyGenerator(
             dim: 1024,
@@ -152,7 +183,7 @@ final class DecodeQKVOnlyGeneratorTests: XCTestCase {
             normEps: 1e-6
         ).milText
 
-        XCTAssertTrue(mil.contains("0.000001"))
+        XCTAssertTrue(mil.contains("norm_scale"))
         XCTAssertFalse(mil.contains("0.00001"))
     }
 }

@@ -476,6 +476,12 @@ import ModelSupport
     #expect(!shouldUseDefaultGPT2Demo(options))
 }
 
+@Test func test_shouldUseDefaultGPT2DemoIsDisabledForChat() {
+    var options = Options()
+    options.command = .chat
+    #expect(!shouldUseDefaultGPT2Demo(options))
+}
+
 @Test func test_demoDefaultsTreatReferenceRunnerAsOptional() throws {
     let fileManager = FileManager.default
     let root = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -714,6 +720,11 @@ private func makeStubDemoDefaults(root: URL) -> DemoDefaults {
     }
 }
 
+@Test func test_powerCapabilityProbeTargetsPowermetricsNotGenericTrue() {
+    #expect(PowerTelemetryCollector.capabilityProbeArguments.contains("/usr/bin/powermetrics"))
+    #expect(!PowerTelemetryCollector.capabilityProbeArguments.contains("/usr/bin/true"))
+}
+
 @Test func test_parsePowermetricsSamplesParsesWattsAndMilliwatts() {
     let log = """
     CPU Power: 850 mW
@@ -738,6 +749,24 @@ private func makeStubDemoDefaults(root: URL) -> DemoDefaults {
     #expect(samples[1].gpuW == 0.21)
     #expect(samples[1].aneW == 1.55)
     #expect(samples[1].packageW == 3.10)
+}
+
+@Test func test_parsePowermetricsSamplesKeepsANEDistinctFromCombinedPackage() {
+    let log = """
+    CPU Power: 2193 mW
+    GPU Power: 19 mW
+    ANE Power: 0 mW
+    Combined Power (CPU + GPU + ANE): 2211 mW
+
+    """
+
+    let samples = parsePowermetricsSamples(from: log)
+    #expect(samples.count == 1)
+    #expect(samples[0].cpuW == 2.193)
+    #expect(samples[0].gpuW == 0.019)
+    #expect(samples[0].aneW == 0)
+    #expect(samples[0].packageW == 2.211)
+    #expect(samples[0].aneW != samples[0].packageW)
 }
 
 @Test func test_liveCompareRendererProducesSideBySideLayout() {
@@ -869,6 +898,21 @@ private func makeStubDemoDefaults(root: URL) -> DemoDefaults {
             command: .demo,
             powerMode: .auto,
             capability: PowerCapability(available: false, message: "missing"),
+            emitWarnings: false
+        ))
+    )
+    #expect(
+        try resolvePowerEnabled(
+            command: .chat,
+            powerMode: .auto,
+            capability: PowerCapability(available: true, message: "ready")
+        )
+    )
+    #expect(
+        !(try resolvePowerEnabled(
+            command: .chat,
+            powerMode: .auto,
+            capability: PowerCapability(available: false, message: "powermetrics requires passwordless sudo or root"),
             emitWarnings: false
         ))
     )
@@ -1052,4 +1096,844 @@ private func makeStubDemoDefaults(root: URL) -> DemoDefaults {
     #expect(!summary.aggregate.allTokenMatch)
     #expect(!summary.aggregate.allTextMatch)
     #expect(!summary.verdict.allCorrectnessGatesPass)
+}
+
+@Test func test_optionsParseChatFlags() throws {
+    let options = try Options.parse([
+        "espresso-generate",
+        "chat",
+        "--model", "/tmp/qwen.esp",
+        "--plain",
+        "--greedy",
+        "--system", "Be terse.",
+        "--top-p", "0.8",
+        "--temperature", "0.2",
+        "-n", "32",
+    ])
+
+    #expect(options.command == .chat)
+    #expect(options.modelName == "/tmp/qwen.esp")
+    #expect(options.plain)
+    #expect(options.greedy)
+    #expect(options.systemPrompt == "Be terse.")
+    #expect(options.topP == 0.8)
+    #expect(options.topPWasSet)
+    #expect(options.temperature == 0.2)
+    #expect(options.temperatureWasSet)
+    #expect(options.maxTokens == 32)
+    #expect(options.powerMode == .auto)
+}
+
+@Test func test_optionsParseChatPowerFlag() throws {
+    let required = try Options.parse([
+        "espresso-generate",
+        "chat",
+        "--power",
+        "--model", "/tmp/qwen.esp",
+    ])
+    #expect(required.command == .chat)
+    #expect(required.powerMode == .on)
+
+    let disabled = try Options.parse([
+        "espresso-generate",
+        "chat",
+        "--no-power",
+        "--model", "/tmp/qwen.esp",
+    ])
+    #expect(disabled.powerMode == .off)
+}
+
+@Test func test_optionsParseGenerateStillWorksWithoutChatFlags() throws {
+    let options = try Options.parse([
+        "espresso-generate",
+        "generate",
+        "--model", "/tmp/qwen.esp",
+        "--prompt", "Hello",
+    ])
+
+    #expect(options.command == .generate)
+    #expect(!options.plain)
+    #expect(!options.greedy)
+    #expect(options.systemPrompt == nil)
+    #expect(options.temperature == 0)
+    #expect(!options.temperatureWasSet)
+    #expect(options.topP == 1)
+    #expect(!options.topPWasSet)
+}
+
+@Test func test_resolvedChatSamplingDefaultsAndGreedy() {
+    var chat = Options()
+    chat.command = .chat
+    let defaults = resolvedSampling(command: .chat, options: chat)
+    #expect(defaults.temperature == 0.7)
+    #expect(defaults.topP == 0.9)
+    #expect(!defaults.isGreedy)
+
+    var greedy = chat
+    greedy.greedy = true
+    greedy.temperature = 0.2
+    greedy.temperatureWasSet = true
+    greedy.topP = 0.5
+    greedy.topPWasSet = true
+    let greedySampling = resolvedSampling(command: .chat, options: greedy)
+    #expect(greedySampling.temperature == 0)
+    #expect(greedySampling.topP == 1)
+    #expect(greedySampling.isGreedy)
+
+    var generate = Options()
+    generate.command = .generate
+    let generateSampling = resolvedSampling(command: .generate, options: generate)
+    #expect(generateSampling.temperature == 0)
+    #expect(generateSampling.topP == 1)
+}
+
+@Test func test_chatForcesHybridFallbackDisable() {
+    var chat = Options()
+    chat.command = .chat
+    #expect(chatForcesHybridFallbackDisable(chat))
+
+    var generate = Options()
+    generate.command = .generate
+    #expect(!chatForcesHybridFallbackDisable(generate))
+
+    generate.disableHybridFallback = true
+    #expect(!chatForcesHybridFallbackDisable(generate))
+}
+
+@Test func test_applyCLIExperimentEnvironmentForcesChatFallbackDisable() {
+    let previous = getenv("ESPRESSO_REALMODEL_DISABLE_HYBRID_FALLBACK").map { String(cString: $0) }
+    defer {
+        if let previous {
+            setenv("ESPRESSO_REALMODEL_DISABLE_HYBRID_FALLBACK", previous, 1)
+        } else {
+            unsetenv("ESPRESSO_REALMODEL_DISABLE_HYBRID_FALLBACK")
+        }
+    }
+    unsetenv("ESPRESSO_REALMODEL_DISABLE_HYBRID_FALLBACK")
+    var chat = Options()
+    chat.command = .chat
+    applyCLIExperimentEnvironment(chat)
+    #expect(ProcessInfo.processInfo.environment["ESPRESSO_REALMODEL_DISABLE_HYBRID_FALLBACK"] == "1")
+}
+
+@Test func test_implicitPromptIsNilForChat() {
+    #expect(implicitPrompt(command: .chat, options: Options()) == nil)
+}
+
+@Test func test_chatSessionKeepsHistoryAndSlashCommands() {
+    var session = ChatSession(system: "Be helpful.")
+    #expect(session.messages.isEmpty)
+
+    switch session.apply(.message("my name is Ada")) {
+    case let .generate(prompt):
+        #expect(prompt.contains("my name is Ada"))
+        #expect(prompt.contains("Be helpful."))
+        #expect(prompt.hasSuffix("<|im_start|>assistant\n"))
+    default:
+        Issue.record("Expected generate after a user turn")
+    }
+
+    session.appendAssistant("Hello Ada.")
+    #expect(session.messages.count == 2)
+
+    switch session.apply(.message("what is my name?")) {
+    case let .generate(prompt):
+        #expect(prompt.contains("my name is Ada"))
+        #expect(prompt.contains("Hello Ada."))
+        #expect(prompt.contains("what is my name?"))
+    default:
+        Issue.record("Expected generate to re-prefill the full history")
+    }
+
+    session.appendAssistant("Ada")
+    switch session.apply(.retry) {
+    case let .generate(prompt):
+        #expect(prompt.contains("what is my name?"))
+        #expect(!prompt.contains("<|im_start|>assistant\nAda<|im_end|>"))
+        #expect(session.messages.last?.role == .user)
+    default:
+        Issue.record("Expected /retry to drop the last assistant turn and regenerate")
+    }
+
+    switch session.apply(.reset) {
+    case .noop:
+        #expect(session.messages.isEmpty)
+        #expect(session.system == "Be helpful.")
+    default:
+        Issue.record("Expected /reset to clear history")
+    }
+
+    #expect(session.apply(.exit) == .exit)
+}
+
+@Test func test_chatSessionStripsChatMarkersFromAssistantText() {
+    #expect(ChatSession.sanitizeAssistantText("Hello Ada.<|im_end|>\n<|im_start|>user") == "Hello Ada.")
+}
+
+@Test func test_chatCommandParseRecognizesSlashCommands() {
+    #expect(ChatCommand.parse("/reset") == .reset)
+    #expect(ChatCommand.parse("  /retry  ") == .retry)
+    #expect(ChatCommand.parse("/exit") == .exit)
+    #expect(ChatCommand.parse("") == .empty)
+    #expect(ChatCommand.parse("hello") == .message("hello"))
+}
+
+@Test func test_chatFooterRendersLiveMetrics() {
+    let footer = ChatStatusFooter(
+        tokensPerSecond: 12.4,
+        ttftMs: 180,
+        decodePath: "hybrid",
+        contextUsed: 142,
+        contextMax: 1024
+    )
+    let rendered = footer.render()
+    #expect(rendered.contains("tok/s 12.4"))
+    #expect(rendered.contains("TTFT 180ms"))
+    #expect(rendered.contains("path=hybrid"))
+    #expect(rendered.contains("ctx 142/1024"))
+    #expect(rendered.contains("power: unavailable"))
+    #expect(!rendered.contains("W"))
+    #expect(!rendered.contains("J/tok"))
+}
+
+@Test func test_joulesPerTokenIsPackageWattsDividedByTokensPerSecond() {
+    #expect(joulesPerToken(packageWatts: 3.25, tokensPerSecond: 13) == 0.25)
+    #expect(joulesPerToken(packageWatts: 4, tokensPerSecond: 8) == 0.5)
+    #expect(joulesPerToken(packageWatts: 3.25, tokensPerSecond: 0) == nil)
+    #expect(joulesPerToken(packageWatts: 3.25, tokensPerSecond: .nan) == nil)
+}
+
+@Test func test_chatPowerFooterUsesMeasuredSummaryForThatCompletionOnly() {
+    let capability = PowerCapability(available: true, message: "powermetrics ready")
+    let measured = chatPowerFooter(
+        capability: capability,
+        summary: PowerSummary(packageW: 3.25, cpuW: 0.85, gpuW: 0.20, aneW: 1.60, sampleCount: 4),
+        tokensPerSecond: 13
+    )
+    guard case let .measured(packageW, cpuW, gpuW, aneW, joules) = measured else {
+        Issue.record("Expected measured power for a live summary")
+        return
+    }
+    #expect(packageW == 3.25)
+    #expect(cpuW == 0.85)
+    #expect(gpuW == 0.20)
+    #expect(aneW == 1.60)
+    #expect(joules == 0.25)
+
+    let cleared = chatPowerFooter(capability: capability, summary: nil, tokensPerSecond: 13)
+    guard case let .unavailable(message) = cleared else {
+        Issue.record("Expected unavailable after a completion with no samples")
+        return
+    }
+    #expect(message.contains("power: unavailable"))
+    #expect(!message.contains("3.25"))
+    #expect(!message.contains("1.60"))
+
+    let emptySummary = chatPowerFooter(
+        capability: capability,
+        summary: .unavailable,
+        tokensPerSecond: 13
+    )
+    guard case let .unavailable(emptyMessage) = emptySummary else {
+        Issue.record("Expected unavailable for sampleCount=0; zeros are not watts")
+        return
+    }
+    #expect(emptyMessage.contains("power: unavailable"))
+    #expect(!emptyMessage.contains("0.00"))
+}
+
+@Test func test_chatPowerFooterUsesCapabilityMessageWhenTelemetryIsDown() {
+    let sudo = chatPowerFooter(
+        capability: PowerCapability(available: false, message: "powermetrics requires passwordless sudo or root"),
+        summary: PowerSummary(packageW: 9, cpuW: 9, gpuW: 9, aneW: 9, sampleCount: 9),
+        tokensPerSecond: 20
+    )
+    guard case let .unavailable(sudoMessage) = sudo else {
+        Issue.record("Expected unavailable when capability is down")
+        return
+    }
+    #expect(sudoMessage == "power: unavailable (sudo)")
+    #expect(!sudoMessage.contains("9"))
+
+    let host = chatPowerFooter(
+        capability: PowerCapability(available: false, message: "powermetrics is unavailable on this host"),
+        summary: nil,
+        tokensPerSecond: 20
+    )
+    guard case let .unavailable(hostMessage) = host else {
+        Issue.record("Expected capability.message when sudo is not the cause")
+        return
+    }
+    #expect(hostMessage == "powermetrics is unavailable on this host")
+}
+
+@Test func test_chatFooterRendersMeasuredPowerAndJoulesPerToken() {
+    let footer = ChatStatusFooter(
+        tokensPerSecond: 13,
+        ttftMs: 180,
+        decodePath: "hybrid",
+        contextUsed: 142,
+        contextMax: 1024,
+        power: .measured(packageW: 3.25, cpuW: 0.85, gpuW: 0.20, aneW: 1.60, joulesPerToken: 0.25)
+    )
+    let rendered = footer.render()
+    #expect(rendered.contains("ANE 1.60W"))
+    #expect(rendered.contains("CPU 0.85W"))
+    #expect(rendered.contains("pkg 3.25W"))
+    #expect(rendered.contains("0.250 J/tok"))
+    #expect(!rendered.contains("power: unavailable"))
+}
+
+@Test func test_chatTUIRendererShowsConversationAndFooter() {
+    let snapshot = ChatSnapshot(
+        modelName: "Qwen2.5-1.5B-Instruct",
+        turns: [
+            ChatTurn(role: .user, content: "my name is Ada"),
+            ChatTurn(role: .assistant, content: "Hello Ada."),
+        ],
+        streamingAssistant: "",
+        status: .idle,
+        footer: ChatStatusFooter(
+            tokensPerSecond: 8.0,
+            ttftMs: 90,
+            decodePath: "hybrid",
+            contextUsed: 40,
+            contextMax: 1024
+        )
+    )
+    let rendered = ChatTUIRenderer().render(snapshot: snapshot, size: TerminalSize(width: 80, height: 24))
+    #expect(rendered.contains("Qwen2.5-1.5B-Instruct"))
+    #expect(rendered.contains("my name is Ada"))
+    #expect(rendered.contains("Hello Ada."))
+    #expect(rendered.contains("path=hybrid"))
+    #expect(rendered.contains("tok/s"))
+    #expect(rendered.contains("TTFT"))
+    #expect(rendered.contains("power: unavailable"))
+    #expect(!rendered.contains("NOPASSWD"))
+    #expect(!rendered.contains("/etc/sudoers"))
+}
+
+@Test func test_cliUsageDocumentsChatPowerFormulaAndSudo() {
+    let usage = cliUsageText()
+    #expect(usage.contains("J/tok = package_watts / tok_s"))
+    #expect(usage.contains("compile"))
+    #expect(usage.contains("--power"))
+    #expect(usage.contains("/usr/bin/powermetrics"))
+    #expect(usage.contains("passwordless sudo"))
+    #expect(usage.contains("NOPASSWD"))
+}
+
+@Test func test_chatRefusesNonHybridDecodePath() {
+    do {
+        try assertChatDecodePathIsHybrid("exact_cpu")
+        Issue.record("Expected exact_cpu to be rejected")
+    } catch let error as CLIError {
+        guard case let .runtime(message) = error else {
+            Issue.record("Expected runtime error, got \(error)")
+            return
+        }
+        #expect(message.contains("hybrid"))
+        #expect(message.contains("exact_cpu"))
+    } catch {
+        Issue.record("Unexpected error: \(error)")
+    }
+
+    do {
+        try assertChatDecodePathIsHybrid("hybrid")
+    } catch {
+        Issue.record("hybrid path should be accepted: \(error)")
+    }
+}
+
+@Test func test_optionsParseChatVsMLXFlags() throws {
+    let options = try Options.parse([
+        "espresso-generate",
+        "chat",
+        "--vs", "mlx",
+        "--greedy",
+        "--model", "/tmp/qwen.esp",
+        "-n", "64",
+    ])
+    #expect(options.command == .chat)
+    #expect(options.compareOpponent == .mlx)
+    #expect(options.greedy)
+    #expect(options.mlxQuant == nil)
+    #expect(options.mlxModel == nil)
+    #expect(options.maxTokens == 64)
+}
+
+@Test func test_optionsParseMLXQuantRequiresExplicitLabel() throws {
+    let labeled = try Options.parse([
+        "espresso-generate",
+        "chat",
+        "--vs", "mlx",
+        "--mlx-quant", "4bit",
+        "--greedy",
+        "--model", "/tmp/qwen.esp",
+    ])
+    #expect(labeled.mlxQuant == "4bit")
+    #expect(labeled.compareOpponent == .mlx)
+
+    do {
+        _ = try Options.parse([
+            "espresso-generate",
+            "chat",
+            "--vs", "stories",
+            "--greedy",
+            "--model", "/tmp/qwen.esp",
+        ])
+        Issue.record("CoreML Stories must not be a chat --vs opponent")
+    } catch let error as CLIError {
+        guard case let .usage(message) = error else {
+            Issue.record("Expected usage error, got \(error)")
+            return
+        }
+        #expect(message.lowercased().contains("mlx"))
+        #expect(message.lowercased().contains("compare"))
+    }
+}
+
+@Test func test_compareCommandIsUnchangedByVsMLXFlags() throws {
+    let options = try Options.parse([
+        "espresso-generate",
+        "compare",
+        "--live",
+        "--prompt", "Hello",
+    ])
+    #expect(options.command == .compare)
+    #expect(options.preferLiveCompare)
+    #expect(options.compareOpponent == nil)
+    #expect(options.mlxQuant == nil)
+}
+
+@Test func test_chatVsMLXFairnessRequiresSameRepoGreedyAndNativePrecision() throws {
+    let fairness = try makeChatVsMLXFairness(
+        espressoModelName: "Qwen2.5-1.5B-Instruct",
+        greedy: true,
+        maxNewTokens: 32,
+        mlxQuantFlag: nil,
+        mlxModelOverride: nil
+    )
+    #expect(fairness.huggingfaceRepo == ChatVsMLXFairness.requiredHuggingFaceRepo)
+    #expect(fairness.huggingfaceRepo == "Qwen/Qwen2.5-1.5B-Instruct")
+    #expect(fairness.espressoModelName == "Qwen2.5-1.5B-Instruct")
+    #expect(fairness.espressoPrecision == "fp16")
+    #expect(fairness.mlxPrecisionLabel == "fp16")
+    #expect(fairness.mlxQuantization == .native)
+    #expect(fairness.greedy)
+    #expect(fairness.maxNewTokens == 32)
+    #expect(fairness.tokPerSecExcludesCompile)
+    #expect(!fairness.mlxLaneHeader().lowercased().contains("4-bit"))
+    #expect(!fairness.espressoLaneHeader().lowercased().contains("4-bit"))
+}
+
+@Test func test_chatVsMLXFairnessRejectsUnlabeledQuantAndNonGreedy() {
+    do {
+        _ = try makeChatVsMLXFairness(
+            espressoModelName: "Qwen2.5-1.5B-Instruct",
+            greedy: false,
+            maxNewTokens: 32,
+            mlxQuantFlag: nil,
+            mlxModelOverride: nil
+        )
+        Issue.record("Expected --vs mlx without --greedy to fail")
+    } catch let error as CLIError {
+        guard case let .usage(message) = error else {
+            Issue.record("Expected usage error, got \(error)")
+            return
+        }
+        #expect(message.contains("--greedy"))
+    } catch {
+        Issue.record("Unexpected error: \(error)")
+    }
+
+    do {
+        _ = try makeChatVsMLXFairness(
+            espressoModelName: "gpt2_124m",
+            greedy: true,
+            maxNewTokens: 32,
+            mlxQuantFlag: nil,
+            mlxModelOverride: nil
+        )
+        Issue.record("Expected non-1.5B espresso model to fail")
+    } catch let error as CLIError {
+        guard case let .usage(message) = error else {
+            Issue.record("Expected usage error, got \(error)")
+            return
+        }
+        #expect(message.contains("Qwen/Qwen2.5-1.5B-Instruct"))
+    } catch {
+        Issue.record("Unexpected error: \(error)")
+    }
+
+    do {
+        _ = try makeChatVsMLXFairness(
+            espressoModelName: "Qwen2.5-1.5B-Instruct",
+            greedy: true,
+            maxNewTokens: 32,
+            mlxQuantFlag: nil,
+            mlxModelOverride: "mlx-community/Qwen2.5-1.5B-Instruct-4bit"
+        )
+        Issue.record("Expected a different MLX repo without --mlx-quant to fail")
+    } catch let error as CLIError {
+        guard case let .usage(message) = error else {
+            Issue.record("Expected usage error, got \(error)")
+            return
+        }
+        #expect(message.contains("Qwen/Qwen2.5-1.5B-Instruct"))
+        #expect(message.contains("--mlx-quant") || message.lowercased().contains("quant"))
+    } catch {
+        Issue.record("Unexpected error: \(error)")
+    }
+}
+
+@Test func test_chatVsMLXQuantMustBeExplicitAndLabeledOnBothLanes() throws {
+    let fairness = try makeChatVsMLXFairness(
+        espressoModelName: "Qwen2.5-1.5B-Instruct",
+        greedy: true,
+        maxNewTokens: 16,
+        mlxQuantFlag: "4bit",
+        mlxModelOverride: nil
+    )
+    #expect(fairness.mlxQuantization == .quantized(label: "4-bit"))
+    #expect(fairness.mlxPrecisionLabel == "4-bit")
+    #expect(fairness.espressoLaneHeader().contains("fp16"))
+    #expect(fairness.espressoLaneHeader().contains("4-bit"))
+    #expect(fairness.mlxLaneHeader().contains("4-bit"))
+    #expect(fairness.title().contains("4-bit"))
+
+    do {
+        _ = try parseMLXQuantizationFlag("")
+        Issue.record("Empty --mlx-quant must be rejected")
+    } catch let error as CLIError {
+        guard case let .usage(message) = error else {
+            Issue.record("Expected usage error, got \(error)")
+            return
+        }
+        #expect(message.contains("--mlx-quant"))
+    }
+
+    do {
+        _ = try parseMLXQuantizationFlag("mystery")
+        Issue.record("Unknown --mlx-quant must be rejected")
+    } catch let error as CLIError {
+        guard case let .usage(message) = error else {
+            Issue.record("Expected usage error, got \(error)")
+            return
+        }
+        #expect(message.contains("--mlx-quant"))
+    }
+}
+
+@Test func test_chatVsMLXRejectsLoadedQuantWithoutFlag() {
+    do {
+        try assertMLXLoadMatchesFairness(
+            quantized: true,
+            precision: "4-bit",
+            repo: ChatVsMLXFairness.requiredHuggingFaceRepo,
+            fairness: try makeChatVsMLXFairness(
+                espressoModelName: "Qwen2.5-1.5B-Instruct",
+                greedy: true,
+                maxNewTokens: 8,
+                mlxQuantFlag: nil,
+                mlxModelOverride: nil
+            )
+        )
+        Issue.record("Unlabeled quantized MLX load must be impossible")
+    } catch let error as CLIError {
+        guard case let .runtime(message) = error else {
+            Issue.record("Expected runtime error, got \(error)")
+            return
+        }
+        #expect(message.contains("--mlx-quant"))
+        #expect(message.lowercased().contains("4-bit") || message.lowercased().contains("quant"))
+    } catch {
+        Issue.record("Unexpected error: \(error)")
+    }
+}
+
+@Test func test_completionTokensPerSecondExcludesCompileWindow() {
+    #expect(completionTokensPerSecond(generatedTokenCount: 13, completionMilliseconds: 1_000) == 13)
+    #expect(completionTokensPerSecond(generatedTokenCount: 8, completionMilliseconds: 2_000) == 4)
+    #expect(completionTokensPerSecond(generatedTokenCount: 0, completionMilliseconds: 1_000) == 0)
+    #expect(completionTokensPerSecond(generatedTokenCount: 10, completionMilliseconds: 0) == 0)
+    let compileMs = 8_400.0
+    let completionMs = 500.0
+    let tokPerSec = completionTokensPerSecond(generatedTokenCount: 10, completionMilliseconds: completionMs)
+    #expect(tokPerSec == 20)
+    #expect(tokPerSec != completionTokensPerSecond(generatedTokenCount: 10, completionMilliseconds: compileMs + completionMs))
+}
+
+@Test func test_chatVsMLXScoreboardNamesAWinnerPerMetricAndHidesMissingWatts() {
+    let espresso = ChatVsMLXTurnMetrics(
+        tokensPerSecond: 8,
+        ttftMs: 180,
+        compileMs: 1_200,
+        packageW: 3.2,
+        joulesPerToken: 0.4
+    )
+    let mlx = ChatVsMLXTurnMetrics(
+        tokensPerSecond: 20,
+        ttftMs: 40,
+        compileMs: 800,
+        packageW: 6.4,
+        joulesPerToken: 0.32
+    )
+    let table = formatChatVsMLXScoreboard(espresso: espresso, mlx: mlx)
+    #expect(table.contains("tok/s"))
+    #expect(table.contains("TTFT"))
+    #expect(table.contains("package W"))
+    #expect(table.contains("J/tok"))
+    #expect(table.contains("winner"))
+    #expect(table.contains("mlx"))
+    #expect(table.contains("espresso"))
+    #expect(table.contains("8.0") || table.contains("8.00") || table.contains("8"))
+    #expect(!table.contains("README"))
+
+    let rows = chatVsMLXScoreboard(espresso: espresso, mlx: mlx)
+    #expect(rows.first { $0.metric == "tok/s" }?.winner == "mlx")
+    #expect(rows.first { $0.metric == "TTFT ms" }?.winner == "mlx")
+    #expect(rows.first { $0.metric == "package W" }?.winner == "espresso")
+    #expect(rows.first { $0.metric == "J/tok" }?.winner == "mlx")
+
+    let noPower = ChatVsMLXTurnMetrics(
+        tokensPerSecond: 8,
+        ttftMs: 180,
+        compileMs: 0,
+        packageW: nil,
+        joulesPerToken: nil
+    )
+    let unavailable = chatVsMLXScoreboard(espresso: noPower, mlx: mlx)
+    #expect(unavailable.first { $0.metric == "package W" }?.espresso == "unavailable")
+    #expect(unavailable.first { $0.metric == "J/tok" }?.espresso == "unavailable")
+    #expect(unavailable.first { $0.metric == "package W" }?.winner == "—")
+    #expect(unavailable.first { $0.metric == "J/tok" }?.winner == "—")
+}
+
+@Test func test_mlxMissingInstallCommandDoesNotSuggestQuantization() {
+    let message = mlxInstallInstructions()
+    #expect(message.contains("pip install mlx-lm"))
+    #expect(message.contains("fp16") || message.contains("bf16") || message.contains("native"))
+    #expect(!message.lowercased().contains("4-bit") || message.lowercased().contains("do not"))
+}
+
+@Test func test_resolveMLXPythonPicksFirstCandidateThatImports() {
+    #expect(
+        resolveMLXPython(candidates: ["/missing", "/good"], canImport: { $0 == "/good" }) == "/good"
+    )
+    #expect(resolveMLXPython(candidates: ["/missing"], canImport: { _ in false }) == nil)
+    #expect(mlxPythonCandidates(environment: ["ESPRESSO_MLX_PYTHON": "/only"]) == ["/only"])
+}
+
+@Test func test_huggingFaceSnapshotRequiresConfigAndWeights() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+    let snapshots = root
+        .appendingPathComponent("models--Qwen--Qwen2.5-1.5B-Instruct", isDirectory: true)
+        .appendingPathComponent("snapshots", isDirectory: true)
+        .appendingPathComponent("abc123", isDirectory: true)
+    try FileManager.default.createDirectory(at: snapshots, withIntermediateDirectories: true)
+    #expect(
+        huggingFaceHubSnapshot(repo: "Qwen/Qwen2.5-1.5B-Instruct", cacheRoot: root) == nil
+    )
+    try "{}".write(to: snapshots.appendingPathComponent("config.json"), atomically: true, encoding: .utf8)
+    #expect(
+        huggingFaceHubSnapshot(repo: "Qwen/Qwen2.5-1.5B-Instruct", cacheRoot: root) == nil
+    )
+    try Data().write(to: snapshots.appendingPathComponent("model.safetensors"))
+    let found = huggingFaceHubSnapshot(repo: "Qwen/Qwen2.5-1.5B-Instruct", cacheRoot: root)
+    #expect(found?.standardizedFileURL.path == snapshots.standardizedFileURL.path)
+}
+
+@Test func test_parseMLXStreamEventsCoverCompileTokenAndCompletion() throws {
+    let hello = try parseMLXStreamEvent(
+        #"{"type":"hello","precision":"float16","quantized":false,"repo":"Qwen/Qwen2.5-1.5B-Instruct"}"#
+    )
+    #expect(hello == .hello(precision: "float16", quantized: false, repo: "Qwen/Qwen2.5-1.5B-Instruct"))
+
+    let compile = try parseMLXStreamEvent(#"{"type":"compile","compile_time_ms":812.5}"#)
+    #expect(compile == .compile(ms: 812.5))
+
+    let token = try parseMLXStreamEvent(
+        #"{"type":"token","text":"Hello","token_index":1,"elapsed_ms":40,"token_latency_ms":40,"tokens_per_second":25}"#
+    )
+    #expect(
+        token == .token(text: "Hello", tokenIndex: 1, elapsedMs: 40, tokenLatencyMs: 40, tokensPerSecond: 25)
+    )
+
+    let done = try parseMLXStreamEvent(
+        #"{"type":"completed","text":"Hello","compile_time_ms":812.5,"first_token_latency_ms":40,"tokens_per_second":20,"generation_tokens":8}"#
+    )
+    #expect(
+        done == .completed(
+            text: "Hello",
+            compileMs: 812.5,
+            ttftMs: 40,
+            tokensPerSecond: 20,
+            tokenCount: 8
+        )
+    )
+}
+
+@Test func test_liveCompareRendererMLXModeShowsPerLaneEnergyAndNotCoreMLStories() throws {
+    let fairness = try makeChatVsMLXFairness(
+        espressoModelName: "Qwen2.5-1.5B-Instruct",
+        greedy: true,
+        maxNewTokens: 32,
+        mlxQuantFlag: nil,
+        mlxModelOverride: nil
+    )
+    var espresso = LiveLaneSnapshot(title: fairness.espressoLaneHeader(), maxTokens: 32)
+    espresso.status = .generating
+    espresso.generatedTokenCount = 4
+    espresso.text = "Start with async/await"
+    espresso.tokensPerSecond = 8.1
+    espresso.ttftMs = 120
+    espresso.compileMs = 900
+    espresso.power = PowerSummary(packageW: 3.2, cpuW: 0.8, gpuW: 0.1, aneW: 1.7, sampleCount: 3)
+    espresso.wattFocus = .ane
+
+    var mlx = LiveLaneSnapshot(title: fairness.mlxLaneHeader(), maxTokens: 32)
+    mlx.status = .generating
+    mlx.generatedTokenCount = 4
+    mlx.text = "Same completion streamed"
+    mlx.tokensPerSecond = 19.4
+    mlx.ttftMs = 45
+    mlx.compileMs = 700
+    mlx.power = PowerSummary(packageW: 6.4, cpuW: 1.1, gpuW: 4.2, aneW: 0.0, sampleCount: 3)
+    mlx.wattFocus = .gpu
+
+    let snapshot = LiveCompareSnapshot(
+        modelName: "Qwen2.5-1.5B-Instruct",
+        prompt: "what is a good way to learn Swift concurrency?",
+        maxTokens: 32,
+        elapsedMs: 800,
+        espresso: espresso,
+        coreML: mlx,
+        livePower: nil,
+        matchCount: 0,
+        totalComparedTokens: 0,
+        events: ["[Espresso] token 1", "[MLX] token 1"],
+        display: .mlx(fairness)
+    )
+    let rendered = LiveCompareRenderer().render(snapshot: snapshot, size: TerminalSize(width: 140, height: 40))
+    #expect(rendered.contains("ESPRESSO"))
+    #expect(rendered.contains("MLX"))
+    #expect(rendered.contains("fp16"))
+    #expect(rendered.contains("TOKENS / SEC"))
+    #expect(rendered.contains("compile"))
+    #expect(rendered.contains("J/tok"))
+    #expect(rendered.contains("Start with async/await"))
+    #expect(rendered.contains("Same completion streamed"))
+    #expect(!rendered.contains("CORE ML"))
+    #expect(!rendered.contains("LIVE GPT-2"))
+    #expect(!rendered.contains("Stories"))
+    #expect(rendered.contains("Ctrl-C cancels the current lane"))
+    #expect(!rendered.contains("Ctrl-C to quit"))
+}
+
+@Test func test_liveCompareRendererCoreMLStoriesPathStillSaysCoreML() {
+    var espresso = LiveLaneSnapshot(title: "Espresso / ANE", maxTokens: 32)
+    espresso.text = "Hello"
+    var coreML = LiveLaneSnapshot(title: "Core ML", maxTokens: 32)
+    coreML.text = "Hello"
+    let snapshot = LiveCompareSnapshot(
+        modelName: "gpt2_124m",
+        prompt: "Hello",
+        maxTokens: 32,
+        elapsedMs: 10,
+        espresso: espresso,
+        coreML: coreML,
+        livePower: nil,
+        matchCount: 1,
+        totalComparedTokens: 1,
+        events: []
+    )
+    let rendered = LiveCompareRenderer().render(snapshot: snapshot, size: TerminalSize(width: 140, height: 40))
+    #expect(rendered.contains("ESPRESSO vs CORE ML LIVE GPT-2"))
+    #expect(rendered.contains("CORE ML"))
+    #expect(rendered.contains("Espresso preflight avg"))
+    #expect(!rendered.contains("MLX"))
+    #expect(rendered.contains("Ctrl-C to quit"))
+    #expect(!rendered.contains("Ctrl-C cancels the current lane"))
+}
+
+@Test func test_cliUsageDocumentsChatVsMLXFairness() {
+    let usage = cliUsageText()
+    #expect(usage.contains("--vs mlx"))
+    #expect(usage.contains("--mlx-quant"))
+    #expect(usage.contains("Qwen/Qwen2.5-1.5B-Instruct"))
+    #expect(usage.contains("fp16"))
+    #expect(usage.contains("compile"))
+    #expect(usage.contains("J/tok"))
+}
+
+@Test func test_chatVsMLXAppliesLoadedNativePrecisionToBothLaneLabels() throws {
+    let fairness = try makeChatVsMLXFairness(
+        espressoModelName: "Qwen2.5-1.5B-Instruct",
+        greedy: true,
+        maxNewTokens: 8,
+        mlxQuantFlag: nil,
+        mlxModelOverride: nil
+    )
+    #expect(mlxNativePrecisionLabel("float16") == "fp16")
+    #expect(mlxNativePrecisionLabel("bfloat16") == "bf16")
+    #expect(mlxNativePrecisionLabel("bf16") == "bf16")
+
+    let bf16 = fairness.applyingLoadedPrecision("bfloat16")
+    #expect(bf16.mlxPrecisionLabel == "bf16")
+    #expect(bf16.mlxLaneHeader().contains("bf16"))
+    #expect(bf16.title().contains("bf16"))
+    #expect(bf16.espressoLaneHeader().contains("fp16"))
+
+    let labeled = try makeChatVsMLXFairness(
+        espressoModelName: "Qwen2.5-1.5B-Instruct",
+        greedy: true,
+        maxNewTokens: 8,
+        mlxQuantFlag: "4bit",
+        mlxModelOverride: nil
+    ).applyingLoadedPrecision("bfloat16")
+    #expect(labeled.mlxPrecisionLabel == "4-bit")
+}
+
+@Test func test_pairedChatVsMLXMetricsDropsUnmatchedTurns() {
+    let espressoOnly = ChatVsMLXTurnMetrics(
+        tokensPerSecond: 10,
+        ttftMs: 100,
+        compileMs: 0,
+        packageW: 4,
+        joulesPerToken: 0.4
+    )
+    let espressoPaired = ChatVsMLXTurnMetrics(
+        tokensPerSecond: 8,
+        ttftMs: 180,
+        compileMs: 0,
+        packageW: 3.2,
+        joulesPerToken: 0.4
+    )
+    let mlxPaired = ChatVsMLXTurnMetrics(
+        tokensPerSecond: 20,
+        ttftMs: 40,
+        compileMs: 0,
+        packageW: 6.4,
+        joulesPerToken: 0.32
+    )
+    let paired = pairedChatVsMLXMetrics(
+        espresso: [espressoPaired, espressoOnly],
+        mlx: [mlxPaired]
+    )
+    #expect(paired.espresso.tokensPerSecond == 8)
+    #expect(paired.mlx.tokensPerSecond == 20)
+    #expect(paired.espresso.tokensPerSecond != 9)
+}
+
+@Test func test_laneJoulesPerTokenUsesPackageWattsOverTokPerSec() {
+    var lane = LiveLaneSnapshot(title: "Espresso", maxTokens: 8)
+    lane.tokensPerSecond = 8
+    lane.power = PowerSummary(packageW: 4, cpuW: 1, gpuW: 0, aneW: 2, sampleCount: 2)
+    #expect(laneJoulesPerToken(lane) == 0.5)
+
+    var unavailable = LiveLaneSnapshot(title: "MLX", maxTokens: 8)
+    unavailable.tokensPerSecond = 20
+    unavailable.power = .unavailable
+    #expect(laneJoulesPerToken(unavailable) == nil)
 }

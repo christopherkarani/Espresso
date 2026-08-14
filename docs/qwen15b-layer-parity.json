@@ -1,0 +1,616 @@
+{
+  "model": "Qwen2.5-1.5B-Instruct",
+  "nLayer": 28,
+  "dModel": 1536,
+  "positions": 8,
+  "promptTokens": [
+    151644,
+    8948,
+    198,
+    2610,
+    525,
+    1207,
+    16948,
+    11
+  ],
+  "prompt": "Explain what a neural engine is in two sentences.",
+  "chatTemplate": true,
+  "reference": "pytorch fp32 (transformers, forward hooks at decoder layer boundaries, pre-final-norm)",
+  "weights": "fp16 blobs converted from bf16 (lossless for this checkpoint)",
+  "backends": {
+    "cpu-fp32": [
+      {
+        "layer": 0,
+        "max_abs": 3.635883331298828e-05,
+        "mean_abs": 3.976119576994582e-06,
+        "max_rel_to_layer_scale": 3.691172989424124e-06,
+        "reference_max_abs": 9.850211143493652
+      },
+      {
+        "layer": 1,
+        "max_abs": 0.006103515625,
+        "mean_abs": 6.060927034923225e-06,
+        "max_rel_to_layer_scale": 2.0879796099603975e-06,
+        "reference_max_abs": 2923.168212890625
+      },
+      {
+        "layer": 2,
+        "max_abs": 0.005859375,
+        "mean_abs": 4.183052491650112e-06,
+        "max_rel_to_layer_scale": 9.244643306993804e-07,
+        "reference_max_abs": 6338.1298828125
+      },
+      {
+        "layer": 3,
+        "max_abs": 0.000244140625,
+        "mean_abs": 1.1590021813390194e-06,
+        "max_rel_to_layer_scale": 3.7815332604757925e-08,
+        "reference_max_abs": 6456.1279296875
+      },
+      {
+        "layer": 4,
+        "max_abs": 0.00048828125,
+        "mean_abs": 1.0849820076449153e-06,
+        "max_rel_to_layer_scale": 7.485045067082097e-08,
+        "reference_max_abs": 6523.42431640625
+      },
+      {
+        "layer": 5,
+        "max_abs": 6.103515625e-05,
+        "mean_abs": 8.893755989447527e-07,
+        "max_rel_to_layer_scale": 9.229237574898955e-09,
+        "reference_max_abs": 6613.2392578125
+      },
+      {
+        "layer": 6,
+        "max_abs": 1.52587890625e-05,
+        "mean_abs": 7.991293008065744e-07,
+        "max_rel_to_layer_scale": 2.3065993912201454e-09,
+        "reference_max_abs": 6615.27490234375
+      },
+      {
+        "layer": 7,
+        "max_abs": 6.103515625e-05,
+        "mean_abs": 1.033708618554859e-06,
+        "max_rel_to_layer_scale": 9.221897595032392e-09,
+        "reference_max_abs": 6618.5029296875
+      },
+      {
+        "layer": 8,
+        "max_abs": 1.9073486328125e-05,
+        "mean_abs": 9.203877198160626e-07,
+        "max_rel_to_layer_scale": 2.8813011613054363e-09,
+        "reference_max_abs": 6619.74755859375
+      },
+      {
+        "layer": 9,
+        "max_abs": 6.103515625e-05,
+        "mean_abs": 9.12246889583912e-07,
+        "max_rel_to_layer_scale": 9.214125741267201e-09,
+        "reference_max_abs": 6624.08544921875
+      },
+      {
+        "layer": 10,
+        "max_abs": 3.4332275390625e-05,
+        "mean_abs": 8.335236619435212e-07,
+        "max_rel_to_layer_scale": 5.181221727109279e-09,
+        "reference_max_abs": 6626.28955078125
+      },
+      {
+        "layer": 11,
+        "max_abs": 2.47955322265625e-05,
+        "mean_abs": 8.345942887899582e-07,
+        "max_rel_to_layer_scale": 3.741485070714758e-09,
+        "reference_max_abs": 6627.18994140625
+      },
+      {
+        "layer": 12,
+        "max_abs": 2.384185791015625e-05,
+        "mean_abs": 7.522180188364777e-07,
+        "max_rel_to_layer_scale": 3.5976939244751463e-09,
+        "reference_max_abs": 6626.9833984375
+      },
+      {
+        "layer": 13,
+        "max_abs": 1.239776611328125e-05,
+        "mean_abs": 9.837879512512397e-07,
+        "max_rel_to_layer_scale": 1.870457125816859e-09,
+        "reference_max_abs": 6628.201171875
+      },
+      {
+        "layer": 14,
+        "max_abs": 3.62396240234375e-05,
+        "mean_abs": 8.12237942682259e-07,
+        "max_rel_to_layer_scale": 5.467343051204497e-09,
+        "reference_max_abs": 6628.37939453125
+      },
+      {
+        "layer": 15,
+        "max_abs": 3.0517578125e-05,
+        "mean_abs": 9.646503258409211e-07,
+        "max_rel_to_layer_scale": 4.603619181255536e-09,
+        "reference_max_abs": 6629.04052734375
+      },
+      {
+        "layer": 16,
+        "max_abs": 1.9073486328125e-05,
+        "mean_abs": 8.533496990518566e-07,
+        "max_rel_to_layer_scale": 2.8769617104291363e-09,
+        "reference_max_abs": 6629.732421875
+      },
+      {
+        "layer": 17,
+        "max_abs": 2.384185791015625e-05,
+        "mean_abs": 9.416735338163562e-07,
+        "max_rel_to_layer_scale": 3.5955610236822035e-09,
+        "reference_max_abs": 6630.91455078125
+      },
+      {
+        "layer": 18,
+        "max_abs": 1.33514404296875e-05,
+        "mean_abs": 1.1717950959185448e-06,
+        "max_rel_to_layer_scale": 2.0126424306795343e-09,
+        "reference_max_abs": 6633.78662109375
+      },
+      {
+        "layer": 19,
+        "max_abs": 7.43865966796875e-05,
+        "mean_abs": 1.3143641505545627e-06,
+        "max_rel_to_layer_scale": 1.1209881730344007e-08,
+        "reference_max_abs": 6635.8056640625
+      },
+      {
+        "layer": 20,
+        "max_abs": 3.24249267578125e-05,
+        "mean_abs": 1.2300242815399542e-06,
+        "max_rel_to_layer_scale": 4.886122848229676e-09,
+        "reference_max_abs": 6636.1259765625
+      },
+      {
+        "layer": 21,
+        "max_abs": 3.0517578125e-05,
+        "mean_abs": 1.5349164641520474e-06,
+        "max_rel_to_layer_scale": 4.598876093548351e-09,
+        "reference_max_abs": 6635.87744140625
+      },
+      {
+        "layer": 22,
+        "max_abs": 3.814697265625e-05,
+        "mean_abs": 2.0231554268927234e-06,
+        "max_rel_to_layer_scale": 5.749626559455113e-09,
+        "reference_max_abs": 6634.68701171875
+      },
+      {
+        "layer": 23,
+        "max_abs": 6.103515625e-05,
+        "mean_abs": 2.1831820807468225e-06,
+        "max_rel_to_layer_scale": 9.201598634217757e-09,
+        "reference_max_abs": 6633.103515625
+      },
+      {
+        "layer": 24,
+        "max_abs": 0.0001220703125,
+        "mean_abs": 2.6721863832790405e-06,
+        "max_rel_to_layer_scale": 1.844670073009828e-08,
+        "reference_max_abs": 6617.46044921875
+      },
+      {
+        "layer": 25,
+        "max_abs": 0.000244140625,
+        "mean_abs": 2.4990984760127808e-06,
+        "max_rel_to_layer_scale": 3.690483843836733e-08,
+        "reference_max_abs": 6615.40966796875
+      },
+      {
+        "layer": 26,
+        "max_abs": 0.02587890625,
+        "mean_abs": 1.0651798220351338e-05,
+        "max_rel_to_layer_scale": 0.0001263860736854656,
+        "reference_max_abs": 204.7607421875
+      },
+      {
+        "layer": 27,
+        "max_abs": 0.0002899169921875,
+        "mean_abs": 4.890664664950843e-06,
+        "max_rel_to_layer_scale": 1.14441368314004e-06,
+        "reference_max_abs": 253.33233642578125
+      }
+    ],
+    "cpu-fp16": [
+      {
+        "layer": 0,
+        "max_abs": 0.017410874366760254,
+        "mean_abs": 0.001104326558485506,
+        "max_rel_to_layer_scale": 0.001767563569260202,
+        "reference_max_abs": 9.850211143493652
+      },
+      {
+        "layer": 1,
+        "max_abs": 0.99462890625,
+        "mean_abs": 0.0008786623287354208,
+        "max_rel_to_layer_scale": 0.0003402571572391464,
+        "reference_max_abs": 2923.168212890625
+      },
+      {
+        "layer": 2,
+        "max_abs": 1.8701171875,
+        "mean_abs": 0.0010662254092608237,
+        "max_rel_to_layer_scale": 0.00029505819888155224,
+        "reference_max_abs": 6338.1298828125
+      },
+      {
+        "layer": 3,
+        "max_abs": 2.13134765625,
+        "mean_abs": 0.0012155528872502448,
+        "max_rel_to_layer_scale": 0.0003301278536395367,
+        "reference_max_abs": 6456.1279296875
+      },
+      {
+        "layer": 4,
+        "max_abs": 0.894287109375,
+        "mean_abs": 0.0010938493107156926,
+        "max_rel_to_layer_scale": 0.0001370886004036086,
+        "reference_max_abs": 6523.42431640625
+      },
+      {
+        "layer": 5,
+        "max_abs": 2.7607421875,
+        "mean_abs": 0.0012853735996524545,
+        "max_rel_to_layer_scale": 0.0004174568739878295,
+        "reference_max_abs": 6613.2392578125
+      },
+      {
+        "layer": 6,
+        "max_abs": 2.08837890625,
+        "mean_abs": 0.0012880954474212558,
+        "max_rel_to_layer_scale": 0.000315690419079954,
+        "reference_max_abs": 6615.27490234375
+      },
+      {
+        "layer": 7,
+        "max_abs": 3.12255859375,
+        "mean_abs": 0.0016338386123114408,
+        "max_rel_to_layer_scale": 0.0004717922809618572,
+        "reference_max_abs": 6618.5029296875
+      },
+      {
+        "layer": 8,
+        "max_abs": 0.999267578125,
+        "mean_abs": 0.0011016269556118157,
+        "max_rel_to_layer_scale": 0.00015095252036125635,
+        "reference_max_abs": 6619.74755859375
+      },
+      {
+        "layer": 9,
+        "max_abs": 1.81787109375,
+        "mean_abs": 0.0012626096097202815,
+        "max_rel_to_layer_scale": 0.0002744335210779023,
+        "reference_max_abs": 6624.08544921875
+      },
+      {
+        "layer": 10,
+        "max_abs": 2.56396484375,
+        "mean_abs": 0.0014258397896279955,
+        "max_rel_to_layer_scale": 0.0003869382441109451,
+        "reference_max_abs": 6626.28955078125
+      },
+      {
+        "layer": 11,
+        "max_abs": 2.7138671875,
+        "mean_abs": 0.0013417696447580358,
+        "max_rel_to_layer_scale": 0.00040950496537664255,
+        "reference_max_abs": 6627.18994140625
+      },
+      {
+        "layer": 12,
+        "max_abs": 1.0166015625,
+        "mean_abs": 0.0011869588438836824,
+        "max_rel_to_layer_scale": 0.00015340336641550857,
+        "reference_max_abs": 6626.9833984375
+      },
+      {
+        "layer": 13,
+        "max_abs": 1.222900390625,
+        "mean_abs": 0.0011510809658451155,
+        "max_rel_to_layer_scale": 0.00018449958878949705,
+        "reference_max_abs": 6628.201171875
+      },
+      {
+        "layer": 14,
+        "max_abs": 1.00439453125,
+        "mean_abs": 0.00116474602375168,
+        "max_rel_to_layer_scale": 0.00015152942694841466,
+        "reference_max_abs": 6628.37939453125
+      },
+      {
+        "layer": 15,
+        "max_abs": 1.5263671875,
+        "mean_abs": 0.001273567192962825,
+        "max_rel_to_layer_scale": 0.0002302546169696769,
+        "reference_max_abs": 6629.04052734375
+      },
+      {
+        "layer": 16,
+        "max_abs": 2.52490234375,
+        "mean_abs": 0.0013317844866378437,
+        "max_rel_to_layer_scale": 0.000380845286518504,
+        "reference_max_abs": 6629.732421875
+      },
+      {
+        "layer": 17,
+        "max_abs": 2.91455078125,
+        "mean_abs": 0.0014240518009197938,
+        "max_rel_to_layer_scale": 0.0004395397888073538,
+        "reference_max_abs": 6630.91455078125
+      },
+      {
+        "layer": 18,
+        "max_abs": 2.84765625,
+        "mean_abs": 0.0016077412213538385,
+        "max_rel_to_layer_scale": 0.0004292655782664428,
+        "reference_max_abs": 6633.78662109375
+      },
+      {
+        "layer": 19,
+        "max_abs": 2.80224609375,
+        "mean_abs": 0.0013412868562833562,
+        "max_rel_to_layer_scale": 0.0004222917661567623,
+        "reference_max_abs": 6635.8056640625
+      },
+      {
+        "layer": 20,
+        "max_abs": 0.7841796875,
+        "mean_abs": 0.0010830632601634231,
+        "max_rel_to_layer_scale": 0.00011816829431351506,
+        "reference_max_abs": 6636.1259765625
+      },
+      {
+        "layer": 21,
+        "max_abs": 0.66943359375,
+        "mean_abs": 0.0011407275061780335,
+        "max_rel_to_layer_scale": 0.00010088094598807662,
+        "reference_max_abs": 6635.87744140625
+      },
+      {
+        "layer": 22,
+        "max_abs": 2.68701171875,
+        "mean_abs": 0.0015333508327633656,
+        "max_rel_to_layer_scale": 0.00040499449544552303,
+        "reference_max_abs": 6634.68701171875
+      },
+      {
+        "layer": 23,
+        "max_abs": 2.25634765625,
+        "mean_abs": 0.001638325566924929,
+        "max_rel_to_layer_scale": 0.000340164698309762,
+        "reference_max_abs": 6633.103515625
+      },
+      {
+        "layer": 24,
+        "max_abs": 2.53955078125,
+        "mean_abs": 0.0016552548528731374,
+        "max_rel_to_layer_scale": 0.0003837651619889646,
+        "reference_max_abs": 6617.46044921875
+      },
+      {
+        "layer": 25,
+        "max_abs": 1.1220703125,
+        "mean_abs": 0.0016395135133583,
+        "max_rel_to_layer_scale": 0.00016961463746273625,
+        "reference_max_abs": 6615.40966796875
+      },
+      {
+        "layer": 26,
+        "max_abs": 1.45703125,
+        "mean_abs": 0.0017081311792329263,
+        "max_rel_to_layer_scale": 0.007115774412781686,
+        "reference_max_abs": 204.7607421875
+      },
+      {
+        "layer": 27,
+        "max_abs": 0.09796142578125,
+        "mean_abs": 0.001348898208865042,
+        "max_rel_to_layer_scale": 0.0003866913603031082,
+        "reference_max_abs": 253.33233642578125
+      }
+    ],
+    "ane": [
+      {
+        "layer": 0,
+        "max_abs": 0.08024537563323975,
+        "mean_abs": 0.005175169598942375,
+        "max_rel_to_layer_scale": 0.008146564014137313,
+        "reference_max_abs": 9.850211143493652
+      },
+      {
+        "layer": 1,
+        "max_abs": 1.168212890625,
+        "mean_abs": 0.00237126184583758,
+        "max_rel_to_layer_scale": 0.00039963929734642014,
+        "reference_max_abs": 2923.168212890625
+      },
+      {
+        "layer": 2,
+        "max_abs": 3.80908203125,
+        "mean_abs": 0.005393640794655615,
+        "max_rel_to_layer_scale": 0.0006009788536488222,
+        "reference_max_abs": 6338.1298828125
+      },
+      {
+        "layer": 3,
+        "max_abs": 3.8720703125,
+        "mean_abs": 0.004129671855518306,
+        "max_rel_to_layer_scale": 0.0005997511751114607,
+        "reference_max_abs": 6456.1279296875
+      },
+      {
+        "layer": 4,
+        "max_abs": 1.105712890625,
+        "mean_abs": 0.005226177527257884,
+        "max_rel_to_layer_scale": 0.00016949884554407407,
+        "reference_max_abs": 6523.42431640625
+      },
+      {
+        "layer": 5,
+        "max_abs": 2.7607421875,
+        "mean_abs": 0.0036985227152210123,
+        "max_rel_to_layer_scale": 0.0004174568739878295,
+        "reference_max_abs": 6613.2392578125
+      },
+      {
+        "layer": 6,
+        "max_abs": 2.08837890625,
+        "mean_abs": 0.0064662490098802055,
+        "max_rel_to_layer_scale": 0.000315690419079954,
+        "reference_max_abs": 6615.27490234375
+      },
+      {
+        "layer": 7,
+        "max_abs": 2.783203125,
+        "mean_abs": 0.007202949846165059,
+        "max_rel_to_layer_scale": 0.0004205185303334771,
+        "reference_max_abs": 6618.5029296875
+      },
+      {
+        "layer": 8,
+        "max_abs": 0.999267578125,
+        "mean_abs": 0.006833712541265413,
+        "max_rel_to_layer_scale": 0.00015095252036125635,
+        "reference_max_abs": 6619.74755859375
+      },
+      {
+        "layer": 9,
+        "max_abs": 2.08642578125,
+        "mean_abs": 0.0071896190655896435,
+        "max_rel_to_layer_scale": 0.00031497567433947803,
+        "reference_max_abs": 6624.08544921875
+      },
+      {
+        "layer": 10,
+        "max_abs": 1.71044921875,
+        "mean_abs": 0.00693236511312989,
+        "max_rel_to_layer_scale": 0.00025813076920979636,
+        "reference_max_abs": 6626.28955078125
+      },
+      {
+        "layer": 11,
+        "max_abs": 4.81005859375,
+        "mean_abs": 0.006764306470775712,
+        "max_rel_to_layer_scale": 0.0007258066595763414,
+        "reference_max_abs": 6627.18994140625
+      },
+      {
+        "layer": 12,
+        "max_abs": 1.0166015625,
+        "mean_abs": 0.006416689563479849,
+        "max_rel_to_layer_scale": 0.00015340336641550857,
+        "reference_max_abs": 6626.9833984375
+      },
+      {
+        "layer": 13,
+        "max_abs": 1.222900390625,
+        "mean_abs": 0.006698869864938691,
+        "max_rel_to_layer_scale": 0.00018449958878949705,
+        "reference_max_abs": 6628.201171875
+      },
+      {
+        "layer": 14,
+        "max_abs": 1.0057373046875,
+        "mean_abs": 0.006693053925516779,
+        "max_rel_to_layer_scale": 0.00015173200639620666,
+        "reference_max_abs": 6628.37939453125
+      },
+      {
+        "layer": 15,
+        "max_abs": 1.5263671875,
+        "mean_abs": 0.006678236102667749,
+        "max_rel_to_layer_scale": 0.0002302546169696769,
+        "reference_max_abs": 6629.04052734375
+      },
+      {
+        "layer": 16,
+        "max_abs": 2.52490234375,
+        "mean_abs": 0.007096032627562939,
+        "max_rel_to_layer_scale": 0.000380845286518504,
+        "reference_max_abs": 6629.732421875
+      },
+      {
+        "layer": 17,
+        "max_abs": 2.91455078125,
+        "mean_abs": 0.007540589271836022,
+        "max_rel_to_layer_scale": 0.0004395397888073538,
+        "reference_max_abs": 6630.91455078125
+      },
+      {
+        "layer": 18,
+        "max_abs": 2.84765625,
+        "mean_abs": 0.008015708473370372,
+        "max_rel_to_layer_scale": 0.0004292655782664428,
+        "reference_max_abs": 6633.78662109375
+      },
+      {
+        "layer": 19,
+        "max_abs": 2.80224609375,
+        "mean_abs": 0.008165590920422497,
+        "max_rel_to_layer_scale": 0.0004222917661567623,
+        "reference_max_abs": 6635.8056640625
+      },
+      {
+        "layer": 20,
+        "max_abs": 1.080322265625,
+        "mean_abs": 0.008092612958383446,
+        "max_rel_to_layer_scale": 0.00016279411654336988,
+        "reference_max_abs": 6636.1259765625
+      },
+      {
+        "layer": 21,
+        "max_abs": 2.2998046875,
+        "mean_abs": 0.008857456669071931,
+        "max_rel_to_layer_scale": 0.00034657130240980374,
+        "reference_max_abs": 6635.87744140625
+      },
+      {
+        "layer": 22,
+        "max_abs": 2.68701171875,
+        "mean_abs": 0.009328819310591522,
+        "max_rel_to_layer_scale": 0.00040499449544552303,
+        "reference_max_abs": 6634.68701171875
+      },
+      {
+        "layer": 23,
+        "max_abs": 4.0927734375,
+        "mean_abs": 0.010383426984011143,
+        "max_rel_to_layer_scale": 0.0006170223980161059,
+        "reference_max_abs": 6633.103515625
+      },
+      {
+        "layer": 24,
+        "max_abs": 1.46044921875,
+        "mean_abs": 0.010222211382824753,
+        "max_rel_to_layer_scale": 0.00022069632753489581,
+        "reference_max_abs": 6617.46044921875
+      },
+      {
+        "layer": 25,
+        "max_abs": 1.1220703125,
+        "mean_abs": 0.010992436719334364,
+        "max_rel_to_layer_scale": 0.00016961463746273625,
+        "reference_max_abs": 6615.40966796875
+      },
+      {
+        "layer": 26,
+        "max_abs": 7.2392578125,
+        "mean_abs": 0.015401755125518926,
+        "max_rel_to_layer_scale": 0.03535471563133421,
+        "reference_max_abs": 204.7607421875
+      },
+      {
+        "layer": 27,
+        "max_abs": 0.1850128173828125,
+        "mean_abs": 0.01130517427676144,
+        "max_rel_to_layer_scale": 0.0007303166267406833,
+        "reference_max_abs": 253.33233642578125
+      }
+    ]
+  }
+}

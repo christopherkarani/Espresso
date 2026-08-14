@@ -94,6 +94,28 @@ import Espresso
     #expect(ClassifierStrategy.select(for: config) == .cpuFP16Tiled)
 }
 
+@Test func qwen25_15bVocabSelectsFP16TiledCPU() {
+    let config = MultiModelConfig(
+        name: "Qwen2.5-1.5B-Instruct",
+        nLayer: 28,
+        nHead: 12,
+        nKVHead: 2,
+        dModel: 1536,
+        headDim: 128,
+        hiddenDim: 8960,
+        vocab: 151_936,
+        maxSeq: 1024,
+        normEps: 1e-6,
+        architecture: .llama,
+        preferredDecodePath: .hybrid
+    )
+    // 151936 * 1536 = 233_373_696 fp16 elements (~467 MB) vs ~16M SRAM (~32 MB).
+    // Capacity policy: stay on cpu_fp16_tiled. Do not move this head to Metal/ANE.
+    #expect(config.vocab * config.dModel > 16_000_000)
+    #expect(ClassifierStrategy.select(for: config) == .cpuFP16Tiled)
+    #expect(ClassifierStrategy.select(for: config).exactHeadBackendLabel == "cpu_fp16_tiled")
+}
+
 @Test func gpt2LargeVocabKeepsPartitionedCPUPath() {
     let config = MultiModelConfig(
         name: "gpt2-large-vocab",

@@ -116,6 +116,7 @@ public enum RealModelInferenceError: Error, Sendable, Equatable, LocalizedError 
     /// leave the ANE hybrid decode path. `stage` names where the fallback was about to
     /// happen and `reason` names the op, kernel, or policy responsible.
     case hybridFallbackDisabled(stage: String, reason: String)
+    case cancelled
 
     public var errorDescription: String? {
         switch self {
@@ -141,6 +142,8 @@ public enum RealModelInferenceError: Error, Sendable, Equatable, LocalizedError 
                 (ESPRESSO_REALMODEL_DISABLE_HYBRID_FALLBACK=1) but \(stage) would fall back \
                 off the ANE: \(reason)
                 """
+        case .cancelled:
+            return "Generation cancelled"
         }
     }
 }
@@ -220,8 +223,20 @@ public struct RealModelInferenceEngine: ~Copyable {
         if environment["ESPRESSO_ENABLE_HYBRID_DONOR_DELTA"] == "1" {
             return true
         }
+        // Donor delta copies a prior layer's net.plist and swaps weights.
+        // At Qwen2.5-1.5B FFN width (8960×1536 = 13.7M elements) that path
+        // misses more often than it hits; keep it for 0.5B-scale FFNs.
+        if config.architecture == .llama,
+           config.hiddenDim * config.dModel > Self.hybridDonorDeltaFFNElementLimit {
+            return false
+        }
         return true
     }
+
+    /// FFN weight elements (`hiddenDim * dModel`) above this skip donor delta.
+    /// 0.5B is 4864×896 = 4.36M and TinyLlama is 5632×2048 = 11.5M (keep);
+    /// 1.5B is 8960×1536 = 13.8M (skip — donor misses more than it hits).
+    static let hybridDonorDeltaFFNElementLimit = 12_000_000
 
     /// Stories 110M family recognition — delegates to `ModelFamily`.
     static func isStories110MVariant(_ config: MultiModelConfig) -> Bool {
@@ -1487,11 +1502,31 @@ public struct RealModelInferenceEngine: ~Copyable {
         )
     }
 
+    /// Compile hybrid decode kernels once for a context that covers later turns.
+    /// Chat re-prefills growing history; compiling per-turn at a larger bucket
+    /// exhausts the per-process ANE compile budget.
+    public mutating func precompileHybridDecode(covering tokenCount: Int? = nil) throws {
+        let target = min(max(tokenCount ?? config.maxSeq, 1), config.maxSeq)
+        let bucket = try Self.compileBucket(
+            for: target,
+            channels: config.dModel,
+            maxSeq: config.maxSeq
+        )
+        switch config.architecture {
+        case .llama:
+            _ = try ensureHybridCompiledLlama(bucket: bucket)
+        case .gpt2:
+            _ = try ensureHybridCompiled(bucket: bucket)
+        }
+    }
+
     public mutating func generate(
         prompt: String,
         maxTokens: Int = 128,
         temperature: Float = 0.0,
-        onStep: ((GenerationStep) -> Void)? = nil
+        topP: Float = 1.0,
+        onStep: ((GenerationStep) -> Void)? = nil,
+        isCancelled: (() -> Bool)? = nil
     ) throws -> GenerationResult {
         guard maxTokens >= 0 else {
             throw RealModelInferenceError.invalidGenerationParameters("maxTokens must be >= 0")
@@ -1499,6 +1534,10 @@ public struct RealModelInferenceEngine: ~Copyable {
         guard temperature.isFinite, temperature >= 0 else {
             throw RealModelInferenceError.invalidGenerationParameters("temperature must be finite and >= 0")
         }
+        guard topP.isFinite, topP > 0, topP <= 1 else {
+            throw RealModelInferenceError.invalidGenerationParameters("topP must be in (0, 1]")
+        }
+        try Self.throwIfCancelled(isCancelled)
 
         let promptTokens = try encodePrompt(prompt)
         guard promptTokens.count < config.maxSeq else {
@@ -1562,9 +1601,11 @@ public struct RealModelInferenceEngine: ~Copyable {
                     promptTokens: promptTokens,
                     effectiveMaxTokens: effectiveMaxTokens,
                     temperature: temperature,
+                    topP: topP,
                     compileTimeMs: 0,
                     maxSeq: bucket,
-                    onStep: onStep
+                    onStep: onStep,
+                    isCancelled: isCancelled
                 )
             case .hybrid:
                 let compileStart = DispatchTime.now().uptimeNanoseconds
@@ -1578,10 +1619,12 @@ public struct RealModelInferenceEngine: ~Copyable {
                     promptTokens: promptTokens,
                     effectiveMaxTokens: effectiveMaxTokens,
                     temperature: temperature,
+                    topP: topP,
                     compileTimeMs: compileTimeMs,
-                    maxSeq: bucket,
+                    maxSeq: max(bucket, compiledHybridBucket),
                     metalAttention: metalAttention,
-                    onStep: onStep
+                    onStep: onStep,
+                    isCancelled: isCancelled
                 )
             }
         }
@@ -1666,10 +1709,12 @@ public struct RealModelInferenceEngine: ~Copyable {
                         promptTokens: promptTokens,
                         effectiveMaxTokens: effectiveMaxTokens,
                         temperature: temperature,
+                        topP: topP,
                         compileTimeMs: fallbackCompileTimeMs,
                         maxSeq: bucket,
                         metalAttention: metalAttention,
-                        onStep: onStep
+                        onStep: onStep,
+                        isCancelled: isCancelled
                     )
                 }
             }
@@ -1678,10 +1723,12 @@ public struct RealModelInferenceEngine: ~Copyable {
                     promptTokens: promptTokens,
                     effectiveMaxTokens: effectiveMaxTokens,
                     temperature: temperature,
+                    topP: topP,
                     compileTimeMs: compileTimeMs,
                     maxSeq: bucket,
                     metalAttention: metalAttention,
-                    onStep: onStep
+                    onStep: onStep,
+                    isCancelled: isCancelled
                 )
             } catch {
                 if ProcessInfo.processInfo.environment["ESPRESSO_REALMODEL_DISABLE_HYBRID_FALLBACK"] == "1" {
@@ -1745,9 +1792,11 @@ public struct RealModelInferenceEngine: ~Copyable {
                 spatial: activeBucket,
                 spatialIndex: sequenceLength - 1
             )
+            try Self.throwIfCancelled(isCancelled)
             let nextToken = selectTokenFromNormalizedHidden(
                 lastHidden,
                 temperature: temperature,
+                topP: topP,
                 using: &rng
             )
 
@@ -4880,10 +4929,12 @@ public struct RealModelInferenceEngine: ~Copyable {
         promptTokens: [TokenID],
         effectiveMaxTokens: Int,
         temperature: Float,
+        topP: Float = 1.0,
         compileTimeMs: Double,
         maxSeq: Int,
         metalAttention: MetalAttentionKernel,
-        onStep: ((GenerationStep) -> Void)?
+        onStep: ((GenerationStep) -> Void)?,
+        isCancelled: (() -> Bool)? = nil
     ) throws -> GenerationResult {
         guard compiledHybridLayers.count == config.nLayer,
               compiledHybridSurfaceHandles.count == config.nLayer,
@@ -5029,6 +5080,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         let headSpatial = compiledHybridHeadSpatial
 
         while generatedTokens.count < effectiveMaxTokens {
+            try Self.throwIfCancelled(isCancelled)
             let nextToken: TokenID
             if useANEGreedyHead {
                 do {
@@ -5080,6 +5132,7 @@ public struct RealModelInferenceEngine: ~Copyable {
                 nextToken = selectTokenFromNormalizedHidden(
                     normalized,
                     temperature: temperature,
+                    topP: topP,
                     using: &rng
                 )
             }
@@ -5677,10 +5730,12 @@ public struct RealModelInferenceEngine: ~Copyable {
         promptTokens: [TokenID],
         effectiveMaxTokens: Int,
         temperature: Float,
+        topP: Float = 1.0,
         compileTimeMs: Double,
         maxSeq: Int,
         metalAttention: MetalAttentionKernel,
-        onStep: ((GenerationStep) -> Void)?
+        onStep: ((GenerationStep) -> Void)?,
+        isCancelled: (() -> Bool)? = nil
     ) throws -> GenerationResult {
         guard compiledHybridLayers.count == config.nLayer,
               compiledHybridSurfaceHandles.count == config.nLayer,
@@ -5700,9 +5755,11 @@ public struct RealModelInferenceEngine: ~Copyable {
                 promptTokens: promptTokens,
                 effectiveMaxTokens: effectiveMaxTokens,
                 temperature: temperature,
+                topP: topP,
                 compileTimeMs: compileTimeMs,
                 maxSeq: maxSeq,
-                onStep: onStep
+                onStep: onStep,
+                isCancelled: isCancelled
             )
         }
 
@@ -6020,8 +6077,11 @@ public struct RealModelInferenceEngine: ~Copyable {
         var allTokens = promptTokens
         var generatedTokens: [TokenID] = []
         var tokenLatenciesMs: [Double] = []
+        var decodeProfileTokens: [HybridDecodeTimingBreakdown] = []
         generatedTokens.reserveCapacity(effectiveMaxTokens)
         tokenLatenciesMs.reserveCapacity(effectiveMaxTokens)
+        decodeProfileTokens.reserveCapacity(effectiveMaxTokens)
+        var pendingDecode = HybridDecodeTimingBreakdown()
 
         let generationStart = DispatchTime.now().uptimeNanoseconds
         var emissionStart = generationStart
@@ -6032,6 +6092,8 @@ public struct RealModelInferenceEngine: ~Copyable {
         let headSpatial = compiledHybridHeadSpatial
 
         while generatedTokens.count < effectiveMaxTokens {
+            try Self.throwIfCancelled(isCancelled)
+            let headStart = DispatchTime.now().uptimeNanoseconds
             let nextToken: TokenID
             if useANEGreedyHead {
                 do {
@@ -6088,9 +6150,15 @@ public struct RealModelInferenceEngine: ~Copyable {
                 nextToken = selectTokenFromNormalizedHidden(
                     normalized,
                     temperature: temperature,
+                    topP: topP,
                     using: &rng
                 )
             }
+            var tokenProfile = pendingDecode
+            tokenProfile.tLMHead = Self.milliseconds(
+                from: DispatchTime.now().uptimeNanoseconds - headStart
+            )
+            decodeProfileTokens.append(tokenProfile)
             let emissionNow = DispatchTime.now().uptimeNanoseconds
             let tokenLatencyMs = Self.milliseconds(from: emissionNow - emissionStart)
 
@@ -6125,6 +6193,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             }
 
             try writeIncrementalEmbeddingLlama(token: nextToken, into: xCur)
+            timings.reset()
             do {
                 try ForwardPass.runHybridDecodeTimed(
                     xCur: xCur,
@@ -6152,7 +6221,12 @@ public struct RealModelInferenceEngine: ~Copyable {
                     "Llama hybrid decode failed at generated token \(generatedTokens.count - 1): \(error)"
                 )
             }
+            pendingDecode = timings
             emissionStart = emissionNow
+        }
+
+        if !decodeProfileTokens.isEmpty {
+            fputs(HybridDecodeTokenProfile(tokens: decodeProfileTokens).formatReport() + "\n", stderr)
         }
 
         let generationEnd = DispatchTime.now().uptimeNanoseconds
@@ -6406,9 +6480,11 @@ public struct RealModelInferenceEngine: ~Copyable {
         promptTokens: [TokenID],
         effectiveMaxTokens: Int,
         temperature: Float,
+        topP: Float = 1.0,
         compileTimeMs: Double,
         maxSeq: Int,
-        onStep: ((GenerationStep) -> Void)?
+        onStep: ((GenerationStep) -> Void)?,
+        isCancelled: (() -> Bool)? = nil
     ) throws -> GenerationResult {
         guard !promptTokens.isEmpty else {
             throw RealModelInferenceError.invalidGenerationParameters("Prompt tokens must not be empty")
@@ -6469,6 +6545,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         var rng = SystemRandomNumberGenerator()
 
         while generatedTokens.count < effectiveMaxTokens {
+            try Self.throwIfCancelled(isCancelled)
             let normalized = Self.rmsNorm(lastHidden, weight: finalNormGamma, eps: Float(config.normEps))
             let nextToken: TokenID
             if temperature == 0 {
@@ -6477,6 +6554,7 @@ public struct RealModelInferenceEngine: ~Copyable {
                 nextToken = selectTokenFromNormalizedHidden(
                     normalized,
                     temperature: temperature,
+                    topP: topP,
                     using: &rng
                 )
             }
@@ -6568,7 +6646,7 @@ public struct RealModelInferenceEngine: ~Copyable {
                 return kernels
             } catch {
                 throw RealModelInferenceError.runtimeFailure(
-                    "Hybrid decode compilation failed for layer \(layerIndex): \(error)"
+                    "Hybrid decode compilation failed for layer \(layerIndex): \(error). Failing-kernel MIL is dumped to $TMPDIR/espresso-hybrid-<kernel>-<unix-seconds>.mil"
                 )
             }
         })
@@ -8364,43 +8442,32 @@ public struct RealModelInferenceEngine: ~Copyable {
         }
     }
 
+    private static func throwIfCancelled(_ isCancelled: (() -> Bool)?) throws {
+        if isCancelled?() == true {
+            throw RealModelInferenceError.cancelled
+        }
+    }
+
     private func sampleToken<R: RandomNumberGenerator>(
         from logits: [Float],
         temperature: Float,
+        topP: Float,
         using rng: inout R
     ) -> TokenID {
-        if temperature <= 0 {
-            let index = logits.enumerated().max(by: { $0.element < $1.element })?.offset ?? 0
-            return TokenID(index)
-        }
-
-        let maxLogit = logits.max() ?? 0
-        var scaled = [Double](repeating: 0, count: logits.count)
-        scaled.reserveCapacity(logits.count)
-        var total = 0.0
-        for index in logits.indices {
-            let value = exp(Double((logits[index] - maxLogit) / temperature))
-            scaled[index] = value
-            total += value
-        }
-        if !total.isFinite || total <= 0 {
-            let index = logits.enumerated().max(by: { $0.element < $1.element })?.offset ?? 0
-            return TokenID(index)
-        }
-
-        var threshold = Double.random(in: 0..<total, using: &rng)
-        for index in scaled.indices {
-            threshold -= scaled[index]
-            if threshold <= 0 {
-                return TokenID(index)
-            }
-        }
-        return TokenID(max(0, scaled.count - 1))
+        TokenID(
+            NucleusSampler.sample(
+                logits: logits,
+                temperature: temperature,
+                topP: topP,
+                using: &rng
+            )
+        )
     }
 
     private mutating func selectTokenFromNormalizedHidden<R: RandomNumberGenerator>(
         _ hidden: [Float],
         temperature: Float,
+        topP: Float = 1.0,
         using rng: inout R
     ) -> TokenID {
         if temperature <= 0 {
@@ -8408,7 +8475,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             return TokenID(index)
         }
         let logits = projectLogits(hidden)
-        return sampleToken(from: logits, temperature: temperature, using: &rng)
+        return sampleToken(from: logits, temperature: temperature, topP: topP, using: &rng)
     }
 
     private mutating func exactClassifierArgmax(_ hidden: [Float]) -> Int {

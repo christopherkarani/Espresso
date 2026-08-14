@@ -9,6 +9,48 @@ enum LiveLaneStatus: String, Sendable {
     case failed = "FAILED"
 }
 
+enum LaneWattFocus: String, Sendable {
+    case ane
+    case gpu
+}
+
+enum LiveComparePowerMode: Equatable, Sendable {
+    case coreMLPreflight
+    case perLaneEnergy
+}
+
+struct LiveCompareDisplay: Equatable, Sendable {
+    var title: String
+    var espressoHeader: String
+    var opponentHeader: String
+    var espressoTextTitle: String
+    var opponentTextTitle: String
+    var powerMode: LiveComparePowerMode
+    var footerHint: String
+
+    static let coreMLGPT2 = LiveCompareDisplay(
+        title: "ESPRESSO vs CORE ML LIVE GPT-2",
+        espressoHeader: "ESPRESSO / ANE",
+        opponentHeader: "CORE ML",
+        espressoTextTitle: "ESPRESSO TEXT",
+        opponentTextTitle: "CORE ML TEXT",
+        powerMode: .coreMLPreflight,
+        footerHint: "Ctrl-C to quit"
+    )
+
+    static func mlx(_ fairness: ChatVsMLXFairness) -> LiveCompareDisplay {
+        LiveCompareDisplay(
+            title: fairness.title(),
+            espressoHeader: fairness.espressoLaneHeader(),
+            opponentHeader: fairness.mlxLaneHeader(),
+            espressoTextTitle: "ESPRESSO TEXT",
+            opponentTextTitle: "MLX TEXT",
+            powerMode: .perLaneEnergy,
+            footerHint: "Ctrl-C cancels the current lane"
+        )
+    }
+}
+
 struct LiveLaneSnapshot: Sendable {
     let title: String
     var status: LiveLaneStatus
@@ -23,6 +65,7 @@ struct LiveLaneSnapshot: Sendable {
     var p95TokenMs: Double
     var totalMs: Double
     var power: PowerSummary?
+    var wattFocus: LaneWattFocus?
 
     init(title: String, maxTokens: Int) {
         self.title = title
@@ -38,6 +81,7 @@ struct LiveLaneSnapshot: Sendable {
         self.p95TokenMs = 0
         self.totalMs = 0
         self.power = nil
+        self.wattFocus = nil
     }
 }
 
@@ -52,6 +96,7 @@ struct LiveCompareSnapshot: Sendable {
     var matchCount: Int
     var totalComparedTokens: Int
     var events: [String]
+    var display: LiveCompareDisplay = .coreMLGPT2
 }
 
 final class LiveCompareStateStore: @unchecked Sendable {
@@ -82,9 +127,9 @@ struct LiveCompareRenderer: Sendable {
         let laneWidth = max(46, (width - 7) / 2)
         let fullWidth = laneWidth * 2 + 7
 
-        let espressoHeader = colored("ESPRESSO / ANE", .cyan, bold: true)
-        let coreHeader = colored("CORE ML", .yellow, bold: true)
-        let title = colored("ESPRESSO vs CORE ML LIVE GPT-2", .white, bold: true)
+        let espressoHeader = colored(snapshot.display.espressoHeader, .cyan, bold: true)
+        let coreHeader = colored(snapshot.display.opponentHeader, .yellow, bold: true)
+        let title = colored(snapshot.display.title, .white, bold: true)
         let promptLine = "prompt: \"\(truncate(snapshot.prompt, to: fullWidth - 24))\""
         let metaLine = "model: \(snapshot.modelName)   tokens: \(snapshot.maxTokens)   elapsed: \(formatDuration(snapshot.elapsedMs))"
         let matchLine = comparisonLine(snapshot)
@@ -95,14 +140,24 @@ struct LiveCompareRenderer: Sendable {
         lines.append("║ \(padRight(promptLine + spaces(4) + metaLine, to: fullWidth - 4)) ║")
         lines.append(doubleLine(fullWidth))
         lines.append(contentsOf: zipColumns(
-            left: laneCard(header: espressoHeader, lane: snapshot.espresso, width: laneWidth),
-            right: laneCard(header: coreHeader, lane: snapshot.coreML, width: laneWidth),
+            left: laneCard(
+                header: espressoHeader,
+                lane: snapshot.espresso,
+                width: laneWidth,
+                showEnergy: snapshot.display.powerMode == .perLaneEnergy
+            ),
+            right: laneCard(
+                header: coreHeader,
+                lane: snapshot.coreML,
+                width: laneWidth,
+                showEnergy: snapshot.display.powerMode == .perLaneEnergy
+            ),
             laneWidth: laneWidth
         ))
         lines.append(singleLine(fullWidth))
         lines.append(contentsOf: zipColumns(
-            left: textCard(title: "ESPRESSO TEXT", text: snapshot.espresso.text, width: laneWidth),
-            right: textCard(title: "CORE ML TEXT", text: snapshot.coreML.text, width: laneWidth),
+            left: textCard(title: snapshot.display.espressoTextTitle, text: snapshot.espresso.text, width: laneWidth),
+            right: textCard(title: snapshot.display.opponentTextTitle, text: snapshot.coreML.text, width: laneWidth),
             laneWidth: laneWidth
         ))
         lines.append(singleLine(fullWidth))
@@ -111,14 +166,14 @@ struct LiveCompareRenderer: Sendable {
         lines.append(contentsOf: eventsCard(snapshot: snapshot, width: fullWidth))
         lines.append(singleLine(fullWidth))
         lines.append("║ \(padRight(matchLine, to: fullWidth - 4)) ║")
-        lines.append("║ \(padRight("Ctrl-C to quit", to: fullWidth - 4)) ║")
+        lines.append("║ \(padRight(snapshot.display.footerHint, to: fullWidth - 4)) ║")
         lines.append(doubleLine(fullWidth))
         return lines.joined(separator: "\n")
     }
 
-    private func laneCard(header: String, lane: LiveLaneSnapshot, width: Int) -> [String] {
+    private func laneCard(header: String, lane: LiveLaneSnapshot, width: Int, showEnergy: Bool = false) -> [String] {
         let barWidth = max(12, width - 28)
-        return [
+        var rows = [
             boxedRow(header, width: width),
             boxedRow("status      \(statusChip(lane.status))", width: width),
             boxedRow("token       \(lane.generatedTokenCount) / \(lane.maxTokens)", width: width),
@@ -128,10 +183,16 @@ struct LiveCompareRenderer: Sendable {
             boxedRow("            \(gradientBar(value: lane.tokensPerSecond, scale: 40, width: barWidth))", width: width),
             boxedRow("TTFT        \(formatDouble(lane.ttftMs)) ms", width: width),
             boxedRow("compile     \(formatDouble(lane.compileMs)) ms", width: width),
+        ]
+        if showEnergy {
+            rows.append(boxedRow(laneEnergyLine(lane), width: width))
+        }
+        rows.append(contentsOf: [
             boxedRow("median tok  \(formatDouble(lane.medianTokenMs)) ms", width: width),
             boxedRow("p95 tok     \(formatDouble(lane.p95TokenMs)) ms", width: width),
             boxedRow("runtime     \(formatDouble(lane.totalMs)) ms", width: width),
-        ]
+        ])
+        return rows
     }
 
     private func textCard(title: String, text: String, width: Int) -> [String] {
@@ -146,22 +207,48 @@ struct LiveCompareRenderer: Sendable {
     }
 
     private func powerCard(snapshot: LiveCompareSnapshot, width: Int) -> [String] {
-        let live = snapshot.livePower ?? .unavailable
-        let espresso = snapshot.espresso.power ?? .unavailable
-        let coreML = snapshot.coreML.power ?? .unavailable
-        let barWidth = max(24, width - 32)
+        switch snapshot.display.powerMode {
+        case .coreMLPreflight:
+            let live = snapshot.livePower ?? .unavailable
+            let espresso = snapshot.espresso.power ?? .unavailable
+            let coreML = snapshot.coreML.power ?? .unavailable
+            let barWidth = max(24, width - 32)
+            return [
+                boxedWideRow(colored("POWER", .green, bold: true), width: width),
+                boxedWideRow(powerLine(label: "SYSTEM TOTAL", watts: live.packageW, barWidth: barWidth), width: width),
+                boxedWideRow(powerLine(label: "ANE", watts: live.aneW, barWidth: barWidth), width: width),
+                boxedWideRow(powerLine(label: "CPU", watts: live.cpuW, barWidth: barWidth), width: width),
+                boxedWideRow(powerLine(label: "GPU", watts: live.gpuW, barWidth: barWidth), width: width),
+                boxedWideRow(
+                    "Espresso preflight avg: \(formatDouble(espresso.packageW)) W   Core ML preflight avg: \(formatDouble(coreML.packageW)) W",
+                    width: width
+                ),
+            ]
+        case .perLaneEnergy:
+            return [
+                boxedWideRow(colored("POWER  J/tok = package_W / tok_s  (compile excluded from tok/s)", .green, bold: true), width: width),
+                boxedWideRow("Espresso  \(laneEnergyLine(snapshot.espresso))", width: width),
+                boxedWideRow("MLX       \(laneEnergyLine(snapshot.coreML))", width: width),
+            ]
+        }
+    }
 
-        return [
-            boxedWideRow(colored("POWER", .green, bold: true), width: width),
-            boxedWideRow(powerLine(label: "SYSTEM TOTAL", watts: live.packageW, barWidth: barWidth), width: width),
-            boxedWideRow(powerLine(label: "ANE", watts: live.aneW, barWidth: barWidth), width: width),
-            boxedWideRow(powerLine(label: "CPU", watts: live.cpuW, barWidth: barWidth), width: width),
-            boxedWideRow(powerLine(label: "GPU", watts: live.gpuW, barWidth: barWidth), width: width),
-            boxedWideRow(
-                "Espresso preflight avg: \(formatDouble(espresso.packageW)) W   Core ML preflight avg: \(formatDouble(coreML.packageW)) W",
-                width: width
-            ),
-        ]
+    private func laneEnergyLine(_ lane: LiveLaneSnapshot) -> String {
+        guard let power = lane.power, power.sampleCount > 0 else {
+            return "power: unavailable"
+        }
+        let focus: String
+        switch lane.wattFocus {
+        case .gpu:
+            focus = String(format: "GPU %.2fW", power.gpuW)
+        case .ane, .none:
+            focus = String(format: "ANE %.2fW", power.aneW)
+        }
+        let watts = String(format: "%@  CPU %.2fW  pkg %.2fW", focus, power.cpuW, power.packageW)
+        if let joules = laneJoulesPerToken(lane) {
+            return watts + String(format: "  %.3f J/tok", joules)
+        }
+        return watts + "  J/tok unavailable"
     }
 
     private func eventsCard(snapshot: LiveCompareSnapshot, width: Int) -> [String] {

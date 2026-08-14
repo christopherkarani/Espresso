@@ -18,8 +18,11 @@ Stable, product-facing helper scripts. Research-only tooling lives under
 | `assert_readme_claims.py` | CI guard: README numbers must match `latest.json` |
 | `assert_demo_helpers.py` | CI guard: GPT-2 demo helper scripts must remain tracked |
 | `convert_weights_gpt2.py` / `convert_weights_llama.py` | Weight conversion helpers |
-| `convert_qwen25_05b_to_esp.py` | Download Qwen2.5-0.5B-Instruct, convert bf16→fp16 blobs, pack the `.esp` bundle |
+| `convert_qwen25_05b_to_esp.py` | Convert Qwen2.5-0.5B-Instruct (default) or Qwen2.5-1.5B-Instruct (`--model`) to a packed `.esp` bundle |
 | `qwen25_pytorch_reference.py` | PyTorch fp32 oracle: layer-parity, logit-parity (probe + NumPy LM head), greedy fixtures |
+| `chat_plain_name_recall.py` | 10-turn `./espresso chat --plain --greedy` smoke: turn 1 names Ada, a later turn must recall it. Writes `docs/qwen15b-chat-name-recall.txt`. |
+| `mlx_qwen_stream.py` | Persistent MLX JSON-line driver for `./espresso chat --vs mlx`. Native fp16/bf16; quantized loads require `--allow-quant`. |
+| `chat_vs_mlx_four_turn.py` | Scripted 4-turn `./espresso chat --vs mlx --plain --greedy --power` driver. Prints the post-run scoreboard; does not record a GIF. |
 | `espresso_llama_weights.py` / `stories_model_identity.py` | Stories/Llama weight identity helpers |
 | `export_llama_coreml.py` | Export Llama-family CoreML baselines |
 | `benchmark-prompts.txt` / `stories_prompt_suite.txt` | Fixed prompt suites |
