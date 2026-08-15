@@ -17,9 +17,10 @@ import struct
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import numpy as np
+if TYPE_CHECKING:
+    import numpy as np
 
 
 BLOBFILE_HEADER_BYTES = 128
@@ -91,6 +92,8 @@ def build_comparison_result(
 
 
 def _load_blobfile(path: Path) -> np.ndarray:
+    import numpy as np
+
     data = path.read_bytes()
     if len(data) < BLOBFILE_HEADER_BYTES:
         raise ValueError(f"BLOBFILE too small: {path}")
@@ -129,6 +132,8 @@ def layer_norm(hidden: np.ndarray, gamma: np.ndarray, beta: np.ndarray, eps: flo
 
 
 def sample_token(logits: np.ndarray, temperature: float, rng: np.random.Generator) -> int:
+    import numpy as np
+
     if temperature <= 0:
         return int(np.argmax(logits))
     scaled = logits / temperature
@@ -166,6 +171,7 @@ def map_compute_units(name: str):
 
 def run_reference(args: argparse.Namespace) -> dict[str, Any]:
     import coremltools as ct
+    import numpy as np
 
     prompt_tokens = list(args.prompt_tokens)
     if args.max_tokens <= 0:
