@@ -11,6 +11,13 @@ on:
       - "README.md"
       - "benchmarks/results/latest.json"
       - "scripts/assert_readme_claims.py"
+      - "scripts/assert_demo_helpers.py"
+      - "scripts/bootstrap_gpt2_demo.py"
+      - "scripts/export_gpt2_coreml.py"
+      - "scripts/convert_weights_gpt2.py"
+      - "scripts/run_gpt2_coreml_reference.py"
+      - "scripts/tests/test_gpt2_demo_helpers.py"
+      - "scripts/tests/test_ci_workflow.py"
       - ".github/workflows/ci.yml"
 
 concurrency:
@@ -61,8 +68,7 @@ jobs:
           # Fail if a non-empty dependency graph snuck back into the package.
           DEPS=$(swift package show-dependencies --format json)
           echo "$DEPS"
-          echo "$DEPS" | python3 -c 'import json,sys; d=json.load(sys.stdin); deps=d.get("dependencies") or [];
-assert not deps, f"package graph must have zero dependencies, found: {deps}"'
+          echo "$DEPS" | python3 -c 'import json,sys; d=json.load(sys.stdin); deps=d.get("dependencies") or []; assert not deps, f"package graph must have zero dependencies, found: {deps}"'
 
       - name: Assert README claims match latest.json
         run: python3 scripts/assert_readme_claims.py
@@ -71,6 +77,7 @@ assert not deps, f"package graph must have zero dependencies, found: {deps}"'
         run: |
           python3 scripts/assert_demo_helpers.py
           python3 scripts/tests/test_gpt2_demo_helpers.py -v
+          python3 scripts/tests/test_ci_workflow.py -v
 
       - name: Build (release)
         run: swift build -c release

@@ -124,6 +124,22 @@ class ExportGPT2CoreMLTests(unittest.TestCase):
 
 
 class RunGPT2CoreMLReferenceTests(unittest.TestCase):
+    def test_module_loads_without_numpy(self) -> None:
+        """CI macos-15 runners do not install numpy; parse_args/result helpers must import anyway."""
+        previous = sys.modules.pop("numpy", None)
+
+        def restore() -> None:
+            if previous is None:
+                sys.modules.pop("numpy", None)
+            else:
+                sys.modules["numpy"] = previous
+
+        self.addCleanup(restore)
+        reference = load_module("run_gpt2_coreml_reference", SCRIPTS / "run_gpt2_coreml_reference.py")
+        self.assertNotIn("numpy", sys.modules)
+        self.assertTrue(hasattr(reference, "parse_args"))
+        self.assertTrue(hasattr(reference, "build_comparison_result"))
+
     def test_parse_args_matches_swift_invocation(self) -> None:
         reference = load_module("run_gpt2_coreml_reference", SCRIPTS / "run_gpt2_coreml_reference.py")
         args = reference.parse_args(
