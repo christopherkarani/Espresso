@@ -1,25 +1,56 @@
 import Accelerate
+import ANEInterop
 
 /// FP16 tiled classifier: converts FP16 weights in L2-sized tiles, runs sgemm on L2-resident FP32 data.
 ///
 /// Each tile of `tileRows × dim` FP16 values (~11.7 MB at 4000×768) fits in L2 cache.
 /// The tile is converted to FP32 via vImageConvert_Planar16FtoPlanarF, then sgemm runs
 /// on the warm FP32 data. This halves the DRAM bandwidth for classifier weights.
+///
+/// At dim=1536 the default 4000-row FP32 tile is ~25 MB and misses L2. Prefer
+/// `streamingMatvecArgmax` (register convert, no tile store) or a reused
+/// `TileScratch` sized with `l2TileRows(forDim:)`.
 public enum FP16TiledClassifier {
 
     /// Default tile size: 4000 rows × 768 cols = 3.07M elements × 2 bytes = ~5.9 MB FP16
     /// The FP32 conversion buffer is 3.07M × 4 = ~11.7 MB — fits in L2 cache.
     public static let tileRows: Int = 4_000
 
+    /// Target FP32 tile bytes so convert+sgemm stays in a typical P-core L2.
+    public static let l2TargetFP32Bytes: Int = 4 * 1024 * 1024
+
+    /// Reusable convert+logit scratch for the tiled path. Avoids a per-token allocate
+    /// of `tileRows × dim` FP32 (~25 MB at 4000×1536).
+    public final class TileScratch: @unchecked Sendable {
+        public let tileFP32: UnsafeMutablePointer<Float>
+        public let tileLogits: UnsafeMutablePointer<Float>
+        public let tileRows: Int
+        public let dim: Int
+
+        public init(tileRows: Int, dim: Int) {
+            precondition(tileRows > 0)
+            precondition(dim > 0)
+            self.tileRows = tileRows
+            self.dim = dim
+            self.tileFP32 = UnsafeMutablePointer<Float>.allocate(capacity: tileRows * dim)
+            self.tileLogits = UnsafeMutablePointer<Float>.allocate(capacity: tileRows)
+        }
+
+        public func deallocate() {
+            tileFP32.deallocate()
+            tileLogits.deallocate()
+        }
+    }
+
+    /// Tile row count whose FP32 conversion buffer is about `l2TargetFP32Bytes`.
+    public static func l2TileRows(forDim dim: Int) -> Int {
+        precondition(dim > 0)
+        return max(1, l2TargetFP32Bytes / (dim * MemoryLayout<Float>.stride))
+    }
+
     /// Compute FP16 tiled matmul argmax: [vocabSize × dim] FP16 × [dim × 1] FP32 → argmax token.
     ///
-    /// - Parameters:
-    ///   - weights: Pointer to `vocabSize * dim` packed Float16 values as UInt16.
-    ///   - input: Pointer to `dim` FP32 input values (already RMSNorm'd).
-    ///   - vocabSize: Number of rows in the weight matrix.
-    ///   - dim: Number of columns (embedding dimension).
-    ///   - tileRows: Number of rows to process per tile (default 4000).
-    /// - Returns: The token index of the highest logit.
+    /// Allocates a fresh tile buffer on every call (the shipped 1.5B path).
     @inline(__always)
     public static func tiledMatvecArgmax(
         weights: UnsafePointer<UInt16>,
@@ -28,28 +59,47 @@ public enum FP16TiledClassifier {
         dim: Int,
         tileRows: Int = Self.tileRows
     ) -> Int {
+        let scratch = TileScratch(tileRows: tileRows, dim: dim)
+        defer { scratch.deallocate() }
+        return tiledMatvecArgmax(
+            weights: weights,
+            input: input,
+            vocabSize: vocabSize,
+            dim: dim,
+            tileRows: tileRows,
+            scratch: scratch
+        )
+    }
+
+    /// Same convert+sgemm algorithm as `tiledMatvecArgmax`, with a reused tile buffer.
+    @inline(__always)
+    public static func tiledMatvecArgmax(
+        weights: UnsafePointer<UInt16>,
+        input: UnsafePointer<Float>,
+        vocabSize: Int,
+        dim: Int,
+        tileRows: Int,
+        scratch: TileScratch
+    ) -> Int {
         precondition(vocabSize > 0)
         precondition(dim > 0)
         precondition(tileRows > 0)
+        precondition(scratch.dim == dim)
+        precondition(scratch.tileRows >= min(tileRows, vocabSize))
 
-        // Allocate tile conversion buffer and logits scratch
-        let tileFP32 = UnsafeMutablePointer<Float>.allocate(capacity: tileRows * dim)
-        let tileLogits = UnsafeMutablePointer<Float>.allocate(capacity: tileRows)
-        defer {
-            tileFP32.deallocate()
-            tileLogits.deallocate()
-        }
+        let tileFP32 = scratch.tileFP32
+        let tileLogits = scratch.tileLogits
+        let step = min(tileRows, scratch.tileRows)
 
         var bestIndex: Int = 0
         var bestValue: Float = -.greatestFiniteMagnitude
 
         var rowStart = 0
         while rowStart < vocabSize {
-            let rowEnd = min(rowStart + tileRows, vocabSize)
+            let rowEnd = min(rowStart + step, vocabSize)
             let blockCount = rowEnd - rowStart
             let elementCount = blockCount * dim
 
-            // Convert FP16 → FP32 for this tile using vImage
             let fp16Ptr = weights.advanced(by: rowStart * dim)
             var srcBuf = vImage_Buffer(
                 data: UnsafeMutableRawPointer(mutating: fp16Ptr),
@@ -65,7 +115,6 @@ public enum FP16TiledClassifier {
             )
             vImageConvert_Planar16FtoPlanarF(&srcBuf, &dstBuf, 0)
 
-            // Compute logits via sgemm: [blockCount × dim] × [dim × 1]
             BLAS.sgemm(
                 CblasRowMajor,
                 CblasNoTrans,
@@ -83,7 +132,6 @@ public enum FP16TiledClassifier {
                 ldc: 1
             )
 
-            // Find best in this tile
             var tileMax: Float = 0
             var tileMaxIdx: vDSP_Length = 0
             vDSP_maxvi(tileLogits, 1, &tileMax, &tileMaxIdx, vDSP_Length(blockCount))
@@ -97,5 +145,27 @@ public enum FP16TiledClassifier {
         }
 
         return bestIndex
+    }
+
+    /// Native FP16 GEMV argmax: convert weights in registers, never store an FP32 tile.
+    /// Same first-max rule as the tiled path. Exact-argmax when FP16→FP32 is lossless
+    /// (it is) and no two logits sit inside FMA-association noise.
+    @inline(__always)
+    public static func streamingMatvecArgmax(
+        weights: UnsafePointer<UInt16>,
+        input: UnsafePointer<Float>,
+        vocabSize: Int,
+        dim: Int
+    ) -> Int {
+        precondition(vocabSize > 0)
+        precondition(dim > 0)
+        return Int(
+            ane_interop_fp16_gemv_argmax(
+                UnsafeRawPointer(weights),
+                input,
+                Int32(vocabSize),
+                Int32(dim)
+            )
+        )
     }
 }

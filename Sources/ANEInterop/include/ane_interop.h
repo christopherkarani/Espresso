@@ -143,6 +143,14 @@ int ane_interop_probe_prepare_chaining(ANEHandle *handle);
 void ane_interop_cvt_f32_to_f16(void *dst, const float *src, int count);
 void ane_interop_cvt_f16_to_f32(float *dst, const void *src, int count);
 
+/// Streaming FP16×FP32 GEMV argmax. Converts each weight in registers and
+/// never stores an FP32 tile. Returns the row of the maximum logit; ties
+/// keep the lowest index (same first-max rule as vDSP_maxvi).
+int ane_interop_fp16_gemv_argmax(const void *weights_f16,
+                                 const float *input,
+                                 int vocab_size,
+                                 int dim);
+
 /// NEON-vectorized contiguous FP16 argmax. Returns index and value of the max
 /// element. On ties, the lowest index wins (first-max semantics).
 void ane_interop_neon_argmax_f16(const void *src, int count,

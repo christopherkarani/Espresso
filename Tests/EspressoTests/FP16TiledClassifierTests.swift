@@ -106,4 +106,94 @@ final class FP16TiledClassifierTests: XCTestCase {
 
         XCTAssertEqual(idx, 7)
     }
+
+    /// Reused tile scratch must match allocate-every-call argmax.
+    func testReusedScratchArgmaxMatchesAllocateEveryCall() {
+        let vocabSize = 200
+        let dim = 32
+        let tileRows = 50
+        let classifierFP32 = TensorBuffer(count: vocabSize * dim, zeroed: true)
+        let input = UnsafeMutablePointer<Float>.allocate(capacity: dim)
+        defer { input.deallocate() }
+
+        classifierFP32.withUnsafeMutablePointer { ptr in
+            for r in 0..<vocabSize {
+                for c in 0..<dim {
+                    ptr[r * dim + c] = Float(r) * 0.01 + Float(c) * 0.001
+                }
+            }
+            for c in 0..<dim {
+                ptr[42 * dim + c] = 10.0
+            }
+        }
+        for i in 0..<dim { input[i] = 1.0 }
+
+        let fp16Weights = TensorBufferFP16(quantizing: classifierFP32, rows: vocabSize, cols: dim)
+        let scratch = FP16TiledClassifier.TileScratch(tileRows: tileRows, dim: dim)
+        defer { scratch.deallocate() }
+
+        let allocated = fp16Weights.withUnsafePointer { fp16Ptr in
+            FP16TiledClassifier.tiledMatvecArgmax(
+                weights: fp16Ptr,
+                input: UnsafePointer(input),
+                vocabSize: vocabSize,
+                dim: dim,
+                tileRows: tileRows
+            )
+        }
+        let reused = fp16Weights.withUnsafePointer { fp16Ptr in
+            FP16TiledClassifier.tiledMatvecArgmax(
+                weights: fp16Ptr,
+                input: UnsafePointer(input),
+                vocabSize: vocabSize,
+                dim: dim,
+                tileRows: tileRows,
+                scratch: scratch
+            )
+        }
+        XCTAssertEqual(reused, allocated)
+        XCTAssertEqual(reused, 42)
+    }
+
+    /// Streaming FP16 GEMV (no FP32 tile store) must match tiled convert+sgemm argmax.
+    func testStreamingFP16GemvArgmaxMatchesTiled() {
+        let vocabSize = 200
+        let dim = 32
+        let classifierFP32 = TensorBuffer(count: vocabSize * dim, zeroed: true)
+        let input = UnsafeMutablePointer<Float>.allocate(capacity: dim)
+        defer { input.deallocate() }
+
+        classifierFP32.withUnsafeMutablePointer { ptr in
+            for r in 0..<vocabSize {
+                for c in 0..<dim {
+                    ptr[r * dim + c] = Float(r) * 0.01 + Float(c) * 0.001
+                }
+            }
+            for c in 0..<dim {
+                ptr[137 * dim + c] = 8.0
+            }
+        }
+        for i in 0..<dim { input[i] = 0.5 }
+
+        let fp16Weights = TensorBufferFP16(quantizing: classifierFP32, rows: vocabSize, cols: dim)
+        let tiled = fp16Weights.withUnsafePointer { fp16Ptr in
+            FP16TiledClassifier.tiledMatvecArgmax(
+                weights: fp16Ptr,
+                input: UnsafePointer(input),
+                vocabSize: vocabSize,
+                dim: dim,
+                tileRows: 50
+            )
+        }
+        let streaming = fp16Weights.withUnsafePointer { fp16Ptr in
+            FP16TiledClassifier.streamingMatvecArgmax(
+                weights: fp16Ptr,
+                input: UnsafePointer(input),
+                vocabSize: vocabSize,
+                dim: dim
+            )
+        }
+        XCTAssertEqual(streaming, tiled)
+        XCTAssertEqual(streaming, 137)
+    }
 }

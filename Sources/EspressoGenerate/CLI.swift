@@ -509,6 +509,8 @@ struct BackendRunMetrics: Sendable {
     let committedExactTokensPerPass: Double?
     let acceptedFutureTokensPerPass: Double?
     let decodePath: String?
+    let hopsPerToken: Int?
+    let decodeProfileReport: String?
 
     init(
         backend: String,
@@ -529,7 +531,9 @@ struct BackendRunMetrics: Sendable {
         cachedBindingsEnabled: Bool? = nil,
         committedExactTokensPerPass: Double? = nil,
         acceptedFutureTokensPerPass: Double? = nil,
-        decodePath: String? = nil
+        decodePath: String? = nil,
+        hopsPerToken: Int? = nil,
+        decodeProfileReport: String? = nil
     ) {
         self.backend = backend
         self.text = text
@@ -550,7 +554,35 @@ struct BackendRunMetrics: Sendable {
         self.committedExactTokensPerPass = committedExactTokensPerPass
         self.acceptedFutureTokensPerPass = acceptedFutureTokensPerPass
         self.decodePath = decodePath
+        self.hopsPerToken = hopsPerToken
+        self.decodeProfileReport = decodeProfileReport
     }
+}
+
+func generateDecodeProfileMeanLine(_ report: String?) -> String? {
+    guard let report, !report.isEmpty else { return nil }
+    return report
+        .split(whereSeparator: \.isNewline)
+        .map(String.init)
+        .first { $0.hasPrefix("decode_profile_mean_ms/token") }
+}
+
+func espressoCompareLaneContractLines(
+    decodePath: String?,
+    hopsPerToken: Int?,
+    decodeProfileReport: String?
+) -> [String] {
+    var lines: [String] = []
+    if let decodePath, !decodePath.isEmpty {
+        lines.append("decode_path=\(decodePath)")
+    }
+    if let hopsPerToken {
+        lines.append("hops/token=\(hopsPerToken)")
+    }
+    if let profile = generateDecodeProfileMeanLine(decodeProfileReport) {
+        lines.append(profile)
+    }
+    return lines
 }
 
 struct CompareReport: Sendable {
@@ -1312,7 +1344,9 @@ private func makeBundleRuntimeMetrics(bundle: ESPRuntimeBundle, invocation: Reso
         cachedBindingsEnabled: result.cachedBindingsEnabled,
         committedExactTokensPerPass: result.committedExactTokensPerPass,
         acceptedFutureTokensPerPass: result.acceptedFutureTokensPerPass,
-        decodePath: result.decodePath
+        decodePath: result.decodePath,
+        hopsPerToken: result.hopsPerToken,
+        decodeProfileReport: result.decodeProfileReport
     )
 }
 
@@ -1395,7 +1429,9 @@ private func runEspressoGeneration(
         cachedBindingsEnabled: result.cachedBindingsEnabled,
         committedExactTokensPerPass: result.committedExactTokensPerPass,
         acceptedFutureTokensPerPass: result.acceptedFutureTokensPerPass,
-        decodePath: result.decodePath
+        decodePath: result.decodePath,
+        hopsPerToken: result.hopsPerToken,
+        decodeProfileReport: result.decodeProfileReport
     )
 }
 
@@ -1464,7 +1500,9 @@ func aggregateBenchmarkRuns(
         cachedBindingsEnabled: cachedBindingsEnabled ?? lastMeasured.cachedBindingsEnabled,
         committedExactTokensPerPass: committedExactTokensPerPass ?? lastMeasured.committedExactTokensPerPass,
         acceptedFutureTokensPerPass: acceptedFutureTokensPerPass ?? lastMeasured.acceptedFutureTokensPerPass,
-        decodePath: lastMeasured.decodePath
+        decodePath: lastMeasured.decodePath,
+        hopsPerToken: lastMeasured.hopsPerToken,
+        decodeProfileReport: lastMeasured.decodeProfileReport
     )
 }
 
@@ -1638,6 +1676,9 @@ private func printGenerateStats(_ invocation: ResolvedInvocation, result: Backen
     if let cachedBindingsEnabled = result.cachedBindingsEnabled {
         stderrLine("cached_bindings_enabled=\(cachedBindingsEnabled)")
     }
+    if let hopsPerToken = result.hopsPerToken {
+        stderrLine("hops/token=\(hopsPerToken)")
+    }
     if let committedExactTokensPerPass = result.committedExactTokensPerPass {
         stderrLine(
             String(
@@ -1661,6 +1702,9 @@ private func printGenerateStats(_ invocation: ResolvedInvocation, result: Backen
     }
     if let decodePath = result.decodePath {
         stderrLine("decode_path=\(decodePath)")
+    }
+    if let decodeProfileMean = generateDecodeProfileMeanLine(result.decodeProfileReport) {
+        stderrLine(decodeProfileMean)
     }
     if let bundlePath = invocation.bundlePath {
         stderrLine("bundle=\(bundlePath)")
@@ -1885,6 +1929,7 @@ private func backendPayload(_ backend: BackendRunMetrics) -> [String: Any] {
         "exact_head_backend": backend.exactHeadBackend ?? NSNull(),
         "cached_bindings_enabled": backend.cachedBindingsEnabled ?? NSNull(),
         "decode_path": backend.decodePath ?? NSNull(),
+        "hops_per_token": backend.hopsPerToken ?? NSNull(),
     ]
 }
 
@@ -3147,6 +3192,15 @@ private func runChatVsMLXEspressoLane(
         )
     }
     try assertChatDecodePathIsHybrid(measured.result.decodePath)
+    if !useTUI {
+        for line in espressoCompareLaneContractLines(
+            decodePath: measured.result.decodePath,
+            hopsPerToken: measured.result.hopsPerToken,
+            decodeProfileReport: measured.result.decodeProfileReport
+        ) {
+            writePlain(line, "\n")
+        }
+    }
     store.mutate { snapshot in
         snapshot.espresso.status = .completed
         snapshot.espresso.tokensPerSecond = measured.result.tokensPerSecond

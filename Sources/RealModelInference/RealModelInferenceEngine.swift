@@ -26,8 +26,12 @@ public struct GenerationResult: Sendable {
     public let cachedBindingsEnabled: Bool
     public let committedExactTokensPerPass: Double?
     public let acceptedFutureTokensPerPass: Double?
-    /// `"hybrid"` or `"exact_cpu"` for llama generate paths; `"unknown"` otherwise.
+    /// `"hybrid"`, `"fused"`, or `"exact_cpu"` for llama generate paths; `"unknown"` otherwise.
     public let decodePath: String
+    /// ANE hops per generated token. Fused N=1 is `nLayer`; split hybrid is `2 * nLayer`.
+    public let hopsPerToken: Int?
+    /// Hybrid per-token bucket report from `HybridDecodeTokenProfile.formatReport()`.
+    public let decodeProfileReport: String?
 
     public init(
         text: String,
@@ -41,7 +45,9 @@ public struct GenerationResult: Sendable {
         cachedBindingsEnabled: Bool = false,
         committedExactTokensPerPass: Double? = nil,
         acceptedFutureTokensPerPass: Double? = nil,
-        decodePath: String = "unknown"
+        decodePath: String = "unknown",
+        hopsPerToken: Int? = nil,
+        decodeProfileReport: String? = nil
     ) {
         self.text = text
         self.tokens = tokens
@@ -55,6 +61,8 @@ public struct GenerationResult: Sendable {
         self.committedExactTokensPerPass = committedExactTokensPerPass
         self.acceptedFutureTokensPerPass = acceptedFutureTokensPerPass
         self.decodePath = decodePath
+        self.hopsPerToken = hopsPerToken
+        self.decodeProfileReport = decodeProfileReport
     }
 
     public func withDecodePath(_ path: String) -> GenerationResult {
@@ -70,7 +78,9 @@ public struct GenerationResult: Sendable {
             cachedBindingsEnabled: cachedBindingsEnabled,
             committedExactTokensPerPass: committedExactTokensPerPass,
             acceptedFutureTokensPerPass: acceptedFutureTokensPerPass,
-            decodePath: path
+            decodePath: path,
+            hopsPerToken: hopsPerToken,
+            decodeProfileReport: decodeProfileReport
         )
     }
 }
@@ -203,14 +213,74 @@ public struct RealModelInferenceEngine: ~Copyable {
             return false
         }
         if config.architecture == .llama {
-            // Default-on for the retained Stories demo family; other Llama
-            // models require an explicit opt-in until proven.
+            // Default-on for the retained Stories demo family and the Qwen
+            // 1.5B hybrid serve. Other Llama models stay opt-in.
             if ModelFamily.isStories110MVariant(config) {
+                return true
+            }
+            if ModelFamily.isQwen15BVariant(config) {
                 return true
             }
             return environment["ESPRESSO_ENABLE_LLAMA_HYBRID_CACHED_BINDINGS"] == "1"
         }
         return true
+    }
+
+    /// Qwen 1.5B must not silently fall back to fresh Metal bindings.
+    /// Stories and other Llama opt-ins keep the historical serial fallback.
+    static func requiresHybridCachedBindings(
+        config: MultiModelConfig,
+        environment: [String: String]
+    ) -> Bool {
+        supportsHybridCachedBindings(config: config, environment: environment)
+            && ModelFamily.isQwen15BVariant(config)
+    }
+
+    /// Phase 11 compiled `max_N = 1` only. Serve that N: one fused program per
+    /// layer with attention in-graph (28 hops, no Metal QKV↔FFN sync).
+    static let fusedDecodePathLabel = FusedHybridDecodeLayerKernelSet.decodePathLabel
+    static let fusedHybridFallbackStage = FusedHybridDecodeLayerKernelSet.fallbackStage
+
+    static func prefersFusedHybridDecode(
+        config: MultiModelConfig,
+        environment: [String: String]
+    ) -> Bool {
+        if environment["ESPRESSO_DISABLE_FUSED_HYBRID_DECODE"] == "1" {
+            return false
+        }
+        if environment["ESPRESSO_ENABLE_FUSED_HYBRID_DECODE"] == "1" {
+            return config.architecture == .llama
+        }
+        return config.architecture == .llama && ModelFamily.isQwen15BVariant(config)
+    }
+
+    static func fusedHopsPerToken(nLayer: Int) -> Int {
+        FusedHybridDecodeLayerKernelSet.hopsPerToken(nLayer: nLayer)
+    }
+
+    static func fusedHybridFallbackError(reason: String) -> RealModelInferenceError {
+        .hybridFallbackDisabled(stage: fusedHybridFallbackStage, reason: reason)
+    }
+
+    static func makeHybridCachedBindingsOrFallback<Bindings>(
+        config: MultiModelConfig,
+        environment: [String: String],
+        create: () throws -> Bindings
+    ) throws -> Bindings? {
+        guard supportsHybridCachedBindings(config: config, environment: environment) else {
+            return nil
+        }
+        do {
+            return try create()
+        } catch {
+            if requiresHybridCachedBindings(config: config, environment: environment) {
+                throw RealModelInferenceError.hybridFallbackDisabled(
+                    stage: "hybrid_cached_bindings",
+                    reason: "cached Metal bindings failed: \(error)"
+                )
+            }
+            return nil
+        }
     }
 
     static func supportsHybridDonorDelta(
@@ -1408,6 +1478,9 @@ public struct RealModelInferenceEngine: ~Copyable {
     private var compiledHybridGreedyNorm: LayerStorage<CompiledHead>
     private var compiledHybridGreedyClassifier: LayerStorage<CompiledClassifier>
     private var compiledHybridGreedySpatial: Int
+    private var compiledFusedHybridBucket: Int
+    private var compiledFusedHybridLayers: LayerStorage<FusedHybridDecodeLayerKernelSet>
+    private var compiledFusedHybridSurfaceHandles: [FusedHybridDecodeSurfaceHandles]
     private var hybridMetalAttention: MetalAttentionKernel?
     private var speculativeRuntimeCache: [SpeculativeRuntimeKey: CachedSpeculativeRuntimePair]
     private var speculativeRuntimeCacheOrder: [SpeculativeRuntimeKey]
@@ -1458,6 +1531,9 @@ public struct RealModelInferenceEngine: ~Copyable {
         self.compiledHybridGreedyNorm = Self.emptyStorage(CompiledHead.self)
         self.compiledHybridGreedyClassifier = Self.emptyStorage(CompiledClassifier.self)
         self.compiledHybridGreedySpatial = 0
+        self.compiledFusedHybridBucket = 0
+        self.compiledFusedHybridLayers = Self.emptyStorage(FusedHybridDecodeLayerKernelSet.self)
+        self.compiledFusedHybridSurfaceHandles = []
         self.hybridMetalAttention = nil
         self.speculativeRuntimeCache = [:]
         self.speculativeRuntimeCacheOrder = []
@@ -1514,7 +1590,23 @@ public struct RealModelInferenceEngine: ~Copyable {
         )
         switch config.architecture {
         case .llama:
-            _ = try ensureHybridCompiledLlama(bucket: bucket)
+            if Self.prefersFusedHybridDecode(
+                config: config,
+                environment: ProcessInfo.processInfo.environment
+            ) {
+                do {
+                    _ = try ensureFusedHybridCompiled(bucket: bucket)
+                } catch let error as RealModelInferenceError {
+                    if case .hybridFallbackDisabled = error { throw error }
+                    throw Self.fusedHybridFallbackError(
+                        reason: error.errorDescription ?? "\(error)"
+                    )
+                } catch {
+                    throw Self.fusedHybridFallbackError(reason: "\(error)")
+                }
+            } else {
+                _ = try ensureHybridCompiledLlama(bucket: bucket)
+            }
         case .gpt2:
             _ = try ensureHybridCompiled(bucket: bucket)
         }
@@ -1552,12 +1644,21 @@ public struct RealModelInferenceEngine: ~Copyable {
         if effectiveMaxTokens == 0 {
             let text = tokenizer.decode(promptTokens.map(Int.init))
             let decodePath: String
+            let hopsPerToken: Int?
             if config.architecture == .llama {
-                decodePath = Self.llamaGenerationPath(config: config, environment: environment) == .exactCPU
-                    ? "exact_cpu"
-                    : "hybrid"
+                if Self.llamaGenerationPath(config: config, environment: environment) == .exactCPU {
+                    decodePath = "exact_cpu"
+                    hopsPerToken = nil
+                } else if Self.prefersFusedHybridDecode(config: config, environment: environment) {
+                    decodePath = Self.fusedDecodePathLabel
+                    hopsPerToken = Self.fusedHopsPerToken(nLayer: config.nLayer)
+                } else {
+                    decodePath = "hybrid"
+                    hopsPerToken = nil
+                }
             } else {
                 decodePath = "unknown"
+                hopsPerToken = nil
             }
             return GenerationResult(
                 text: text,
@@ -1566,7 +1667,8 @@ public struct RealModelInferenceEngine: ~Copyable {
                 tokensPerSecond: 0,
                 compileTimeMs: 0,
                 firstTokenLatencyMs: 0,
-                decodePath: decodePath
+                decodePath: decodePath,
+                hopsPerToken: hopsPerToken
             )
         }
 
@@ -1608,6 +1710,32 @@ public struct RealModelInferenceEngine: ~Copyable {
                     isCancelled: isCancelled
                 )
             case .hybrid:
+                if Self.prefersFusedHybridDecode(config: config, environment: environment) {
+                    let compileStart = DispatchTime.now().uptimeNanoseconds
+                    let compileDidRun: Bool
+                    do {
+                        compileDidRun = try ensureFusedHybridCompiled(bucket: bucket)
+                    } catch let error as RealModelInferenceError {
+                        if case .hybridFallbackDisabled = error { throw error }
+                        throw Self.fusedHybridFallbackError(
+                            reason: error.errorDescription ?? "\(error)"
+                        )
+                    } catch {
+                        throw Self.fusedHybridFallbackError(reason: "\(error)")
+                    }
+                    let compileEnd = DispatchTime.now().uptimeNanoseconds
+                    let compileTimeMs = compileDidRun ? Self.milliseconds(from: compileEnd - compileStart) : 0
+                    return try generateIncrementalFusedHybridLlama(
+                        promptTokens: promptTokens,
+                        effectiveMaxTokens: effectiveMaxTokens,
+                        temperature: temperature,
+                        topP: topP,
+                        compileTimeMs: compileTimeMs,
+                        maxSeq: max(bucket, compiledFusedHybridBucket),
+                        onStep: onStep,
+                        isCancelled: isCancelled
+                    )
+                }
                 let compileStart = DispatchTime.now().uptimeNanoseconds
                 let compileDidRun = try ensureHybridCompiledLlama(bucket: bucket)
                 guard let metalAttention = hybridMetalAttention else {
@@ -1961,13 +2089,31 @@ public struct RealModelInferenceEngine: ~Copyable {
             maxSeq: config.maxSeq
         )
 
+        let environment = ProcessInfo.processInfo.environment
         let path = try resolvedLlamaGenerationPath(
             config: config,
-            environment: ProcessInfo.processInfo.environment
+            environment: environment
+        )
+        let useFused = path == .hybrid && prefersFusedHybridDecode(
+            config: config,
+            environment: environment
         )
         var compileTimeMs = 0.0
         var metalAttention: MetalAttentionKernel?
-        if path == .hybrid {
+        if useFused {
+            let compileStart = DispatchTime.now().uptimeNanoseconds
+            let compileDidRun: Bool
+            do {
+                compileDidRun = try engine.ensureFusedHybridCompiled(bucket: bucket)
+            } catch let error as RealModelInferenceError {
+                if case .hybridFallbackDisabled = error { throw error }
+                throw fusedHybridFallbackError(reason: error.errorDescription ?? "\(error)")
+            } catch {
+                throw fusedHybridFallbackError(reason: "\(error)")
+            }
+            let compileEnd = DispatchTime.now().uptimeNanoseconds
+            compileTimeMs = compileDidRun ? milliseconds(from: compileEnd - compileStart) : 0
+        } else if path == .hybrid {
             let compileStart = DispatchTime.now().uptimeNanoseconds
             let compileDidRun = try engine.ensureHybridCompiledLlama(bucket: bucket)
             guard let attention = engine.hybridMetalAttention else {
@@ -2000,20 +2146,51 @@ public struct RealModelInferenceEngine: ~Copyable {
                     )
                 )
             case .hybrid:
-                guard let attention = metalAttention else {
-                    throw RealModelInferenceError.runtimeFailure("Hybrid Metal attention unavailable for llama testing helper")
-                }
-                results.append(
-                    try engine.generateIncrementalHybridLlama(
+                if useFused {
+                    let result = try engine.generateIncrementalFusedHybridLlama(
                         promptTokens: prompt,
                         effectiveMaxTokens: effectiveMaxTokens,
                         temperature: 0,
                         compileTimeMs: results.isEmpty ? compileTimeMs : 0,
-                        maxSeq: bucket,
-                        metalAttention: attention,
+                        maxSeq: max(bucket, engine.compiledFusedHybridBucket),
                         onStep: nil
                     )
-                )
+                    // Drop the profile string so the next ANE eval cannot smash a
+                    // heap object that must survive the whole suite.
+                    results.append(
+                        GenerationResult(
+                            text: result.text,
+                            tokens: result.tokens,
+                            promptTokens: result.promptTokens,
+                            tokenLatenciesMs: result.tokenLatenciesMs,
+                            tokensPerSecond: result.tokensPerSecond,
+                            compileTimeMs: result.compileTimeMs,
+                            firstTokenLatencyMs: result.firstTokenLatencyMs,
+                            exactHeadBackend: result.exactHeadBackend,
+                            cachedBindingsEnabled: result.cachedBindingsEnabled,
+                            committedExactTokensPerPass: result.committedExactTokensPerPass,
+                            acceptedFutureTokensPerPass: result.acceptedFutureTokensPerPass,
+                            decodePath: result.decodePath,
+                            hopsPerToken: result.hopsPerToken,
+                            decodeProfileReport: nil
+                        )
+                    )
+                } else {
+                    guard let attention = metalAttention else {
+                        throw RealModelInferenceError.runtimeFailure("Hybrid Metal attention unavailable for llama testing helper")
+                    }
+                    results.append(
+                        try engine.generateIncrementalHybridLlama(
+                            promptTokens: prompt,
+                            effectiveMaxTokens: effectiveMaxTokens,
+                            temperature: 0,
+                            compileTimeMs: results.isEmpty ? compileTimeMs : 0,
+                            maxSeq: bucket,
+                            metalAttention: attention,
+                            onStep: nil
+                        )
+                    )
+                }
             }
         }
         return results
@@ -4949,33 +5126,25 @@ public struct RealModelInferenceEngine: ~Copyable {
         )
 
         // Pre-create cached Metal bindings for all layers (GPT-2 path)
-        let cachedBindings: [MetalAttentionKernel.CachedLayerBindings]? = Self.supportsHybridCachedBindings(
+        let cachedBindings: [MetalAttentionKernel.CachedLayerBindings]? = try Self.makeHybridCachedBindingsOrFallback(
             config: config,
             environment: ProcessInfo.processInfo.environment
-        ) ? {
-            var bindings: [MetalAttentionKernel.CachedLayerBindings] = []
-            bindings.reserveCapacity(compiledHybridSurfaceHandles.count)
-            for handles in compiledHybridSurfaceHandles {
-                do {
-                    let binding = try metalAttention.createCachedLayerBindings(
-                        qSurface: handles.qOut,
-                        kOutputSurface: handles.kOut,
-                        vOutputSurface: handles.vOut,
-                        kCacheSurface: handles.kCacheFull,
-                        vCacheSurface: handles.vCacheFull,
-                        contextSurface: handles.projectionContextIn,
-                        dim: handles.qDim,
-                        kvDim: handles.kvDim,
-                        laneStride: handles.laneSpatial,
-                        cacheStride: maxSeq
-                    )
-                    bindings.append(binding)
-                } catch {
-                    return nil
-                }
+        ) {
+            try compiledHybridSurfaceHandles.map { handles in
+                try metalAttention.createCachedLayerBindings(
+                    qSurface: handles.qOut,
+                    kOutputSurface: handles.kOut,
+                    vOutputSurface: handles.vOut,
+                    kCacheSurface: handles.kCacheFull,
+                    vCacheSurface: handles.vCacheFull,
+                    contextSurface: handles.projectionContextIn,
+                    dim: handles.qDim,
+                    kvDim: handles.kvDim,
+                    laneStride: handles.laneSpatial,
+                    cacheStride: maxSeq
+                )
             }
-            return bindings
-        }() : nil
+        }
 
         if ProcessInfo.processInfo.environment["ESPRESSO_REALMODEL_DEBUG_HYBRID_CACHE"] == "1",
            let firstHandles = compiledHybridSurfaceHandles.first {
@@ -5726,6 +5895,257 @@ public struct RealModelInferenceEngine: ~Copyable {
         }
     }
 
+    private mutating func ensureFusedHybridCompiled(bucket: Int) throws -> Bool {
+        if compiledFusedHybridBucket >= bucket,
+           compiledFusedHybridLayers.count == config.nLayer,
+           compiledFusedHybridSurfaceHandles.count == config.nLayer {
+            return false
+        }
+
+        let newLayers: LayerStorage<FusedHybridDecodeLayerKernelSet>
+        do {
+            newLayers = try Self.compileFusedHybridLayers(
+                config: config,
+                weightDirURL: weightDirURL,
+                maxSeq: bucket
+            )
+        } catch let error as RealModelInferenceError {
+            if case .hybridFallbackDisabled = error { throw error }
+            throw Self.fusedHybridFallbackError(reason: error.errorDescription ?? "\(error)")
+        } catch {
+            throw Self.fusedHybridFallbackError(reason: "\(error)")
+        }
+
+        var newSurfaceHandles: [FusedHybridDecodeSurfaceHandles] = []
+        newSurfaceHandles.reserveCapacity(newLayers.count)
+        for layerIndex in 0..<newLayers.count {
+            do {
+                newSurfaceHandles.append(
+                    try FusedHybridDecodeSurfaceHandles(kernels: newLayers[layerIndex])
+                )
+            } catch {
+                throw Self.fusedHybridFallbackError(
+                    reason: "fused N=1 surfaces unavailable for layer \(layerIndex): \(error)"
+                )
+            }
+        }
+
+        compiledFusedHybridLayers = newLayers
+        compiledFusedHybridSurfaceHandles = newSurfaceHandles
+        compiledFusedHybridBucket = bucket
+        return true
+    }
+
+    private static func compileFusedHybridLayers(
+        config: MultiModelConfig,
+        weightDirURL: URL,
+        maxSeq: Int
+    ) throws -> LayerStorage<FusedHybridDecodeLayerKernelSet> {
+        guard config.nHead > 0, config.nKVHead > 0, config.headDim > 0,
+              config.nHead % config.nKVHead == 0 else {
+            throw fusedHybridFallbackError(
+                reason: "invalid fused N=1 head geometry nHead=\(config.nHead) nKVHead=\(config.nKVHead) headDim=\(config.headDim)"
+            )
+        }
+        var donor: FusedHybridDecodeLayerKernelSet.DonorHexIDs?
+        return try LayerStorage(count: config.nLayer, throwingInitializer: { layerIndex in
+            fputs(
+                "[FusedHybridDecode] compiling layer \(layerIndex)/\(config.nLayer) maxSeq=\(maxSeq) n=1\n",
+                stderr
+            )
+            let paths = LayerWeightPaths.forLayer(
+                layerIndex,
+                config: config,
+                blobDir: weightDirURL.path
+            )
+            let weights = try loadHybridLayerWeightsLlama(config: config, paths: paths)
+            let compiled = try FusedHybridDecodeLayerKernelSet(
+                weights: weights,
+                maxSeq: maxSeq,
+                nHeads: config.nHead,
+                nKVHeads: config.nKVHead,
+                headDim: config.headDim,
+                donorHexIDs: donor
+            )
+            donor = compiled.donorHexIDs
+            return compiled
+        })
+    }
+
+    private mutating func generateIncrementalFusedHybridLlama(
+        promptTokens: [TokenID],
+        effectiveMaxTokens: Int,
+        temperature: Float,
+        topP: Float = 1.0,
+        compileTimeMs: Double,
+        maxSeq: Int,
+        onStep: ((GenerationStep) -> Void)?,
+        isCancelled: (() -> Bool)? = nil
+    ) throws -> GenerationResult {
+        guard compiledFusedHybridLayers.count == config.nLayer,
+              compiledFusedHybridSurfaceHandles.count == config.nLayer else {
+            throw Self.fusedHybridFallbackError(
+                reason: """
+                    fused N=1 state is incomplete: \
+                    layers=\(compiledFusedHybridLayers.count)/\(config.nLayer) \
+                    surfaces=\(compiledFusedHybridSurfaceHandles.count)/\(config.nLayer)
+                    """
+            )
+        }
+
+        do {
+            try ForwardPass.initializeFusedHybridDecodeCaches(
+                surfaceHandles: compiledFusedHybridSurfaceHandles
+            )
+        } catch {
+            throw Self.fusedHybridFallbackError(reason: "fused N=1 cache init failed: \(error)")
+        }
+
+        let xCur = TensorBuffer(count: config.dModel, zeroed: true)
+        var decodeState: DecodeState
+        do {
+            decodeState = try DecodeState(maxSeq: maxSeq)
+        } catch {
+            throw Self.fusedHybridFallbackError(reason: "fused decode state initialization failed: \(error)")
+        }
+        var timings = HybridDecodeTimingBreakdown()
+        let hopsPerToken = Self.fusedHopsPerToken(nLayer: config.nLayer)
+
+        for (position, token) in promptTokens.enumerated() {
+            try writeIncrementalEmbeddingLlama(token: token, into: xCur)
+            do {
+                try ForwardPass.runFusedHybridDecodeTimed(
+                    xCur: xCur,
+                    kernels: compiledFusedHybridLayers,
+                    surfaceHandles: compiledFusedHybridSurfaceHandles,
+                    decodeState: &decodeState,
+                    headDim: config.headDim,
+                    ropeTheta: config.ropeTheta,
+                    timings: &timings
+                )
+            } catch {
+                throw Self.fusedHybridFallbackError(
+                    reason: "fused N=1 prefill failed at prompt position \(position): \(error)"
+                )
+            }
+        }
+
+        var allTokens = promptTokens
+        var generatedTokens: [TokenID] = []
+        var tokenLatenciesMs: [Double] = []
+        var decodeProfileTokens: [HybridDecodeTimingBreakdown] = []
+        generatedTokens.reserveCapacity(effectiveMaxTokens)
+        tokenLatenciesMs.reserveCapacity(effectiveMaxTokens)
+        decodeProfileTokens.reserveCapacity(effectiveMaxTokens)
+        var pendingDecode = HybridDecodeTimingBreakdown()
+
+        let generationStart = DispatchTime.now().uptimeNanoseconds
+        var emissionStart = generationStart
+        var firstTokenLatencyMs = 0.0
+        var firstTokenRecorded = false
+        var rng = SystemRandomNumberGenerator()
+        var normalized = [Float](repeating: 0, count: config.dModel)
+
+        while generatedTokens.count < effectiveMaxTokens {
+            try Self.throwIfCancelled(isCancelled)
+            let headStart = DispatchTime.now().uptimeNanoseconds
+            normalized = xCur.withUnsafeBufferPointer {
+                Self.rmsNorm(Array($0), weight: llamaAssets.finalNormGamma, eps: Float(config.normEps))
+            }
+            let nextToken = selectTokenFromNormalizedHidden(
+                normalized,
+                temperature: temperature,
+                topP: topP,
+                using: &rng
+            )
+            var tokenProfile = pendingDecode
+            tokenProfile.tLMHead = Self.milliseconds(
+                from: DispatchTime.now().uptimeNanoseconds - headStart
+            )
+            decodeProfileTokens.append(tokenProfile)
+            let emissionNow = DispatchTime.now().uptimeNanoseconds
+            let tokenLatencyMs = Self.milliseconds(from: emissionNow - emissionStart)
+
+            if !firstTokenRecorded {
+                firstTokenLatencyMs = Self.milliseconds(from: emissionNow - generationStart)
+                firstTokenRecorded = true
+            }
+
+            if let eosToken = config.eosToken, nextToken == eosToken {
+                generatedTokens.append(nextToken)
+                break
+            }
+            generatedTokens.append(nextToken)
+            allTokens.append(nextToken)
+            let elapsedMs = Self.milliseconds(from: emissionNow - generationStart)
+            let tokensPerSecond = Double(generatedTokens.count) / max(elapsedMs / 1_000, 1e-9)
+            tokenLatenciesMs.append(tokenLatencyMs)
+            onStep?(
+                GenerationStep(
+                    token: nextToken,
+                    generatedTokens: generatedTokens,
+                    text: tokenizer.decode(allTokens.map(Int.init)),
+                    tokenLatencyMs: tokenLatencyMs,
+                    elapsedMs: elapsedMs,
+                    firstTokenLatencyMs: firstTokenLatencyMs,
+                    tokensPerSecond: tokensPerSecond
+                )
+            )
+
+            if generatedTokens.count >= effectiveMaxTokens || allTokens.count >= config.maxSeq {
+                break
+            }
+
+            try writeIncrementalEmbeddingLlama(token: nextToken, into: xCur)
+            timings.reset()
+            do {
+                try ForwardPass.runFusedHybridDecodeTimed(
+                    xCur: xCur,
+                    kernels: compiledFusedHybridLayers,
+                    surfaceHandles: compiledFusedHybridSurfaceHandles,
+                    decodeState: &decodeState,
+                    headDim: config.headDim,
+                    ropeTheta: config.ropeTheta,
+                    timings: &timings
+                )
+            } catch {
+                throw Self.fusedHybridFallbackError(
+                    reason: "fused N=1 decode failed at generated token \(generatedTokens.count - 1): \(error)"
+                )
+            }
+            pendingDecode = timings
+            emissionStart = emissionNow
+        }
+
+        let decodeProfileReport = decodeProfileTokens.isEmpty
+            ? nil
+            : HybridDecodeTokenProfile(tokens: decodeProfileTokens).formatReport()
+        if let decodeProfileReport {
+            fputs(decodeProfileReport + "\n", stderr)
+        }
+
+        let generationEnd = DispatchTime.now().uptimeNanoseconds
+        let generationTimeMs = Self.milliseconds(from: generationEnd - generationStart)
+        let tokensPerSecond = generatedTokens.isEmpty
+            ? 0
+            : Double(generatedTokens.count) / max(generationTimeMs / 1_000, 1e-9)
+
+        return GenerationResult(
+            text: tokenizer.decode(allTokens.map(Int.init)),
+            tokens: generatedTokens,
+            promptTokens: promptTokens,
+            tokenLatenciesMs: tokenLatenciesMs,
+            tokensPerSecond: tokensPerSecond,
+            compileTimeMs: compileTimeMs,
+            firstTokenLatencyMs: firstTokenLatencyMs,
+            exactHeadBackend: classifierStrategy.exactHeadBackendLabel,
+            cachedBindingsEnabled: false,
+            decodePath: Self.fusedDecodePathLabel,
+            hopsPerToken: hopsPerToken,
+            decodeProfileReport: decodeProfileReport
+        )
+    }
+
     private mutating func generateIncrementalHybridLlama(
         promptTokens: [TokenID],
         effectiveMaxTokens: Int,
@@ -5769,33 +6189,25 @@ public struct RealModelInferenceEngine: ~Copyable {
         )
 
         // Pre-create cached decode-surface metadata for all layers.
-        let cachedBindings: [MetalAttentionKernel.CachedLayerBindings]? = Self.supportsHybridCachedBindings(
+        let cachedBindings: [MetalAttentionKernel.CachedLayerBindings]? = try Self.makeHybridCachedBindingsOrFallback(
             config: config,
             environment: ProcessInfo.processInfo.environment
-        ) ? {
-            var bindings: [MetalAttentionKernel.CachedLayerBindings] = []
-            bindings.reserveCapacity(compiledHybridSurfaceHandles.count)
-            for handles in compiledHybridSurfaceHandles {
-                do {
-                    let binding = try metalAttention.createCachedLayerBindings(
-                        qSurface: handles.qOut,
-                        kOutputSurface: handles.kOut,
-                        vOutputSurface: handles.vOut,
-                        kCacheSurface: handles.kCacheFull,
-                        vCacheSurface: handles.vCacheFull,
-                        contextSurface: handles.projectionContextIn,
-                        dim: handles.qDim,
-                        kvDim: handles.kvDim,
-                        laneStride: handles.laneSpatial,
-                        cacheStride: maxSeq
-                    )
-                    bindings.append(binding)
-                } catch {
-                    return nil
-                }
+        ) {
+            try compiledHybridSurfaceHandles.map { handles in
+                try metalAttention.createCachedLayerBindings(
+                    qSurface: handles.qOut,
+                    kOutputSurface: handles.kOut,
+                    vOutputSurface: handles.vOut,
+                    kCacheSurface: handles.kCacheFull,
+                    vCacheSurface: handles.vCacheFull,
+                    contextSurface: handles.projectionContextIn,
+                    dim: handles.qDim,
+                    kvDim: handles.kvDim,
+                    laneStride: handles.laneSpatial,
+                    cacheStride: maxSeq
+                )
             }
-            return bindings
-        }() : nil
+        }
 
         let xCur = TensorBuffer(count: config.dModel, zeroed: true)
         var decodeState: DecodeState
@@ -6225,8 +6637,11 @@ public struct RealModelInferenceEngine: ~Copyable {
             emissionStart = emissionNow
         }
 
-        if !decodeProfileTokens.isEmpty {
-            fputs(HybridDecodeTokenProfile(tokens: decodeProfileTokens).formatReport() + "\n", stderr)
+        let decodeProfileReport = decodeProfileTokens.isEmpty
+            ? nil
+            : HybridDecodeTokenProfile(tokens: decodeProfileTokens).formatReport()
+        if let decodeProfileReport {
+            fputs(decodeProfileReport + "\n", stderr)
         }
 
         let generationEnd = DispatchTime.now().uptimeNanoseconds
@@ -6247,7 +6662,8 @@ public struct RealModelInferenceEngine: ~Copyable {
                 ? "ane_factored_classifier"
                 : classifierStrategy.exactHeadBackendLabel,
             cachedBindingsEnabled: cachedBindings != nil,
-            decodePath: "hybrid"
+            decodePath: "hybrid",
+            decodeProfileReport: decodeProfileReport
         )
     }
 
@@ -8480,6 +8896,10 @@ public struct RealModelInferenceEngine: ~Copyable {
 
     private mutating func exactClassifierArgmax(_ hidden: [Float]) -> Int {
         precondition(hidden.count == config.dModel)
+        if let dumpPath = ProcessInfo.processInfo.environment["ESPRESSO_DUMP_LM_HEAD_HIDDEN"],
+           !dumpPath.isEmpty {
+            Self.appendLMHeadHiddenDump(hidden, to: dumpPath)
+        }
         switch classifierStrategy {
         case .ane, .cpuPartitionedFP32:
             let blockSize = Self.classifierArgmaxBlockSize
@@ -8670,6 +9090,25 @@ public struct RealModelInferenceEngine: ~Copyable {
         }
 
         return bestIndex
+    }
+
+    private static func appendLMHeadHiddenDump(_ hidden: [Float], to path: String) {
+        var values = hidden
+        values.withUnsafeBytes { raw in
+            guard let bytes = raw.baseAddress else { return }
+            let handle: FileHandle
+            do {
+                if !FileManager.default.fileExists(atPath: path) {
+                    FileManager.default.createFile(atPath: path, contents: nil)
+                }
+                handle = try FileHandle(forWritingTo: URL(fileURLWithPath: path))
+                try handle.seekToEnd()
+                try handle.write(contentsOf: UnsafeRawBufferPointer(start: bytes, count: raw.count))
+                try handle.close()
+            } catch {
+                return
+            }
+        }
     }
 
     private static func extractSpatialSlice(
