@@ -83,6 +83,15 @@ class CIWorkflowTests(unittest.TestCase):
         )
         self.assertIn(f'--filter "{expected_filter}"', text)
 
+    def test_matrix_uses_swift_6_2_xcode(self) -> None:
+        """macos-15 default / Xcode 16.x is Swift 6.0–6.1; Package.swift is tools 6.2."""
+        text = CI_YML.read_text(encoding="utf-8")
+        self.assertIn('- "26.2"', text)
+        self.assertIn('- "26.3"', text)
+        self.assertNotIn('- "16.2"', text)
+        self.assertNotIn('- "16.3"', text)
+        self.assertIn("Xcode_26.3", text)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -34,8 +34,8 @@ jobs:
       fail-fast: true
       matrix:
         xcode:
-          - "16.2"
-          - "16.3"
+          - "26.2"
+          - "26.3"
 
     steps:
       - name: Checkout
@@ -44,11 +44,12 @@ jobs:
       - name: Select Xcode ${{ matrix.xcode }}
         run: |
           XCODE_PATH=$(find /Applications -maxdepth 1 -name "Xcode_${{ matrix.xcode }}*.app" | head -1)
-          if [ -n "$XCODE_PATH" ]; then
-            sudo xcode-select -s "$XCODE_PATH"
-          else
-            echo "Xcode ${{ matrix.xcode }} not found, using default"
+          if [ -z "$XCODE_PATH" ]; then
+            echo "Xcode ${{ matrix.xcode }} not found (need Swift 6.2+)"
+            ls /Applications/Xcode*.app || true
+            exit 1
           fi
+          sudo xcode-select -s "$XCODE_PATH"
           xcodebuild -version
           swift --version
 
@@ -92,6 +93,17 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+      - name: Select Xcode 26.3
+        run: |
+          XCODE_PATH=$(find /Applications -maxdepth 1 -name "Xcode_26.3*.app" | head -1)
+          if [ -z "$XCODE_PATH" ]; then
+            echo "Xcode 26.3 not found (need Swift 6.2+)"
+            ls /Applications/Xcode*.app || true
+            exit 1
+          fi
+          sudo xcode-select -s "$XCODE_PATH"
+          xcodebuild -version
+          swift --version
       - name: Resolve dependencies
         run: swift package resolve
       - name: Show dependency graph

@@ -16,7 +16,7 @@ Thank you for your interest in contributing to Espresso. This document covers de
 **Requirements**
 
 - macOS 15.0+
-- Xcode 16.2+ (Swift 6.2)
+- Xcode 26.2+ (Swift 6.2)
 - Apple Silicon Mac (M1 or later) — required for ANE hardware tests
 
 **Clone and build**
