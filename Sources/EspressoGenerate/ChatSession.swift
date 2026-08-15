@@ -117,9 +117,9 @@ func chatForcesHybridFallbackDisable(_ options: Options) -> Bool {
 
 func assertChatDecodePathIsHybrid(_ path: String) throws {
     let normalized = path.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-    guard normalized == "hybrid" else {
+    guard normalized == "hybrid" || normalized == "fused" else {
         throw CLIError.runtime(
-            "chat requires path=hybrid (ESPRESSO_REALMODEL_DISABLE_HYBRID_FALLBACK=1); got \(path)"
+            "chat requires path=hybrid or path=fused (ESPRESSO_REALMODEL_DISABLE_HYBRID_FALLBACK=1); got \(path)"
         )
     }
 }

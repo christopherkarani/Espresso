@@ -125,6 +125,31 @@ import ANETypes
     ))
 }
 
+@Test func modelFamilyRecognizesQwen15BVariants() {
+    #expect(ModelFamily.isQwen15BVariant(name: "Qwen2.5-1.5B-Instruct"))
+    #expect(ModelFamily.isQwen15BVariant(name: "  Qwen2.5-1.5B-Instruct  "))
+    #expect(ModelFamily.isQwen15BVariant(name: "qwen2.5-1.5b"))
+    #expect(!ModelFamily.isQwen15BVariant(name: "Qwen2.5-0.5B-Instruct"))
+    #expect(!ModelFamily.isQwen15BVariant(name: "qwen2.5"))
+    #expect(!ModelFamily.isQwen15BVariant(name: "stories110m"))
+    #expect(!ModelFamily.isQwen15BVariant(name: "tinyLlama_1_1b"))
+    #expect(ModelFamily.isQwen15BVariant(
+        MultiModelConfig(
+            name: "Qwen2.5-1.5B-Instruct",
+            nLayer: 28,
+            nHead: 12,
+            nKVHead: 2,
+            dModel: 1536,
+            headDim: 128,
+            hiddenDim: 8960,
+            vocab: 151_936,
+            maxSeq: 1024,
+            normEps: 1e-6,
+            architecture: .llama
+        )
+    ))
+}
+
 @Test func preferredDecodePathParseTrimsAndLowercases() throws {
     #expect(try MultiModelConfig.PreferredDecodePath.parse("hybrid") == .hybrid)
     #expect(try MultiModelConfig.PreferredDecodePath.parse(" EXACT_CPU ") == .exactCPU)

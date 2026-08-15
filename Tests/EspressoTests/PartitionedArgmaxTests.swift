@@ -113,4 +113,57 @@ final class PartitionedArgmaxTests: XCTestCase {
         XCTAssertEqual(stats.totalBlocks, 1)
         XCTAssertEqual(stats.prunedBlocks, 0)
     }
+
+    /// Parallel remaining-block CS must match sequential first-max argmax.
+    func testParallelPartitionedArgmaxMatchesSequential() {
+        let vocabSize = 100
+        let dim = 32
+        let blockSize = 25
+        let classifier = UnsafeMutablePointer<Float>.allocate(capacity: vocabSize * dim)
+        let input = UnsafeMutablePointer<Float>.allocate(capacity: dim)
+        let sequentialScratch = UnsafeMutablePointer<Float>.allocate(capacity: blockSize)
+        defer {
+            classifier.deallocate()
+            input.deallocate()
+            sequentialScratch.deallocate()
+        }
+        for r in 0..<vocabSize {
+            for c in 0..<dim {
+                classifier[r * dim + c] = Float(r) * 0.01 + Float(c) * 0.001
+            }
+        }
+        for c in 0..<dim {
+            classifier[73 * dim + c] = 10.0
+        }
+        for i in 0..<dim { input[i] = 1.0 }
+
+        let blockMaxNorms = PartitionedArgmax.precomputeBlockMaxNorms(
+            classifier: classifier, vocabSize: vocabSize, dim: dim, blockSize: blockSize
+        )
+        var skipped = 0
+        let sequential = blockMaxNorms.withUnsafeBufferPointer { norms in
+            PartitionedArgmax.compute(
+                classifier: classifier,
+                input: input,
+                logitsScratch: sequentialScratch,
+                blockMaxNorms: norms.baseAddress!,
+                vocabSize: vocabSize,
+                dim: dim,
+                blockSize: blockSize,
+                skippedBlocks: &skipped
+            )
+        }
+        let parallel = blockMaxNorms.withUnsafeBufferPointer { norms in
+            PartitionedArgmax.computeParallel(
+                classifier: classifier,
+                input: input,
+                blockMaxNorms: norms.baseAddress!,
+                vocabSize: vocabSize,
+                dim: dim,
+                blockSize: blockSize
+            )
+        }
+        XCTAssertEqual(parallel, sequential)
+        XCTAssertEqual(parallel, 73)
+    }
 }

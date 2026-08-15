@@ -123,6 +123,113 @@ public enum PartitionedArgmax {
         return bestIndex
     }
 
+    /// Same first-max argmax as `compute`, but evaluates remaining candidate
+    /// blocks in parallel after the first block sets a Cauchy-Schwarz bound.
+    /// Extra evaluated blocks are still exact; they only reduce pruning.
+    public static func computeParallel(
+        classifier: UnsafePointer<Float>,
+        input: UnsafePointer<Float>,
+        blockMaxNorms: UnsafePointer<Float>,
+        vocabSize: Int,
+        dim: Int,
+        blockSize: Int
+    ) -> Int {
+        var inputNormSquared: Float = 0
+        vDSP_svesq(input, 1, &inputNormSquared, vDSP_Length(dim))
+        let inputNorm = sqrtf(inputNormSquared)
+
+        let firstCount = min(blockSize, vocabSize)
+        let firstScratch = UnsafeMutablePointer<Float>.allocate(capacity: firstCount)
+        defer { firstScratch.deallocate() }
+        BLAS.sgemm(
+            CblasRowMajor,
+            CblasNoTrans,
+            CblasNoTrans,
+            m: Int32(firstCount),
+            n: 1,
+            k: Int32(dim),
+            alpha: 1.0,
+            a: classifier,
+            lda: Int32(dim),
+            b: input,
+            ldb: 1,
+            beta: 0.0,
+            c: firstScratch,
+            ldc: 1
+        )
+        var bestValue: Float = 0
+        var bestIdx: vDSP_Length = 0
+        vDSP_maxvi(firstScratch, 1, &bestValue, &bestIdx, vDSP_Length(firstCount))
+        var bestIndex = Int(bestIdx)
+
+        let totalBlocks = (vocabSize + blockSize - 1) / blockSize
+        guard totalBlocks > 1 else { return bestIndex }
+
+        var candidates: [(blockIndex: Int, start: Int, count: Int)] = []
+        candidates.reserveCapacity(totalBlocks - 1)
+        var blockIndex = 1
+        var blockStart = firstCount
+        while blockStart < vocabSize {
+            let blockEnd = min(blockStart + blockSize, vocabSize)
+            let upperBound = blockMaxNorms[blockIndex] * inputNorm
+            if upperBound >= bestValue {
+                candidates.append((blockIndex, blockStart, blockEnd - blockStart))
+            }
+            blockIndex += 1
+            blockStart = blockEnd
+        }
+        guard !candidates.isEmpty else { return bestIndex }
+
+        let frozenCandidates = candidates
+        let candidateCount = frozenCandidates.count
+        let results = UnsafeMutablePointer<(Float, Int)>.allocate(capacity: candidateCount)
+        defer { results.deallocate() }
+        for i in 0..<candidateCount {
+            results[i] = (-.infinity, 0)
+        }
+
+        let classifierAddr = UInt(bitPattern: classifier)
+        let inputAddr = UInt(bitPattern: input)
+        let resultsAddr = UInt(bitPattern: results)
+        DispatchQueue.concurrentPerform(iterations: candidateCount) { i in
+            let candidate = frozenCandidates[i]
+            let scratch = UnsafeMutablePointer<Float>.allocate(capacity: candidate.count)
+            defer { scratch.deallocate() }
+            let classifierPtr = UnsafePointer<Float>(bitPattern: classifierAddr)!
+            let inputPtr = UnsafePointer<Float>(bitPattern: inputAddr)!
+            let resultsPtr = UnsafeMutablePointer<(Float, Int)>(bitPattern: resultsAddr)!
+            BLAS.sgemm(
+                CblasRowMajor,
+                CblasNoTrans,
+                CblasNoTrans,
+                m: Int32(candidate.count),
+                n: 1,
+                k: Int32(dim),
+                alpha: 1.0,
+                a: classifierPtr.advanced(by: candidate.start * dim),
+                lda: Int32(dim),
+                b: inputPtr,
+                ldb: 1,
+                beta: 0.0,
+                c: scratch,
+                ldc: 1
+            )
+            var blockMax: Float = 0
+            var blockMaxIdx: vDSP_Length = 0
+            vDSP_maxvi(scratch, 1, &blockMax, &blockMaxIdx, vDSP_Length(candidate.count))
+            resultsPtr[i] = (blockMax, candidate.start + Int(blockMaxIdx))
+        }
+
+        for i in 0..<candidateCount {
+            let (value, index) = results[i]
+            if value > bestValue {
+                bestValue = value
+                bestIndex = index
+            }
+        }
+        return bestIndex
+    }
+
     public struct EvalStats: Sendable {
         public let tokenIndex: Int
         public let evaluatedBlocks: Int

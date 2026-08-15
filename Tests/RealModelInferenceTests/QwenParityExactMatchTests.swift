@@ -292,13 +292,30 @@ private func assertQwenGreedyFixtureCoversTheRequiredSuite(profile: QwenParityPr
         tokensPerSecond: 0,
         compileTimeMs: 1,
         firstTokenLatencyMs: 1,
-        exactHeadBackend: "cpu_fp16_tiled"
+        exactHeadBackend: "cpu_fp16_tiled",
+        decodeProfileReport: "decode_profile_mean_ms/token qkv=1.00 rope=2.00 attn=3.00 ffn=4.00 lm_head=5.00 io=6.00 n=1 exclude_ttft=1"
     )
     #expect(original.decodePath == "unknown")
+    #expect(original.hopsPerToken == nil)
     let labeled = original.withDecodePath("hybrid")
     #expect(labeled.decodePath == "hybrid")
+    #expect(labeled.hopsPerToken == nil)
     #expect(labeled.tokens == original.tokens)
     #expect(labeled.exactHeadBackend == "cpu_fp16_tiled")
+    #expect(labeled.decodeProfileReport == original.decodeProfileReport)
+    let fused = GenerationResult(
+        text: "hi",
+        tokens: [1],
+        promptTokens: [9],
+        tokensPerSecond: 0,
+        compileTimeMs: 1,
+        firstTokenLatencyMs: 1,
+        exactHeadBackend: "cpu_fp16_tiled",
+        cachedBindingsEnabled: false,
+        decodePath: "fused",
+        hopsPerToken: 28
+    )
+    #expect(fused.withDecodePath("fused").hopsPerToken == 28)
 }
 
 /// Greedy decoding on the ANE hybrid path must reproduce the PyTorch reference token IDs.
@@ -361,9 +378,26 @@ private func assertQwenGreedyParityMatchesPyTorchReferenceOnANE(
         ],
         maxTokens: fixture.maxNewTokens
     )
-    #expect(allResults.count == cases.count + 2)
-    #expect(allResults.allSatisfy { $0.decodePath == "hybrid" })
-    let results = Array(allResults.prefix(cases.count))
+    let snapshots = allResults.map { result in
+        (
+            decodePath: result.decodePath,
+            hopsPerToken: result.hopsPerToken,
+            exactHeadBackend: result.exactHeadBackend,
+            cachedBindingsEnabled: result.cachedBindingsEnabled,
+            tokens: result.tokens
+        )
+    }
+    #expect(snapshots.count == cases.count + 2)
+    let expectedDecodePath = ModelFamily.isQwen15BVariant(config)
+        ? RealModelInferenceEngine.fusedDecodePathLabel
+        : "hybrid"
+    #expect(snapshots.allSatisfy { $0.decodePath == expectedDecodePath })
+    if expectedDecodePath == RealModelInferenceEngine.fusedDecodePathLabel {
+        #expect(snapshots.allSatisfy { $0.hopsPerToken == 28 })
+        #expect(snapshots.allSatisfy { $0.cachedBindingsEnabled == false })
+        #expect(snapshots.allSatisfy { $0.exactHeadBackend == "cpu_fp16_tiled" })
+    }
+    let results = Array(snapshots.prefix(cases.count))
 
     var matchingPrefixLengths: [Int] = []
     var exactMatches = 0

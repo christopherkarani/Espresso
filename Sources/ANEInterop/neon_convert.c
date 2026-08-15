@@ -16,6 +16,59 @@ void ane_interop_cvt_f16_to_f32(float *dst, const void *src, int count) {
     for (; i < count; i++) dst[i] = (float)src16[i];
 }
 
+// MARK: - Streaming FP16×FP32 GEMV argmax
+//
+// Reads row-major FP16 weights [vocab × dim] and an FP32 input [dim].
+// Converts each 8-wide weight vector in registers, FMAs against the input,
+// and tracks the first-max row. No FP32 tile is stored.
+
+int ane_interop_fp16_gemv_argmax(const void *weights_f16,
+                                 const float *input,
+                                 int vocab_size,
+                                 int dim) {
+    const __fp16 *w = (const __fp16 *)weights_f16;
+    if (vocab_size <= 0 || dim <= 0) {
+        return 0;
+    }
+
+    int bestIndex = 0;
+    float bestValue = -FLT_MAX;
+    const int dim8 = dim & ~7;
+
+    for (int r = 0; r < vocab_size; r++) {
+        const __fp16 *row = w + (size_t)r * (size_t)dim;
+        if (r + 1 < vocab_size) {
+            __builtin_prefetch(row + dim, 0, 3);
+        }
+
+        float32x4_t acc0 = vdupq_n_f32(0.0f);
+        float32x4_t acc1 = vdupq_n_f32(0.0f);
+        int j = 0;
+        for (; j + 15 < dim8; j += 16) {
+            float16x8_t h0 = vld1q_f16(row + j);
+            float16x8_t h1 = vld1q_f16(row + j + 8);
+            acc0 = vfmaq_f32(acc0, vcvt_f32_f16(vget_low_f16(h0)), vld1q_f32(input + j));
+            acc1 = vfmaq_f32(acc1, vcvt_f32_f16(vget_high_f16(h0)), vld1q_f32(input + j + 4));
+            acc0 = vfmaq_f32(acc0, vcvt_f32_f16(vget_low_f16(h1)), vld1q_f32(input + j + 8));
+            acc1 = vfmaq_f32(acc1, vcvt_f32_f16(vget_high_f16(h1)), vld1q_f32(input + j + 12));
+        }
+        for (; j < dim8; j += 8) {
+            float16x8_t h = vld1q_f16(row + j);
+            acc0 = vfmaq_f32(acc0, vcvt_f32_f16(vget_low_f16(h)), vld1q_f32(input + j));
+            acc1 = vfmaq_f32(acc1, vcvt_f32_f16(vget_high_f16(h)), vld1q_f32(input + j + 4));
+        }
+        float sum = vaddvq_f32(vaddq_f32(acc0, acc1));
+        for (; j < dim; j++) {
+            sum += (float)row[j] * input[j];
+        }
+        if (sum > bestValue) {
+            bestValue = sum;
+            bestIndex = r;
+        }
+    }
+    return bestIndex;
+}
+
 void ane_interop_cvt_f32_to_f16(void *dst, const float *src, int count) {
     _Float16 *dst16 = (_Float16 *)dst;
     int i = 0;

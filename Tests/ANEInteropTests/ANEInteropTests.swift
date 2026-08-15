@@ -219,6 +219,33 @@ final class ANEInteropTests: XCTestCase {
         XCTAssertEqual(value, 99, accuracy: 0.001)
     }
 
+    func test_fp16_gemv_argmax_picks_dominant_row() {
+        let vocab = 20
+        let dim = 16
+        var weightsFP32 = [Float](repeating: 0.1, count: vocab * dim)
+        for col in 0..<dim {
+            weightsFP32[7 * dim + col] = 5.0
+        }
+        var weightsFP16 = [UInt16](repeating: 0, count: vocab * dim)
+        weightsFP32.withUnsafeBufferPointer { src in
+            weightsFP16.withUnsafeMutableBytes { dst in
+                ane_interop_cvt_f32_to_f16(dst.baseAddress, src.baseAddress, Int32(vocab * dim))
+            }
+        }
+        let input = [Float](repeating: 1.0, count: dim)
+        let index = weightsFP16.withUnsafeBytes { raw in
+            input.withUnsafeBufferPointer { inBuf in
+                ane_interop_fp16_gemv_argmax(
+                    raw.baseAddress,
+                    inBuf.baseAddress,
+                    Int32(vocab),
+                    Int32(dim)
+                )
+            }
+        }
+        XCTAssertEqual(index, 7)
+    }
+
     func test_baseline_classifier_unavailable_when_runtime_is_missing() {
         let status = classifyANEBaseline(runtimeAvailable: false, compileSucceeded: true, evalSucceeded: true)
         XCTAssertEqual(status, .unavailable)

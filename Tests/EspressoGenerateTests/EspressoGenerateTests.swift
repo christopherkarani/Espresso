@@ -192,6 +192,72 @@ import ModelSupport
         decodePath: "hybrid"
     )
     #expect(metrics.decodePath == "hybrid")
+    #expect(metrics.hopsPerToken == nil)
+
+    let fusedMetrics = BackendRunMetrics(
+        backend: "espresso",
+        text: "Paris",
+        generatedTokens: [11],
+        promptTokens: [1],
+        compileTimeMs: 10,
+        firstTokenLatencyMs: 5,
+        tokensPerSecond: 20,
+        medianTokenMs: 5,
+        p95TokenMs: 5,
+        totalTimeMs: 20,
+        tokenLatenciesMs: [5],
+        cachedBindingsEnabled: false,
+        decodePath: "fused",
+        hopsPerToken: 28
+    )
+    #expect(fusedMetrics.decodePath == "fused")
+    #expect(fusedMetrics.hopsPerToken == 28)
+    #expect(fusedMetrics.cachedBindingsEnabled == false)
+}
+
+@Test func test_generateDecodeProfileMeanLineExtractsContractLine() {
+    let report = """
+    decode_profile_mean_ms/token qkv=1.00 rope=2.00 attn=3.00 ffn=4.00 lm_head=5.00 io=6.00 n=31 exclude_ttft=1
+    decode_profile_ttft_ms=90.00 lm_head=90.00
+    decode_profile_token i=0 qkv=0.00 rope=0.00 attn=0.00 ffn=0.00 lm_head=90.00 io=0.00
+    """
+    #expect(
+        generateDecodeProfileMeanLine(report)
+            == "decode_profile_mean_ms/token qkv=1.00 rope=2.00 attn=3.00 ffn=4.00 lm_head=5.00 io=6.00 n=31 exclude_ttft=1"
+    )
+    #expect(generateDecodeProfileMeanLine(nil) == nil)
+    #expect(generateDecodeProfileMeanLine("") == nil)
+    #expect(generateDecodeProfileMeanLine("cached_bindings_enabled=false") == nil)
+
+    #expect(
+        espressoCompareLaneContractLines(
+            decodePath: "fused",
+            hopsPerToken: 28,
+            decodeProfileReport: report
+        ) == [
+            "decode_path=fused",
+            "hops/token=28",
+            "decode_profile_mean_ms/token qkv=1.00 rope=2.00 attn=3.00 ffn=4.00 lm_head=5.00 io=6.00 n=31 exclude_ttft=1",
+        ]
+    )
+    #expect(espressoCompareLaneContractLines(decodePath: nil, hopsPerToken: nil, decodeProfileReport: nil).isEmpty)
+
+    let metrics = BackendRunMetrics(
+        backend: "espresso",
+        text: "Paris",
+        generatedTokens: [11],
+        promptTokens: [1],
+        compileTimeMs: 10,
+        firstTokenLatencyMs: 5,
+        tokensPerSecond: 20,
+        medianTokenMs: 5,
+        p95TokenMs: 5,
+        totalTimeMs: 20,
+        tokenLatenciesMs: [5],
+        decodePath: "hybrid",
+        decodeProfileReport: report
+    )
+    #expect(metrics.decodeProfileReport == report)
 }
 
 @Test func test_metadataConfigFilePreservesOptionalRopeThetaAndEOSToken() throws {
@@ -1442,6 +1508,12 @@ private func makeStubDemoDefaults(root: URL) -> DemoDefaults {
         try assertChatDecodePathIsHybrid("hybrid")
     } catch {
         Issue.record("hybrid path should be accepted: \(error)")
+    }
+
+    do {
+        try assertChatDecodePathIsHybrid("fused")
+    } catch {
+        Issue.record("fused path should be accepted: \(error)")
     }
 }
 

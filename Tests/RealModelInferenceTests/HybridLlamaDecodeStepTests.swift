@@ -223,6 +223,173 @@ import ModelSupport
             ]
         ) == false
     )
+    let qwen15b = MultiModelConfig(
+        name: "Qwen2.5-1.5B-Instruct",
+        nLayer: 28,
+        nHead: 12,
+        nKVHead: 2,
+        dModel: 1536,
+        headDim: 128,
+        hiddenDim: 8960,
+        vocab: 151_936,
+        maxSeq: 1024,
+        normEps: 1e-6,
+        architecture: .llama,
+        preferredDecodePath: .hybrid
+    )
+    let qwen05b = MultiModelConfig(
+        name: "Qwen2.5-0.5B-Instruct",
+        nLayer: 24,
+        nHead: 14,
+        nKVHead: 2,
+        dModel: 896,
+        headDim: 64,
+        hiddenDim: 4864,
+        vocab: 151_936,
+        maxSeq: 1024,
+        normEps: 1e-6,
+        architecture: .llama,
+        preferredDecodePath: .hybrid
+    )
+    #expect(
+        RealModelInferenceEngine.supportsHybridCachedBindings(
+            config: qwen15b,
+            environment: [:]
+        ) == true
+    )
+    #expect(
+        RealModelInferenceEngine.supportsHybridCachedBindings(
+            config: qwen05b,
+            environment: [:]
+        ) == false
+    )
+    #expect(
+        RealModelInferenceEngine.supportsHybridCachedBindings(
+            config: qwen15b,
+            environment: ["ESPRESSO_DISABLE_HYBRID_CACHED_BINDINGS": "1"]
+        ) == false
+    )
+    #expect(
+        RealModelInferenceEngine.supportsHybridCachedBindings(
+            config: qwen05b,
+            environment: ["ESPRESSO_ENABLE_LLAMA_HYBRID_CACHED_BINDINGS": "1"]
+        ) == true
+    )
+}
+
+@Test func test_qwen15bHybridCachedBindingsThrowInsteadOfSilentSerialFallback() throws {
+    let qwen15b = MultiModelConfig(
+        name: "Qwen2.5-1.5B-Instruct",
+        nLayer: 28,
+        nHead: 12,
+        nKVHead: 2,
+        dModel: 1536,
+        headDim: 128,
+        hiddenDim: 8960,
+        vocab: 151_936,
+        maxSeq: 1024,
+        normEps: 1e-6,
+        architecture: .llama,
+        preferredDecodePath: .hybrid
+    )
+    let storiesConfig = ModelRegistry.stories110m
+    enum ProbeError: Error { case createFailed }
+
+    do {
+        _ = try RealModelInferenceEngine.makeHybridCachedBindingsOrFallback(
+            config: qwen15b,
+            environment: [:]
+        ) { () -> [Int] in
+            throw ProbeError.createFailed
+        }
+        Issue.record("Qwen 1.5B cached-binding failure must throw")
+    } catch let error as RealModelInferenceError {
+        guard case let .hybridFallbackDisabled(stage, reason) = error else {
+            Issue.record("expected hybridFallbackDisabled, got \(error)")
+            return
+        }
+        #expect(stage == "hybrid_cached_bindings")
+        #expect(reason.contains("cached Metal bindings failed"))
+    } catch {
+        Issue.record("expected RealModelInferenceError, got \(error)")
+    }
+
+    #expect(
+        try RealModelInferenceEngine.makeHybridCachedBindingsOrFallback(
+            config: qwen15b,
+            environment: [:]
+        ) { [1, 2, 3] } == [1, 2, 3]
+    )
+    #expect(
+        try RealModelInferenceEngine.makeHybridCachedBindingsOrFallback(
+            config: qwen15b,
+            environment: ["ESPRESSO_DISABLE_HYBRID_CACHED_BINDINGS": "1"]
+        ) { () -> [Int] in
+            throw ProbeError.createFailed
+        } == nil
+    )
+    #expect(
+        try RealModelInferenceEngine.makeHybridCachedBindingsOrFallback(
+            config: storiesConfig,
+            environment: [:]
+        ) { () -> [Int] in
+            throw ProbeError.createFailed
+        } == nil
+    )
+}
+
+@Test func test_prefersFusedHybridDecodeDefaultOnForQwen15BOnly() {
+    let qwen15b = MultiModelConfig(
+        name: "Qwen2.5-1.5B-Instruct",
+        nLayer: 28,
+        nHead: 12,
+        nKVHead: 2,
+        dModel: 1536,
+        headDim: 128,
+        hiddenDim: 8960,
+        vocab: 151_936,
+        maxSeq: 1024,
+        normEps: 1e-6,
+        architecture: .llama,
+        preferredDecodePath: .hybrid
+    )
+    let qwen05b = MultiModelConfig(
+        name: "Qwen2.5-0.5B-Instruct",
+        nLayer: 24,
+        nHead: 14,
+        nKVHead: 2,
+        dModel: 896,
+        headDim: 64,
+        hiddenDim: 4864,
+        vocab: 151_936,
+        maxSeq: 1024,
+        normEps: 1e-6,
+        architecture: .llama,
+        preferredDecodePath: .hybrid
+    )
+    #expect(RealModelInferenceEngine.prefersFusedHybridDecode(config: qwen15b, environment: [:]) == true)
+    #expect(RealModelInferenceEngine.prefersFusedHybridDecode(config: qwen05b, environment: [:]) == false)
+    #expect(
+        RealModelInferenceEngine.prefersFusedHybridDecode(
+            config: qwen15b,
+            environment: ["ESPRESSO_DISABLE_FUSED_HYBRID_DECODE": "1"]
+        ) == false
+    )
+    #expect(
+        RealModelInferenceEngine.prefersFusedHybridDecode(
+            config: qwen05b,
+            environment: ["ESPRESSO_ENABLE_FUSED_HYBRID_DECODE": "1"]
+        ) == true
+    )
+    #expect(RealModelInferenceEngine.fusedHopsPerToken(nLayer: 28) == 28)
+    #expect(RealModelInferenceEngine.fusedDecodePathLabel == "fused")
+    let missing = RealModelInferenceEngine.fusedHybridFallbackError(reason: "missing N=1 kernel")
+    guard case let .hybridFallbackDisabled(stage, reason) = missing else {
+        Issue.record("expected hybridFallbackDisabled, got \(missing)")
+        return
+    }
+    #expect(stage == "fused_hybrid_decode")
+    #expect(reason.contains("missing N=1 kernel"))
 }
 
 @Test func test_hybridDonorDeltaDefaultsOnForStoriesAndAllowsDisableOverride() {
