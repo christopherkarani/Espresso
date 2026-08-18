@@ -10,7 +10,24 @@ import ANEGraphIR
 /// Inputs (alphabetical): kCache, mask, posMask, ropePack, vCache, x
 /// Outputs (alphabetical): kNew, vNew, xOut
 public struct FusedHybridDecodeLayerGenerator: MILProgramGenerator {
+    /// Qwen2.5-1.5B-Instruct widths for the serve Layer graph. The Block
+    /// compile probe reads this catalog; it does not own it.
+    public enum Qwen15BShape {
+        public static let nLayer = 28
+        public static let dModel = 1536
+        public static let nHead = 12
+        public static let nKVHead = 2
+        public static let headDim = 128
+        public static let hiddenDim = 8960
+        public static let qDim = dModel
+        public static let kvDim = nKVHead * headDim
+        public static let ropeTheta: Float = 1_000_000
+        public static let normEps: Float = 1e-6
+        public static let laneSpatial = 32
+    }
+
     public static let phase11MaxN = 1
+    public static let decodePathLabel = "fused"
 
     public let dim: Int
     public let qDim: Int
@@ -33,8 +50,8 @@ public struct FusedHybridDecodeLayerGenerator: MILProgramGenerator {
         nKVHeads: Int,
         headDim: Int,
         maxSeq: Int,
-        laneSpatial: Int = FusedHybridDecodeBlockGenerator.Qwen15BShape.laneSpatial,
-        normEps: Float = FusedHybridDecodeBlockGenerator.Qwen15BShape.normEps,
+        laneSpatial: Int = Qwen15BShape.laneSpatial,
+        normEps: Float = Qwen15BShape.normEps,
         hasQKVBias: Bool = true
     ) {
         precondition(dim > 0 && qDim > 0 && kvDim > 0 && hiddenDim > 0)
@@ -56,9 +73,9 @@ public struct FusedHybridDecodeLayerGenerator: MILProgramGenerator {
 
     public static func qwen15B(
         maxSeq: Int,
-        laneSpatial: Int = FusedHybridDecodeBlockGenerator.Qwen15BShape.laneSpatial
+        laneSpatial: Int = Qwen15BShape.laneSpatial
     ) -> Self {
-        let shape = FusedHybridDecodeBlockGenerator.Qwen15BShape.self
+        let shape = Qwen15BShape.self
         return Self(
             dim: shape.dModel,
             qDim: shape.qDim,
@@ -75,7 +92,7 @@ public struct FusedHybridDecodeLayerGenerator: MILProgramGenerator {
     }
 
     public static func hopsPerToken(
-        nLayer: Int = FusedHybridDecodeBlockGenerator.Qwen15BShape.nLayer,
+        nLayer: Int = Qwen15BShape.nLayer,
         blockSize: Int = phase11MaxN
     ) -> Int {
         precondition(nLayer > 0 && blockSize > 0)

@@ -238,9 +238,6 @@ public struct RealModelInferenceEngine: ~Copyable {
 
     /// Phase 11 compiled `max_N = 1` only. Serve that N: one fused program per
     /// layer with attention in-graph (28 hops, no Metal QKV↔FFN sync).
-    static let fusedDecodePathLabel = FusedHybridDecodeLayerKernelSet.decodePathLabel
-    static let fusedHybridFallbackStage = FusedHybridDecodeLayerKernelSet.fallbackStage
-
     static func prefersFusedHybridDecode(
         config: MultiModelConfig,
         environment: [String: String]
@@ -254,12 +251,8 @@ public struct RealModelInferenceEngine: ~Copyable {
         return config.architecture == .llama && ModelFamily.isQwen15BVariant(config)
     }
 
-    static func fusedHopsPerToken(nLayer: Int) -> Int {
-        FusedHybridDecodeLayerKernelSet.hopsPerToken(nLayer: nLayer)
-    }
-
     static func fusedHybridFallbackError(reason: String) -> RealModelInferenceError {
-        .hybridFallbackDisabled(stage: fusedHybridFallbackStage, reason: reason)
+        .hybridFallbackDisabled(stage: "fused_hybrid_decode", reason: reason)
     }
 
     static func makeHybridCachedBindingsOrFallback<Bindings>(
@@ -1650,8 +1643,8 @@ public struct RealModelInferenceEngine: ~Copyable {
                     decodePath = "exact_cpu"
                     hopsPerToken = nil
                 } else if Self.prefersFusedHybridDecode(config: config, environment: environment) {
-                    decodePath = Self.fusedDecodePathLabel
-                    hopsPerToken = Self.fusedHopsPerToken(nLayer: config.nLayer)
+                    decodePath = FusedHybridDecodeLayerGenerator.decodePathLabel
+                    hopsPerToken = FusedHybridDecodeLayerGenerator.hopsPerToken(nLayer: config.nLayer)
                 } else {
                     decodePath = "hybrid"
                     hopsPerToken = nil
@@ -6009,7 +6002,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             throw Self.fusedHybridFallbackError(reason: "fused decode state initialization failed: \(error)")
         }
         var timings = HybridDecodeTimingBreakdown()
-        let hopsPerToken = Self.fusedHopsPerToken(nLayer: config.nLayer)
+        let hopsPerToken = FusedHybridDecodeLayerGenerator.hopsPerToken(nLayer: config.nLayer)
 
         for (position, token) in promptTokens.enumerated() {
             try writeIncrementalEmbeddingLlama(token: token, into: xCur)
@@ -6140,7 +6133,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             firstTokenLatencyMs: firstTokenLatencyMs,
             exactHeadBackend: classifierStrategy.exactHeadBackendLabel,
             cachedBindingsEnabled: false,
-            decodePath: Self.fusedDecodePathLabel,
+            decodePath: FusedHybridDecodeLayerGenerator.decodePathLabel,
             hopsPerToken: hopsPerToken,
             decodeProfileReport: decodeProfileReport
         )

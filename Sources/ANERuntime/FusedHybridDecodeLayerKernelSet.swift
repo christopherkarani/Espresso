@@ -4,16 +4,8 @@ import ANETypes
 import MILGenerator
 
 /// One compiled Phase-11 `max_N = 1` fused layer (QKV + attention + FFN).
+/// Shape, hops, and the `fused` path label live on `FusedHybridDecodeLayerGenerator`.
 public struct FusedHybridDecodeLayerKernelSet: ~Copyable {
-    public static let phase11MaxN = 1
-    public static let decodePathLabel = "fused"
-    public static let fallbackStage = "fused_hybrid_decode"
-
-    public static func hopsPerToken(nLayer: Int, blockSize: Int = phase11MaxN) -> Int {
-        precondition(nLayer > 0 && blockSize > 0)
-        return (nLayer + blockSize - 1) / blockSize
-    }
-
     public struct DonorHexIDs: Sendable {
         public let fusedLayer: String
     }

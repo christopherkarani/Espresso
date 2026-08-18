@@ -8,21 +8,8 @@ import ANEGraphIR
 /// Attention / RoPE stay off this graph (Metal). Each stacked layer is:
 /// RMSNorm → QKV(+bias) → zero-scale keep-alive → RMSNorm → SwiGLU FFN → residual.
 /// Stories recurrent fusion is a different graph and does not count as a pass.
+/// Shape and hops live on `FusedHybridDecodeLayerGenerator`.
 public struct FusedHybridDecodeBlockGenerator: MILProgramGenerator {
-    public enum Qwen15BShape {
-        public static let nLayer = 28
-        public static let dModel = 1536
-        public static let nHead = 12
-        public static let nKVHead = 2
-        public static let headDim = 128
-        public static let hiddenDim = 8960
-        public static let qDim = dModel
-        public static let kvDim = nKVHead * headDim
-        public static let ropeTheta: Float = 1_000_000
-        public static let normEps: Float = 1e-6
-        public static let laneSpatial = 32
-    }
-
     public let layerCount: Int
     public let dim: Int
     public let qDim: Int
@@ -38,8 +25,8 @@ public struct FusedHybridDecodeBlockGenerator: MILProgramGenerator {
         qDim: Int,
         kvDim: Int,
         hiddenDim: Int,
-        laneSpatial: Int = Qwen15BShape.laneSpatial,
-        normEps: Float = Qwen15BShape.normEps,
+        laneSpatial: Int = FusedHybridDecodeLayerGenerator.Qwen15BShape.laneSpatial,
+        normEps: Float = FusedHybridDecodeLayerGenerator.Qwen15BShape.normEps,
         hasQKVBias: Bool = true
     ) {
         precondition(layerCount > 0)
@@ -55,22 +42,21 @@ public struct FusedHybridDecodeBlockGenerator: MILProgramGenerator {
         self.hasQKVBias = hasQKVBias
     }
 
-    public static func qwen15B(layerCount: Int, laneSpatial: Int = Qwen15BShape.laneSpatial) -> Self {
-        Self(
+    public static func qwen15B(
+        layerCount: Int,
+        laneSpatial: Int = FusedHybridDecodeLayerGenerator.Qwen15BShape.laneSpatial
+    ) -> Self {
+        let shape = FusedHybridDecodeLayerGenerator.Qwen15BShape.self
+        return Self(
             layerCount: layerCount,
-            dim: Qwen15BShape.dModel,
-            qDim: Qwen15BShape.qDim,
-            kvDim: Qwen15BShape.kvDim,
-            hiddenDim: Qwen15BShape.hiddenDim,
+            dim: shape.dModel,
+            qDim: shape.qDim,
+            kvDim: shape.kvDim,
+            hiddenDim: shape.hiddenDim,
             laneSpatial: laneSpatial,
-            normEps: Qwen15BShape.normEps,
+            normEps: shape.normEps,
             hasQKVBias: true
         )
-    }
-
-    public static func hopsPerToken(layerCount: Int, modelLayers: Int = Qwen15BShape.nLayer) -> Int {
-        precondition(layerCount > 0)
-        return (modelLayers + layerCount - 1) / layerCount
     }
 
     public var inputBytes: Int { dim * laneSpatial * 2 }
