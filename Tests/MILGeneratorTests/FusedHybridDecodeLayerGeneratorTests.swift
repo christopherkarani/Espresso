@@ -21,6 +21,27 @@ final class FusedHybridDecodeLayerGeneratorTests: XCTestCase {
         XCTAssertEqual(gen.outputByteSizes.count, 3)
         XCTAssertEqual(FusedHybridDecodeLayerGenerator.hopsPerToken(nLayer: 28), 28)
         XCTAssertEqual(FusedHybridDecodeLayerGenerator.phase11MaxN, 1)
+        XCTAssertEqual(FusedHybridDecodeLayerGenerator.decodePathLabel, "fused")
+    }
+
+    func test_qwen15b_shape_catalog_and_hops_live_on_layer() {
+        let shape = FusedHybridDecodeLayerGenerator.Qwen15BShape.self
+        XCTAssertEqual(shape.nLayer, 28)
+        XCTAssertEqual(shape.dModel, 1536)
+        XCTAssertEqual(shape.nHead, 12)
+        XCTAssertEqual(shape.nKVHead, 2)
+        XCTAssertEqual(shape.headDim, 128)
+        XCTAssertEqual(shape.hiddenDim, 8960)
+        XCTAssertEqual(shape.qDim, 1536)
+        XCTAssertEqual(shape.kvDim, 256)
+        XCTAssertEqual(shape.ropeTheta, 1_000_000)
+        XCTAssertEqual(shape.normEps, 1e-6)
+        XCTAssertEqual(shape.laneSpatial, 32)
+        XCTAssertEqual(FusedHybridDecodeLayerGenerator.hopsPerToken(), 28)
+        XCTAssertEqual(FusedHybridDecodeLayerGenerator.hopsPerToken(nLayer: 28, blockSize: 1), 28)
+        XCTAssertEqual(FusedHybridDecodeLayerGenerator.hopsPerToken(nLayer: 28, blockSize: 2), 14)
+        XCTAssertEqual(FusedHybridDecodeLayerGenerator.hopsPerToken(nLayer: 28, blockSize: 4), 7)
+        XCTAssertEqual(FusedHybridDecodeLayerGenerator.hopsPerToken(nLayer: 28, blockSize: 7), 4)
     }
 
     func test_input_and_output_names_are_alphabetical() {

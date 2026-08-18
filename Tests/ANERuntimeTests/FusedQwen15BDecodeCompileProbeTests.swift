@@ -94,7 +94,7 @@ final class FusedHybridDecodeBlockSpecTests: XCTestCase {
         XCTAssertTrue(spec.milText.contains("func main<ios18>"))
         XCTAssertTrue(spec.milText.contains("l0_bq.bin"))
         XCTAssertGreaterThan(spec.weightBlobBytes, 80_000_000)
-        XCTAssertEqual(FusedHybridDecodeBlockGenerator.hopsPerToken(layerCount: 1), 28)
+        XCTAssertEqual(FusedHybridDecodeLayerGenerator.hopsPerToken(nLayer: 28, blockSize: 1), 28)
     }
 }
 

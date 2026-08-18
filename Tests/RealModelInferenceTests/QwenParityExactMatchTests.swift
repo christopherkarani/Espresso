@@ -2,6 +2,7 @@ import ANETypes
 import Darwin
 import ESPRuntime
 import Foundation
+import MILGenerator
 import ModelSupport
 import Testing
 @testable import RealModelInference
@@ -389,10 +390,10 @@ private func assertQwenGreedyParityMatchesPyTorchReferenceOnANE(
     }
     #expect(snapshots.count == cases.count + 2)
     let expectedDecodePath = ModelFamily.isQwen15BVariant(config)
-        ? RealModelInferenceEngine.fusedDecodePathLabel
+        ? FusedHybridDecodeLayerGenerator.decodePathLabel
         : "hybrid"
     #expect(snapshots.allSatisfy { $0.decodePath == expectedDecodePath })
-    if expectedDecodePath == RealModelInferenceEngine.fusedDecodePathLabel {
+    if expectedDecodePath == FusedHybridDecodeLayerGenerator.decodePathLabel {
         #expect(snapshots.allSatisfy { $0.hopsPerToken == 28 })
         #expect(snapshots.allSatisfy { $0.cachedBindingsEnabled == false })
         #expect(snapshots.allSatisfy { $0.exactHeadBackend == "cpu_fp16_tiled" })

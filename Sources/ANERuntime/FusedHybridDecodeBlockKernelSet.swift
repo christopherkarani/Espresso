@@ -17,7 +17,10 @@ public struct FusedHybridDecodeBlockCompileReport: Sendable {
     public let errorDescription: String?
 
     public var hopsPerToken: Int {
-        FusedHybridDecodeBlockGenerator.hopsPerToken(layerCount: layerCount)
+        FusedHybridDecodeLayerGenerator.hopsPerToken(
+            nLayer: FusedHybridDecodeLayerGenerator.Qwen15BShape.nLayer,
+            blockSize: layerCount
+        )
     }
 }
 
@@ -52,10 +55,10 @@ public enum FusedHybridDecodeBlockKernelSet {
     }
 
     public static func dummyQwen15BWeightBlobs(layerCount: Int, value: Float = 0.01) -> [(path: String, data: Data)] {
-        let dim = FusedHybridDecodeBlockGenerator.Qwen15BShape.dModel
-        let qDim = FusedHybridDecodeBlockGenerator.Qwen15BShape.qDim
-        let kvDim = FusedHybridDecodeBlockGenerator.Qwen15BShape.kvDim
-        let hidden = FusedHybridDecodeBlockGenerator.Qwen15BShape.hiddenDim
+        let dim = FusedHybridDecodeLayerGenerator.Qwen15BShape.dModel
+        let qDim = FusedHybridDecodeLayerGenerator.Qwen15BShape.qDim
+        let kvDim = FusedHybridDecodeLayerGenerator.Qwen15BShape.kvDim
+        let hidden = FusedHybridDecodeLayerGenerator.Qwen15BShape.hiddenDim
         var blobs: [(path: String, data: Data)] = []
         blobs.reserveCapacity(layerCount * 11)
         for layer in 0..<layerCount {

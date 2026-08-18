@@ -202,7 +202,7 @@ let package = Package(
         ),
         .target(
             name: "RealModelInference",
-            dependencies: ["ModelSupport", "ANEGraphIR", "ANEBuilder", "ANECodegen", "ANEPasses", "ANERuntime", "ANETypes", "ANEInterop", "CPUOps", "Espresso"],
+            dependencies: ["ModelSupport", "ANEGraphIR", "ANEBuilder", "ANECodegen", "ANEPasses", "ANERuntime", "ANETypes", "ANEInterop", "CPUOps", "Espresso", "MILGenerator"],
             path: "Sources/RealModelInference",
             swiftSettings: [.swiftLanguageMode(.v6)],
             linkerSettings: [
@@ -235,7 +235,7 @@ let package = Package(
             name: "RealModelInferenceTests",
             dependencies: [
                 "RealModelInference", "ModelSupport", "ANEGraphIR", "ANETypes", "Espresso",
-                "ESPRuntime", "ESPBundle",
+                "ESPRuntime", "ESPBundle", "MILGenerator", "ANERuntime",
             ],
             path: "Tests/RealModelInferenceTests",
             resources: [.copy("Fixtures")],

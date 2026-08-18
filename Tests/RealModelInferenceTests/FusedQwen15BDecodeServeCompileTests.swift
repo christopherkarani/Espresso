@@ -2,6 +2,7 @@ import XCTest
 import Foundation
 import ANERuntime
 import ESPRuntime
+import MILGenerator
 import ModelSupport
 @testable import RealModelInference
 
@@ -45,9 +46,8 @@ final class FusedQwen15BDecodeServeCompileTests: XCTestCase {
         XCTAssertEqual(kernels.dim, 1536)
         XCTAssertEqual(kernels.kvDim, 256)
         XCTAssertEqual(kernels.maxSeq, 32)
-        XCTAssertEqual(FusedHybridDecodeLayerKernelSet.phase11MaxN, 1)
-        XCTAssertEqual(FusedHybridDecodeLayerKernelSet.hopsPerToken(nLayer: 28), 28)
-        XCTAssertEqual(FusedHybridDecodeLayerKernelSet.decodePathLabel, "fused")
-        XCTAssertEqual(FusedHybridDecodeLayerKernelSet.fallbackStage, "fused_hybrid_decode")
+        XCTAssertEqual(FusedHybridDecodeLayerGenerator.phase11MaxN, 1)
+        XCTAssertEqual(FusedHybridDecodeLayerGenerator.hopsPerToken(nLayer: 28), 28)
+        XCTAssertEqual(FusedHybridDecodeLayerGenerator.decodePathLabel, "fused")
     }
 }

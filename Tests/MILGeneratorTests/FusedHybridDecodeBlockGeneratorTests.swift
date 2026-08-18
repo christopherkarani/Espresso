@@ -29,7 +29,6 @@ final class FusedHybridDecodeBlockGeneratorTests: XCTestCase {
         XCTAssertFalse(mil.contains("tanh"), "Tanh SiLU identity must stay opt-in")
         XCTAssertEqual(gen.inputByteSizes, [1536 * 32 * 2])
         XCTAssertEqual(gen.outputByteSizes, [1536 * 32 * 2])
-        XCTAssertEqual(FusedHybridDecodeBlockGenerator.hopsPerToken(layerCount: 1), 28)
     }
 
     func test_qwen15b_n2_emits_two_layer_weight_prefixes() {
@@ -40,9 +39,6 @@ final class FusedHybridDecodeBlockGeneratorTests: XCTestCase {
         XCTAssertTrue(mil.contains("l1_w1.bin"))
         XCTAssertTrue(mil.contains("l0_bq.bin"))
         XCTAssertTrue(mil.contains("l1_bq.bin"))
-        XCTAssertEqual(FusedHybridDecodeBlockGenerator.hopsPerToken(layerCount: 2), 14)
-        XCTAssertEqual(FusedHybridDecodeBlockGenerator.hopsPerToken(layerCount: 4), 7)
-        XCTAssertEqual(FusedHybridDecodeBlockGenerator.hopsPerToken(layerCount: 7), 4)
     }
 
     func test_ssa_names_are_unique_for_n4() {
@@ -61,19 +57,5 @@ final class FusedHybridDecodeBlockGeneratorTests: XCTestCase {
             }
         }
         XCTAssertEqual(names.count, Set(names).count, "Duplicate SSA names in N=4 fused block")
-    }
-
-    func test_shape_constants_match_qwen15b_contract() {
-        let shape = FusedHybridDecodeBlockGenerator.Qwen15BShape.self
-        XCTAssertEqual(shape.nLayer, 28)
-        XCTAssertEqual(shape.dModel, 1536)
-        XCTAssertEqual(shape.nHead, 12)
-        XCTAssertEqual(shape.nKVHead, 2)
-        XCTAssertEqual(shape.headDim, 128)
-        XCTAssertEqual(shape.hiddenDim, 8960)
-        XCTAssertEqual(shape.qDim, 1536)
-        XCTAssertEqual(shape.kvDim, 256)
-        XCTAssertEqual(shape.ropeTheta, 1_000_000)
-        XCTAssertEqual(shape.normEps, 1e-6)
     }
 }

@@ -1,6 +1,7 @@
 import Foundation
 import Testing
 import ANETypes
+import MILGenerator
 import ModelSupport
 @testable import RealModelInference
 
@@ -381,8 +382,8 @@ import ModelSupport
             environment: ["ESPRESSO_ENABLE_FUSED_HYBRID_DECODE": "1"]
         ) == true
     )
-    #expect(RealModelInferenceEngine.fusedHopsPerToken(nLayer: 28) == 28)
-    #expect(RealModelInferenceEngine.fusedDecodePathLabel == "fused")
+    #expect(FusedHybridDecodeLayerGenerator.hopsPerToken(nLayer: 28) == 28)
+    #expect(FusedHybridDecodeLayerGenerator.decodePathLabel == "fused")
     let missing = RealModelInferenceEngine.fusedHybridFallbackError(reason: "missing N=1 kernel")
     guard case let .hybridFallbackDisabled(stage, reason) = missing else {
         Issue.record("expected hybridFallbackDisabled, got \(missing)")
