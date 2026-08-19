@@ -54,6 +54,16 @@ func chatPowerFooter(
     )
 }
 
+/// Published chat TTFT is submit→first token including prefill, not LM-head-only.
+func applyPublishedGenerateTiming(
+    prefillMs: Double,
+    ttftIncludingPrefillMs: Double,
+    to footer: inout ChatStatusFooter
+) {
+    footer.prefillMs = prefillMs
+    footer.ttftMs = max(ttftIncludingPrefillMs, prefillMs)
+}
+
 func chatPowerUnavailableMessage(_ capability: PowerCapability) -> String {
     let message = capability.message.trimmingCharacters(in: .whitespacesAndNewlines)
     let lowered = message.lowercased()
@@ -69,6 +79,7 @@ func chatPowerUnavailableMessage(_ capability: PowerCapability) -> String {
 struct ChatStatusFooter: Equatable, Sendable {
     var tokensPerSecond: Double
     var ttftMs: Double
+    var prefillMs: Double = 0
     var decodePath: String
     var contextUsed: Int
     var contextMax: Int
@@ -77,7 +88,8 @@ struct ChatStatusFooter: Equatable, Sendable {
     func render() -> String {
         let tok = tokensPerSecond.isFinite ? String(format: "%.1f", tokensPerSecond) : "—"
         let ttft = ttftMs.isFinite ? String(format: "%.0f", ttftMs) : "—"
-        let metrics = "tok/s \(tok)  TTFT \(ttft)ms  path=\(decodePath)  ctx \(contextUsed)/\(contextMax)"
+        let prefill = prefillMs.isFinite ? String(format: "%.0f", prefillMs) : "—"
+        let metrics = "tok/s \(tok)  TTFT \(ttft)ms  prefill \(prefill)ms  path=\(decodePath)  ctx \(contextUsed)/\(contextMax)"
         return metrics + "\n" + power.render()
     }
 

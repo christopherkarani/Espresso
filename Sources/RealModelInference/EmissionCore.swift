@@ -34,7 +34,9 @@ struct EmissionCore {
     private let startNanos: UInt64
     /// Clock of the previous emission (initialized to session start).
     private var lastEmissionNanos: UInt64
+    private var clock: GenerateClock
     private var firstTokenLatencyMsValue = 0.0
+    private var prefillMsValue = 0.0
     private var firstTokenRecorded = false
 
     /// Prompt plus every fully emitted token; the text carrier.
@@ -53,14 +55,17 @@ struct EmissionCore {
         eos: EOSPolicy,
         onStep: ((GenerationStep) -> Void)?,
         decodeText: @escaping ([Int]) -> String,
-        startNanos: UInt64 = DispatchTime.now().uptimeNanoseconds
+        startNanos: UInt64 = DispatchTime.now().uptimeNanoseconds,
+        clock: GenerateClock? = nil
     ) {
         self.eosTokenID = switch eos {
         case .fixed(let tokenID): tokenID
         case .fromConfig(let tokenID): tokenID
         }
-        self.startNanos = startNanos
-        self.lastEmissionNanos = startNanos
+        let resolvedClock = clock ?? GenerateClock(submitNS: startNanos)
+        self.clock = resolvedClock
+        self.startNanos = resolvedClock.submitNS
+        self.lastEmissionNanos = resolvedClock.submitNS
         self.allTokens = promptTokens
         self.generatedTokens = []
         self.generatedTokens.reserveCapacity(capacity)
@@ -95,7 +100,10 @@ struct EmissionCore {
     /// closure-style loops whose only capture point is the emit itself.
     mutating func recordFirstTokenIfFirst(at now: UInt64) {
         guard !firstTokenRecorded else { return }
-        firstTokenLatencyMsValue = Self.milliseconds(from: now - startNanos)
+        clock.markPrefillEnd(at: now)
+        let timing = clock.timing(firstTokenNS: now)
+        firstTokenLatencyMsValue = timing.firstTokenLatencyMs
+        prefillMsValue = timing.prefillMs
         firstTokenRecorded = true
     }
 
@@ -123,6 +131,7 @@ struct EmissionCore {
                 tokenLatencyMs: tokenLatencyMs,
                 elapsedMs: elapsedMs,
                 firstTokenLatencyMs: firstTokenLatencyMsValue,
+                prefillMs: prefillMsValue,
                 tokensPerSecond: tokensPerSecond
             )
         )
@@ -161,6 +170,7 @@ struct EmissionCore {
             ),
             compileTimeMs: compileTimeMs,
             firstTokenLatencyMs: firstTokenLatencyMsValue,
+            prefillMs: prefillMsValue,
             exactHeadBackend: exactHeadBackend ?? "unknown",
             cachedBindingsEnabled: cachedBindingsEnabled,
             committedExactTokensPerPass: committedExactTokensPerPass,

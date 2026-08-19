@@ -1367,6 +1367,46 @@ private func makeStubDemoDefaults(root: URL) -> DemoDefaults {
     #expect(!rendered.contains("J/tok"))
 }
 
+@Test func test_chatFooterPublishedTTFTIncludesPrefillNotHeadOnly() {
+    var footer = ChatStatusFooter(
+        tokensPerSecond: 2.1,
+        ttftMs: 21,
+        decodePath: "hybrid",
+        contextUsed: 64,
+        contextMax: 1024
+    )
+    applyPublishedGenerateTiming(prefillMs: 80, ttftIncludingPrefillMs: 101, to: &footer)
+    #expect(footer.prefillMs == 80)
+    #expect(footer.ttftMs == 101)
+    #expect(footer.ttftMs >= footer.prefillMs)
+    #expect(footer.ttftMs != 21)
+    let rendered = footer.render()
+    #expect(rendered.contains("TTFT 101ms"))
+    #expect(rendered.contains("prefill 80ms"))
+}
+
+@Test func test_generateJSONTimingFieldsPublishIncludingPrefillTTFT() {
+    let metrics = BackendRunMetrics(
+        backend: "espresso",
+        text: "hi",
+        generatedTokens: [1],
+        promptTokens: [9, 8, 7, 6],
+        compileTimeMs: 10,
+        firstTokenLatencyMs: 101,
+        prefillMs: 80,
+        tokensPerSecond: 2,
+        medianTokenMs: 21,
+        p95TokenMs: 21,
+        totalTimeMs: 200,
+        tokenLatenciesMs: [21]
+    )
+    let fields = generateTimingJSONFields(from: metrics)
+    #expect(fields["prefill_ms"] == 80)
+    #expect(fields["ttft_including_prefill_ms"] == 101)
+    #expect(fields["first_token_latency_ms"] == fields["ttft_including_prefill_ms"])
+    #expect(fields["first_token_latency_ms"]! >= fields["prefill_ms"]!)
+}
+
 @Test func test_joulesPerTokenIsPackageWattsDividedByTokensPerSecond() {
     #expect(joulesPerToken(packageWatts: 3.25, tokensPerSecond: 13) == 0.25)
     #expect(joulesPerToken(packageWatts: 4, tokensPerSecond: 8) == 0.5)

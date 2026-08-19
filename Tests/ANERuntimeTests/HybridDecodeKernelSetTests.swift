@@ -76,6 +76,61 @@ final class HybridDecodeKernelSetTests: XCTestCase {
         XCTAssertTrue(specs[2].milText.contains("w2.bin"))
     }
 
+    func test_prefill_compile_specs_exist_for_seq64_and_seq256() {
+        let weights = makeHybridTestLayerWeights()
+        XCTAssertEqual(HybridDecodeKernelSet.prefillSequenceLengths, [64, 256])
+        for seq in HybridDecodeKernelSet.prefillSequenceLengths {
+            let specs = HybridDecodeKernelSet.prefillCompileSpecs(weights: weights, sequenceLength: seq)
+            XCTAssertEqual(specs.count, 3)
+            XCTAssertEqual(specs[0].kind, .decodeQKVOnly)
+            XCTAssertEqual(specs[1].kind, .decodeProjection)
+            XCTAssertEqual(specs[2].kind, .decodeFFN)
+            XCTAssertEqual(specs[0].inputSizes, [ModelConfig.dim * seq * 2])
+            XCTAssertEqual(specs[2].inputSizes, [ModelConfig.dim * seq * 2])
+        }
+    }
+
+    func test_prefill_kernel_compile_seq64_when_ane_available() throws {
+        try requireHybridANEHardware()
+        let weights = makeHybridTestLayerWeights()
+        let kernels = try HybridDecodeKernelSet(prefillWeights: weights, sequenceLength: 64)
+        XCTAssertEqual(kernels.laneSpatial, 64)
+        XCTAssertEqual(kernels.maxSeq, 64)
+    }
+
+    func test_prefill_qkv_eval_records_wall_next_to_lastHWExecutionTimeNS() throws {
+        try requireHybridANEHardware()
+        let weights = makeHybridTestLayerWeights()
+        let kernels = try HybridDecodeKernelSet(prefillWeights: weights, sequenceLength: 64)
+        do {
+            try kernels.decodeQKVOnly.eval()
+        } catch {
+            throw XCTSkip("ANE QKV eval unavailable: \(error)")
+        }
+        print(
+            "eval_timing wall_us=\(kernels.decodeQKVOnly.lastEvalWallMicroseconds) hw_ns=\(kernels.decodeQKVOnly.lastEvalHWExecutionTimeNS) lastHW=\(kernels.decodeQKVOnly.lastHWExecutionTimeNS())"
+        )
+        XCTAssertGreaterThan(kernels.decodeQKVOnly.lastEvalWallMicroseconds, 0)
+        XCTAssertEqual(
+            kernels.decodeQKVOnly.lastEvalHWExecutionTimeNS,
+            kernels.decodeQKVOnly.lastHWExecutionTimeNS()
+        )
+        if kernels.decodeQKVOnly.lastEvalHWExecutionTimeNS > 0 {
+            XCTAssertGreaterThanOrEqual(
+                kernels.decodeQKVOnly.lastEvalWallNanoseconds,
+                kernels.decodeQKVOnly.lastEvalHWExecutionTimeNS
+            )
+        }
+    }
+
+    func test_prefill_kernel_compile_seq256_when_ane_available() throws {
+        try requireHybridANEHardware()
+        let weights = makeHybridTestLayerWeights()
+        let kernels = try HybridDecodeKernelSet(prefillWeights: weights, sequenceLength: 256)
+        XCTAssertEqual(kernels.laneSpatial, 256)
+        XCTAssertEqual(kernels.maxSeq, 256)
+    }
+
     func test_compile_specs_include_gpt2_layernorm_and_bias_weights() {
         let weights = makeHybridTestLayerWeights().withArchitecture(.gpt2)
         let specs = HybridDecodeKernelSet.compileSpecs(weights: weights, maxSeq: 17)

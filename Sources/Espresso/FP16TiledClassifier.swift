@@ -1,5 +1,6 @@
 import Accelerate
 import ANEInterop
+import Dispatch
 
 /// FP16 tiled classifier: converts FP16 weights in L2-sized tiles, runs sgemm on L2-resident FP32 data.
 ///
@@ -167,5 +168,118 @@ public enum FP16TiledClassifier {
                 Int32(dim)
             )
         )
+    }
+
+    /// Isolated BNNS FP16 8-shard GEMV argmax. Same first-max rule as tiled/streaming.
+    public static let eightShardCount = 8
+
+    public static func shardRowRange(vocabSize: Int, shard: Int, shardCount: Int = eightShardCount) -> Range<Int> {
+        precondition(vocabSize > 0)
+        precondition(shardCount > 0)
+        precondition(shard >= 0 && shard < shardCount)
+        let base = vocabSize / shardCount
+        let rem = vocabSize % shardCount
+        let start = shard * base + min(shard, rem)
+        let count = base + (shard < rem ? 1 : 0)
+        return start..<(start + count)
+    }
+
+    @inline(__always)
+    public static func bnnsEightShardMatvecArgmax(
+        weights: UnsafePointer<UInt16>,
+        input: UnsafePointer<Float>,
+        vocabSize: Int,
+        dim: Int
+    ) -> Int {
+        precondition(vocabSize > 0)
+        precondition(dim > 0)
+        let shardCount = eightShardCount
+        let shardMax = UnsafeMutablePointer<Float>.allocate(capacity: shardCount)
+        let shardIdx = UnsafeMutablePointer<Int>.allocate(capacity: shardCount)
+        defer {
+            shardMax.deallocate()
+            shardIdx.deallocate()
+        }
+        for shard in 0..<shardCount {
+            shardMax[shard] = -.greatestFiniteMagnitude
+            shardIdx[shard] = 0
+        }
+
+        nonisolated(unsafe) let weightsPtr = weights
+        nonisolated(unsafe) let inputPtr = input
+        nonisolated(unsafe) let shardMaxPtr = shardMax
+        nonisolated(unsafe) let shardIdxPtr = shardIdx
+        DispatchQueue.concurrentPerform(iterations: shardCount) { shard in
+            let range = shardRowRange(vocabSize: vocabSize, shard: shard, shardCount: shardCount)
+            guard !range.isEmpty else { return }
+            _ = ane_interop_amx_shared_resource_hint(1, Int32(shard), 2)
+            defer { _ = ane_interop_amx_shared_resource_hint(0, Int32(shard), 2) }
+
+            let rows = range.count
+            let tileFP32 = UnsafeMutablePointer<Float>.allocate(capacity: rows * dim)
+            let logits = UnsafeMutablePointer<Float>.allocate(capacity: rows)
+            defer {
+                tileFP32.deallocate()
+                logits.deallocate()
+            }
+
+            let fp16Ptr = UnsafeMutableRawPointer(mutating: weightsPtr.advanced(by: range.lowerBound * dim))
+            var srcBuf = vImage_Buffer(
+                data: fp16Ptr,
+                height: 1,
+                width: vImagePixelCount(rows * dim),
+                rowBytes: rows * dim * MemoryLayout<UInt16>.stride
+            )
+            var dstBuf = vImage_Buffer(
+                data: UnsafeMutableRawPointer(tileFP32),
+                height: 1,
+                width: vImagePixelCount(rows * dim),
+                rowBytes: rows * dim * MemoryLayout<Float>.stride
+            )
+            vImageConvert_Planar16FtoPlanarF(&srcBuf, &dstBuf, 0)
+
+            let bnnsRC = ane_interop_bnns_fp32_gemv(
+                UnsafePointer(tileFP32),
+                inputPtr,
+                logits,
+                Int32(rows),
+                Int32(dim),
+                1
+            )
+            if bnnsRC != 0 {
+                BLAS.sgemm(
+                    CblasRowMajor,
+                    CblasNoTrans,
+                    CblasNoTrans,
+                    m: Int32(rows),
+                    n: 1,
+                    k: Int32(dim),
+                    alpha: 1.0,
+                    a: UnsafePointer(tileFP32),
+                    lda: Int32(dim),
+                    b: inputPtr,
+                    ldb: 1,
+                    beta: 0.0,
+                    c: logits,
+                    ldc: 1
+                )
+            }
+
+            var tileMax: Float = 0
+            var tileMaxIdx: vDSP_Length = 0
+            vDSP_maxvi(logits, 1, &tileMax, &tileMaxIdx, vDSP_Length(rows))
+            shardMaxPtr[shard] = tileMax
+            shardIdxPtr[shard] = range.lowerBound + Int(tileMaxIdx)
+        }
+
+        var bestValue: Float = -.greatestFiniteMagnitude
+        var bestIndex = 0
+        for shard in 0..<shardCount {
+            if shardMax[shard] > bestValue {
+                bestValue = shardMax[shard]
+                bestIndex = shardIdx[shard]
+            }
+        }
+        return bestIndex
     }
 }

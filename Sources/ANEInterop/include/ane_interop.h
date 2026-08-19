@@ -151,6 +151,26 @@ int ane_interop_fp16_gemv_argmax(const void *weights_f16,
                                  int vocab_size,
                                  int dim);
 
+/// FP32 GEMV via BNNS with `n_threads` (use 1 per AMX shard). Returns 0 on success.
+int ane_interop_bnns_fp32_gemv(const float *weights,
+                               const float *input,
+                               float *out,
+                               int rows,
+                               int dim,
+                               int n_threads);
+
+/// FP32 GEMM via BNNS: C[m,n] = A[m,k] * B[k,n], all row-major. `n_threads` 1 per shard.
+int ane_interop_bnns_fp32_gemm(const float *a,
+                               const float *b,
+                               float *c,
+                               int m,
+                               int n,
+                               int k,
+                               int n_threads);
+
+/// Best-effort `__bsdthread_ctl` shared-resource hint (0x2000). Returns 0 on success.
+int ane_interop_amx_shared_resource_hint(int enable, int worker_index, int cluster_concurrency);
+
 /// NEON-vectorized contiguous FP16 argmax. Returns index and value of the max
 /// element. On ties, the lowest index wins (first-max semantics).
 void ane_interop_neon_argmax_f16(const void *src, int count,
