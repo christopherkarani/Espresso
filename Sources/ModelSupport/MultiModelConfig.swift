@@ -16,11 +16,14 @@ public struct MultiModelConfig: Sendable, Equatable {
     public let eosToken: TokenID?
     public let architecture: Architecture
 
-    /// What the artifact itself declares about where it should decode.
+    /// Coarse artifact preference for decode placement (hybrid family vs exact-CPU).
     ///
     /// When an artifact states this, the runtime honours it instead of guessing from the
     /// model name. `nil` means the artifact is silent and legacy name-based routing
     /// applies, which keeps older bundles behaving exactly as before.
+    ///
+    /// Fused vs split hybrid is **not** declared here — that is runtime policy resolved
+    /// into ``Trunk``. See ``Trunk`` and `CONTEXT.md`.
     public let preferredDecodePath: PreferredDecodePath?
 
     public var attentionDim: Int { nHead * headDim }
@@ -31,6 +34,10 @@ public struct MultiModelConfig: Sendable, Equatable {
         case llama
     }
 
+    /// Wire-format preference in `metadata.json` / bundle manifests.
+    ///
+    /// Only distinguishes the ANE hybrid family from exact-CPU. Resolved serving uses
+    /// ``Trunk`` (`fusedHybrid` | `splitHybrid` | `exactCPU`).
     public enum PreferredDecodePath: String, Sendable, Equatable {
         case hybrid
         case exactCPU = "exact_cpu"
