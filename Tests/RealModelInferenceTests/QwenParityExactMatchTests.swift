@@ -295,9 +295,11 @@ private func assertQwenGreedyFixtureCoversTheRequiredSuite(profile: QwenParityPr
         exactHeadBackend: "cpu_fp16_tiled",
         decodeProfileReport: "decode_profile_mean_ms/token qkv=1.00 rope=2.00 attn=3.00 ffn=4.00 lm_head=5.00 io=6.00 n=1 exclude_ttft=1"
     )
+    #expect(original.trunk == nil)
     #expect(original.decodePath == "unknown")
     #expect(original.hopsPerToken == nil)
-    let labeled = original.withDecodePath("hybrid")
+    let labeled = original.withTrunk(.splitHybrid)
+    #expect(labeled.trunk == .splitHybrid)
     #expect(labeled.decodePath == "hybrid")
     #expect(labeled.hopsPerToken == nil)
     #expect(labeled.tokens == original.tokens)
@@ -356,12 +358,13 @@ private func assertQwenGreedyParityMatchesPyTorchReferenceOnANE(
     let weightDir = bundle.archive.weightsURL.path
     #expect(config.preferredDecodePath == .hybrid)
     #expect(config.name == profile.displayName)
-    // With fallback disabled this artifact must resolve to the ANE hybrid path, never CPU.
+    // With fallback disabled this artifact must resolve to an ANE hybrid trunk, never CPU.
+    let expectedTrunk: Trunk = ModelFamily.isQwen15BVariant(config) ? .fusedHybrid : .splitHybrid
     #expect(
-        try RealModelInferenceEngine.resolvedLlamaGenerationPath(
+        try RealModelInferenceEngine.resolvedTrunk(
             config: config,
             environment: ["ESPRESSO_REALMODEL_DISABLE_HYBRID_FALLBACK": "1"]
-        ) == .hybrid
+        ) == expectedTrunk
     )
 
     let cases = fixture.cases
@@ -388,11 +391,9 @@ private func assertQwenGreedyParityMatchesPyTorchReferenceOnANE(
         )
     }
     #expect(snapshots.count == cases.count + 2)
-    let expectedDecodePath = ModelFamily.isQwen15BVariant(config)
-        ? RealModelInferenceEngine.fusedDecodePathLabel
-        : "hybrid"
+    let expectedDecodePath = expectedTrunk.telemetryLabel
     #expect(snapshots.allSatisfy { $0.decodePath == expectedDecodePath })
-    if expectedDecodePath == RealModelInferenceEngine.fusedDecodePathLabel {
+    if expectedTrunk == .fusedHybrid {
         #expect(snapshots.allSatisfy { $0.hopsPerToken == 28 })
         #expect(snapshots.allSatisfy { $0.cachedBindingsEnabled == false })
         #expect(snapshots.allSatisfy { $0.exactHeadBackend == "cpu_fp16_tiled" })

@@ -26,12 +26,18 @@ public struct GenerationResult: Sendable {
     public let cachedBindingsEnabled: Bool
     public let committedExactTokensPerPass: Double?
     public let acceptedFutureTokensPerPass: Double?
-    /// `"hybrid"`, `"fused"`, or `"exact_cpu"` for llama generate paths; `"unknown"` otherwise.
-    public let decodePath: String
+    /// Resolved llama serving trunk. `nil` when the run is not on a typed llama trunk
+    /// (for example GPT-2), which telemetry still reports as `"unknown"`.
+    public let trunk: Trunk?
     /// ANE hops per generated token. Fused N=1 is `nLayer`; split hybrid is `2 * nLayer`.
     public let hopsPerToken: Int?
     /// Hybrid per-token bucket report from `HybridDecodeTokenProfile.formatReport()`.
     public let decodeProfileReport: String?
+
+    /// Stable telemetry label: `Trunk.telemetryLabel`, or `"unknown"` when `trunk` is nil.
+    public var decodePath: String {
+        trunk?.telemetryLabel ?? "unknown"
+    }
 
     public init(
         text: String,
@@ -45,7 +51,7 @@ public struct GenerationResult: Sendable {
         cachedBindingsEnabled: Bool = false,
         committedExactTokensPerPass: Double? = nil,
         acceptedFutureTokensPerPass: Double? = nil,
-        decodePath: String = "unknown",
+        trunk: Trunk? = nil,
         hopsPerToken: Int? = nil,
         decodeProfileReport: String? = nil
     ) {
@@ -60,12 +66,53 @@ public struct GenerationResult: Sendable {
         self.cachedBindingsEnabled = cachedBindingsEnabled
         self.committedExactTokensPerPass = committedExactTokensPerPass
         self.acceptedFutureTokensPerPass = acceptedFutureTokensPerPass
-        self.decodePath = decodePath
+        self.trunk = trunk
         self.hopsPerToken = hopsPerToken
         self.decodeProfileReport = decodeProfileReport
     }
 
-    public func withDecodePath(_ path: String) -> GenerationResult {
+    /// Compatibility initializer that accepts a telemetry path label.
+    public init(
+        text: String,
+        tokens: [TokenID],
+        promptTokens: [TokenID],
+        tokenLatenciesMs: [Double] = [],
+        tokensPerSecond: Double,
+        compileTimeMs: Double,
+        firstTokenLatencyMs: Double,
+        exactHeadBackend: String = "unknown",
+        cachedBindingsEnabled: Bool = false,
+        committedExactTokensPerPass: Double? = nil,
+        acceptedFutureTokensPerPass: Double? = nil,
+        decodePath: String,
+        hopsPerToken: Int? = nil,
+        decodeProfileReport: String? = nil
+    ) {
+        let resolvedTrunk: Trunk?
+        if decodePath == "unknown" {
+            resolvedTrunk = nil
+        } else {
+            resolvedTrunk = try? Trunk.parseTelemetryLabel(decodePath)
+        }
+        self.init(
+            text: text,
+            tokens: tokens,
+            promptTokens: promptTokens,
+            tokenLatenciesMs: tokenLatenciesMs,
+            tokensPerSecond: tokensPerSecond,
+            compileTimeMs: compileTimeMs,
+            firstTokenLatencyMs: firstTokenLatencyMs,
+            exactHeadBackend: exactHeadBackend,
+            cachedBindingsEnabled: cachedBindingsEnabled,
+            committedExactTokensPerPass: committedExactTokensPerPass,
+            acceptedFutureTokensPerPass: acceptedFutureTokensPerPass,
+            trunk: resolvedTrunk,
+            hopsPerToken: hopsPerToken,
+            decodeProfileReport: decodeProfileReport
+        )
+    }
+
+    public func withTrunk(_ trunk: Trunk?) -> GenerationResult {
         GenerationResult(
             text: text,
             tokens: tokens,
@@ -78,10 +125,17 @@ public struct GenerationResult: Sendable {
             cachedBindingsEnabled: cachedBindingsEnabled,
             committedExactTokensPerPass: committedExactTokensPerPass,
             acceptedFutureTokensPerPass: acceptedFutureTokensPerPass,
-            decodePath: path,
+            trunk: trunk,
             hopsPerToken: hopsPerToken,
             decodeProfileReport: decodeProfileReport
         )
+    }
+
+    public func withDecodePath(_ path: String) -> GenerationResult {
+        if path == "unknown" {
+            return withTrunk(nil)
+        }
+        return withTrunk(try? Trunk.parseTelemetryLabel(path))
     }
 }
 
@@ -238,7 +292,7 @@ public struct RealModelInferenceEngine: ~Copyable {
 
     /// Phase 11 compiled `max_N = 1` only. Serve that N: one fused program per
     /// layer with attention in-graph (28 hops, no Metal QKV↔FFN sync).
-    static let fusedDecodePathLabel = FusedHybridDecodeLayerKernelSet.decodePathLabel
+    static let fusedDecodePathLabel = Trunk.fusedHybrid.telemetryLabel
     static let fusedHybridFallbackStage = FusedHybridDecodeLayerKernelSet.fallbackStage
 
     static func prefersFusedHybridDecode(
@@ -442,18 +496,18 @@ public struct RealModelInferenceEngine: ~Copyable {
         environment["ESPRESSO_REALMODEL_DISABLE_HYBRID_FALLBACK"] == "1"
     }
 
-    /// Resolves the llama decode path, refusing to leave the ANE silently.
+    /// Resolves the llama serving ``Trunk``, refusing to leave the ANE silently.
     ///
-    /// With `ESPRESSO_REALMODEL_DISABLE_HYBRID_FALLBACK=1`, landing on the pure-CPU path is
+    /// With `ESPRESSO_REALMODEL_DISABLE_HYBRID_FALLBACK=1`, landing on the pure-CPU trunk is
     /// a failure rather than a quiet downgrade, and the thrown error names which policy
     /// chose CPU so the cause is actionable instead of mysterious.
-    static func resolvedLlamaGenerationPath(
+    static func resolvedTrunk(
         config: MultiModelConfig,
         environment: [String: String]
-    ) throws -> LlamaGenerationPath {
-        let path = llamaGenerationPath(config: config, environment: environment)
-        guard path == .exactCPU, isHybridFallbackDisabled(environment: environment) else {
-            return path
+    ) throws -> Trunk {
+        let trunk = selectTrunk(config: config, environment: environment)
+        guard trunk == .exactCPU, isHybridFallbackDisabled(environment: environment) else {
+            return trunk
         }
         let reason: String
         if environment["ESPRESSO_USE_CPU_EXACT_DECODE"] == "1" {
@@ -468,9 +522,17 @@ public struct RealModelInferenceEngine: ~Copyable {
                 """
         }
         throw RealModelInferenceError.hybridFallbackDisabled(
-            stage: "llama decode path selection",
+            stage: "llama trunk selection",
             reason: reason
         )
+    }
+
+    /// Backward-compatible alias for ``resolvedTrunk``.
+    static func resolvedLlamaGenerationPath(
+        config: MultiModelConfig,
+        environment: [String: String]
+    ) throws -> Trunk {
+        try resolvedTrunk(config: config, environment: environment)
     }
 
     static func milDeploymentTarget(
@@ -515,16 +577,36 @@ public struct RealModelInferenceEngine: ~Copyable {
         return .normThenClassifier
     }
 
-    enum LlamaGenerationPath: Sendable, Equatable {
-        case hybrid
-        case exactCPU
+    /// Select the serving trunk for a llama-family config (no fallback-disabled gate).
+    static func selectTrunk(
+        config: MultiModelConfig,
+        environment: [String: String]
+    ) -> Trunk {
+        if prefersCPUExactDecode(config: config, environment: environment) {
+            return .exactCPU
+        }
+        if prefersFusedHybridDecode(config: config, environment: environment) {
+            return .fusedHybrid
+        }
+        return .splitHybrid
     }
 
+    /// Backward-compatible family discriminator used by older tests and call sites.
+    /// Prefer ``selectTrunk`` / ``resolvedTrunk`` for new code.
     static func llamaGenerationPath(
         config: MultiModelConfig,
         environment: [String: String]
-    ) -> LlamaGenerationPath {
-        prefersCPUExactDecode(config: config, environment: environment) ? .exactCPU : .hybrid
+    ) -> Trunk {
+        selectTrunk(config: config, environment: environment)
+    }
+
+    static func hopsPerToken(for trunk: Trunk, nLayer: Int) -> Int? {
+        switch trunk {
+        case .fusedHybrid:
+            return fusedHopsPerToken(nLayer: nLayer)
+        case .splitHybrid, .exactCPU:
+            return nil
+        }
     }
 
     struct TopLevelWeightPaths: Sendable, Equatable {
@@ -1643,21 +1725,14 @@ public struct RealModelInferenceEngine: ~Copyable {
         let environment = ProcessInfo.processInfo.environment
         if effectiveMaxTokens == 0 {
             let text = tokenizer.decode(promptTokens.map(Int.init))
-            let decodePath: String
+            let trunk: Trunk?
             let hopsPerToken: Int?
             if config.architecture == .llama {
-                if Self.llamaGenerationPath(config: config, environment: environment) == .exactCPU {
-                    decodePath = "exact_cpu"
-                    hopsPerToken = nil
-                } else if Self.prefersFusedHybridDecode(config: config, environment: environment) {
-                    decodePath = Self.fusedDecodePathLabel
-                    hopsPerToken = Self.fusedHopsPerToken(nLayer: config.nLayer)
-                } else {
-                    decodePath = "hybrid"
-                    hopsPerToken = nil
-                }
+                let selected = Self.selectTrunk(config: config, environment: environment)
+                trunk = selected
+                hopsPerToken = Self.hopsPerToken(for: selected, nLayer: config.nLayer)
             } else {
-                decodePath = "unknown"
+                trunk = nil
                 hopsPerToken = nil
             }
             return GenerationResult(
@@ -1667,7 +1742,7 @@ public struct RealModelInferenceEngine: ~Copyable {
                 tokensPerSecond: 0,
                 compileTimeMs: 0,
                 firstTokenLatencyMs: 0,
-                decodePath: decodePath,
+                trunk: trunk,
                 hopsPerToken: hopsPerToken
             )
         }
@@ -1694,7 +1769,7 @@ public struct RealModelInferenceEngine: ~Copyable {
                     onStep: onStep
                 )
             }
-            switch try Self.resolvedLlamaGenerationPath(
+            switch try Self.resolvedTrunk(
                 config: config,
                 environment: environment
             ) {
@@ -1709,33 +1784,32 @@ public struct RealModelInferenceEngine: ~Copyable {
                     onStep: onStep,
                     isCancelled: isCancelled
                 )
-            case .hybrid:
-                if Self.prefersFusedHybridDecode(config: config, environment: environment) {
-                    let compileStart = DispatchTime.now().uptimeNanoseconds
-                    let compileDidRun: Bool
-                    do {
-                        compileDidRun = try ensureFusedHybridCompiled(bucket: bucket)
-                    } catch let error as RealModelInferenceError {
-                        if case .hybridFallbackDisabled = error { throw error }
-                        throw Self.fusedHybridFallbackError(
-                            reason: error.errorDescription ?? "\(error)"
-                        )
-                    } catch {
-                        throw Self.fusedHybridFallbackError(reason: "\(error)")
-                    }
-                    let compileEnd = DispatchTime.now().uptimeNanoseconds
-                    let compileTimeMs = compileDidRun ? Self.milliseconds(from: compileEnd - compileStart) : 0
-                    return try generateIncrementalFusedHybridLlama(
-                        promptTokens: promptTokens,
-                        effectiveMaxTokens: effectiveMaxTokens,
-                        temperature: temperature,
-                        topP: topP,
-                        compileTimeMs: compileTimeMs,
-                        maxSeq: max(bucket, compiledFusedHybridBucket),
-                        onStep: onStep,
-                        isCancelled: isCancelled
+            case .fusedHybrid:
+                let compileStart = DispatchTime.now().uptimeNanoseconds
+                let compileDidRun: Bool
+                do {
+                    compileDidRun = try ensureFusedHybridCompiled(bucket: bucket)
+                } catch let error as RealModelInferenceError {
+                    if case .hybridFallbackDisabled = error { throw error }
+                    throw Self.fusedHybridFallbackError(
+                        reason: error.errorDescription ?? "\(error)"
                     )
+                } catch {
+                    throw Self.fusedHybridFallbackError(reason: "\(error)")
                 }
+                let compileEnd = DispatchTime.now().uptimeNanoseconds
+                let compileTimeMs = compileDidRun ? Self.milliseconds(from: compileEnd - compileStart) : 0
+                return try generateIncrementalFusedHybridLlama(
+                    promptTokens: promptTokens,
+                    effectiveMaxTokens: effectiveMaxTokens,
+                    temperature: temperature,
+                    topP: topP,
+                    compileTimeMs: compileTimeMs,
+                    maxSeq: max(bucket, compiledFusedHybridBucket),
+                    onStep: onStep,
+                    isCancelled: isCancelled
+                )
+            case .splitHybrid:
                 let compileStart = DispatchTime.now().uptimeNanoseconds
                 let compileDidRun = try ensureHybridCompiledLlama(bucket: bucket)
                 guard let metalAttention = hybridMetalAttention else {
@@ -2090,17 +2164,14 @@ public struct RealModelInferenceEngine: ~Copyable {
         )
 
         let environment = ProcessInfo.processInfo.environment
-        let path = try resolvedLlamaGenerationPath(
-            config: config,
-            environment: environment
-        )
-        let useFused = path == .hybrid && prefersFusedHybridDecode(
+        let trunk = try resolvedTrunk(
             config: config,
             environment: environment
         )
         var compileTimeMs = 0.0
         var metalAttention: MetalAttentionKernel?
-        if useFused {
+        switch trunk {
+        case .fusedHybrid:
             let compileStart = DispatchTime.now().uptimeNanoseconds
             let compileDidRun: Bool
             do {
@@ -2113,7 +2184,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             }
             let compileEnd = DispatchTime.now().uptimeNanoseconds
             compileTimeMs = compileDidRun ? milliseconds(from: compileEnd - compileStart) : 0
-        } else if path == .hybrid {
+        case .splitHybrid:
             let compileStart = DispatchTime.now().uptimeNanoseconds
             let compileDidRun = try engine.ensureHybridCompiledLlama(bucket: bucket)
             guard let attention = engine.hybridMetalAttention else {
@@ -2122,6 +2193,8 @@ public struct RealModelInferenceEngine: ~Copyable {
             metalAttention = attention
             let compileEnd = DispatchTime.now().uptimeNanoseconds
             compileTimeMs = compileDidRun ? milliseconds(from: compileEnd - compileStart) : 0
+        case .exactCPU:
+            break
         }
 
         var results: [GenerationResult] = []
@@ -2133,7 +2206,7 @@ public struct RealModelInferenceEngine: ~Copyable {
                     "Prompt of \(prompt.count) tokens leaves no room to generate within context \(config.maxSeq)"
                 )
             }
-            switch path {
+            switch trunk {
             case .exactCPU:
                 results.append(
                     try engine.generateIncrementalExactCPULlama(
@@ -2145,52 +2218,50 @@ public struct RealModelInferenceEngine: ~Copyable {
                         onStep: nil
                     )
                 )
-            case .hybrid:
-                if useFused {
-                    let result = try engine.generateIncrementalFusedHybridLlama(
+            case .fusedHybrid:
+                let result = try engine.generateIncrementalFusedHybridLlama(
+                    promptTokens: prompt,
+                    effectiveMaxTokens: effectiveMaxTokens,
+                    temperature: 0,
+                    compileTimeMs: results.isEmpty ? compileTimeMs : 0,
+                    maxSeq: max(bucket, engine.compiledFusedHybridBucket),
+                    onStep: nil
+                )
+                // Drop the profile string so the next ANE eval cannot smash a
+                // heap object that must survive the whole suite.
+                results.append(
+                    GenerationResult(
+                        text: result.text,
+                        tokens: result.tokens,
+                        promptTokens: result.promptTokens,
+                        tokenLatenciesMs: result.tokenLatenciesMs,
+                        tokensPerSecond: result.tokensPerSecond,
+                        compileTimeMs: result.compileTimeMs,
+                        firstTokenLatencyMs: result.firstTokenLatencyMs,
+                        exactHeadBackend: result.exactHeadBackend,
+                        cachedBindingsEnabled: result.cachedBindingsEnabled,
+                        committedExactTokensPerPass: result.committedExactTokensPerPass,
+                        acceptedFutureTokensPerPass: result.acceptedFutureTokensPerPass,
+                        trunk: result.trunk,
+                        hopsPerToken: result.hopsPerToken,
+                        decodeProfileReport: nil
+                    )
+                )
+            case .splitHybrid:
+                guard let attention = metalAttention else {
+                    throw RealModelInferenceError.runtimeFailure("Hybrid Metal attention unavailable for llama testing helper")
+                }
+                results.append(
+                    try engine.generateIncrementalHybridLlama(
                         promptTokens: prompt,
                         effectiveMaxTokens: effectiveMaxTokens,
                         temperature: 0,
                         compileTimeMs: results.isEmpty ? compileTimeMs : 0,
-                        maxSeq: max(bucket, engine.compiledFusedHybridBucket),
+                        maxSeq: bucket,
+                        metalAttention: attention,
                         onStep: nil
                     )
-                    // Drop the profile string so the next ANE eval cannot smash a
-                    // heap object that must survive the whole suite.
-                    results.append(
-                        GenerationResult(
-                            text: result.text,
-                            tokens: result.tokens,
-                            promptTokens: result.promptTokens,
-                            tokenLatenciesMs: result.tokenLatenciesMs,
-                            tokensPerSecond: result.tokensPerSecond,
-                            compileTimeMs: result.compileTimeMs,
-                            firstTokenLatencyMs: result.firstTokenLatencyMs,
-                            exactHeadBackend: result.exactHeadBackend,
-                            cachedBindingsEnabled: result.cachedBindingsEnabled,
-                            committedExactTokensPerPass: result.committedExactTokensPerPass,
-                            acceptedFutureTokensPerPass: result.acceptedFutureTokensPerPass,
-                            decodePath: result.decodePath,
-                            hopsPerToken: result.hopsPerToken,
-                            decodeProfileReport: nil
-                        )
-                    )
-                } else {
-                    guard let attention = metalAttention else {
-                        throw RealModelInferenceError.runtimeFailure("Hybrid Metal attention unavailable for llama testing helper")
-                    }
-                    results.append(
-                        try engine.generateIncrementalHybridLlama(
-                            promptTokens: prompt,
-                            effectiveMaxTokens: effectiveMaxTokens,
-                            temperature: 0,
-                            compileTimeMs: results.isEmpty ? compileTimeMs : 0,
-                            maxSeq: bucket,
-                            metalAttention: attention,
-                            onStep: nil
-                        )
-                    )
-                }
+                )
             }
         }
         return results
@@ -6140,7 +6211,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             firstTokenLatencyMs: firstTokenLatencyMs,
             exactHeadBackend: classifierStrategy.exactHeadBackendLabel,
             cachedBindingsEnabled: false,
-            decodePath: Self.fusedDecodePathLabel,
+            trunk: .fusedHybrid,
             hopsPerToken: hopsPerToken,
             decodeProfileReport: decodeProfileReport
         )
@@ -6662,7 +6733,7 @@ public struct RealModelInferenceEngine: ~Copyable {
                 ? "ane_factored_classifier"
                 : classifierStrategy.exactHeadBackendLabel,
             cachedBindingsEnabled: cachedBindings != nil,
-            decodePath: "hybrid",
+            trunk: .splitHybrid,
             decodeProfileReport: decodeProfileReport
         )
     }
@@ -6781,7 +6852,7 @@ public struct RealModelInferenceEngine: ~Copyable {
                 cachedBindingsEnabled: false,
                 committedExactTokensPerPass: nil,
                 acceptedFutureTokensPerPass: nil,
-                decodePath: "exact_cpu"
+                trunk: .exactCPU
             )
         }
         let firstEmission = DispatchTime.now().uptimeNanoseconds
@@ -6801,7 +6872,7 @@ public struct RealModelInferenceEngine: ~Copyable {
                 cachedBindingsEnabled: false,
                 committedExactTokensPerPass: nil,
                 acceptedFutureTokensPerPass: nil,
-                decodePath: "exact_cpu"
+                trunk: .exactCPU
             )
         }
 
@@ -6888,7 +6959,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             cachedBindingsEnabled: false,
             committedExactTokensPerPass: committedExactTokensPerPass,
             acceptedFutureTokensPerPass: acceptedFutureTokensPerPass,
-            decodePath: "exact_cpu"
+            trunk: .exactCPU
         )
     }
 
@@ -7027,7 +7098,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             compileTimeMs: compileTimeMs,
             firstTokenLatencyMs: firstTokenLatencyMs,
             exactHeadBackend: classifierStrategy.exactHeadBackendLabel,
-            decodePath: "exact_cpu"
+            trunk: .exactCPU
         )
     }
 

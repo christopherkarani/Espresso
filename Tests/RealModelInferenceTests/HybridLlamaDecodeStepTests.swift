@@ -382,7 +382,9 @@ import ModelSupport
         ) == true
     )
     #expect(RealModelInferenceEngine.fusedHopsPerToken(nLayer: 28) == 28)
-    #expect(RealModelInferenceEngine.fusedDecodePathLabel == "fused")
+    #expect(RealModelInferenceEngine.fusedDecodePathLabel == Trunk.fusedHybrid.telemetryLabel)
+    #expect(RealModelInferenceEngine.selectTrunk(config: qwen15b, environment: [:]) == .fusedHybrid)
+    #expect(RealModelInferenceEngine.selectTrunk(config: qwen05b, environment: [:]) == .splitHybrid)
     let missing = RealModelInferenceEngine.fusedHybridFallbackError(reason: "missing N=1 kernel")
     guard case let .hybridFallbackDisabled(stage, reason) = missing else {
         Issue.record("expected hybridFallbackDisabled, got \(missing)")

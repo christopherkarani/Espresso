@@ -781,7 +781,7 @@ private func shouldRunLegacyQwenExperimentTests(
     )
 }
 
-@Test func test_llamaGenerationPath_skipsHybridForQwenExactCPU() {
+@Test func test_selectTrunk_skipsHybridForQwenExactCPU() {
     let qwenConfig = MultiModelConfig(
         name: "qwen3",
         nLayer: 1,
@@ -810,22 +810,22 @@ private func shouldRunLegacyQwenExperimentTests(
     )
 
     #expect(
-        RealModelInferenceEngine.llamaGenerationPath(
+        RealModelInferenceEngine.selectTrunk(
             config: qwenConfig,
             environment: [:]
         ) == .exactCPU
     )
     #expect(
-        RealModelInferenceEngine.llamaGenerationPath(
+        RealModelInferenceEngine.selectTrunk(
             config: qwenConfig,
             environment: ["ESPRESSO_FORCE_HYBRID_DECODE": "1"]
-        ) == .hybrid
+        ) == .splitHybrid
     )
     #expect(
-        RealModelInferenceEngine.llamaGenerationPath(
+        RealModelInferenceEngine.selectTrunk(
             config: llamaConfig,
             environment: [:]
-        ) == .hybrid
+        ) == .splitHybrid
     )
 }
 
@@ -853,26 +853,26 @@ private func makeDecodePathRoutingConfig(
     // A Qwen-named artifact that declares the hybrid path must reach the ANE, otherwise
     // "runs on the ANE" would silently mean "runs on the CPU".
     #expect(
-        RealModelInferenceEngine.llamaGenerationPath(
+        RealModelInferenceEngine.selectTrunk(
             config: makeDecodePathRoutingConfig(name: "Qwen2.5-0.5B-Instruct", preferredDecodePath: .hybrid),
             environment: [:]
-        ) == .hybrid
+        ) == .splitHybrid
     )
     #expect(
-        RealModelInferenceEngine.llamaGenerationPath(
+        RealModelInferenceEngine.selectTrunk(
             config: makeDecodePathRoutingConfig(name: "Qwen2.5-1.5B-Instruct", preferredDecodePath: .hybrid),
             environment: [:]
-        ) == .hybrid
+        ) == .fusedHybrid
     )
     #expect(
-        RealModelInferenceEngine.llamaGenerationPath(
+        RealModelInferenceEngine.selectTrunk(
             config: makeDecodePathRoutingConfig(name: "llama3", preferredDecodePath: .exactCPU),
             environment: [:]
         ) == .exactCPU
     )
     // An artifact declaring hybrid still yields to an explicit operator override.
     #expect(
-        RealModelInferenceEngine.llamaGenerationPath(
+        RealModelInferenceEngine.selectTrunk(
             config: makeDecodePathRoutingConfig(name: "Qwen2.5-0.5B-Instruct", preferredDecodePath: .hybrid),
             environment: ["ESPRESSO_USE_CPU_EXACT_DECODE": "1"]
         ) == .exactCPU
@@ -917,12 +917,12 @@ private func makeDecodePathRoutingConfig(
     }
 }
 
-@Test func test_resolvedLlamaGenerationPathThrowsWhenFallbackDisabledWouldLeaveANE() throws {
+@Test func test_resolvedTrunkThrowsWhenFallbackDisabledWouldLeaveANE() throws {
     let disabled = ["ESPRESSO_REALMODEL_DISABLE_HYBRID_FALLBACK": "1"]
 
     // Legacy name-based CPU routing must be loud, naming the policy responsible.
     do {
-        _ = try RealModelInferenceEngine.resolvedLlamaGenerationPath(
+        _ = try RealModelInferenceEngine.resolvedTrunk(
             config: makeDecodePathRoutingConfig(name: "Qwen2.5-0.5B-Instruct"),
             environment: disabled
         )
@@ -932,13 +932,13 @@ private func makeDecodePathRoutingConfig(
             Issue.record("expected hybridFallbackDisabled, got \(error)")
             return
         }
-        #expect(stage.contains("decode path"))
+        #expect(stage.contains("trunk"))
         #expect(reason.contains("legacy Qwen"))
     }
 
     // An explicit CPU request must also be loud rather than quietly honoured.
     do {
-        _ = try RealModelInferenceEngine.resolvedLlamaGenerationPath(
+        _ = try RealModelInferenceEngine.resolvedTrunk(
             config: makeDecodePathRoutingConfig(name: "llama3"),
             environment: disabled.merging(["ESPRESSO_USE_CPU_EXACT_DECODE": "1"]) { current, _ in current }
         )
@@ -953,7 +953,7 @@ private func makeDecodePathRoutingConfig(
 
     // An artifact that declares exact_cpu is still a fallback when the flag forbids one.
     do {
-        _ = try RealModelInferenceEngine.resolvedLlamaGenerationPath(
+        _ = try RealModelInferenceEngine.resolvedTrunk(
             config: makeDecodePathRoutingConfig(name: "llama3", preferredDecodePath: .exactCPU),
             environment: disabled
         )
@@ -966,12 +966,12 @@ private func makeDecodePathRoutingConfig(
         #expect(reason.contains("preferredDecodePath"))
     }
 
-    // The hybrid path is unaffected by the flag.
+    // Hybrid trunks are unaffected by the flag.
     #expect(
-        try RealModelInferenceEngine.resolvedLlamaGenerationPath(
+        try RealModelInferenceEngine.resolvedTrunk(
             config: makeDecodePathRoutingConfig(name: "Qwen2.5-0.5B-Instruct", preferredDecodePath: .hybrid),
             environment: disabled
-        ) == .hybrid
+        ) == .splitHybrid
     )
 }
 
