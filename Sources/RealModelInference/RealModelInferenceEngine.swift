@@ -72,6 +72,9 @@ public struct GenerationResult: Sendable {
     }
 
     /// Compatibility initializer that accepts a telemetry path label.
+    ///
+    /// - Throws: ``Trunk/ParseError`` when `decodePath` is not `"unknown"` and not a known
+    ///   trunk label. Prefer the `trunk:` initializer for new code.
     public init(
         text: String,
         tokens: [TokenID],
@@ -87,12 +90,12 @@ public struct GenerationResult: Sendable {
         decodePath: String,
         hopsPerToken: Int? = nil,
         decodeProfileReport: String? = nil
-    ) {
+    ) throws {
         let resolvedTrunk: Trunk?
         if decodePath == "unknown" {
             resolvedTrunk = nil
         } else {
-            resolvedTrunk = try? Trunk.parseTelemetryLabel(decodePath)
+            resolvedTrunk = try Trunk.parseTelemetryLabel(decodePath)
         }
         self.init(
             text: text,
@@ -131,11 +134,14 @@ public struct GenerationResult: Sendable {
         )
     }
 
-    public func withDecodePath(_ path: String) -> GenerationResult {
+    /// Compatibility helper that parses a telemetry path label into ``trunk``.
+    ///
+    /// - Throws: ``Trunk/ParseError`` when `path` is not `"unknown"` and not a known trunk label.
+    public func withDecodePath(_ path: String) throws -> GenerationResult {
         if path == "unknown" {
             return withTrunk(nil)
         }
-        return withTrunk(try? Trunk.parseTelemetryLabel(path))
+        return withTrunk(try Trunk.parseTelemetryLabel(path))
     }
 }
 
@@ -527,14 +533,6 @@ public struct RealModelInferenceEngine: ~Copyable {
         )
     }
 
-    /// Backward-compatible alias for ``resolvedTrunk``.
-    static func resolvedLlamaGenerationPath(
-        config: MultiModelConfig,
-        environment: [String: String]
-    ) throws -> Trunk {
-        try resolvedTrunk(config: config, environment: environment)
-    }
-
     static func milDeploymentTarget(
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> String {
@@ -589,15 +587,6 @@ public struct RealModelInferenceEngine: ~Copyable {
             return .fusedHybrid
         }
         return .splitHybrid
-    }
-
-    /// Backward-compatible family discriminator used by older tests and call sites.
-    /// Prefer ``selectTrunk`` / ``resolvedTrunk`` for new code.
-    static func llamaGenerationPath(
-        config: MultiModelConfig,
-        environment: [String: String]
-    ) -> Trunk {
-        selectTrunk(config: config, environment: environment)
     }
 
     static func hopsPerToken(for trunk: Trunk, nLayer: Int) -> Int? {
@@ -1672,10 +1661,11 @@ public struct RealModelInferenceEngine: ~Copyable {
         )
         switch config.architecture {
         case .llama:
-            if Self.prefersFusedHybridDecode(
+            switch Self.selectTrunk(
                 config: config,
                 environment: ProcessInfo.processInfo.environment
             ) {
+            case .fusedHybrid:
                 do {
                     _ = try ensureFusedHybridCompiled(bucket: bucket)
                 } catch let error as RealModelInferenceError {
@@ -1686,8 +1676,10 @@ public struct RealModelInferenceEngine: ~Copyable {
                 } catch {
                     throw Self.fusedHybridFallbackError(reason: "\(error)")
                 }
-            } else {
+            case .splitHybrid:
                 _ = try ensureHybridCompiledLlama(bucket: bucket)
+            case .exactCPU:
+                break
             }
         case .gpt2:
             _ = try ensureHybridCompiled(bucket: bucket)
@@ -6238,7 +6230,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             )
         }
 
-        if try Self.resolvedLlamaGenerationPath(
+        if try Self.resolvedTrunk(
             config: config,
             environment: ProcessInfo.processInfo.environment
         ) == .exactCPU {

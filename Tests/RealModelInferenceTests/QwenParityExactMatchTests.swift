@@ -284,7 +284,7 @@ private func assertQwenGreedyFixtureCoversTheRequiredSuite(profile: QwenParityPr
     #expect(resolved15b?.rootURL.path != resolved05b?.rootURL.path)
 }
 
-@Test func test_generationResultWithDecodePathPreservesTokens() {
+@Test func test_generationResultWithDecodePathPreservesTokens() throws {
     let original = GenerationResult(
         text: "hi",
         tokens: [1, 2],
@@ -305,7 +305,7 @@ private func assertQwenGreedyFixtureCoversTheRequiredSuite(profile: QwenParityPr
     #expect(labeled.tokens == original.tokens)
     #expect(labeled.exactHeadBackend == "cpu_fp16_tiled")
     #expect(labeled.decodeProfileReport == original.decodeProfileReport)
-    let fused = GenerationResult(
+    let fused = try GenerationResult(
         text: "hi",
         tokens: [1],
         promptTokens: [9],
@@ -317,7 +317,18 @@ private func assertQwenGreedyFixtureCoversTheRequiredSuite(profile: QwenParityPr
         decodePath: "fused",
         hopsPerToken: 28
     )
-    #expect(fused.withDecodePath("fused").hopsPerToken == 28)
+    #expect(try fused.withDecodePath("fused").hopsPerToken == 28)
+    #expect(throws: Trunk.ParseError.unsupported("metal")) {
+        try GenerationResult(
+            text: "hi",
+            tokens: [1],
+            promptTokens: [9],
+            tokensPerSecond: 0,
+            compileTimeMs: 1,
+            firstTokenLatencyMs: 1,
+            decodePath: "metal"
+        )
+    }
 }
 
 /// Greedy decoding on the ANE hybrid path must reproduce the PyTorch reference token IDs.
