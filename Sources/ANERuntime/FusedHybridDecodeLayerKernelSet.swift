@@ -32,7 +32,8 @@ public struct FusedHybridDecodeLayerKernelSet: ~Copyable {
         nHeads: Int,
         nKVHeads: Int,
         headDim: Int,
-        donorHexIDs: DonorHexIDs? = nil
+        donorHexIDs: DonorHexIDs? = nil,
+        options: HybridDecodeKernelOptions? = nil
     ) throws(ANEError) {
         guard maxSeq > 0 else {
             throw .invalidArguments("fused hybrid decode maxSeq must be > 0")
@@ -40,7 +41,8 @@ public struct FusedHybridDecodeLayerKernelSet: ~Copyable {
         guard nHeads > 0, nKVHeads > 0, nHeads % nKVHeads == 0, headDim > 0 else {
             throw .invalidArguments("fused hybrid decode head geometry is invalid")
         }
-        let laneSpatial = HybridDecodeKernelSet.resolvedLaneSpatialForCurrentProcess()
+        let resolvedOptions = options ?? .resolve()
+        let laneSpatial = resolvedOptions.laneSpatial ?? DecodeKernelSet.defaultLaneSpatial
         let compiled = try Self.compile(
             weights: weights,
             maxSeq: maxSeq,
@@ -48,7 +50,8 @@ public struct FusedHybridDecodeLayerKernelSet: ~Copyable {
             nHeads: nHeads,
             nKVHeads: nKVHeads,
             headDim: headDim,
-            donorHexId: donorHexIDs?.fusedLayer
+            donorHexId: donorHexIDs?.fusedLayer,
+            disableDonorDelta: resolvedOptions.disableDonorDelta
         )
         let hexId = compiled.hexId
         self.fusedLayer = compiled
@@ -66,7 +69,8 @@ public struct FusedHybridDecodeLayerKernelSet: ~Copyable {
         nHeads: Int,
         nKVHeads: Int,
         headDim: Int,
-        donorHexId: String?
+        donorHexId: String?,
+        disableDonorDelta: Bool
     ) throws(ANEError) -> ANEKernel {
         let spec = makeSpec(
             weights: weights,
@@ -76,8 +80,7 @@ public struct FusedHybridDecodeLayerKernelSet: ~Copyable {
             nKVHeads: nKVHeads,
             headDim: headDim
         )
-        let donorDisabled = ProcessInfo.processInfo.environment["ESPRESSO_DISABLE_HYBRID_DONOR_DELTA"] == "1"
-        if !donorDisabled, let donorHexId, !donorHexId.isEmpty {
+        if !disableDonorDelta, let donorHexId, !donorHexId.isEmpty {
             do {
                 return try ANEKernel(
                     milText: spec.milText,

@@ -5,66 +5,6 @@ import ANERuntime
 import ANETypes
 import CPUOps
 
-/// Surfaces for one Phase-11 `max_N = 1` fused layer.
-///
-/// Inputs (alphabetical): kCache, mask, posMask, ropePack, vCache, x
-/// Outputs (alphabetical): kNew, vNew, xOut
-public struct FusedHybridDecodeSurfaceHandles {
-    public let kCache: IOSurfaceRef
-    public let mask: IOSurfaceRef
-    public let posMask: IOSurfaceRef
-    public let ropePack: IOSurfaceRef
-    public let vCache: IOSurfaceRef
-    public let xIn: IOSurfaceRef
-    public let kNew: IOSurfaceRef
-    public let vNew: IOSurfaceRef
-    public let xOut: IOSurfaceRef
-    public let maxSeq: Int
-    public let laneSpatial: Int
-    public let dim: Int
-    public let kvDim: Int
-
-    public init(
-        kernels: borrowing FusedHybridDecodeLayerKernelSet,
-        sharedMask: IOSurfaceRef? = nil,
-        sharedPosMask: IOSurfaceRef? = nil,
-        sharedRopePack: IOSurfaceRef? = nil
-    ) throws(ANEError) {
-        self.kCache = try kernels.fusedLayer.inputSurface(at: 0)
-        let ownedMask = try kernels.fusedLayer.inputSurface(at: 1)
-        let ownedPos = try kernels.fusedLayer.inputSurface(at: 2)
-        let ownedRope = try kernels.fusedLayer.inputSurface(at: 3)
-        self.vCache = try kernels.fusedLayer.inputSurface(at: 4)
-        self.xIn = try kernels.fusedLayer.inputSurface(at: 5)
-        self.kNew = try kernels.fusedLayer.outputSurface(at: 0)
-        self.vNew = try kernels.fusedLayer.outputSurface(at: 1)
-        self.xOut = try kernels.fusedLayer.outputSurface(at: 2)
-        self.maxSeq = kernels.maxSeq
-        self.laneSpatial = kernels.laneSpatial
-        self.dim = kernels.dim
-        self.kvDim = kernels.kvDim
-
-        if let sharedMask {
-            try kernels.fusedLayer.rebindInput(at: 1, to: sharedMask)
-            self.mask = sharedMask
-        } else {
-            self.mask = ownedMask
-        }
-        if let sharedPosMask {
-            try kernels.fusedLayer.rebindInput(at: 2, to: sharedPosMask)
-            self.posMask = sharedPosMask
-        } else {
-            self.posMask = ownedPos
-        }
-        if let sharedRopePack {
-            try kernels.fusedLayer.rebindInput(at: 3, to: sharedRopePack)
-            self.ropePack = sharedRopePack
-        } else {
-            self.ropePack = ownedRope
-        }
-    }
-}
-
 extension ForwardPass {
     public static func initializeFusedHybridDecodeCaches(
         surfaceHandles: [FusedHybridDecodeSurfaceHandles]
