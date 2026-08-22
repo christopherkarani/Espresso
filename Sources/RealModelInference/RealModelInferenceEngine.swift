@@ -6035,6 +6035,158 @@ public struct RealModelInferenceEngine: ~Copyable {
         })
     }
 
+    /// Fused hybrid Trunk stepper: one ANE program per transformer layer, attention included.
+    ///
+    /// Holds per-run hidden buffer and decode state; compiled programs stay on the
+    /// host engine and are borrowed through it on every decode step.
+    private final class FusedHybridStepper: LlamaStepping {
+
+        let contextLimit: Int
+        let tracksDecodeProfile = true
+
+        private let expectedNLayer: Int
+        private let dModel: Int
+        private let headDim: Int
+        private let ropeTheta: Float
+        private let normEps: Float
+        private let decodeMaxSeq: Int
+        private let tokenEmbedding: [Float]
+        private let finalNormGamma: [Float]
+        private let selector: LlamaTokenSelector
+        private let tokenizerRef: LoadedTokenizer
+        private let isCancelled: (() -> Bool)?
+
+        private let xCur: TensorBuffer
+        private var decodeState: DecodeState
+        private var pendingTimings = HybridDecodeTimingBreakdown()
+        private var stepTimings = HybridDecodeTimingBreakdown()
+
+        init(
+            config: MultiModelConfig,
+            decodeMaxSeq: Int,
+            tokenEmbedding: [Float],
+            finalNormGamma: [Float],
+            tokenizerRef: LoadedTokenizer,
+            selector: LlamaTokenSelector,
+            isCancelled: (() -> Bool)?
+        ) throws {
+            self.expectedNLayer = config.nLayer
+            self.dModel = config.dModel
+            self.headDim = config.headDim
+            self.ropeTheta = config.ropeTheta
+            self.normEps = Float(config.normEps)
+            self.contextLimit = config.maxSeq
+            self.decodeMaxSeq = decodeMaxSeq
+            self.tokenEmbedding = tokenEmbedding
+            self.finalNormGamma = finalNormGamma
+            self.tokenizerRef = tokenizerRef
+            self.selector = selector
+            self.isCancelled = isCancelled
+            self.xCur = TensorBuffer(count: config.dModel, zeroed: true)
+            do {
+                self.decodeState = try DecodeState(maxSeq: decodeMaxSeq)
+            } catch {
+                throw RealModelInferenceError.runtimeFailure("fused N=1 decode state initialization failed: \(error)")
+            }
+        }
+
+        func begin(host: inout RealModelInferenceEngine, promptTokens: [TokenID]) throws {
+            guard host.compiledFusedHybridLayers.count == expectedNLayer,
+                  host.compiledFusedHybridSurfaceHandles.count == expectedNLayer else {
+                throw RealModelInferenceEngine.fusedHybridFallbackError(
+                    reason: """
+                        fused N=1 state is incomplete: \
+                        layers=\(host.compiledFusedHybridLayers.count)/\(expectedNLayer) \
+                        surfaces=\(host.compiledFusedHybridSurfaceHandles.count)/\(expectedNLayer)
+                        """
+                )
+            }
+
+            do {
+                try ForwardPass.initializeFusedHybridDecodeCaches(
+                    surfaceHandles: host.compiledFusedHybridSurfaceHandles
+                )
+            } catch {
+                throw RealModelInferenceEngine.fusedHybridFallbackError(reason: "fused N=1 cache init failed: \(error)")
+            }
+
+            for (position, token) in promptTokens.enumerated() {
+                try writeEmbeddingLlama(token: token, into: xCur)
+                do {
+                    try ForwardPass.runFusedHybridDecodeTimed(
+                        xCur: xCur,
+                        kernels: host.compiledFusedHybridLayers,
+                        surfaceHandles: host.compiledFusedHybridSurfaceHandles,
+                        decodeState: &decodeState,
+                        headDim: headDim,
+                        ropeTheta: ropeTheta,
+                        timings: &stepTimings
+                    )
+                } catch {
+                    throw RealModelInferenceEngine.fusedHybridFallbackError(
+                        reason: "fused N=1 prefill failed at prompt position \(position): \(error)"
+                    )
+                }
+            }
+        }
+
+        func proposal(host: inout RealModelInferenceEngine) throws -> LlamaDecodeProposal {
+            let normalized = xCur.withUnsafeBufferPointer {
+                RealModelInferenceEngine.rmsNorm(Array($0), weight: finalNormGamma, eps: normEps)
+            }
+            return .normalizedHidden(normalized)
+        }
+
+        func advance(host: inout RealModelInferenceEngine, consuming token: TokenID, generatedCount: Int) throws {
+            try writeEmbeddingLlama(token: token, into: xCur)
+            stepTimings.reset()
+            do {
+                try ForwardPass.runFusedHybridDecodeTimed(
+                    xCur: xCur,
+                    kernels: host.compiledFusedHybridLayers,
+                    surfaceHandles: host.compiledFusedHybridSurfaceHandles,
+                    decodeState: &decodeState,
+                    headDim: headDim,
+                    ropeTheta: ropeTheta,
+                    timings: &stepTimings
+                )
+            } catch {
+                throw RealModelInferenceEngine.fusedHybridFallbackError(
+                    reason: "fused N=1 decode failed at generated token \(generatedCount - 1): \(error)"
+                )
+            }
+            pendingTimings = stepTimings
+        }
+
+        func takePendingTimings() -> HybridDecodeTimingBreakdown? { pendingTimings }
+
+        func resolveToken(hidden: [Float], temperature: Float, topP: Float) -> TokenID {
+            selector.selectToken(hidden: hidden, temperature: temperature, topP: topP)
+        }
+
+        func decodeText(_ tokens: [TokenID]) -> String {
+            tokenizerRef.decode(tokens.map(Int.init))
+        }
+
+        func throwIfCancelled() throws {
+            try RealModelInferenceEngine.throwIfCancelled(isCancelled)
+        }
+
+        private func writeEmbeddingLlama(token: TokenID, into buffer: borrowing TensorBuffer) throws {
+            let tokenBase = Int(token) * dModel
+            guard tokenBase + dModel <= tokenEmbedding.count else {
+                throw RealModelInferenceError.runtimeFailure(
+                    "Llama embedding OOB: token=\(token), base=\(tokenBase), embeddingCount=\(tokenEmbedding.count), dModel=\(dModel)"
+                )
+            }
+            buffer.withUnsafeMutableBufferPointer { dst in
+                for channel in 0..<dModel {
+                    dst[channel] = tokenEmbedding[tokenBase + channel]
+                }
+            }
+        }
+    }
+
     private mutating func generateIncrementalFusedHybridLlama(
         promptTokens: [TokenID],
         effectiveMaxTokens: Int,
@@ -6045,168 +6197,507 @@ public struct RealModelInferenceEngine: ~Copyable {
         onStep: ((GenerationStep) -> Void)?,
         isCancelled: (() -> Bool)? = nil
     ) throws -> GenerationResult {
-        guard compiledFusedHybridLayers.count == config.nLayer,
-              compiledFusedHybridSurfaceHandles.count == config.nLayer else {
-            throw Self.fusedHybridFallbackError(
-                reason: """
-                    fused N=1 state is incomplete: \
-                    layers=\(compiledFusedHybridLayers.count)/\(config.nLayer) \
-                    surfaces=\(compiledFusedHybridSurfaceHandles.count)/\(config.nLayer)
-                    """
-            )
-        }
-
-        do {
-            try ForwardPass.initializeFusedHybridDecodeCaches(
-                surfaceHandles: compiledFusedHybridSurfaceHandles
-            )
-        } catch {
-            throw Self.fusedHybridFallbackError(reason: "fused N=1 cache init failed: \(error)")
-        }
-
-        let xCur = TensorBuffer(count: config.dModel, zeroed: true)
-        var decodeState: DecodeState
-        do {
-            decodeState = try DecodeState(maxSeq: maxSeq)
-        } catch {
-            throw Self.fusedHybridFallbackError(reason: "fused decode state initialization failed: \(error)")
-        }
-        var timings = HybridDecodeTimingBreakdown()
-        let hopsPerToken = Self.fusedHopsPerToken(nLayer: config.nLayer)
-
-        for (position, token) in promptTokens.enumerated() {
-            try writeIncrementalEmbeddingLlama(token: token, into: xCur)
-            do {
-                try ForwardPass.runFusedHybridDecodeTimed(
-                    xCur: xCur,
-                    kernels: compiledFusedHybridLayers,
-                    surfaceHandles: compiledFusedHybridSurfaceHandles,
-                    decodeState: &decodeState,
-                    headDim: config.headDim,
-                    ropeTheta: config.ropeTheta,
-                    timings: &timings
-                )
-            } catch {
-                throw Self.fusedHybridFallbackError(
-                    reason: "fused N=1 prefill failed at prompt position \(position): \(error)"
-                )
-            }
-        }
-
-        var allTokens = promptTokens
-        var generatedTokens: [TokenID] = []
-        var tokenLatenciesMs: [Double] = []
-        var decodeProfileTokens: [HybridDecodeTimingBreakdown] = []
-        generatedTokens.reserveCapacity(effectiveMaxTokens)
-        tokenLatenciesMs.reserveCapacity(effectiveMaxTokens)
-        decodeProfileTokens.reserveCapacity(effectiveMaxTokens)
-        var pendingDecode = HybridDecodeTimingBreakdown()
-
-        let generationStart = DispatchTime.now().uptimeNanoseconds
-        var emissionStart = generationStart
-        var firstTokenLatencyMs = 0.0
-        var firstTokenRecorded = false
-        var rng = SystemRandomNumberGenerator()
-        var normalized = [Float](repeating: 0, count: config.dModel)
-
-        while generatedTokens.count < effectiveMaxTokens {
-            try Self.throwIfCancelled(isCancelled)
-            let headStart = DispatchTime.now().uptimeNanoseconds
-            normalized = xCur.withUnsafeBufferPointer {
-                Self.rmsNorm(Array($0), weight: llamaAssets.finalNormGamma, eps: Float(config.normEps))
-            }
-            let nextToken = selectTokenFromNormalizedHidden(
-                normalized,
-                temperature: temperature,
-                topP: topP,
-                using: &rng
-            )
-            var tokenProfile = pendingDecode
-            tokenProfile.tLMHead = Self.milliseconds(
-                from: DispatchTime.now().uptimeNanoseconds - headStart
-            )
-            decodeProfileTokens.append(tokenProfile)
-            let emissionNow = DispatchTime.now().uptimeNanoseconds
-            let tokenLatencyMs = Self.milliseconds(from: emissionNow - emissionStart)
-
-            if !firstTokenRecorded {
-                firstTokenLatencyMs = Self.milliseconds(from: emissionNow - generationStart)
-                firstTokenRecorded = true
-            }
-
-            if let eosToken = config.eosToken, nextToken == eosToken {
-                generatedTokens.append(nextToken)
-                break
-            }
-            generatedTokens.append(nextToken)
-            allTokens.append(nextToken)
-            let elapsedMs = Self.milliseconds(from: emissionNow - generationStart)
-            let tokensPerSecond = Double(generatedTokens.count) / max(elapsedMs / 1_000, 1e-9)
-            tokenLatenciesMs.append(tokenLatencyMs)
-            onStep?(
-                GenerationStep(
-                    token: nextToken,
-                    generatedTokens: generatedTokens,
-                    text: tokenizer.decode(allTokens.map(Int.init)),
-                    tokenLatencyMs: tokenLatencyMs,
-                    elapsedMs: elapsedMs,
-                    firstTokenLatencyMs: firstTokenLatencyMs,
-                    tokensPerSecond: tokensPerSecond
-                )
-            )
-
-            if generatedTokens.count >= effectiveMaxTokens || allTokens.count >= config.maxSeq {
-                break
-            }
-
-            try writeIncrementalEmbeddingLlama(token: nextToken, into: xCur)
-            timings.reset()
-            do {
-                try ForwardPass.runFusedHybridDecodeTimed(
-                    xCur: xCur,
-                    kernels: compiledFusedHybridLayers,
-                    surfaceHandles: compiledFusedHybridSurfaceHandles,
-                    decodeState: &decodeState,
-                    headDim: config.headDim,
-                    ropeTheta: config.ropeTheta,
-                    timings: &timings
-                )
-            } catch {
-                throw Self.fusedHybridFallbackError(
-                    reason: "fused N=1 decode failed at generated token \(generatedTokens.count - 1): \(error)"
-                )
-            }
-            pendingDecode = timings
-            emissionStart = emissionNow
-        }
-
-        let decodeProfileReport = decodeProfileTokens.isEmpty
-            ? nil
-            : HybridDecodeTokenProfile(tokens: decodeProfileTokens).formatReport()
-        if let decodeProfileReport {
-            fputs(decodeProfileReport + "\n", stderr)
-        }
-
-        let generationEnd = DispatchTime.now().uptimeNanoseconds
-        let generationTimeMs = Self.milliseconds(from: generationEnd - generationStart)
-        let tokensPerSecond = generatedTokens.isEmpty
-            ? 0
-            : Double(generatedTokens.count) / max(generationTimeMs / 1_000, 1e-9)
-
+        let stepper = try FusedHybridStepper(
+            config: config,
+            decodeMaxSeq: maxSeq,
+            tokenEmbedding: llamaAssets.tokenEmbedding,
+            finalNormGamma: llamaAssets.finalNormGamma,
+            tokenizerRef: tokenizer,
+            selector: makeLlamaTokenSelector(),
+            isCancelled: isCancelled
+        )
+        var session = LlamaServingSession(
+            stepper: stepper,
+            effectiveMaxTokens: effectiveMaxTokens,
+            endOfSequenceToken: config.eosToken,
+            temperature: temperature,
+            topP: topP,
+            onStep: onStep
+        )
+        let transcript = try session.run(host: &self, promptTokens: promptTokens)
         return GenerationResult(
-            text: tokenizer.decode(allTokens.map(Int.init)),
-            tokens: generatedTokens,
-            promptTokens: promptTokens,
-            tokenLatenciesMs: tokenLatenciesMs,
-            tokensPerSecond: tokensPerSecond,
+            text: transcript.text,
+            tokens: transcript.generatedTokens,
+            promptTokens: transcript.promptTokens,
+            tokenLatenciesMs: transcript.tokenLatenciesMs,
+            tokensPerSecond: transcript.tokensPerSecond,
             compileTimeMs: compileTimeMs,
-            firstTokenLatencyMs: firstTokenLatencyMs,
+            firstTokenLatencyMs: transcript.firstTokenLatencyMs,
             exactHeadBackend: classifierStrategy.exactHeadBackendLabel,
             cachedBindingsEnabled: false,
             trunk: .fusedHybrid,
-            hopsPerToken: hopsPerToken,
-            decodeProfileReport: decodeProfileReport
+            hopsPerToken: Self.fusedHopsPerToken(nLayer: config.nLayer),
+            decodeProfileReport: transcript.decodeProfileReport
         )
+    }
+
+    /// Split hybrid Trunk stepper: ANE QKV, host attention, ANE FFN per decode step.
+    ///
+    /// Owns the per-run hidden buffer, decode state, RoPE scratch, and CPU-exact-QKV
+    /// buffers; compiled programs and surfaces stay on the host engine.
+    private final class SplitHybridStepper: LlamaStepping {
+
+        let contextLimit: Int
+        let tracksDecodeProfile = true
+
+        private let expectedNLayer: Int
+        private let dModel: Int
+        private let nHeads: Int
+        private let nKVHeads: Int
+        private let headDim: Int
+        private let ropeTheta: Float
+        private let normEps: Float
+        private let vocabSize: Int
+        private let decodeMaxSeq: Int
+        private let metalAttention: MetalAttentionKernel
+        private let cachedBindings: [MetalAttentionKernel.CachedLayerBindings]?
+        private let preferCPUDecodeAttention: Bool
+        private let greedyHeadMode: HybridGreedyHeadMode
+        private let useANEGreedyHead: Bool
+        private let useCPUExactGreedyHead: Bool
+        private let cpuExactQKVLayerWeights: [LlamaCPUQKVWeights]?
+        private let tokenEmbedding: [Float]
+        private let finalNormGamma: [Float]
+        private let selector: LlamaTokenSelector
+        private let tokenizerRef: LoadedTokenizer
+        private let isCancelled: (() -> Bool)?
+
+        private let xCur: TensorBuffer
+        private var decodeState: DecodeState
+        private var pendingTimings = HybridDecodeTimingBreakdown()
+        private var stepTimings = HybridDecodeTimingBreakdown()
+
+        // RoPE scratch, allocated once per session run.
+        private var ropeQBuf: UnsafeMutableBufferPointer<Float>?
+        private var ropeKBuf: UnsafeMutableBufferPointer<Float>?
+        private var layerQKNormWeights: [LlamaQKNormWeights?] = []
+
+        // CPU exact QKV scratch, allocated when the override is active.
+        private var cpuQKVHiddenBuf: UnsafeMutableBufferPointer<Float>?
+        private var cpuQKVAttnNormedBuf: UnsafeMutableBufferPointer<Float>?
+        private var cpuQBuf: UnsafeMutableBufferPointer<Float>?
+        private var cpuKBuf: UnsafeMutableBufferPointer<Float>?
+        private var cpuVBuf: UnsafeMutableBufferPointer<Float>?
+
+        init(
+            config: MultiModelConfig,
+            decodeMaxSeq: Int,
+            metalAttention: MetalAttentionKernel,
+            cachedBindings: [MetalAttentionKernel.CachedLayerBindings]?,
+            preferCPUDecodeAttention: Bool,
+            greedyHeadMode: HybridGreedyHeadMode,
+            useANEGreedyHead: Bool,
+            useCPUExactGreedyHead: Bool,
+            cpuExactQKVLayerWeights: [LlamaCPUQKVWeights]?,
+            tokenEmbedding: [Float],
+            finalNormGamma: [Float],
+            tokenizerRef: LoadedTokenizer,
+            selector: LlamaTokenSelector,
+            isCancelled: (() -> Bool)?
+        ) throws {
+            self.expectedNLayer = config.nLayer
+            self.dModel = config.dModel
+            self.nHeads = config.nHead
+            self.nKVHeads = config.nKVHead
+            self.headDim = config.headDim
+            self.ropeTheta = config.ropeTheta
+            self.normEps = Float(config.normEps)
+            self.vocabSize = config.vocab
+            self.contextLimit = config.maxSeq
+            self.decodeMaxSeq = decodeMaxSeq
+            self.metalAttention = metalAttention
+            self.cachedBindings = cachedBindings
+            self.preferCPUDecodeAttention = preferCPUDecodeAttention
+            self.greedyHeadMode = greedyHeadMode
+            self.useANEGreedyHead = useANEGreedyHead
+            self.useCPUExactGreedyHead = useCPUExactGreedyHead
+            self.cpuExactQKVLayerWeights = cpuExactQKVLayerWeights
+            self.tokenEmbedding = tokenEmbedding
+            self.finalNormGamma = finalNormGamma
+            self.tokenizerRef = tokenizerRef
+            self.selector = selector
+            self.isCancelled = isCancelled
+            self.xCur = TensorBuffer(count: config.dModel, zeroed: true)
+            do {
+                self.decodeState = try DecodeState(maxSeq: decodeMaxSeq)
+            } catch {
+                throw RealModelInferenceError.runtimeFailure("Llama hybrid decode state initialization failed: \(error)")
+            }
+        }
+
+        deinit {
+            ropeQBuf?.deallocate()
+            ropeKBuf?.deallocate()
+            cpuQKVHiddenBuf?.deallocate()
+            cpuQKVAttnNormedBuf?.deallocate()
+            cpuQBuf?.deallocate()
+            cpuKBuf?.deallocate()
+            cpuVBuf?.deallocate()
+        }
+
+        func begin(host: inout RealModelInferenceEngine, promptTokens: [TokenID]) throws {
+            guard host.compiledHybridLayers.count == expectedNLayer,
+                  host.compiledHybridSurfaceHandles.count == expectedNLayer,
+                  host.compiledHybridLlamaQKNormWeights.count == expectedNLayer,
+                  host.compiledHybridHead.count == 1,
+                  host.compiledHybridHeadSpatial > 0 else {
+                throw RealModelInferenceError.runtimeFailure(
+                    "Llama hybrid decode state is unavailable: layers=\(host.compiledHybridLayers.count)/\(expectedNLayer) surfaces=\(host.compiledHybridSurfaceHandles.count)/\(expectedNLayer) qkNorms=\(host.compiledHybridLlamaQKNormWeights.count)/\(expectedNLayer) head=\(host.compiledHybridHead.count) headSpatial=\(host.compiledHybridHeadSpatial)"
+                )
+            }
+
+            try ForwardPass.initializeHybridDecodeCaches(
+                surfaceHandles: host.compiledHybridSurfaceHandles,
+                dim: dModel
+            )
+
+            layerQKNormWeights = host.compiledHybridLlamaQKNormWeights
+            allocateRoPEScratchIfNeeded()
+            allocateCPUQKVScratchIfNeeded()
+
+            for (position, token) in promptTokens.enumerated() {
+                try writeEmbeddingLlama(token: token, into: xCur)
+                do {
+                    try ForwardPass.runHybridDecodeTimed(
+                        xCur: xCur,
+                        kernels: host.compiledHybridLayers,
+                        surfaceHandles: host.compiledHybridSurfaceHandles,
+                        metalAttention: metalAttention,
+                        decodeState: &decodeState,
+                        dim: dModel,
+                        nHeads: nHeads,
+                        nKVHeads: nKVHeads,
+                        headDim: headDim,
+                        preferCPUDecodeAttention: preferCPUDecodeAttention,
+                        qkvOverride: makeCPUExactQKVOverride(),
+                        postQKVHook: currentMetalRoPEConfig != nil ? nil : try makeRopeHook(),
+                        readFinalOutputIntoXCur: !useANEGreedyHead,
+                        cachedBindings: cachedBindings,
+                        metalRoPEConfig: currentMetalRoPEConfig,
+                        timings: &stepTimings
+                    )
+                } catch {
+                    throw RealModelInferenceError.runtimeFailure(
+                        "Llama hybrid prefill failed at prompt position \(position): \(error)"
+                    )
+                }
+            }
+        }
+
+        func proposal(host: inout RealModelInferenceEngine) throws -> LlamaDecodeProposal {
+            let nextToken: TokenID
+            if useANEGreedyHead {
+                do {
+                    if greedyHeadMode != .normThenClassifier {
+                        try host.compiledHybridGreedyClassifier[0].kernel.eval()
+                    } else {
+                        try host.compiledHybridGreedyNorm[0].kernel.eval()
+                        try host.compiledHybridGreedyClassifier[0].kernel.eval()
+                    }
+                    let argmax = try RealModelInferenceEngine.greedyArgmax(
+                        classifier: host.compiledHybridGreedyClassifier[0],
+                        headSpatial: host.compiledHybridHeadSpatial,
+                        vocab: vocabSize
+                    )
+                    guard let token = TokenID(exactly: argmax.index) else {
+                        throw RealModelInferenceError.runtimeFailure(
+                            "Llama greedy ANE classifier selected out-of-range token \(argmax.index)"
+                        )
+                    }
+                    nextToken = token
+                } catch {
+                    throw RealModelInferenceError.runtimeFailure("Llama hybrid greedy ANE head evaluation failed: \(error)")
+                }
+                return .selected(nextToken)
+            }
+
+            if useCPUExactGreedyHead {
+                let normalized = xCur.withUnsafeBufferPointer {
+                    RealModelInferenceEngine.rmsNorm(Array($0), weight: finalNormGamma, eps: normEps)
+                }
+                return .normalizedHidden(normalized)
+            }
+
+            let headSpatial = host.compiledHybridHeadSpatial
+            do {
+                try xCur.withUnsafeBufferPointer { buffer in
+                    try RealModelInferenceEngine.writeFP32SpatialSlice(
+                        to: host.compiledHybridHead[0].inputSurface,
+                        spatialIndex: 0,
+                        spatial: headSpatial,
+                        data: buffer,
+                        channels: dModel
+                    )
+                }
+                try host.compiledHybridHead[0].kernel.eval()
+                var normalized = [Float](repeating: 0, count: dModel)
+                try normalized.withUnsafeMutableBufferPointer { buffer in
+                    try RealModelInferenceEngine.readFP32SpatialSlice(
+                        from: host.compiledHybridHead[0].outputSurface,
+                        spatialIndex: 0,
+                        spatial: headSpatial,
+                        into: buffer,
+                        channels: dModel
+                    )
+                }
+                return .normalizedHidden(normalized)
+            } catch {
+                throw RealModelInferenceError.runtimeFailure("Llama hybrid step head evaluation failed: \(error)")
+            }
+        }
+
+        func advance(host: inout RealModelInferenceEngine, consuming token: TokenID, generatedCount: Int) throws {
+            try writeEmbeddingLlama(token: token, into: xCur)
+            stepTimings.reset()
+            do {
+                try ForwardPass.runHybridDecodeTimed(
+                    xCur: xCur,
+                    kernels: host.compiledHybridLayers,
+                    surfaceHandles: host.compiledHybridSurfaceHandles,
+                    metalAttention: metalAttention,
+                    decodeState: &decodeState,
+                    dim: dModel,
+                    nHeads: nHeads,
+                    nKVHeads: nKVHeads,
+                    headDim: headDim,
+                    preferCPUDecodeAttention: preferCPUDecodeAttention,
+                    qkvOverride: makeCPUExactQKVOverride(),
+                    postQKVHook: currentMetalRoPEConfig != nil ? nil : try makeRopeHook(),
+                    readFinalOutputIntoXCur: !useANEGreedyHead,
+                    cachedBindings: cachedBindings,
+                    metalRoPEConfig: currentMetalRoPEConfig,
+                    timings: &stepTimings
+                )
+            } catch {
+                throw RealModelInferenceError.runtimeFailure(
+                    "Llama hybrid decode failed at generated token \(generatedCount - 1): \(error)"
+                )
+            }
+            pendingTimings = stepTimings
+        }
+
+        func takePendingTimings() -> HybridDecodeTimingBreakdown? { pendingTimings }
+
+        func resolveToken(hidden: [Float], temperature: Float, topP: Float) -> TokenID {
+            selector.selectToken(hidden: hidden, temperature: temperature, topP: topP)
+        }
+
+        func decodeText(_ tokens: [TokenID]) -> String {
+            tokenizerRef.decode(tokens.map(Int.init))
+        }
+
+        func throwIfCancelled() throws {
+            try RealModelInferenceEngine.throwIfCancelled(isCancelled)
+        }
+
+        // MARK: RoPE hook machinery
+
+        private var currentMetalRoPEConfig: MetalAttentionKernel.MetalRoPEConfig?
+
+        private func allocateRoPEScratchIfNeeded() {
+            guard ropeQBuf == nil else { return }
+            let qBufSize = nHeads * headDim
+            let kBufSize = nKVHeads * headDim
+            ropeQBuf = UnsafeMutableBufferPointer<Float>.allocate(capacity: qBufSize)
+            ropeKBuf = UnsafeMutableBufferPointer<Float>.allocate(capacity: kBufSize)
+
+            let hasAnyQKNorm = layerQKNormWeights.contains { $0 != nil }
+            currentMetalRoPEConfig =
+                RealModelInferenceEngine.supportsLlamaMetalRoPEFastPath(
+                    cachedBindingsAvailable: cachedBindings != nil && !hasAnyQKNorm,
+                    kBindingContainsKVCache: false
+                )
+                ? MetalAttentionKernel.MetalRoPEConfig(
+                    nHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim, theta: ropeTheta
+                )
+                : nil
+        }
+
+        private func makeRopeHook() throws -> (Int, IOSurfaceRef, IOSurfaceRef, Int, Int) throws -> Void {
+            guard let ropeQBuf, let ropeKBuf else {
+                throw RealModelInferenceError.runtimeFailure("Llama hybrid RoPE scratch unavailable")
+            }
+            return { [weak self] layerIndex, qSurf, kSurf, laneSp, tokenIndex in
+                guard let self else { return }
+                do {
+                    try SurfaceIO.readFP16SpatialSlice(
+                        from: qSurf, channelOffset: 0, spatialIndex: 0, spatial: laneSp,
+                        into: ropeQBuf, channels: ropeQBuf.count
+                    )
+                    try SurfaceIO.readFP16SpatialSlice(
+                        from: kSurf, channelOffset: 0, spatialIndex: 0, spatial: laneSp,
+                        into: ropeKBuf, channels: ropeKBuf.count
+                    )
+                } catch {
+                    throw ANEError.invalidArguments("RoPE hook surface read failed: \(error)")
+                }
+
+                if let norms = self.layerQKNormWeights[layerIndex] {
+                    norms.q.withUnsafeBufferPointer { weights in
+                        RMSNorm.applyPerHeadSingleTokenInPlace(
+                            values: ropeQBuf.baseAddress!,
+                            headCount: self.nHeads,
+                            headDim: self.headDim,
+                            weights: weights.baseAddress!,
+                            epsilon: self.normEps
+                        )
+                    }
+                    norms.k.withUnsafeBufferPointer { weights in
+                        RMSNorm.applyPerHeadSingleTokenInPlace(
+                            values: ropeKBuf.baseAddress!,
+                            headCount: self.nKVHeads,
+                            headDim: self.headDim,
+                            weights: weights.baseAddress!,
+                            epsilon: self.normEps
+                        )
+                    }
+                }
+
+                RoPE.applyDecodeStep(
+                    q: ropeQBuf.baseAddress!,
+                    k: ropeKBuf.baseAddress!,
+                    nHeads: self.nHeads,
+                    nKVHeads: self.nKVHeads,
+                    headDim: self.headDim,
+                    position: tokenIndex,
+                    theta: self.ropeTheta
+                )
+
+                do {
+                    try SurfaceIO.writeFP16SpatialSlice(
+                        to: qSurf, channelOffset: 0, spatialIndex: 0, spatial: laneSp,
+                        data: UnsafeBufferPointer(ropeQBuf), channels: ropeQBuf.count
+                    )
+                    try SurfaceIO.writeFP16SpatialSlice(
+                        to: kSurf, channelOffset: 0, spatialIndex: 0, spatial: laneSp,
+                        data: UnsafeBufferPointer(ropeKBuf), channels: ropeKBuf.count
+                    )
+                } catch {
+                    throw ANEError.invalidArguments("RoPE hook surface write failed: \(error)")
+                }
+            }
+        }
+
+        // MARK: CPU exact QKV override machinery
+
+        private func allocateCPUQKVScratchIfNeeded() {
+            guard cpuExactQKVLayerWeights != nil, cpuQKVHiddenBuf == nil else { return }
+            cpuQKVHiddenBuf = UnsafeMutableBufferPointer<Float>.allocate(capacity: dModel)
+            cpuQKVAttnNormedBuf = UnsafeMutableBufferPointer<Float>.allocate(capacity: dModel)
+            cpuQBuf = UnsafeMutableBufferPointer<Float>.allocate(capacity: nHeads * headDim)
+            cpuKBuf = UnsafeMutableBufferPointer<Float>.allocate(capacity: nKVHeads * headDim)
+            cpuVBuf = UnsafeMutableBufferPointer<Float>.allocate(capacity: nKVHeads * headDim)
+        }
+
+        private func makeCPUExactQKVOverride() -> ((Int, HybridDecodeSurfaceHandles, Int, Int) throws -> Void)? {
+            guard let layerWeights = cpuExactQKVLayerWeights,
+                  let hiddenBuf = cpuQKVHiddenBuf,
+                  let attnNormedBuf = cpuQKVAttnNormedBuf,
+                  let qBuf = cpuQBuf,
+                  let kBuf = cpuKBuf,
+                  let vBuf = cpuVBuf else {
+                return nil
+            }
+            return { layerIndex, handles, laneSp, _ in
+                let weights = layerWeights[layerIndex]
+                do {
+                    try SurfaceIO.readFP16SpatialSlice(
+                        from: handles.qkvIn,
+                        channelOffset: 0,
+                        spatialIndex: 0,
+                        spatial: laneSp,
+                        into: hiddenBuf,
+                        channels: self.dModelForOverride
+                    )
+                } catch {
+                    throw ANEError.invalidArguments("CPU exact QKV input read failed: \(error)")
+                }
+
+                var sumSq: Float = 0
+                vDSP_dotpr(hiddenBuf.baseAddress!, 1, hiddenBuf.baseAddress!, 1, &sumSq, vDSP_Length(self.dModelForOverride))
+                var invRms = 1.0 / sqrtf(sumSq / Float(self.dModelForOverride) + self.normEps)
+                vDSP_vsmul(hiddenBuf.baseAddress!, 1, &invRms, attnNormedBuf.baseAddress!, 1, vDSP_Length(self.dModelForOverride))
+                weights.rmsAtt.withUnsafeBufferPointer { gamma in
+                    vDSP_vmul(attnNormedBuf.baseAddress!, 1, gamma.baseAddress!, 1, attnNormedBuf.baseAddress!, 1, vDSP_Length(self.dModelForOverride))
+                }
+
+                RealModelInferenceEngine.multiplyRowMajorMatrix(
+                    matrix: weights.wq,
+                    rows: self.qDimForOverride,
+                    cols: self.dModelForOverride,
+                    vector: UnsafeBufferPointer(attnNormedBuf),
+                    into: qBuf
+                )
+                RealModelInferenceEngine.multiplyRowMajorMatrix(
+                    matrix: weights.wk,
+                    rows: self.kvDimForOverride,
+                    cols: self.dModelForOverride,
+                    vector: UnsafeBufferPointer(attnNormedBuf),
+                    into: kBuf
+                )
+                RealModelInferenceEngine.multiplyRowMajorMatrix(
+                    matrix: weights.wv,
+                    rows: self.kvDimForOverride,
+                    cols: self.dModelForOverride,
+                    vector: UnsafeBufferPointer(attnNormedBuf),
+                    into: vBuf
+                )
+                if let qkvBias = weights.qkvBias {
+                    RealModelInferenceEngine.addBiasInPlace(qkvBias.q, into: qBuf)
+                    RealModelInferenceEngine.addBiasInPlace(qkvBias.k, into: kBuf)
+                    RealModelInferenceEngine.addBiasInPlace(qkvBias.v, into: vBuf)
+                }
+
+                do {
+                    try SurfaceIO.writeFP16SpatialSlice(
+                        to: handles.qOut,
+                        channelOffset: 0,
+                        spatialIndex: 0,
+                        spatial: laneSp,
+                        data: UnsafeBufferPointer(qBuf),
+                        channels: self.qDimForOverride
+                    )
+                    try SurfaceIO.writeFP16SpatialSlice(
+                        to: handles.kOut,
+                        channelOffset: 0,
+                        spatialIndex: 0,
+                        spatial: laneSp,
+                        data: UnsafeBufferPointer(kBuf),
+                        channels: self.kvDimForOverride
+                    )
+                    try SurfaceIO.writeFP16SpatialSlice(
+                        to: handles.vOut,
+                        channelOffset: 0,
+                        spatialIndex: 0,
+                        spatial: laneSp,
+                        data: UnsafeBufferPointer(vBuf),
+                        channels: self.kvDimForOverride
+                    )
+                } catch {
+                    throw ANEError.invalidArguments("CPU exact QKV surface write failed: \(error)")
+                }
+            }
+        }
+
+        private var dModelForOverride: Int { dModel }
+        private var qDimForOverride: Int { nHeads * headDim }
+        private var kvDimForOverride: Int { nKVHeads * headDim }
+
+        // MARK: Shared helpers
+
+        private func writeEmbeddingLlama(token: TokenID, into buffer: borrowing TensorBuffer) throws {
+            let tokenBase = Int(token) * dModel
+            guard tokenBase + dModel <= tokenEmbedding.count else {
+                throw RealModelInferenceError.runtimeFailure(
+                    "Llama embedding OOB: token=\(token), base=\(tokenBase), embeddingCount=\(tokenEmbedding.count), dModel=\(dModel)"
+                )
+            }
+            buffer.withUnsafeMutableBufferPointer { dst in
+                for channel in 0..<dModel {
+                    dst[channel] = tokenEmbedding[tokenBase + channel]
+                }
+            }
+        }
     }
 
     private mutating func generateIncrementalHybridLlama(
@@ -6220,38 +6711,6 @@ public struct RealModelInferenceEngine: ~Copyable {
         onStep: ((GenerationStep) -> Void)?,
         isCancelled: (() -> Bool)? = nil
     ) throws -> GenerationResult {
-        guard compiledHybridLayers.count == config.nLayer,
-              compiledHybridSurfaceHandles.count == config.nLayer,
-              compiledHybridLlamaQKNormWeights.count == config.nLayer,
-              compiledHybridHead.count == 1,
-              compiledHybridHeadSpatial > 0 else {
-            throw RealModelInferenceError.runtimeFailure(
-                "Llama hybrid decode state is unavailable: layers=\(compiledHybridLayers.count)/\(config.nLayer) surfaces=\(compiledHybridSurfaceHandles.count)/\(config.nLayer) qkNorms=\(compiledHybridLlamaQKNormWeights.count)/\(config.nLayer) head=\(compiledHybridHead.count) headSpatial=\(compiledHybridHeadSpatial)"
-            )
-        }
-
-        if try Self.resolvedTrunk(
-            config: config,
-            environment: ProcessInfo.processInfo.environment
-        ) == .exactCPU {
-            return try generateIncrementalExactCPULlama(
-                promptTokens: promptTokens,
-                effectiveMaxTokens: effectiveMaxTokens,
-                temperature: temperature,
-                topP: topP,
-                compileTimeMs: compileTimeMs,
-                maxSeq: maxSeq,
-                onStep: onStep,
-                isCancelled: isCancelled
-            )
-        }
-
-        try ForwardPass.initializeHybridDecodeCaches(
-            surfaceHandles: compiledHybridSurfaceHandles,
-            dim: config.dModel
-        )
-
-        // Pre-create cached decode-surface metadata for all layers.
         let cachedBindings: [MetalAttentionKernel.CachedLayerBindings]? = try Self.makeHybridCachedBindingsOrFallback(
             config: config,
             environment: ProcessInfo.processInfo.environment
@@ -6272,15 +6731,8 @@ public struct RealModelInferenceEngine: ~Copyable {
             }
         }
 
-        let xCur = TensorBuffer(count: config.dModel, zeroed: true)
-        var decodeState: DecodeState
-        do {
-            decodeState = try DecodeState(maxSeq: maxSeq)
-        } catch {
-            throw RealModelInferenceError.runtimeFailure("Llama hybrid decode state initialization failed: \(error)")
-        }
-        var timings = HybridDecodeTimingBreakdown()
-        let greedyHeadMode = hybridGreedyHeadMode()
+        let environment = ProcessInfo.processInfo.environment
+        let greedyHeadMode = hybridGreedyHeadMode(environment: environment)
         let useANEGreedyHead =
             temperature == 0 &&
             classifierStrategy.usesANEClassifier &&
@@ -6288,445 +6740,58 @@ public struct RealModelInferenceEngine: ~Copyable {
             (greedyHeadMode == .normThenClassifier
                 ? compiledHybridGreedyNorm.count == 1
                 : compiledHybridGreedyNorm.count == 0)
-
         let useCPUExactGreedyHead =
             temperature == 0 &&
             classifierStrategy.usesCPUExactClassifier
 
-        // Build the RoPE hook closure that rotates Q and K between ANE QKV eval and Metal attention
-        let nHeads = config.nHead
-        let nKVHeads = config.nKVHead
-        let headDim = config.headDim
-        let qDim = config.attentionDim
-        let theta = config.ropeTheta
-        let layerQKNormWeights = compiledHybridLlamaQKNormWeights
-        let normEps = Float(config.normEps)
-        let hasAnyQKNorm = layerQKNormWeights.contains { $0 != nil }
-
-        let qBufSize = qDim
-        let kBufSize = nKVHeads * headDim
-        // Pre-allocate RoPE scratch buffers once, reused across all layers and tokens.
-        let ropeQBuf = UnsafeMutableBufferPointer<Float>.allocate(capacity: qBufSize)
-        let ropeKBuf = UnsafeMutableBufferPointer<Float>.allocate(capacity: kBufSize)
-        defer { ropeQBuf.deallocate() }
-        defer { ropeKBuf.deallocate() }
-        func applyRoPEHook(
-            layerIndex: Int,
-            qSurf: IOSurfaceRef,
-            kSurf: IOSurfaceRef,
-            laneSp: Int,
-            tokenIndex: Int
-        ) throws(ANEError) {
-            do {
-                try SurfaceIO.readFP16SpatialSlice(
-                    from: qSurf, channelOffset: 0, spatialIndex: 0, spatial: laneSp,
-                    into: ropeQBuf, channels: qBufSize
-                )
-                try SurfaceIO.readFP16SpatialSlice(
-                    from: kSurf, channelOffset: 0, spatialIndex: 0, spatial: laneSp,
-                    into: ropeKBuf, channels: kBufSize
-                )
-            } catch {
-                throw ANEError.invalidArguments("RoPE hook surface read failed: \(error)")
-            }
-
-            if let norms = layerQKNormWeights[layerIndex] {
-                norms.q.withUnsafeBufferPointer { weights in
-                    RMSNorm.applyPerHeadSingleTokenInPlace(
-                        values: ropeQBuf.baseAddress!,
-                        headCount: nHeads,
-                        headDim: headDim,
-                        weights: weights.baseAddress!,
-                        epsilon: normEps
-                    )
-                }
-                norms.k.withUnsafeBufferPointer { weights in
-                    RMSNorm.applyPerHeadSingleTokenInPlace(
-                        values: ropeKBuf.baseAddress!,
-                        headCount: nKVHeads,
-                        headDim: headDim,
-                        weights: weights.baseAddress!,
-                        epsilon: normEps
-                    )
-                }
-            }
-
-            RoPE.applyDecodeStep(
-                q: ropeQBuf.baseAddress!,
-                k: ropeKBuf.baseAddress!,
-                nHeads: nHeads,
-                nKVHeads: nKVHeads,
-                headDim: headDim,
-                position: tokenIndex,
-                theta: theta
-            )
-
-            do {
-                try SurfaceIO.writeFP16SpatialSlice(
-                    to: qSurf, channelOffset: 0, spatialIndex: 0, spatial: laneSp,
-                    data: UnsafeBufferPointer(ropeQBuf), channels: qBufSize
-                )
-                try SurfaceIO.writeFP16SpatialSlice(
-                    to: kSurf, channelOffset: 0, spatialIndex: 0, spatial: laneSp,
-                    data: UnsafeBufferPointer(ropeKBuf), channels: kBufSize
-                )
-            } catch {
-                throw ANEError.invalidArguments("RoPE hook surface write failed: \(error)")
-            }
-        }
-        let ropeHook: (Int, IOSurfaceRef, IOSurfaceRef, Int, Int) throws -> Void = { layerIndex, qSurf, kSurf, laneSp, tokenIndex in
-            try applyRoPEHook(
-                layerIndex: layerIndex,
-                qSurf: qSurf,
-                kSurf: kSurf,
-                laneSp: laneSp,
-                tokenIndex: tokenIndex
-            )
-        }
-
-        let metalRoPEConfig: MetalAttentionKernel.MetalRoPEConfig? = Self.supportsLlamaMetalRoPEFastPath(
-            cachedBindingsAvailable: cachedBindings != nil && !hasAnyQKNorm,
-            kBindingContainsKVCache: false
-        )
-            ? MetalAttentionKernel.MetalRoPEConfig(
-                nHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim, theta: theta
-            )
-            : nil
-        let decodeDModel = config.dModel
-        let decodeQDim = config.attentionDim
-        let decodeKVDim = config.kvDim
-
-        let useCPUExactQKV = Self.prefersCPUExactQKV(
-            config: config,
-            environment: ProcessInfo.processInfo.environment
-        )
-        let cpuExactQKVLayerWeights: [LlamaCPUQKVWeights]? = if useCPUExactQKV {
-            try (0..<config.nLayer).map { layerIndex in
+        let useCPUExactQKV = Self.prefersCPUExactQKV(config: config, environment: environment)
+        var cpuExactQKVLayerWeights: [LlamaCPUQKVWeights]? = nil
+        if useCPUExactQKV {
+            cpuExactQKVLayerWeights = try (0..<config.nLayer).map { layerIndex in
                 let paths = LayerWeightPaths.forLayer(layerIndex, config: config, blobDir: weightDirURL.path)
                 return try Self.loadLlamaCPUQKVWeights(config: config, paths: paths)
             }
-        } else {
-            nil
-        }
-        let cpuQKVHiddenBuf = useCPUExactQKV
-            ? UnsafeMutableBufferPointer<Float>.allocate(capacity: decodeDModel)
-            : nil
-        let cpuQKVAttnNormedBuf = useCPUExactQKV
-            ? UnsafeMutableBufferPointer<Float>.allocate(capacity: decodeDModel)
-            : nil
-        let cpuQBuf = useCPUExactQKV
-            ? UnsafeMutableBufferPointer<Float>.allocate(capacity: decodeQDim)
-            : nil
-        let cpuKBuf = useCPUExactQKV
-            ? UnsafeMutableBufferPointer<Float>.allocate(capacity: decodeKVDim)
-            : nil
-        let cpuVBuf = useCPUExactQKV
-            ? UnsafeMutableBufferPointer<Float>.allocate(capacity: decodeKVDim)
-            : nil
-        defer { cpuQKVHiddenBuf?.deallocate() }
-        defer { cpuQKVAttnNormedBuf?.deallocate() }
-        defer { cpuQBuf?.deallocate() }
-        defer { cpuKBuf?.deallocate() }
-        defer { cpuVBuf?.deallocate() }
-        let cpuExactQKV: ((Int, HybridDecodeSurfaceHandles, Int, Int) throws -> Void)? = if let layerWeights = cpuExactQKVLayerWeights,
-                                                                                           let hiddenBuf = cpuQKVHiddenBuf,
-                                                                                           let attnNormedBuf = cpuQKVAttnNormedBuf,
-                                                                                           let qBuf = cpuQBuf,
-                                                                                           let kBuf = cpuKBuf,
-                                                                                           let vBuf = cpuVBuf {
-            { layerIndex, handles, laneSp, _ in
-                let weights = layerWeights[layerIndex]
-                do {
-                    try SurfaceIO.readFP16SpatialSlice(
-                        from: handles.qkvIn,
-                        channelOffset: 0,
-                        spatialIndex: 0,
-                        spatial: laneSp,
-                        into: hiddenBuf,
-                        channels: decodeDModel
-                    )
-                } catch {
-                    throw ANEError.invalidArguments("CPU exact QKV input read failed: \(error)")
-                }
-
-                var sumSq: Float = 0
-                vDSP_dotpr(hiddenBuf.baseAddress!, 1, hiddenBuf.baseAddress!, 1, &sumSq, vDSP_Length(decodeDModel))
-                var invRms = 1.0 / sqrtf(sumSq / Float(decodeDModel) + normEps)
-                vDSP_vsmul(hiddenBuf.baseAddress!, 1, &invRms, attnNormedBuf.baseAddress!, 1, vDSP_Length(decodeDModel))
-                weights.rmsAtt.withUnsafeBufferPointer { gamma in
-                    vDSP_vmul(attnNormedBuf.baseAddress!, 1, gamma.baseAddress!, 1, attnNormedBuf.baseAddress!, 1, vDSP_Length(decodeDModel))
-                }
-
-                Self.multiplyRowMajorMatrix(
-                    matrix: weights.wq,
-                    rows: decodeQDim,
-                    cols: decodeDModel,
-                    vector: UnsafeBufferPointer(attnNormedBuf),
-                    into: qBuf
-                )
-                Self.multiplyRowMajorMatrix(
-                    matrix: weights.wk,
-                    rows: decodeKVDim,
-                    cols: decodeDModel,
-                    vector: UnsafeBufferPointer(attnNormedBuf),
-                    into: kBuf
-                )
-                Self.multiplyRowMajorMatrix(
-                    matrix: weights.wv,
-                    rows: decodeKVDim,
-                    cols: decodeDModel,
-                    vector: UnsafeBufferPointer(attnNormedBuf),
-                    into: vBuf
-                )
-                if let qkvBias = weights.qkvBias {
-                    Self.addBiasInPlace(qkvBias.q, into: qBuf)
-                    Self.addBiasInPlace(qkvBias.k, into: kBuf)
-                    Self.addBiasInPlace(qkvBias.v, into: vBuf)
-                }
-
-                do {
-                    try SurfaceIO.writeFP16SpatialSlice(
-                        to: handles.qOut,
-                        channelOffset: 0,
-                        spatialIndex: 0,
-                        spatial: laneSp,
-                        data: UnsafeBufferPointer(qBuf),
-                        channels: decodeQDim
-                    )
-                    try SurfaceIO.writeFP16SpatialSlice(
-                        to: handles.kOut,
-                        channelOffset: 0,
-                        spatialIndex: 0,
-                        spatial: laneSp,
-                        data: UnsafeBufferPointer(kBuf),
-                        channels: decodeKVDim
-                    )
-                    try SurfaceIO.writeFP16SpatialSlice(
-                        to: handles.vOut,
-                        channelOffset: 0,
-                        spatialIndex: 0,
-                        spatial: laneSp,
-                        data: UnsafeBufferPointer(vBuf),
-                        channels: decodeKVDim
-                    )
-                } catch {
-                    throw ANEError.invalidArguments("CPU exact QKV surface write failed: \(error)")
-                }
-            }
-        } else {
-            nil
         }
 
-        // Prefill: process prompt tokens
-        for (position, token) in promptTokens.enumerated() {
-            try writeIncrementalEmbeddingLlama(token: token, into: xCur)
-            do {
-                try ForwardPass.runHybridDecodeTimed(
-                    xCur: xCur,
-                    kernels: compiledHybridLayers,
-                    surfaceHandles: compiledHybridSurfaceHandles,
-                    metalAttention: metalAttention,
-                    decodeState: &decodeState,
-                    dim: config.dModel,
-                    nHeads: nHeads,
-                    nKVHeads: nKVHeads,
-                    headDim: headDim,
-                    preferCPUDecodeAttention: Self.prefersCPUDecodeAttention(
-                        config: config,
-                        environment: ProcessInfo.processInfo.environment
-                    ),
-                    qkvOverride: cpuExactQKV,
-                    postQKVHook: metalRoPEConfig != nil ? nil : ropeHook,
-                    readFinalOutputIntoXCur: !useANEGreedyHead,
-                    cachedBindings: cachedBindings,
-                    metalRoPEConfig: metalRoPEConfig,
-                    timings: &timings
-                )
-            } catch {
-                throw RealModelInferenceError.runtimeFailure(
-                    "Llama hybrid prefill failed at prompt position \(position): \(error)"
-                )
-            }
-        }
-
-        var allTokens = promptTokens
-        var generatedTokens: [TokenID] = []
-        var tokenLatenciesMs: [Double] = []
-        var decodeProfileTokens: [HybridDecodeTimingBreakdown] = []
-        generatedTokens.reserveCapacity(effectiveMaxTokens)
-        tokenLatenciesMs.reserveCapacity(effectiveMaxTokens)
-        decodeProfileTokens.reserveCapacity(effectiveMaxTokens)
-        var pendingDecode = HybridDecodeTimingBreakdown()
-
-        let generationStart = DispatchTime.now().uptimeNanoseconds
-        var emissionStart = generationStart
-        var firstTokenLatencyMs = 0.0
-        var firstTokenRecorded = false
-        var rng = SystemRandomNumberGenerator()
-        var normalized = [Float](repeating: 0, count: config.dModel)
-        let headSpatial = compiledHybridHeadSpatial
-
-        while generatedTokens.count < effectiveMaxTokens {
-            try Self.throwIfCancelled(isCancelled)
-            let headStart = DispatchTime.now().uptimeNanoseconds
-            let nextToken: TokenID
-            if useANEGreedyHead {
-                do {
-                    if greedyHeadMode != .normThenClassifier {
-                        try compiledHybridGreedyClassifier[0].kernel.eval()
-                    } else {
-                        try compiledHybridGreedyNorm[0].kernel.eval()
-                        try compiledHybridGreedyClassifier[0].kernel.eval()
-                    }
-                    let argmax = try Self.greedyArgmax(
-                        classifier: compiledHybridGreedyClassifier[0],
-                        headSpatial: headSpatial,
-                        vocab: config.vocab
-                    )
-                    guard let token = TokenID(exactly: argmax.index) else {
-                        throw RealModelInferenceError.runtimeFailure(
-                            "Llama greedy ANE classifier selected out-of-range token \(argmax.index)"
-                        )
-                    }
-                    nextToken = token
-                } catch {
-                    throw RealModelInferenceError.runtimeFailure("Llama hybrid greedy ANE head evaluation failed: \(error)")
-                }
-            } else if useCPUExactGreedyHead {
-                normalized = xCur.withUnsafeBufferPointer {
-                    Self.rmsNorm(Array($0), weight: llamaAssets.finalNormGamma, eps: Float(config.normEps))
-                }
-                nextToken = TokenID(exactClassifierArgmax(normalized))
-            } else {
-                do {
-                    try xCur.withUnsafeBufferPointer { buffer in
-                        try Self.writeFP32SpatialSlice(
-                            to: compiledHybridHead[0].inputSurface,
-                            spatialIndex: 0,
-                            spatial: headSpatial,
-                            data: buffer,
-                            channels: config.dModel
-                        )
-                    }
-                    try compiledHybridHead[0].kernel.eval()
-                    try normalized.withUnsafeMutableBufferPointer { buffer in
-                        try Self.readFP32SpatialSlice(
-                            from: compiledHybridHead[0].outputSurface,
-                            spatialIndex: 0,
-                            spatial: headSpatial,
-                            into: buffer,
-                            channels: config.dModel
-                        )
-                    }
-                } catch {
-                    throw RealModelInferenceError.runtimeFailure("Llama hybrid step head evaluation failed: \(error)")
-                }
-
-                nextToken = selectTokenFromNormalizedHidden(
-                    normalized,
-                    temperature: temperature,
-                    topP: topP,
-                    using: &rng
-                )
-            }
-            var tokenProfile = pendingDecode
-            tokenProfile.tLMHead = Self.milliseconds(
-                from: DispatchTime.now().uptimeNanoseconds - headStart
-            )
-            decodeProfileTokens.append(tokenProfile)
-            let emissionNow = DispatchTime.now().uptimeNanoseconds
-            let tokenLatencyMs = Self.milliseconds(from: emissionNow - emissionStart)
-
-            if !firstTokenRecorded {
-                firstTokenLatencyMs = Self.milliseconds(from: emissionNow - generationStart)
-                firstTokenRecorded = true
-            }
-
-            if let eosToken = config.eosToken, nextToken == eosToken {
-                generatedTokens.append(nextToken)
-                break
-            }
-            generatedTokens.append(nextToken)
-            allTokens.append(nextToken)
-            let elapsedMs = Self.milliseconds(from: emissionNow - generationStart)
-            let tokensPerSecond = Double(generatedTokens.count) / max(elapsedMs / 1_000, 1e-9)
-            tokenLatenciesMs.append(tokenLatencyMs)
-            onStep?(
-                GenerationStep(
-                    token: nextToken,
-                    generatedTokens: generatedTokens,
-                    text: tokenizer.decode(allTokens.map(Int.init)),
-                    tokenLatencyMs: tokenLatencyMs,
-                    elapsedMs: elapsedMs,
-                    firstTokenLatencyMs: firstTokenLatencyMs,
-                    tokensPerSecond: tokensPerSecond
-                )
-            )
-
-            if generatedTokens.count >= effectiveMaxTokens || allTokens.count >= config.maxSeq {
-                break
-            }
-
-            try writeIncrementalEmbeddingLlama(token: nextToken, into: xCur)
-            timings.reset()
-            do {
-                try ForwardPass.runHybridDecodeTimed(
-                    xCur: xCur,
-                    kernels: compiledHybridLayers,
-                    surfaceHandles: compiledHybridSurfaceHandles,
-                    metalAttention: metalAttention,
-                    decodeState: &decodeState,
-                    dim: config.dModel,
-                    nHeads: nHeads,
-                    nKVHeads: nKVHeads,
-                    headDim: headDim,
-                    preferCPUDecodeAttention: Self.prefersCPUDecodeAttention(
-                        config: config,
-                        environment: ProcessInfo.processInfo.environment
-                    ),
-                    qkvOverride: cpuExactQKV,
-                    postQKVHook: metalRoPEConfig != nil ? nil : ropeHook,
-                    readFinalOutputIntoXCur: !useANEGreedyHead,
-                    cachedBindings: cachedBindings,
-                    metalRoPEConfig: metalRoPEConfig,
-                    timings: &timings
-                )
-            } catch {
-                throw RealModelInferenceError.runtimeFailure(
-                    "Llama hybrid decode failed at generated token \(generatedTokens.count - 1): \(error)"
-                )
-            }
-            pendingDecode = timings
-            emissionStart = emissionNow
-        }
-
-        let decodeProfileReport = decodeProfileTokens.isEmpty
-            ? nil
-            : HybridDecodeTokenProfile(tokens: decodeProfileTokens).formatReport()
-        if let decodeProfileReport {
-            fputs(decodeProfileReport + "\n", stderr)
-        }
-
-        let generationEnd = DispatchTime.now().uptimeNanoseconds
-        let generationTimeMs = Self.milliseconds(from: generationEnd - generationStart)
-        let tokensPerSecond = generatedTokens.isEmpty
-            ? 0
-            : Double(generatedTokens.count) / max(generationTimeMs / 1_000, 1e-9)
-
+        let stepper = try SplitHybridStepper(
+            config: config,
+            decodeMaxSeq: maxSeq,
+            metalAttention: metalAttention,
+            cachedBindings: cachedBindings,
+            preferCPUDecodeAttention: Self.prefersCPUDecodeAttention(config: config, environment: environment),
+            greedyHeadMode: greedyHeadMode,
+            useANEGreedyHead: useANEGreedyHead,
+            useCPUExactGreedyHead: useCPUExactGreedyHead,
+            cpuExactQKVLayerWeights: cpuExactQKVLayerWeights,
+            tokenEmbedding: llamaAssets.tokenEmbedding,
+            finalNormGamma: llamaAssets.finalNormGamma,
+            tokenizerRef: tokenizer,
+            selector: makeLlamaTokenSelector(),
+            isCancelled: isCancelled
+        )
+        var session = LlamaServingSession(
+            stepper: stepper,
+            effectiveMaxTokens: effectiveMaxTokens,
+            endOfSequenceToken: config.eosToken,
+            temperature: temperature,
+            topP: topP,
+            onStep: onStep
+        )
+        let transcript = try session.run(host: &self, promptTokens: promptTokens)
         return GenerationResult(
-            text: tokenizer.decode(allTokens.map(Int.init)),
-            tokens: generatedTokens,
-            promptTokens: promptTokens,
-            tokenLatenciesMs: tokenLatenciesMs,
-            tokensPerSecond: tokensPerSecond,
+            text: transcript.text,
+            tokens: transcript.generatedTokens,
+            promptTokens: transcript.promptTokens,
+            tokenLatenciesMs: transcript.tokenLatenciesMs,
+            tokensPerSecond: transcript.tokensPerSecond,
             compileTimeMs: compileTimeMs,
-            firstTokenLatencyMs: firstTokenLatencyMs,
+            firstTokenLatencyMs: transcript.firstTokenLatencyMs,
             exactHeadBackend: greedyHeadMode == .classifierOnlyFactored && useANEGreedyHead
                 ? "ane_factored_classifier"
                 : classifierStrategy.exactHeadBackendLabel,
             cachedBindingsEnabled: cachedBindings != nil,
             trunk: .splitHybrid,
-            decodeProfileReport: decodeProfileReport
+            decodeProfileReport: transcript.decodeProfileReport
         )
     }
 
@@ -6790,53 +6855,27 @@ public struct RealModelInferenceEngine: ~Copyable {
         try fullRuntime.prefill(promptTokens: promptTokens)
         try draftRuntime.prefill(promptTokens: promptTokens)
 
-        var allTokens = promptTokens
-        var generatedTokens: [TokenID] = []
-        var tokenLatenciesMs: [Double] = []
-        generatedTokens.reserveCapacity(effectiveMaxTokens)
-        tokenLatenciesMs.reserveCapacity(effectiveMaxTokens)
-
         let generationStart = DispatchTime.now().uptimeNanoseconds
-        var emissionStart = generationStart
-        var firstTokenLatencyMs = 0.0
-        var firstTokenRecorded = false
+        let sessionTokenizer = tokenizer
+        var emitter = TokenEmitter(
+            promptTokens: promptTokens,
+            maxTokens: effectiveMaxTokens,
+            generationStart: generationStart,
+            decodeText: { tokens in sessionTokenizer.decode(tokens.map(Int.init)) },
+            onStep: onStep
+        )
         var committedExactTokensTotal = 0
         var acceptedFutureTokensTotal = 0
         var speculativePassCount = 0
 
-        func emit(_ token: TokenID, at emissionNow: UInt64) {
-            generatedTokens.append(token)
-            allTokens.append(token)
-            let elapsedMs = Self.milliseconds(from: emissionNow - generationStart)
-            let tokenLatencyMs = Self.milliseconds(from: emissionNow - emissionStart)
-            tokenLatenciesMs.append(tokenLatencyMs)
-            if !firstTokenRecorded {
-                firstTokenLatencyMs = Self.milliseconds(from: emissionNow - generationStart)
-                firstTokenRecorded = true
-            }
-            let tokensPerSecond = Double(generatedTokens.count) / max(elapsedMs / 1_000, 1e-9)
-            onStep?(
-                GenerationStep(
-                    token: token,
-                    generatedTokens: generatedTokens,
-                    text: tokenizer.decode(allTokens.map(Int.init)),
-                    tokenLatencyMs: tokenLatencyMs,
-                    elapsedMs: elapsedMs,
-                    firstTokenLatencyMs: firstTokenLatencyMs,
-                    tokensPerSecond: tokensPerSecond
-                )
-            )
-            emissionStart = emissionNow
-        }
-
         let firstToken = fullRuntime.selectGreedyToken()
         if let eosToken = config.eosToken, firstToken == eosToken {
-            generatedTokens.append(firstToken)
+            emitter.commitEndOfSequence(firstToken)
             return GenerationResult(
-                text: tokenizer.decode((promptTokens + generatedTokens).map(Int.init)),
-                tokens: generatedTokens,
+                text: sessionTokenizer.decode((promptTokens + emitter.generatedTokens).map(Int.init)),
+                tokens: emitter.generatedTokens,
                 promptTokens: promptTokens,
-                tokenLatenciesMs: tokenLatenciesMs,
+                tokenLatenciesMs: emitter.tokenLatenciesMs,
                 tokensPerSecond: 0,
                 compileTimeMs: compileTimeMs,
                 firstTokenLatencyMs: 0,
@@ -6848,18 +6887,18 @@ public struct RealModelInferenceEngine: ~Copyable {
             )
         }
         let firstEmission = DispatchTime.now().uptimeNanoseconds
-        emit(firstToken, at: firstEmission)
-        if generatedTokens.count >= effectiveMaxTokens || allTokens.count >= config.maxSeq {
-            let totalMs = Self.milliseconds(from: DispatchTime.now().uptimeNanoseconds - generationStart)
-            let tps = generatedTokens.isEmpty ? 0 : Double(generatedTokens.count) / max(totalMs / 1_000, 1e-9)
+        emitter.emit(firstToken, at: firstEmission)
+        if emitter.generatedCount >= effectiveMaxTokens || emitter.totalTokenCount >= config.maxSeq {
+            let totalMs = Self.milliseconds(from: DispatchTime.now().uptimeNanoseconds &- generationStart)
+            let tps = emitter.generatedCount == 0 ? 0 : Double(emitter.generatedCount) / max(totalMs / 1_000, 1e-9)
             return GenerationResult(
-                text: tokenizer.decode(allTokens.map(Int.init)),
-                tokens: generatedTokens,
+                text: sessionTokenizer.decode(emitter.allTokens.map(Int.init)),
+                tokens: emitter.generatedTokens,
                 promptTokens: promptTokens,
-                tokenLatenciesMs: tokenLatenciesMs,
+                tokenLatenciesMs: emitter.tokenLatenciesMs,
                 tokensPerSecond: tps,
                 compileTimeMs: compileTimeMs,
-                firstTokenLatencyMs: firstTokenLatencyMs,
+                firstTokenLatencyMs: emitter.firstTokenLatencyMs,
                 exactHeadBackend: "cpu_exact_two_token_draft",
                 cachedBindingsEnabled: false,
                 committedExactTokensPerPass: nil,
@@ -6871,9 +6910,9 @@ public struct RealModelInferenceEngine: ~Copyable {
         try fullRuntime.advance(token: firstToken)
         try draftRuntime.advance(token: firstToken)
 
-        while generatedTokens.count < effectiveMaxTokens, allTokens.count < config.maxSeq {
+        while emitter.generatedCount < effectiveMaxTokens, emitter.totalTokenCount < config.maxSeq {
             speculativePassCount += 1
-            let remainingTokenBudget = min(effectiveMaxTokens - generatedTokens.count, config.maxSeq - allTokens.count)
+            let remainingTokenBudget = min(effectiveMaxTokens - emitter.generatedCount, config.maxSeq - emitter.totalTokenCount)
             let draftCheckpoint = draftRuntime.captureCheckpoint()
             let proposedToken0 = draftRuntime.selectGreedyToken()
             try draftRuntime.advance(token: proposedToken0)
@@ -6889,7 +6928,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             }
 
             let firstRoundEmission = DispatchTime.now().uptimeNanoseconds
-            emit(exactToken0, at: firstRoundEmission)
+            emitter.emit(exactToken0, at: firstRoundEmission)
             committedInPass += 1
             if let eosToken = config.eosToken, exactToken0 == eosToken {
                 committedExactTokensTotal += committedInPass
@@ -6901,7 +6940,7 @@ public struct RealModelInferenceEngine: ~Copyable {
                 try draftRuntime.advance(token: exactToken0)
             }
 
-            if generatedTokens.count >= effectiveMaxTokens || allTokens.count >= config.maxSeq || remainingTokenBudget <= 1 {
+            if emitter.generatedCount >= effectiveMaxTokens || emitter.totalTokenCount >= config.maxSeq || remainingTokenBudget <= 1 {
                 committedExactTokensTotal += committedInPass
                 acceptedFutureTokensTotal += acceptedInPass
                 continue
@@ -6913,7 +6952,7 @@ public struct RealModelInferenceEngine: ~Copyable {
                 acceptedInPass += 1
             }
             let secondRoundEmission = DispatchTime.now().uptimeNanoseconds
-            emit(exactToken1, at: secondRoundEmission)
+            emitter.emit(exactToken1, at: secondRoundEmission)
             committedInPass += 1
             if let eosToken = config.eosToken, exactToken1 == eosToken {
                 committedExactTokensTotal += committedInPass
@@ -6928,10 +6967,6 @@ public struct RealModelInferenceEngine: ~Copyable {
         }
 
         let generationEnd = DispatchTime.now().uptimeNanoseconds
-        let generationTimeMs = Self.milliseconds(from: generationEnd - generationStart)
-        let tokensPerSecond = generatedTokens.isEmpty
-            ? 0
-            : Double(generatedTokens.count) / max(generationTimeMs / 1_000, 1e-9)
         let committedExactTokensPerPass = speculativePassCount == 0
             ? nil
             : Double(committedExactTokensTotal) / Double(speculativePassCount)
@@ -6940,19 +6975,126 @@ public struct RealModelInferenceEngine: ~Copyable {
             : Double(acceptedFutureTokensTotal) / Double(speculativePassCount)
 
         return GenerationResult(
-            text: tokenizer.decode(allTokens.map(Int.init)),
-            tokens: generatedTokens,
+            text: sessionTokenizer.decode(emitter.allTokens.map(Int.init)),
+            tokens: emitter.generatedTokens,
             promptTokens: promptTokens,
-            tokenLatenciesMs: tokenLatenciesMs,
-            tokensPerSecond: tokensPerSecond,
+            tokenLatenciesMs: emitter.tokenLatenciesMs,
+            tokensPerSecond: emitter.tokensPerSecond(until: generationEnd),
             compileTimeMs: compileTimeMs,
-            firstTokenLatencyMs: firstTokenLatencyMs,
+            firstTokenLatencyMs: emitter.firstTokenLatencyMs,
             exactHeadBackend: "cpu_exact_two_token_draft",
             cachedBindingsEnabled: false,
             committedExactTokensPerPass: committedExactTokensPerPass,
             acceptedFutureTokensPerPass: acceptedFutureTokensPerPass,
             trunk: .exactCPU
         )
+    }
+
+    /// Exact-CPU Trunk stepper: transformer layers on the CPU, also the Qwen oracle.
+    ///
+    /// Owns the KV caches and rolling hidden state for one session run.
+    private final class ExactCPUStepper: LlamaStepping {
+
+        let contextLimit: Int
+        let tracksDecodeProfile = false
+
+        private let config: MultiModelConfig
+        private let weights: CachedExactCPULlamaWeights
+        private let roundIntermediatesToFP16: Bool
+        private let selector: LlamaTokenSelector
+        private let tokenizerRef: LoadedTokenizer
+        private let isCancelled: (() -> Bool)?
+
+        private var kCaches: [[Float]] = []
+        private var vCaches: [[Float]] = []
+        private var lastHidden: [Float] = []
+        private var nextPosition = 0
+
+        init(
+            config: MultiModelConfig,
+            maxSeq: Int,
+            weights: CachedExactCPULlamaWeights,
+            tokenizerRef: LoadedTokenizer,
+            selector: LlamaTokenSelector,
+            isCancelled: (() -> Bool)?
+        ) {
+            self.config = config
+            self.contextLimit = maxSeq
+            self.weights = weights
+            self.roundIntermediatesToFP16 =
+                RealModelInferenceEngine.shouldRoundCPUExactDecodeIntermediatesToFP16()
+            self.tokenizerRef = tokenizerRef
+            self.selector = selector
+            self.isCancelled = isCancelled
+        }
+
+        func begin(host: inout RealModelInferenceEngine, promptTokens: [TokenID]) throws {
+            kCaches = Array(
+                repeating: [Float](repeating: 0, count: config.kvDim * contextLimit),
+                count: config.nLayer
+            )
+            vCaches = Array(
+                repeating: [Float](repeating: 0, count: config.kvDim * contextLimit),
+                count: config.nLayer
+            )
+            lastHidden = [Float](repeating: 0, count: config.dModel)
+            for (position, token) in promptTokens.enumerated() {
+                lastHidden = try forwardToken(token, position: position)
+            }
+            nextPosition = promptTokens.count
+        }
+
+        func proposal(host: inout RealModelInferenceEngine) throws -> LlamaDecodeProposal {
+            let normalized = RealModelInferenceEngine.rmsNorm(
+                lastHidden,
+                weight: weights.finalNormGamma,
+                eps: Float(config.normEps)
+            )
+            return .normalizedHidden(normalized)
+        }
+
+        func advance(host: inout RealModelInferenceEngine, consuming token: TokenID, generatedCount: Int) throws {
+            lastHidden = try forwardToken(token, position: nextPosition)
+            nextPosition += 1
+        }
+
+        func takePendingTimings() -> HybridDecodeTimingBreakdown? { nil }
+
+        func resolveToken(hidden: [Float], temperature: Float, topP: Float) -> TokenID {
+            selector.selectToken(hidden: hidden, temperature: temperature, topP: topP)
+        }
+
+        func decodeText(_ tokens: [TokenID]) -> String {
+            tokenizerRef.decode(tokens.map(Int.init))
+        }
+
+        func throwIfCancelled() throws {
+            try RealModelInferenceEngine.throwIfCancelled(isCancelled)
+        }
+
+        private func forwardToken(_ token: TokenID, position: Int) throws -> [Float] {
+            let tokenIndex = Int(token)
+            let tokenEnd = (tokenIndex + 1) * config.dModel
+            guard tokenIndex < config.vocab, tokenEnd <= weights.tokenEmbedding.count else {
+                throw RealModelInferenceError.runtimeFailure(
+                    "Llama embedding OOB: token=\(token), base=\(tokenIndex * config.dModel), embeddingCount=\(weights.tokenEmbedding.count), dModel=\(config.dModel)"
+                )
+            }
+            var hidden = Array(weights.tokenEmbedding[tokenIndex * config.dModel..<tokenEnd])
+            for layerIndex in 0..<config.nLayer {
+                hidden = try RealModelInferenceEngine.exactCPULlamaLayerForward(
+                    hidden: hidden,
+                    layer: weights.layers[layerIndex],
+                    config: config,
+                    position: position,
+                    kCache: &kCaches[layerIndex],
+                    vCache: &vCaches[layerIndex],
+                    cacheStride: contextLimit,
+                    roundIntermediatesToFP16: roundIntermediatesToFP16
+                )
+            }
+            return hidden
+        }
     }
 
     private mutating func generateIncrementalExactCPULlama(
@@ -6968,127 +7110,32 @@ public struct RealModelInferenceEngine: ~Copyable {
         guard !promptTokens.isEmpty else {
             throw RealModelInferenceError.invalidGenerationParameters("Prompt tokens must not be empty")
         }
-        let roundIntermediatesToFP16 = Self.shouldRoundCPUExactDecodeIntermediatesToFP16()
-        let exactWeights = try loadCachedExactCPULlamaWeights()
-        let tokenEmbedding = exactWeights.tokenEmbedding
-        let finalNormGamma = exactWeights.finalNormGamma
-        let layers = exactWeights.layers
-
-        var kCaches = Array(
-            repeating: [Float](repeating: 0, count: config.kvDim * maxSeq),
-            count: config.nLayer
+        let weights = try loadCachedExactCPULlamaWeights()
+        let stepper = ExactCPUStepper(
+            config: config,
+            maxSeq: maxSeq,
+            weights: weights,
+            tokenizerRef: tokenizer,
+            selector: makeLlamaTokenSelector(),
+            isCancelled: isCancelled
         )
-        var vCaches = Array(
-            repeating: [Float](repeating: 0, count: config.kvDim * maxSeq),
-            count: config.nLayer
+        var session = LlamaServingSession(
+            stepper: stepper,
+            effectiveMaxTokens: effectiveMaxTokens,
+            endOfSequenceToken: config.eosToken,
+            temperature: temperature,
+            topP: topP,
+            onStep: onStep
         )
-
-        func forwardToken(_ token: TokenID, position: Int) throws -> [Float] {
-            let tokenIndex = Int(token)
-            let tokenEnd = (tokenIndex + 1) * config.dModel
-            guard tokenIndex < config.vocab, tokenEnd <= tokenEmbedding.count else {
-                throw RealModelInferenceError.runtimeFailure(
-                    "Llama embedding OOB: token=\(token), base=\(tokenIndex * config.dModel), embeddingCount=\(tokenEmbedding.count), dModel=\(config.dModel)"
-                )
-            }
-            var hidden = Array(tokenEmbedding[tokenIndex * config.dModel..<tokenEnd])
-            for layerIndex in 0..<config.nLayer {
-                hidden = Self.exactCPULlamaLayerForward(
-                    hidden: hidden,
-                    layer: layers[layerIndex],
-                    config: config,
-                    position: position,
-                    kCache: &kCaches[layerIndex],
-                    vCache: &vCaches[layerIndex],
-                    cacheStride: maxSeq,
-                    roundIntermediatesToFP16: roundIntermediatesToFP16
-                )
-            }
-            return hidden
-        }
-
-        var allTokens = promptTokens
-        var lastHidden = [Float](repeating: 0, count: config.dModel)
-        for (position, token) in promptTokens.enumerated() {
-            lastHidden = try forwardToken(token, position: position)
-        }
-
-        let generationStart = DispatchTime.now().uptimeNanoseconds
-        var emissionStart = generationStart
-        var firstTokenLatencyMs = 0.0
-        var firstTokenRecorded = false
-        var generatedTokens: [TokenID] = []
-        var tokenLatenciesMs: [Double] = []
-        generatedTokens.reserveCapacity(effectiveMaxTokens)
-        tokenLatenciesMs.reserveCapacity(effectiveMaxTokens)
-        var rng = SystemRandomNumberGenerator()
-
-        while generatedTokens.count < effectiveMaxTokens {
-            try Self.throwIfCancelled(isCancelled)
-            let normalized = Self.rmsNorm(lastHidden, weight: finalNormGamma, eps: Float(config.normEps))
-            let nextToken: TokenID
-            if temperature == 0 {
-                nextToken = TokenID(exactClassifierArgmax(normalized))
-            } else {
-                nextToken = selectTokenFromNormalizedHidden(
-                    normalized,
-                    temperature: temperature,
-                    topP: topP,
-                    using: &rng
-                )
-            }
-
-            let emissionNow = DispatchTime.now().uptimeNanoseconds
-            let tokenLatencyMs = Self.milliseconds(from: emissionNow - emissionStart)
-            if !firstTokenRecorded {
-                firstTokenLatencyMs = Self.milliseconds(from: emissionNow - generationStart)
-                firstTokenRecorded = true
-            }
-
-            if let eosToken = config.eosToken, nextToken == eosToken {
-                generatedTokens.append(nextToken)
-                break
-            }
-
-            generatedTokens.append(nextToken)
-            allTokens.append(nextToken)
-            let elapsedMs = Self.milliseconds(from: emissionNow - generationStart)
-            let tokensPerSecond = Double(generatedTokens.count) / max(elapsedMs / 1_000, 1e-9)
-            tokenLatenciesMs.append(tokenLatencyMs)
-            onStep?(
-                GenerationStep(
-                    token: nextToken,
-                    generatedTokens: generatedTokens,
-                    text: tokenizer.decode(allTokens.map(Int.init)),
-                    tokenLatencyMs: tokenLatencyMs,
-                    elapsedMs: elapsedMs,
-                    firstTokenLatencyMs: firstTokenLatencyMs,
-                    tokensPerSecond: tokensPerSecond
-                )
-            )
-
-            if generatedTokens.count >= effectiveMaxTokens || allTokens.count >= maxSeq {
-                break
-            }
-
-            lastHidden = try forwardToken(nextToken, position: allTokens.count - 1)
-            emissionStart = emissionNow
-        }
-
-        let generationEnd = DispatchTime.now().uptimeNanoseconds
-        let generationTimeMs = Self.milliseconds(from: generationEnd - generationStart)
-        let tokensPerSecond = generatedTokens.isEmpty
-            ? 0
-            : Double(generatedTokens.count) / max(generationTimeMs / 1_000, 1e-9)
-
+        let transcript = try session.run(host: &self, promptTokens: promptTokens)
         return GenerationResult(
-            text: tokenizer.decode(allTokens.map(Int.init)),
-            tokens: generatedTokens,
-            promptTokens: promptTokens,
-            tokenLatenciesMs: tokenLatenciesMs,
-            tokensPerSecond: tokensPerSecond,
+            text: transcript.text,
+            tokens: transcript.generatedTokens,
+            promptTokens: transcript.promptTokens,
+            tokenLatenciesMs: transcript.tokenLatenciesMs,
+            tokensPerSecond: transcript.tokensPerSecond,
             compileTimeMs: compileTimeMs,
-            firstTokenLatencyMs: firstTokenLatencyMs,
+            firstTokenLatencyMs: transcript.firstTokenLatencyMs,
             exactHeadBackend: classifierStrategy.exactHeadBackendLabel,
             trunk: .exactCPU
         )
@@ -9512,6 +9559,301 @@ public struct RealModelInferenceEngine: ~Copyable {
             }
         }
         return output
+    }
+
+    // MARK: - Llama serving session loop
+
+    /// One Trunk's decode-step implementation behind the serving-session seam.
+    ///
+    /// Steppers own per-run hidden-state and KV-cache state; compiled ANE programs
+    /// stay on the host engine and are reached through it. Host flows concretely
+    /// because the engine is noncopyable and cannot cross an existential.
+    protocol LlamaStepping: AnyObject {
+        var contextLimit: Int { get }
+        var tracksDecodeProfile: Bool { get }
+
+        func begin(host: inout RealModelInferenceEngine, promptTokens: [TokenID]) throws
+        func proposal(host: inout RealModelInferenceEngine) throws -> LlamaDecodeProposal
+        func advance(
+            host: inout RealModelInferenceEngine,
+            consuming token: TokenID,
+            generatedCount: Int
+        ) throws
+        func takePendingTimings() -> HybridDecodeTimingBreakdown?
+        func resolveToken(hidden: [Float], temperature: Float, topP: Float) -> TokenID
+        func decodeText(_ tokens: [TokenID]) -> String
+        func throwIfCancelled() throws
+    }
+
+    /// The one decode-step loop for every llama serving session: sampling policy,
+    /// cancellation, EOS, timing, telemetry, streaming, and context limits live here
+    /// exactly once; Trunks sit behind ``LlamaStepping``.
+    struct LlamaServingSession {
+        private let stepper: any LlamaStepping
+        private let effectiveMaxTokens: Int
+        private let endOfSequenceToken: TokenID?
+        private let temperature: Float
+        private let topP: Float
+        private let onStep: ((GenerationStep) -> Void)?
+
+        init(
+            stepper: any LlamaStepping,
+            effectiveMaxTokens: Int,
+            endOfSequenceToken: TokenID?,
+            temperature: Float,
+            topP: Float,
+            onStep: ((GenerationStep) -> Void)?
+        ) {
+            self.stepper = stepper
+            self.effectiveMaxTokens = effectiveMaxTokens
+            self.endOfSequenceToken = endOfSequenceToken
+            self.temperature = temperature
+            self.topP = topP
+            self.onStep = onStep
+        }
+
+        func run(host: inout RealModelInferenceEngine, promptTokens: [TokenID]) throws -> SessionTranscript {
+            try stepper.begin(host: &host, promptTokens: promptTokens)
+
+            let generationStart = TokenEmitter.now()
+            let stepperBox = stepper
+            var emitter = TokenEmitter(
+                promptTokens: promptTokens,
+                maxTokens: effectiveMaxTokens,
+                generationStart: generationStart,
+                decodeText: { tokens in stepperBox.decodeText(tokens) },
+                onStep: onStep
+            )
+
+            var decodeProfileTokens: [HybridDecodeTimingBreakdown] = []
+            if stepper.tracksDecodeProfile {
+                decodeProfileTokens.reserveCapacity(effectiveMaxTokens)
+            }
+
+            while emitter.generatedCount < effectiveMaxTokens {
+                try stepper.throwIfCancelled()
+
+                let headStart = TokenEmitter.now()
+                let proposal = try stepper.proposal(host: &host)
+                let nextToken: TokenID
+                switch proposal {
+                case .selected(let token):
+                    nextToken = token
+                case .normalizedHidden(let hidden):
+                    nextToken = stepper.resolveToken(hidden: hidden, temperature: temperature, topP: topP)
+                }
+
+                if stepper.tracksDecodeProfile {
+                    var entry = stepper.takePendingTimings() ?? HybridDecodeTimingBreakdown()
+                    entry.tLMHead = TokenEmitter.milliseconds(from: TokenEmitter.now() &- headStart)
+                    decodeProfileTokens.append(entry)
+                }
+
+                let emissionNow = TokenEmitter.now()
+                let tokenLatencyMs = emitter.noteResolution(at: emissionNow)
+
+                if isEndOfSequence(nextToken) {
+                    emitter.commitEndOfSequence(nextToken)
+                    break
+                }
+
+                emitter.commit(nextToken, tokenLatencyMs: tokenLatencyMs, at: emissionNow)
+
+                if emitter.generatedCount >= effectiveMaxTokens
+                    || emitter.totalTokenCount >= stepper.contextLimit {
+                    break
+                }
+
+                try stepper.advance(
+                    host: &host,
+                    consuming: nextToken,
+                    generatedCount: emitter.generatedCount
+                )
+            }
+
+            let decodeProfileReport = decodeProfileTokens.isEmpty
+                ? nil
+                : HybridDecodeTokenProfile(tokens: decodeProfileTokens).formatReport()
+            if let decodeProfileReport {
+                fputs(decodeProfileReport + "\n", stderr)
+            }
+
+            return emitter.makeTranscript(decodeProfileReport: decodeProfileReport)
+        }
+
+        private func isEndOfSequence(_ token: TokenID) -> Bool {
+            guard let endOfSequenceToken else { return false }
+            return token == endOfSequenceToken
+        }
+    }
+
+    // MARK: - Llama serving session steppers
+
+    /// Shared token selection over normalized hidden state.
+    ///
+    /// One instance per llama serving session; owns the sampling RNG and the
+    /// classifier logits scratch so selection behavior matches the engine's own
+    /// path draw-for-draw and byte-for-byte.
+    final class LlamaTokenSelector {
+        private let strategy: ClassifierStrategy
+        private let lmHeadWeights: [Float]
+        private let lmHeadFP16: [UInt16]?
+        private let classifierBlockMaxNorms: [Float]
+        private var logitsScratch: [Float]
+        private let vocabSize: Int
+        private let dim: Int
+        private var rng = SystemRandomNumberGenerator()
+
+        init(
+            strategy: ClassifierStrategy,
+            lmHeadWeights: [Float],
+            lmHeadFP16: [UInt16]?,
+            classifierBlockMaxNorms: [Float],
+            vocab: Int,
+            dModel: Int
+        ) {
+            self.strategy = strategy
+            self.lmHeadWeights = lmHeadWeights
+            self.lmHeadFP16 = lmHeadFP16
+            self.classifierBlockMaxNorms = classifierBlockMaxNorms
+            self.logitsScratch = [Float](repeating: 0, count: vocab)
+            self.vocabSize = vocab
+            self.dim = dModel
+        }
+
+        func selectToken(hidden: [Float], temperature: Float, topP: Float) -> TokenID {
+            if temperature <= 0 {
+                return TokenID(exactClassifierArgmax(hidden))
+            }
+            let logits = projectLogits(hidden)
+            return TokenID(
+                NucleusSampler.sample(
+                    logits: logits,
+                    temperature: temperature,
+                    topP: topP,
+                    using: &rng
+                )
+            )
+        }
+
+        private func exactClassifierArgmax(_ hidden: [Float]) -> Int {
+            precondition(hidden.count == dim)
+            if let dumpPath = ProcessInfo.processInfo.environment["ESPRESSO_DUMP_LM_HEAD_HIDDEN"],
+               !dumpPath.isEmpty {
+                RealModelInferenceEngine.appendLMHeadHiddenDump(hidden, to: dumpPath)
+            }
+            switch strategy {
+            case .ane, .cpuPartitionedFP32:
+                return hidden.withUnsafeBufferPointer { hiddenBuffer in
+                    lmHeadWeights.withUnsafeBufferPointer { weightBuffer in
+                        classifierBlockMaxNorms.withUnsafeBufferPointer { normsBuffer in
+                            logitsScratch.withUnsafeMutableBufferPointer { scratchBuffer in
+                                guard let hiddenBase = hiddenBuffer.baseAddress,
+                                      let weightBase = weightBuffer.baseAddress,
+                                      let normsBase = normsBuffer.baseAddress,
+                                      let scratchBase = scratchBuffer.baseAddress else {
+                                    return 0
+                                }
+                                return RealModelInferenceEngine.partitionedArgmax(
+                                    classifier: weightBase,
+                                    input: hiddenBase,
+                                    logitsScratch: scratchBase,
+                                    blockMaxNorms: normsBase,
+                                    vocabSize: vocabSize,
+                                    dim: dim,
+                                    blockSize: RealModelInferenceEngine.classifierArgmaxBlockSize
+                                )
+                            }
+                        }
+                    }
+                }
+            case .cpuFP16Tiled:
+                guard let lmHeadFP16 else {
+                    return hidden.withUnsafeBufferPointer { hiddenBuffer in
+                        lmHeadWeights.withUnsafeBufferPointer { weightBuffer in
+                            classifierBlockMaxNorms.withUnsafeBufferPointer { normsBuffer in
+                                logitsScratch.withUnsafeMutableBufferPointer { scratchBuffer in
+                                    guard let hiddenBase = hiddenBuffer.baseAddress,
+                                          let weightBase = weightBuffer.baseAddress,
+                                          let normsBase = normsBuffer.baseAddress,
+                                          let scratchBase = scratchBuffer.baseAddress else {
+                                        return 0
+                                    }
+                                    return RealModelInferenceEngine.partitionedArgmax(
+                                        classifier: weightBase,
+                                        input: hiddenBase,
+                                        logitsScratch: scratchBase,
+                                        blockMaxNorms: normsBase,
+                                        vocabSize: vocabSize,
+                                        dim: dim,
+                                        blockSize: RealModelInferenceEngine.classifierArgmaxBlockSize
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+                return hidden.withUnsafeBufferPointer { hiddenBuffer in
+                    lmHeadFP16.withUnsafeBufferPointer { weightBuffer in
+                        guard let hiddenBase = hiddenBuffer.baseAddress,
+                              let weightBase = weightBuffer.baseAddress else {
+                            return 0
+                        }
+                        return FP16TiledClassifier.tiledMatvecArgmax(
+                            weights: weightBase,
+                            input: hiddenBase,
+                            vocabSize: vocabSize,
+                            dim: dim
+                        )
+                    }
+                }
+            }
+        }
+
+        private func projectLogits(_ hidden: [Float]) -> [Float] {
+            precondition(hidden.count == dim)
+            var logits = [Float](repeating: 0, count: vocabSize)
+            logits.withUnsafeMutableBufferPointer { logitsBuffer in
+                lmHeadWeights.withUnsafeBufferPointer { weightBuffer in
+                    hidden.withUnsafeBufferPointer { hiddenBuffer in
+                        guard let logitsBase = logitsBuffer.baseAddress,
+                              let weightBase = weightBuffer.baseAddress,
+                              let hiddenBase = hiddenBuffer.baseAddress else {
+                            return
+                        }
+                        vDSP_mmul(
+                            weightBase,
+                            1,
+                            hiddenBase,
+                            1,
+                            logitsBase,
+                            1,
+                            vDSP_Length(vocabSize),
+                            1,
+                            vDSP_Length(dim)
+                        )
+                    }
+                }
+            }
+            return logits
+        }
+    }
+
+    private func makeLlamaTokenSelector() -> LlamaTokenSelector {
+        let fp16Head: [UInt16]?
+        if case let .llama(assets) = assets {
+            fp16Head = assets.lmHeadFP16
+        } else {
+            fp16Head = nil
+        }
+        return LlamaTokenSelector(
+            strategy: classifierStrategy,
+            lmHeadWeights: lmHeadWeights,
+            lmHeadFP16: fp16Head,
+            classifierBlockMaxNorms: classifierBlockMaxNorms,
+            vocab: config.vocab,
+            dModel: config.dModel
+        )
     }
 }
 
