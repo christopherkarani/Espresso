@@ -1631,12 +1631,14 @@ public extension ForwardPass {
         decodeState: inout DecodeState,
         dim: Int = ModelConfig.dim,
         timings: inout StepTimingBreakdown,
-        profiler: DecodeKernelProfiler? = nil
+        profiler: DecodeKernelProfiler? = nil,
+        ffnOnlyEval: Bool? = nil
     ) throws(ANEError) {
         precondition(kernels.count > 0)
         precondition(surfaceHandles.count == kernels.count)
         precondition(dim > 0)
         precondition(xCur.count == dim)
+        let evalFFNOnly = ffnOnlyEval ?? (ProcessInfo.processInfo.environment["DECODE_EVAL_FFN_ONLY"] == "1")
         let maxSeq = decodeState.maxSeq
         for handles in surfaceHandles {
             precondition(handles.maxSeq == maxSeq)
@@ -1685,7 +1687,7 @@ public extension ForwardPass {
                 }
             }
 
-            if ProcessInfo.processInfo.environment["DECODE_EVAL_FFN_ONLY"] == "1" {
+            if evalFFNOnly {
                 t0 = RuntimeClock.now()
                 do {
                     try SurfaceIO.copyFP16(
