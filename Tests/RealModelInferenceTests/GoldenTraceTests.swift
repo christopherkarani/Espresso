@@ -204,9 +204,9 @@ enum GoldenTraceRunner {
 
 @Test func goldenTraceRecord() throws {
     guard ProcessInfo.processInfo.environment["ESPRESSO_RECORD_GOLDEN_TRACES"] == "1" else {
-        throw GoldenTraceRunner.CaseUnavailable(
-            "recording disabled; set ESPRESSO_RECORD_GOLDEN_TRACES=1"
-        )
+        // Recording is an explicit operator action on ANE hardware; replay is the gate.
+        print("[golden-traces] SKIP goldenTraceRecord: set ESPRESSO_RECORD_GOLDEN_TRACES=1 to record")
+        return
     }
     let only = ProcessInfo.processInfo.environment["ESPRESSO_GOLDEN_TRACE_CASE"]
 
