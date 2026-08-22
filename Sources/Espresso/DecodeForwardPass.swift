@@ -432,84 +432,6 @@ public struct HybridDecodeTokenProfile: Sendable {
     }
 }
 
-/// Decode surfaces for the split hybrid path:
-/// ANE QKV-only -> Metal attention/projection -> ANE FFN.
-///
-/// Supports GQA: K/V caches use `kvDim` (nKVHeads * headDim) which may differ from `dim`.
-public struct HybridDecodeSurfaceHandles {
-    public let qkvIn: IOSurfaceRef
-    public let qOut: IOSurfaceRef
-    public let kOut: IOSurfaceRef
-    public let vOut: IOSurfaceRef
-    public let projectionContextIn: IOSurfaceRef
-    public let projectionResidualIn: IOSurfaceRef
-    public let projectionOut: IOSurfaceRef
-    public let ffnIn: IOSurfaceRef
-    public let ffnOut: IOSurfaceRef
-    public let kCacheFull: IOSurfaceRef
-    public let vCacheFull: IOSurfaceRef
-    public let zeroLane: IOSurfaceRef
-    public let maxSeq: Int
-    public let laneSpatial: Int
-
-    public let dim: Int
-    public let qDim: Int
-    public let kvDim: Int
-
-    public init(
-        kernels: borrowing HybridDecodeKernelSet,
-        logicalMaxSeq: Int? = nil,
-        dim: Int = ModelConfig.dim,
-        qDim: Int? = nil,
-        kvDim: Int? = nil
-    ) throws(ANEError) {
-        let resolvedQDim = qDim ?? dim
-        let resolvedKVDim = kvDim ?? dim
-        let qkvIn = try kernels.decodeQKVOnly.inputSurface(at: 0)
-        let kOut = try kernels.decodeQKVOnly.outputSurface(at: 0)
-        let qOut = try kernels.decodeQKVOnly.outputSurface(at: 1)
-        let vOut = try kernels.decodeQKVOnly.outputSurface(at: 2)
-        let projectionContextIn = try kernels.decodeProjection.inputSurface(at: 0)
-        let projectionOut = try kernels.decodeProjection.outputSurface(at: 0)
-        let ffnOut = try (kernels.usesFusedPostAttention
-            ? kernels.decodeProjection.outputSurface(at: 0)
-            : kernels.decodeFFN.outputSurface(at: 0))
-        try kernels.decodeProjection.rebindInput(at: 1, to: qkvIn)
-        if !kernels.usesFusedPostAttention {
-            try kernels.decodeFFN.rebindInput(at: 0, to: projectionOut)
-        }
-
-        self.dim = dim
-        self.qDim = resolvedQDim
-        self.kvDim = resolvedKVDim
-        self.qkvIn = qkvIn
-        self.kOut = kOut
-        self.qOut = qOut
-        self.vOut = vOut
-        self.projectionContextIn = projectionContextIn
-        self.projectionResidualIn = qkvIn
-        self.projectionOut = projectionOut
-        self.ffnIn = kernels.usesFusedPostAttention ? qkvIn : projectionOut
-        self.ffnOut = ffnOut
-        self.maxSeq = logicalMaxSeq ?? kernels.maxSeq
-        self.laneSpatial = kernels.laneSpatial
-
-        guard let kCacheFull = ane_interop_create_surface(resolvedKVDim * self.maxSeq * 2),
-              let vCacheFull = ane_interop_create_surface(resolvedKVDim * self.maxSeq * 2),
-              let zeroLane = ane_interop_create_surface(dim * kernels.laneSpatial * 2) else {
-            throw .surfaceAllocationFailed
-        }
-        self.kCacheFull = kCacheFull
-        self.vCacheFull = vCacheFull
-        self.zeroLane = zeroLane
-
-        let zeroLaneValues = Array(repeating: Float(0), count: dim * kernels.laneSpatial)
-        try mapSurfaceIOToANEError { try zeroLaneValues.withUnsafeBufferPointer { src in
-            try SurfaceIO.writeFP16(to: zeroLane, data: src, channels: dim, spatial: kernels.laneSpatial)
-        } }
-    }
-}
-
 /// Decode surfaces for one layer using the fused (attn + FFN) kernel.
 ///
 /// The fused kernel has 4 inputs and 3 outputs:
@@ -1282,10 +1204,7 @@ public extension ForwardPass {
                     // Run previous layer's ANE ProjFFN (it reads the Metal context output)
                     t0 = RuntimeClock.now()
                     do {
-                        try kernels[layerIndex - 1].decodeProjection.eval()
-                        if !kernels[layerIndex - 1].usesFusedPostAttention {
-                            try kernels[layerIndex - 1].decodeFFN.eval()
-                        }
+                        try kernels[layerIndex - 1].evalPostAttention()
                     } catch {
                         throw .invalidArguments("hybrid ProjFFN pipelined failed at layer \(layerIndex - 1): \(error)")
                     }
@@ -1413,10 +1332,7 @@ public extension ForwardPass {
                 let lastLayer = kernels.count - 1
                 t0 = RuntimeClock.now()
                 do {
-                    try kernels[lastLayer].decodeProjection.eval()
-                    if !kernels[lastLayer].usesFusedPostAttention {
-                        try kernels[lastLayer].decodeFFN.eval()
-                    }
+                    try kernels[lastLayer].evalPostAttention()
                 } catch {
                     throw .invalidArguments("hybrid ProjFFN final failed: \(error)")
                 }
@@ -1478,15 +1394,9 @@ public extension ForwardPass {
                     timings.tMetal += RuntimeClock.ms(RuntimeClock.now() - t0)
 
                     t0 = RuntimeClock.now()
-                    try kernels[layerIndex].decodeProjection.eval()
-                    if !kernels[layerIndex].usesFusedPostAttention {
-                        try kernels[layerIndex].decodeFFN.eval()
-                    }
+                    try kernels[layerIndex].evalPostAttention()
                 } catch {
-                    let kernelName = kernels[layerIndex].usesFusedPostAttention
-                        ? "decodeProjectionFFN"
-                        : "decodeProjection+decodeFFN"
-                    throw .invalidArguments("hybrid \(kernelName) failed at layer \(layerIndex), token \(tokenIndex): \(error)")
+                    throw .invalidArguments("hybrid \(kernels[layerIndex].postAttentionStageName) failed at layer \(layerIndex), token \(tokenIndex): \(error)")
                 }
                 timings.tAneFFN += RuntimeClock.ms(RuntimeClock.now() - t0)
 
@@ -1587,15 +1497,9 @@ public extension ForwardPass {
                     timings.tMetal += RuntimeClock.ms(RuntimeClock.now() - t0)
 
                     t0 = RuntimeClock.now()
-                    try kernels[layerIndex].decodeProjection.eval()
-                    if !kernels[layerIndex].usesFusedPostAttention {
-                        try kernels[layerIndex].decodeFFN.eval()
-                    }
+                    try kernels[layerIndex].evalPostAttention()
                 } catch {
-                    let kernelName = kernels[layerIndex].usesFusedPostAttention
-                        ? "decodeProjectionFFN"
-                        : "decodeProjection+decodeFFN"
-                    throw .invalidArguments("hybrid \(kernelName) failed at layer \(layerIndex), token \(tokenIndex): \(error)")
+                    throw .invalidArguments("hybrid \(kernels[layerIndex].postAttentionStageName) failed at layer \(layerIndex), token \(tokenIndex): \(error)")
                 }
                 timings.tAneFFN += RuntimeClock.ms(RuntimeClock.now() - t0)
 
