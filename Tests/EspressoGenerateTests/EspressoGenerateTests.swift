@@ -1266,20 +1266,25 @@ private func makeStubDemoDefaults(root: URL) -> DemoDefaults {
     #expect(!chatForcesHybridFallbackDisable(generate))
 }
 
-@Test func test_applyCLIExperimentEnvironmentForcesChatFallbackDisable() {
-    let previous = getenv("ESPRESSO_REALMODEL_DISABLE_HYBRID_FALLBACK").map { String(cString: $0) }
-    defer {
-        if let previous {
-            setenv("ESPRESSO_REALMODEL_DISABLE_HYBRID_FALLBACK", previous, 1)
-        } else {
-            unsetenv("ESPRESSO_REALMODEL_DISABLE_HYBRID_FALLBACK")
-        }
-    }
-    unsetenv("ESPRESSO_REALMODEL_DISABLE_HYBRID_FALLBACK")
+@Test func test_cliDecodePathOptionsForceChatFallbackDisable() {
     var chat = Options()
     chat.command = .chat
-    applyCLIExperimentEnvironment(chat)
-    #expect(ProcessInfo.processInfo.environment["ESPRESSO_REALMODEL_DISABLE_HYBRID_FALLBACK"] == "1")
+    #expect(cliDecodePathOptions(chat, environment: [:]).disableHybridFallback)
+
+    var generate = Options()
+    generate.command = .generate
+    #expect(!cliDecodePathOptions(generate, environment: [:]).disableHybridFallback)
+
+    generate.disableHybridFallback = true
+    #expect(cliDecodePathOptions(generate, environment: [:]).disableHybridFallback)
+
+    // Environment variables remain the fallback when the CLI does not own the flag.
+    #expect(
+        cliDecodePathOptions(
+            generate,
+            environment: ["ESPRESSO_REALMODEL_DISABLE_HYBRID_FALLBACK": "1"]
+        ).disableHybridFallback
+    )
 }
 
 @Test func test_implicitPromptIsNilForChat() {
