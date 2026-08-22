@@ -515,10 +515,6 @@ public struct RealModelInferenceEngine: ~Copyable {
         )
     }
 
-    static func isHybridFallbackDisabled(environment: [String: String]) -> Bool {
-        DecodePathPolicy.optionsFromEnvironment(environment).disableHybridFallback
-    }
-
     /// Resolves the llama serving ``Trunk``, refusing to leave the ANE silently.
     ///
     /// With `ESPRESSO_REALMODEL_DISABLE_HYBRID_FALLBACK=1`, landing on the pure-CPU trunk is
