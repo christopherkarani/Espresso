@@ -6665,6 +6665,7 @@ public struct RealModelInferenceEngine: ~Copyable {
                 compileTimeMs: compileTimeMs,
                 exactHeadBackend: "cpu_exact_two_token_draft",
                 trunk: .exactCPU,
+                tokensPerSecondOverride: 0,
                 textOverride: tokenizer.decode((promptTokens + [firstToken]).map(Int.init))
             )
         }
