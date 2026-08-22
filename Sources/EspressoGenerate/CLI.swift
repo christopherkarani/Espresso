@@ -414,6 +414,7 @@ struct ResolvedInvocation {
     let seed: Int
     let outputDir: String?
     let rawPrompt: Bool
+    let decodePathOptions: DecodePathOptions
 
     init(
         config: MultiModelConfig,
@@ -434,7 +435,8 @@ struct ResolvedInvocation {
         allowBootstrap: Bool,
         seed: Int,
         outputDir: String?,
-        rawPrompt: Bool = false
+        rawPrompt: Bool = false,
+        decodePathOptions: DecodePathOptions? = nil
     ) {
         self.config = config
         self.bundlePath = bundlePath
@@ -455,6 +457,9 @@ struct ResolvedInvocation {
         self.seed = seed
         self.outputDir = outputDir
         self.rawPrompt = rawPrompt
+        self.decodePathOptions = decodePathOptions ?? DecodePathPolicy.optionsFromEnvironment(
+            ProcessInfo.processInfo.environment
+        )
     }
 }
 
@@ -484,7 +489,8 @@ extension ResolvedInvocation {
             allowBootstrap: allowBootstrap,
             seed: seed,
             outputDir: outputDir ?? self.outputDir,
-            rawPrompt: rawPrompt
+            rawPrompt: rawPrompt,
+            decodePathOptions: decodePathOptions
         )
     }
 }
@@ -651,9 +657,6 @@ private final class LockedValueBox<Value>: @unchecked Sendable {
 }
 
 func applyCLIExperimentEnvironment(_ options: Options) {
-    if options.disableHybridFallback || chatForcesHybridFallbackDisable(options) {
-        setenv("ESPRESSO_REALMODEL_DISABLE_HYBRID_FALLBACK", "1", 1)
-    }
     if options.rawPrompt {
         setenv("ESPRESSO_RAW_PROMPT", "1", 1)
     }
@@ -673,6 +676,20 @@ func applyCLIExperimentEnvironment(_ options: Options) {
     default:
         setenv("ESPRESSO_GPT2_USE_RMS_NORM", "0", 1)
     }
+}
+
+/// Decode-path steering passed explicitly to engine entry points. Environment
+/// variables set externally remain the fallback for flags the CLI does not own;
+/// CLI intent wins over them.
+func cliDecodePathOptions(
+    _ options: Options,
+    environment: [String: String] = ProcessInfo.processInfo.environment
+) -> DecodePathOptions {
+    var decodeOptions = DecodePathPolicy.optionsFromEnvironment(environment)
+    if options.disableHybridFallback || chatForcesHybridFallbackDisable(options) {
+        decodeOptions.disableHybridFallback = true
+    }
+    return decodeOptions
 }
 
 private let posixLocale = Locale(identifier: "en_US_POSIX")
@@ -1245,7 +1262,8 @@ func resolveInvocation(from options: Options, demoDefaults: DemoDefaults, comman
             allowBootstrap: options.allowBootstrap,
             seed: options.seed,
             outputDir: options.outputDir,
-            rawPrompt: options.rawPrompt
+            rawPrompt: options.rawPrompt,
+            decodePathOptions: cliDecodePathOptions(options)
         )
     }
 
@@ -1296,7 +1314,8 @@ func resolveInvocation(from options: Options, demoDefaults: DemoDefaults, comman
         allowBootstrap: options.allowBootstrap,
         seed: options.seed,
         outputDir: options.outputDir,
-        rawPrompt: options.rawPrompt
+        rawPrompt: options.rawPrompt,
+        decodePathOptions: cliDecodePathOptions(options)
     )
 }
 
@@ -1406,7 +1425,8 @@ private func runEspressoGeneration(
             tokenLatenciesMs.append(step.tokenLatencyMs)
             totalTimeMs = step.elapsedMs
             onStep?(step)
-        }
+        },
+        options: invocation.decodePathOptions
     )
     let compileStatsAfter = ANECompileStats.snapshot()
     let compileStatsDelta = compileStatsAfter.subtracting(compileStatsBefore)
@@ -2122,7 +2142,8 @@ private func runLiveCompare(invocation: ResolvedInvocation, defaults: DemoDefaul
                 rawPrompt: invocation.rawPrompt
             ),
             maxTokens: min(invocation.maxTokens, 4),
-            temperature: invocation.temperature
+            temperature: invocation.temperature,
+            options: invocation.decodePathOptions
         )
     }.power
 
@@ -2945,7 +2966,10 @@ private func runChatVsMLX(
 
     var engine = try makeEspressoEngine(invocation: invocation)
     let compileStarted = DispatchTime.now().uptimeNanoseconds
-    try engine.precompileHybridDecode(covering: invocation.config.maxSeq)
+    try engine.precompileHybridDecode(
+        covering: invocation.config.maxSeq,
+        options: invocation.decodePathOptions
+    )
     let espressoCompileMs = millisecondsSince(compileStarted)
     let tokenizer = try loadTokenizer(config: invocation.config, tokenizerDir: invocation.tokenizerDir)
     var session = ChatSession(system: options.systemPrompt ?? QwenInstructPrompt.systemBanner)
@@ -3188,7 +3212,8 @@ private func runChatVsMLXEspressoLane(
                     writePlain(tokenizer.decode([Int(step.token)]), "")
                 }
             },
-            isCancelled: { cancel.isCancelled }
+            isCancelled: { cancel.isCancelled },
+            options: invocation.decodePathOptions
         )
     }
     try assertChatDecodePathIsHybrid(measured.result.decodePath)
@@ -3342,7 +3367,10 @@ private func plainLaneFooter(lane: LiveLaneSnapshot, focus: LaneWattFocus, capab
 private func runChat(invocation: ResolvedInvocation, options: Options, powerEnabled: Bool) throws -> Int32 {
     applyCLIExperimentEnvironment(options)
     var engine = try makeEspressoEngine(invocation: invocation)
-    try engine.precompileHybridDecode(covering: invocation.config.maxSeq)
+    try engine.precompileHybridDecode(
+        covering: invocation.config.maxSeq,
+        options: invocation.decodePathOptions
+    )
     let tokenizer = try loadTokenizer(config: invocation.config, tokenizerDir: invocation.tokenizerDir)
     var session = ChatSession(system: options.systemPrompt ?? QwenInstructPrompt.systemBanner)
     let sampling = resolvedSampling(command: .chat, options: options)
@@ -3468,7 +3496,8 @@ private func runChat(invocation: ResolvedInvocation, options: Options, powerEnab
                                 writePlain(tokenizer.decode([Int(step.token)]), terminator: "")
                             }
                         },
-                        isCancelled: { cancel.isCancelled }
+                        isCancelled: { cancel.isCancelled },
+                        options: invocation.decodePathOptions
                     )
                 }
                 let result = measured.result
