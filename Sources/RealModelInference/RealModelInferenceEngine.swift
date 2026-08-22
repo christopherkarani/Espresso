@@ -1523,11 +1523,19 @@ public struct RealModelInferenceEngine: ~Copyable {
         }
     }
 
-    private var compiledBucket: Int
+    /// Per-trunk compile readiness; the ensure functions below are the only writers.
+    private var baselineReadiness = CompiledReadiness<BaselineCompiledRuntime>.notCompiled
+    private var splitHybridReadiness = CompiledReadiness<SplitHybridCompiledRuntime>.notCompiled
+    private var fusedHybridReadiness = CompiledReadiness<FusedHybridCompiledRuntime>.notCompiled
+    /// Bucket of the last fully resident split-hybrid layer-program set.
+    ///
+    /// Incremental-compile watermark consulted only by ``ensureHybridCompiled``
+    /// (so a mid-compile failure never recompiles finished layers) and by the
+    /// dispatch max-sequence defaults; loop readiness itself is carried by
+    /// ``splitHybridReadiness``.
+    private var splitHybridLayerBucket = 0
     private var compiledLayers: LayerStorage<CompiledLayer>
-    private var firstLayerInputSurface: IOSurfaceRef?
     private var compiledHead: LayerStorage<CompiledHead>
-    private var compiledHybridBucket: Int
     private var compiledHybridLayers: LayerStorage<HybridDecodeKernelSet>
     private var compiledHybridSurfaceHandles: [HybridDecodeSurfaceHandles]
     private var compiledHybridLlamaQKNormWeights: [LlamaQKNormWeights?]
@@ -1536,7 +1544,6 @@ public struct RealModelInferenceEngine: ~Copyable {
     private var compiledHybridGreedyNorm: LayerStorage<CompiledHead>
     private var compiledHybridGreedyClassifier: LayerStorage<CompiledClassifier>
     private var compiledHybridGreedySpatial: Int
-    private var compiledFusedHybridBucket: Int
     private var compiledFusedHybridLayers: LayerStorage<FusedHybridDecodeLayerKernelSet>
     private var compiledFusedHybridSurfaceHandles: [FusedHybridDecodeSurfaceHandles]
     private var hybridMetalAttention: MetalAttentionKernel?
@@ -1576,11 +1583,8 @@ public struct RealModelInferenceEngine: ~Copyable {
         self.weightDirURL = weightDirURL
         self.tokenizer = tokenizer
         self.assets = assets
-        self.compiledBucket = 0
         self.compiledLayers = Self.emptyStorage(CompiledLayer.self)
-        self.firstLayerInputSurface = nil
         self.compiledHead = Self.emptyStorage(CompiledHead.self)
-        self.compiledHybridBucket = 0
         self.compiledHybridLayers = Self.emptyStorage(HybridDecodeKernelSet.self)
         self.compiledHybridSurfaceHandles = []
         self.compiledHybridLlamaQKNormWeights = []
@@ -1589,7 +1593,6 @@ public struct RealModelInferenceEngine: ~Copyable {
         self.compiledHybridGreedyNorm = Self.emptyStorage(CompiledHead.self)
         self.compiledHybridGreedyClassifier = Self.emptyStorage(CompiledClassifier.self)
         self.compiledHybridGreedySpatial = 0
-        self.compiledFusedHybridBucket = 0
         self.compiledFusedHybridLayers = Self.emptyStorage(FusedHybridDecodeLayerKernelSet.self)
         self.compiledFusedHybridSurfaceHandles = []
         self.hybridMetalAttention = nil
@@ -1709,7 +1712,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         }
         if trunk == .splitHybrid {
             let compileStart = DispatchTime.now().uptimeNanoseconds
-            let compileDidRun = try ensureHybridCompiledLlama(bucket: bucket)
+            let compileDidRun = try ensureHybridCompiled(bucket: bucket)
             guard let metalAttention = hybridMetalAttention else {
                 throw RealModelInferenceError.runtimeFailure("Hybrid Metal attention unavailable for \(sessionKind)")
             }
@@ -1759,7 +1762,7 @@ public struct RealModelInferenceEngine: ~Copyable {
                 temperature: request.temperature,
                 topP: request.topP,
                 compileTimeMs: sessionCompileTimeMs,
-                maxSeq: request.maxSeq ?? max(request.bucket, compiledFusedHybridBucket),
+                maxSeq: request.maxSeq ?? max(request.bucket, fusedHybridReadiness.runtime?.bucket ?? request.bucket),
                 onStep: request.onStep,
                 isCancelled: request.isCancelled
             )
@@ -1790,7 +1793,7 @@ public struct RealModelInferenceEngine: ~Copyable {
                 temperature: request.temperature,
                 topP: request.topP,
                 compileTimeMs: sessionCompileTimeMs,
-                maxSeq: request.maxSeq ?? max(request.bucket, compiledHybridBucket),
+                maxSeq: request.maxSeq ?? max(request.bucket, splitHybridLayerBucket),
                 metalAttention: metalAttention,
                 onStep: request.onStep,
                 isCancelled: request.isCancelled
@@ -1922,21 +1925,22 @@ public struct RealModelInferenceEngine: ~Copyable {
         do {
             let hybridDidRun = try ensureHybridCompiled(bucket: bucket)
             compileDidRun = compileDidRun || hybridDidRun
-            useHybridFastPath =
-                compiledHybridLayers.count == config.nLayer &&
-                compiledHybridSurfaceHandles.count == config.nLayer &&
-                compiledHybridHead.count == 1 &&
-                hybridMetalAttention != nil
-            if !useHybridFastPath, !plan.allowsHybridFallback {
-                throw RealModelInferenceError.hybridFallbackDisabled(
-                    stage: "hybrid decode compile",
-                    reason: """
-                        hybrid decode state is incomplete: layers=\(compiledHybridLayers.count)/\(config.nLayer) \
-                        surfaces=\(compiledHybridSurfaceHandles.count)/\(config.nLayer) \
-                        head=\(compiledHybridHead.count)/1 \
-                        metalAttention=\(hybridMetalAttention != nil)
-                        """
-                )
+            switch splitHybridReadiness {
+            case .compiled:
+                useHybridFastPath = true
+            case .notCompiled:
+                useHybridFastPath = false
+                guard plan.allowsHybridFallback else {
+                    throw RealModelInferenceError.hybridFallbackDisabled(
+                        stage: "hybrid decode compile",
+                        reason: """
+                            hybrid decode state is incomplete: layers=\(compiledHybridLayers.count)/\(config.nLayer) \
+                            surfaces=\(compiledHybridSurfaceHandles.count)/\(config.nLayer) \
+                            head=\(compiledHybridHead.count)/1 \
+                            metalAttention=\(hybridMetalAttention != nil)
+                            """
+                    )
+                }
             }
         } catch let error as RealModelInferenceError {
             // A disabled-fallback error is the answer, not something to recover from.
@@ -2029,9 +2033,14 @@ public struct RealModelInferenceEngine: ~Copyable {
         let compileEnd = DispatchTime.now().uptimeNanoseconds
         let compileTimeMs = compileDidRun ? Self.milliseconds(from: compileEnd - compileStart) : 0
 
-        guard let inputSurface = firstLayerInputSurface, compiledLayers.count == config.nLayer, compiledHead.count == 1 else {
+        let baseline: BaselineCompiledRuntime
+        switch baselineReadiness {
+        case .compiled(let runtime):
+            baseline = runtime
+        case .notCompiled:
             throw RealModelInferenceError.runtimeFailure("Compiled ANE surfaces are unavailable")
         }
+        let inputSurface = baseline.inputSurface
 
         let generationStart = DispatchTime.now().uptimeNanoseconds
         let tokenizer = self.tokenizer
@@ -2044,7 +2053,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             startNanos: generationStart
         )
         var rng = SystemRandomNumberGenerator()
-        let activeBucket = compiledBucket
+        let activeBucket = baseline.bucket
 
         for _ in 0..<effectiveMaxTokens {
             let sequenceLength = emission.allTokensCount
@@ -4817,8 +4826,11 @@ public struct RealModelInferenceEngine: ~Copyable {
     }
 
     private mutating func ensureCompiled(bucket: Int) throws -> Bool {
-        guard compiledBucket < bucket else {
+        switch baselineReadiness {
+        case .compiled(let runtime) where runtime.bucket >= bucket:
             return false
+        case .compiled, .notCompiled:
+            break
         }
 
         let newLayers = try Self.compileLayers(
@@ -4842,144 +4854,30 @@ public struct RealModelInferenceEngine: ~Copyable {
         }
         compiledLayers = newLayers
         compiledHead = newHead
-        firstLayerInputSurface = newInputSurface
-        compiledBucket = bucket
+        baselineReadiness = .compiled(BaselineCompiledRuntime(bucket: bucket, inputSurface: newInputSurface))
         return true
     }
 
+    /// Compiles split-hybrid decode programs when the resident set covers less context.
+    ///
+    /// One parameterized implementation serves both model families: the former
+    /// GPT-2/llama ensure twins differed only in surface-handle geometry,
+    /// output-head compilation, and error prefixes. Split-hybrid readiness
+    /// transitions to `.compiled` after the output-head section, before the
+    /// family-specific greedy-classifier section — a greedy-head compile failure
+    /// must not unready the trunk's decode programs, matching the former flag
+    /// semantics where such failures still served hybrid decode via CPU logits.
     private mutating func ensureHybridCompiled(bucket: Int) throws -> Bool {
         var didCompile = false
 
-        if compiledHybridBucket < bucket {
-            let newLayers = try Self.compileHybridLayers(
-                config: config,
-                weightDirURL: weightDirURL,
-                maxSeq: bucket
-            )
-            let newQKNormWeights = try Self.loadHybridLlamaQKNormWeights(
-                config: config,
-                weightDirURL: weightDirURL
-            )
-            var newSurfaceHandles: [HybridDecodeSurfaceHandles] = []
-            newSurfaceHandles.reserveCapacity(newLayers.count)
-            for layerIndex in 0..<newLayers.count {
-                do {
-                    newSurfaceHandles.append(
-                        try HybridDecodeSurfaceHandles(
-                            kernels: newLayers[layerIndex],
-                            logicalMaxSeq: bucket
-                        )
-                    )
-                } catch {
-                    throw RealModelInferenceError.runtimeFailure(
-                        "Hybrid decode surfaces unavailable for layer \(layerIndex): \(error)"
-                    )
-                }
-            }
-            if newLayers.count > 1,
-               Self.usesHybridLayerInputRebinding(
-                   architecture: config.architecture,
-                   environment: Self.processEnvironment
-               ) {
-                for layerIndex in 1..<newLayers.count {
-                    do {
-                        try newLayers[layerIndex].decodeQKVOnly.rebindInput(
-                            at: 0,
-                            to: newSurfaceHandles[layerIndex - 1].ffnOut
-                        )
-                    } catch {
-                        throw RealModelInferenceError.runtimeFailure(
-                            "Hybrid decode chaining unavailable for layer \(layerIndex): \(error)"
-                        )
-                    }
-                }
-            }
+        // Both flavors share every program up to the output head; only the
+        // surface-handle geometry and head compilation differ.
+        let isLlama = config.architecture == .llama
+        let surfaceDim = isLlama ? config.dModel : ModelConfig.dim
+        let surfaceQDim: Int? = isLlama ? config.attentionDim : nil
+        let surfaceKVDim: Int? = isLlama ? config.nKVHead * config.headDim : nil
 
-            compiledHybridLayers = newLayers
-            compiledHybridSurfaceHandles = newSurfaceHandles
-            compiledHybridLlamaQKNormWeights = newQKNormWeights
-            compiledHybridBucket = bucket
-            didCompile = true
-        }
-
-        if compiledHybridLlamaQKNormWeights.count != config.nLayer {
-            compiledHybridLlamaQKNormWeights = try Self.loadHybridLlamaQKNormWeights(
-                config: config,
-                weightDirURL: weightDirURL
-            )
-        }
-
-        if hybridMetalAttention == nil {
-            do {
-                hybridMetalAttention = try MetalAttentionKernel()
-            } catch {
-                throw RealModelInferenceError.runtimeFailure("Hybrid Metal attention initialization failed: \(error)")
-            }
-            didCompile = true
-        }
-
-        let hybridHeadSpatial = Self.incrementalHeadSpatial(channels: config.dModel)
-        if compiledHybridHead.count != 1 || compiledHybridHeadSpatial != hybridHeadSpatial {
-            compiledHybridHead = try LayerStorage<CompiledHead>(count: 1, throwingInitializer: { _ in
-                try Self.compileHead(
-                    config: config,
-                    weightDirURL: weightDirURL,
-                    assets: gpt2Assets,
-                    spatial: hybridHeadSpatial
-                )
-            })
-            compiledHybridHeadSpatial = hybridHeadSpatial
-            try Self.zeroSurface(compiledHybridHead[0].inputSurface)
-            didCompile = true
-        }
-
-        if classifierStrategy.usesANEClassifier {
-            if compiledHybridGreedyNorm.count != 1 ||
-                compiledHybridGreedyClassifier.count != 1 ||
-                compiledHybridGreedySpatial != hybridHeadSpatial {
-                compiledHybridGreedyNorm = try LayerStorage<CompiledHead>(count: 1, throwingInitializer: { _ in
-                    try Self.compileHead(
-                        config: config,
-                        weightDirURL: weightDirURL,
-                        assets: gpt2Assets,
-                        spatial: hybridHeadSpatial,
-                        inputDType: .fp16,
-                        outputDType: .fp16
-                    )
-                })
-                compiledHybridGreedyClassifier = try LayerStorage<CompiledClassifier>(count: 1, throwingInitializer: { _ in
-                    try Self.compileClassifier(
-                        config: config,
-                        assets: gpt2Assets,
-                        spatial: hybridHeadSpatial
-                    )
-                })
-                compiledHybridGreedySpatial = hybridHeadSpatial
-                try compiledHybridGreedyClassifier[0].kernel.rebindInput(
-                    at: 0,
-                    to: compiledHybridGreedyNorm[0].outputSurface
-                )
-                didCompile = true
-            }
-
-            if compiledHybridGreedyNorm.count == 1,
-               compiledHybridGreedyClassifier.count == 1,
-               let finalSurface = compiledHybridSurfaceHandles.last?.ffnOut {
-                try compiledHybridGreedyNorm[0].kernel.rebindInput(at: 0, to: finalSurface)
-                try compiledHybridGreedyClassifier[0].kernel.rebindInput(
-                    at: 0,
-                    to: compiledHybridGreedyNorm[0].outputSurface
-                )
-            }
-        }
-
-        return didCompile
-    }
-
-    private mutating func ensureHybridCompiledLlama(bucket: Int) throws -> Bool {
-        var didCompile = false
-
-        if compiledHybridBucket < bucket {
+        if splitHybridLayerBucket < bucket {
             let newLayers = try Self.compileHybridLayers(
                 config: config,
                 weightDirURL: weightDirURL,
@@ -4997,14 +4895,14 @@ public struct RealModelInferenceEngine: ~Copyable {
                         try HybridDecodeSurfaceHandles(
                             kernels: newLayers[layerIndex],
                             logicalMaxSeq: bucket,
-                            dim: config.dModel,
-                            qDim: config.attentionDim,
-                            kvDim: config.nKVHead * config.headDim
+                            dim: surfaceDim,
+                            qDim: surfaceQDim,
+                            kvDim: surfaceKVDim
                         )
                     )
                 } catch {
                     throw RealModelInferenceError.runtimeFailure(
-                        "Llama hybrid decode surfaces unavailable for layer \(layerIndex): \(error)"
+                        "\(isLlama ? "Llama hybrid" : "Hybrid") decode surfaces unavailable for layer \(layerIndex): \(error)"
                     )
                 }
             }
@@ -5021,7 +4919,7 @@ public struct RealModelInferenceEngine: ~Copyable {
                         )
                     } catch {
                         throw RealModelInferenceError.runtimeFailure(
-                            "Llama hybrid decode chaining unavailable for layer \(layerIndex): \(error)"
+                            "\(isLlama ? "Llama hybrid" : "Hybrid") decode chaining unavailable for layer \(layerIndex): \(error)"
                         )
                     }
                 }
@@ -5030,7 +4928,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             compiledHybridLayers = newLayers
             compiledHybridSurfaceHandles = newSurfaceHandles
             compiledHybridLlamaQKNormWeights = newQKNormWeights
-            compiledHybridBucket = bucket
+            splitHybridLayerBucket = bucket
             didCompile = true
         }
 
@@ -5045,21 +4943,28 @@ public struct RealModelInferenceEngine: ~Copyable {
             do {
                 hybridMetalAttention = try MetalAttentionKernel()
             } catch {
-                throw RealModelInferenceError.runtimeFailure("Llama hybrid Metal attention initialization failed: \(error)")
+                throw RealModelInferenceError.runtimeFailure(
+                    "\(isLlama ? "Llama hybrid" : "Hybrid") Metal attention initialization failed: \(error)"
+                )
             }
             didCompile = true
         }
 
         let hybridHeadSpatial = Self.incrementalHeadSpatial(channels: config.dModel)
-        let greedyHeadMode = hybridGreedyHeadMode()
-
-        // Compile RMSNorm head (no beta) for llama
         if compiledHybridHead.count != 1 || compiledHybridHeadSpatial != hybridHeadSpatial {
             compiledHybridHead = try LayerStorage<CompiledHead>(count: 1, throwingInitializer: { _ in
-                try Self.compileLlamaHead(
+                if isLlama {
+                    return try Self.compileLlamaHead(
+                        config: config,
+                        weightDirURL: weightDirURL,
+                        assets: llamaAssets,
+                        spatial: hybridHeadSpatial
+                    )
+                }
+                return try Self.compileHead(
                     config: config,
                     weightDirURL: weightDirURL,
-                    assets: llamaAssets,
+                    assets: gpt2Assets,
                     spatial: hybridHeadSpatial
                 )
             })
@@ -5068,78 +4973,131 @@ public struct RealModelInferenceEngine: ~Copyable {
             didCompile = true
         }
 
+        // Readiness transition: every program the split-hybrid decode loop
+        // requires is now resident, independent of the greedy head below.
+        if let runtime = SplitHybridCompiledRuntime(
+            bucket: max(bucket, splitHybridLayerBucket),
+            layerCount: compiledHybridLayers.count,
+            surfaceHandleCount: compiledHybridSurfaceHandles.count,
+            expectedLayerCount: config.nLayer,
+            headCount: compiledHybridHead.count,
+            qKNormCount: isLlama ? compiledHybridLlamaQKNormWeights.count : nil,
+            headSpatial: compiledHybridHeadSpatial
+        ) {
+            splitHybridReadiness = .compiled(runtime)
+        } else {
+            splitHybridReadiness = .notCompiled
+        }
+
         if classifierStrategy.usesANEClassifier {
-            switch greedyHeadMode {
-            case .classifierOnlyFactored:
-                if compiledHybridGreedyNorm.count != 0 {
-                    compiledHybridGreedyNorm = Self.emptyStorage(CompiledHead.self)
-                    didCompile = true
-                }
-                if compiledHybridGreedyClassifier.count != 1 {
-                    do {
+            if isLlama {
+                switch hybridGreedyHeadMode() {
+                case .classifierOnlyFactored:
+                    if compiledHybridGreedyNorm.count != 0 {
+                        compiledHybridGreedyNorm = Self.emptyStorage(CompiledHead.self)
+                        didCompile = true
+                    }
+                    if compiledHybridGreedyClassifier.count != 1 {
+                        do {
+                            compiledHybridGreedyClassifier = try LayerStorage<CompiledClassifier>(count: 1, throwingInitializer: { _ in
+                                try Self.compileLlamaFactoredClassifier(
+                                    config: config,
+                                    assets: llamaAssets,
+                                    spatial: hybridHeadSpatial
+                                )
+                            })
+                        } catch {
+                            fputs(
+                                "[RealModelInference] Llama factored classifier compile failed; falling back to dense ANE classifier: \(error)\n",
+                                stderr
+                            )
+                            compiledHybridGreedyClassifier = Self.emptyStorage(CompiledClassifier.self)
+                        }
+                        didCompile = true
+                    }
+                    if compiledHybridGreedyClassifier.count == 1,
+                       let finalSurface = compiledHybridSurfaceHandles.last?.ffnOut {
+                        try compiledHybridGreedyClassifier[0].kernel.rebindInput(at: 0, to: finalSurface)
+                    }
+                case .classifierOnlyFused:
+                    if compiledHybridGreedyNorm.count != 0 {
+                        compiledHybridGreedyNorm = Self.emptyStorage(CompiledHead.self)
+                        didCompile = true
+                    }
+                    if compiledHybridGreedyClassifier.count != 1 {
                         compiledHybridGreedyClassifier = try LayerStorage<CompiledClassifier>(count: 1, throwingInitializer: { _ in
-                            try Self.compileLlamaFactoredClassifier(
+                            try Self.compileLlamaRMSNormClassifier(
                                 config: config,
                                 assets: llamaAssets,
                                 spatial: hybridHeadSpatial
                             )
                         })
-                    } catch {
-                        fputs(
-                            "[RealModelInference] Llama factored classifier compile failed; falling back to dense ANE classifier: \(error)\n",
-                            stderr
-                        )
-                        compiledHybridGreedyClassifier = Self.emptyStorage(CompiledClassifier.self)
+                        didCompile = true
                     }
-                    didCompile = true
-                }
-                if compiledHybridGreedyClassifier.count == 1,
-                   let finalSurface = compiledHybridSurfaceHandles.last?.ffnOut {
-                    try compiledHybridGreedyClassifier[0].kernel.rebindInput(at: 0, to: finalSurface)
-                }
-            case .classifierOnlyFused:
-                if compiledHybridGreedyNorm.count != 0 {
-                    compiledHybridGreedyNorm = Self.emptyStorage(CompiledHead.self)
-                    didCompile = true
-                }
-                if compiledHybridGreedyClassifier.count != 1 {
-                    compiledHybridGreedyClassifier = try LayerStorage<CompiledClassifier>(count: 1, throwingInitializer: { _ in
-                        try Self.compileLlamaRMSNormClassifier(
-                            config: config,
-                            assets: llamaAssets,
-                            spatial: hybridHeadSpatial
+                    if compiledHybridGreedyClassifier.count == 1,
+                       let finalSurface = compiledHybridSurfaceHandles.last?.ffnOut {
+                        try compiledHybridGreedyClassifier[0].kernel.rebindInput(at: 0, to: finalSurface)
+                    }
+                case .normThenClassifier:
+                    if compiledHybridGreedyNorm.count != 1 || compiledHybridGreedySpatial != hybridHeadSpatial {
+                        compiledHybridGreedyNorm = try LayerStorage<CompiledHead>(count: 1, throwingInitializer: { _ in
+                            try Self.compileLlamaHead(
+                                config: config,
+                                weightDirURL: weightDirURL,
+                                assets: llamaAssets,
+                                spatial: hybridHeadSpatial,
+                                inputDType: .fp16,
+                                outputDType: .fp16
+                            )
+                        })
+                        compiledHybridGreedySpatial = hybridHeadSpatial
+                        didCompile = true
+                    }
+
+                    if compiledHybridGreedyClassifier.count != 1 {
+                        compiledHybridGreedyClassifier = try LayerStorage<CompiledClassifier>(count: 1, throwingInitializer: { _ in
+                            try Self.compileLlamaClassifier(
+                                config: config,
+                                assets: llamaAssets,
+                                spatial: hybridHeadSpatial
+                            )
+                        })
+                        try compiledHybridGreedyClassifier[0].kernel.rebindInput(
+                            at: 0,
+                            to: compiledHybridGreedyNorm[0].outputSurface
                         )
-                    })
-                    didCompile = true
+                        didCompile = true
+                    }
+
+                    if compiledHybridGreedyClassifier.count == 1 {
+                        try compiledHybridGreedyClassifier[0].kernel.rebindInput(
+                            at: 0,
+                            to: compiledHybridGreedyNorm[0].outputSurface
+                        )
+                    }
                 }
-                if compiledHybridGreedyClassifier.count == 1,
-                   let finalSurface = compiledHybridSurfaceHandles.last?.ffnOut {
-                    try compiledHybridGreedyClassifier[0].kernel.rebindInput(at: 0, to: finalSurface)
-                }
-            case .normThenClassifier:
-                if compiledHybridGreedyNorm.count != 1 || compiledHybridGreedySpatial != hybridHeadSpatial {
+            } else {
+                if compiledHybridGreedyNorm.count != 1 ||
+                    compiledHybridGreedyClassifier.count != 1 ||
+                    compiledHybridGreedySpatial != hybridHeadSpatial {
                     compiledHybridGreedyNorm = try LayerStorage<CompiledHead>(count: 1, throwingInitializer: { _ in
-                        try Self.compileLlamaHead(
+                        try Self.compileHead(
                             config: config,
                             weightDirURL: weightDirURL,
-                            assets: llamaAssets,
+                            assets: gpt2Assets,
                             spatial: hybridHeadSpatial,
                             inputDType: .fp16,
                             outputDType: .fp16
                         )
                     })
-                    compiledHybridGreedySpatial = hybridHeadSpatial
-                    didCompile = true
-                }
-
-                if compiledHybridGreedyClassifier.count != 1 {
                     compiledHybridGreedyClassifier = try LayerStorage<CompiledClassifier>(count: 1, throwingInitializer: { _ in
-                        try Self.compileLlamaClassifier(
+                        try Self.compileClassifier(
                             config: config,
-                            assets: llamaAssets,
+                            assets: gpt2Assets,
                             spatial: hybridHeadSpatial
                         )
                     })
+                    compiledHybridGreedySpatial = hybridHeadSpatial
                     try compiledHybridGreedyClassifier[0].kernel.rebindInput(
                         at: 0,
                         to: compiledHybridGreedyNorm[0].outputSurface
@@ -5147,7 +5105,10 @@ public struct RealModelInferenceEngine: ~Copyable {
                     didCompile = true
                 }
 
-                if compiledHybridGreedyClassifier.count == 1 {
+                if compiledHybridGreedyNorm.count == 1,
+                   compiledHybridGreedyClassifier.count == 1,
+                   let finalSurface = compiledHybridSurfaceHandles.last?.ffnOut {
+                    try compiledHybridGreedyNorm[0].kernel.rebindInput(at: 0, to: finalSurface)
                     try compiledHybridGreedyClassifier[0].kernel.rebindInput(
                         at: 0,
                         to: compiledHybridGreedyNorm[0].outputSurface
@@ -5156,7 +5117,8 @@ public struct RealModelInferenceEngine: ~Copyable {
             }
         }
 
-        if compiledHybridGreedyNorm.count == 1,
+        if isLlama,
+           compiledHybridGreedyNorm.count == 1,
            let finalSurface = compiledHybridSurfaceHandles.last?.ffnOut {
             try compiledHybridGreedyNorm[0].kernel.rebindInput(at: 0, to: finalSurface)
         }
@@ -5185,10 +5147,10 @@ public struct RealModelInferenceEngine: ~Copyable {
         onStep: ((GenerationStep) -> Void)?,
         isCancelled: (() -> Bool)? = nil
     ) throws -> GenerationResult {
-        guard compiledHybridLayers.count == config.nLayer,
-              compiledHybridSurfaceHandles.count == config.nLayer,
-              compiledHybridHead.count == 1,
-              compiledHybridHeadSpatial > 0 else {
+        switch splitHybridReadiness {
+        case .compiled:
+            break
+        case .notCompiled:
             throw RealModelInferenceError.runtimeFailure("Hybrid decode state is unavailable")
         }
 
@@ -5894,10 +5856,11 @@ public struct RealModelInferenceEngine: ~Copyable {
     }
 
     private mutating func ensureFusedHybridCompiled(bucket: Int) throws -> Bool {
-        if compiledFusedHybridBucket >= bucket,
-           compiledFusedHybridLayers.count == config.nLayer,
-           compiledFusedHybridSurfaceHandles.count == config.nLayer {
+        switch fusedHybridReadiness {
+        case .compiled(let runtime) where runtime.bucket >= bucket:
             return false
+        case .compiled, .notCompiled:
+            break
         }
 
         let newLayers: LayerStorage<FusedHybridDecodeLayerKernelSet>
@@ -5930,7 +5893,16 @@ public struct RealModelInferenceEngine: ~Copyable {
 
         compiledFusedHybridLayers = newLayers
         compiledFusedHybridSurfaceHandles = newSurfaceHandles
-        compiledFusedHybridBucket = bucket
+        if let runtime = FusedHybridCompiledRuntime(
+            bucket: bucket,
+            layerCount: compiledFusedHybridLayers.count,
+            surfaceHandleCount: compiledFusedHybridSurfaceHandles.count,
+            expectedLayerCount: config.nLayer
+        ) {
+            fusedHybridReadiness = .compiled(runtime)
+        } else {
+            fusedHybridReadiness = .notCompiled
+        }
         return true
     }
 
@@ -5980,8 +5952,10 @@ public struct RealModelInferenceEngine: ~Copyable {
         onStep: ((GenerationStep) -> Void)?,
         isCancelled: (() -> Bool)? = nil
     ) throws -> GenerationResult {
-        guard compiledFusedHybridLayers.count == config.nLayer,
-              compiledFusedHybridSurfaceHandles.count == config.nLayer else {
+        switch fusedHybridReadiness {
+        case .compiled:
+            break
+        case .notCompiled:
             throw Self.fusedHybridFallbackError(
                 reason: """
                     fused N=1 state is incomplete: \
@@ -6122,11 +6096,10 @@ public struct RealModelInferenceEngine: ~Copyable {
         onStep: ((GenerationStep) -> Void)?,
         isCancelled: (() -> Bool)? = nil
     ) throws -> GenerationResult {
-        guard compiledHybridLayers.count == config.nLayer,
-              compiledHybridSurfaceHandles.count == config.nLayer,
-              compiledHybridLlamaQKNormWeights.count == config.nLayer,
-              compiledHybridHead.count == 1,
-              compiledHybridHeadSpatial > 0 else {
+        switch splitHybridReadiness {
+        case .compiled:
+            break
+        case .notCompiled:
             throw RealModelInferenceError.runtimeFailure(
                 "Llama hybrid decode state is unavailable: layers=\(compiledHybridLayers.count)/\(config.nLayer) surfaces=\(compiledHybridSurfaceHandles.count)/\(config.nLayer) qkNorms=\(compiledHybridLlamaQKNormWeights.count)/\(config.nLayer) head=\(compiledHybridHead.count) headSpatial=\(compiledHybridHeadSpatial)"
             )
