@@ -1824,7 +1824,17 @@ public struct RealModelInferenceEngine: ~Copyable {
         let seam = Self.resolveDecodePlanSeam(config: config, options: decodeOptions, environment: environment)
         let plan = seam.plan
         if effectiveMaxTokens == 0 {
-            let text = tokenizer.decode(promptTokens.map(Int.init))
+            let tokenizer = self.tokenizer
+            let eosPolicy: EOSPolicy = config.architecture == .llama
+                ? .fromConfig(config.eosToken.map(Int.init))
+                : .fixed(Int(Self.gpt2EOSToken))
+            let emission = EmissionCore(
+                promptTokens: promptTokens,
+                capacity: 0,
+                eos: eosPolicy,
+                onStep: nil,
+                decodeText: { tokenizer.decode($0) }
+            )
             var trunk: Trunk?
             var hopsPerToken: Int?
             if config.architecture == .llama {
@@ -1833,16 +1843,7 @@ public struct RealModelInferenceEngine: ~Copyable {
                     ? Self.fusedHopsPerToken(nLayer: config.nLayer)
                     : nil
             }
-            return GenerationResult(
-                text: text,
-                tokens: [],
-                promptTokens: promptTokens,
-                tokensPerSecond: 0,
-                compileTimeMs: 0,
-                firstTokenLatencyMs: 0,
-                trunk: trunk,
-                hopsPerToken: hopsPerToken
-            )
+            return emission.makeResult(compileTimeMs: 0, trunk: trunk, hopsPerToken: hopsPerToken)
         }
 
         let targetTokenCount = min(config.maxSeq, promptTokens.count + effectiveMaxTokens)
@@ -2003,22 +2004,22 @@ public struct RealModelInferenceEngine: ~Copyable {
             throw RealModelInferenceError.runtimeFailure("Compiled ANE surfaces are unavailable")
         }
 
-        var allTokens = promptTokens
-        var generatedTokens: [TokenID] = []
-        var tokenLatenciesMs: [Double] = []
-        generatedTokens.reserveCapacity(effectiveMaxTokens)
-        tokenLatenciesMs.reserveCapacity(effectiveMaxTokens)
-
         let generationStart = DispatchTime.now().uptimeNanoseconds
-        var firstTokenLatencyMs = 0.0
-        var firstTokenRecorded = false
+        let tokenizer = self.tokenizer
+        var emission = EmissionCore(
+            promptTokens: promptTokens,
+            capacity: effectiveMaxTokens,
+            eos: .fixed(Int(Self.gpt2EOSToken)),
+            onStep: onStep,
+            decodeText: { tokenizer.decode($0) },
+            startNanos: generationStart
+        )
         var rng = SystemRandomNumberGenerator()
         let activeBucket = compiledBucket
 
         for _ in 0..<effectiveMaxTokens {
-            let stepStart = DispatchTime.now().uptimeNanoseconds
-            let sequenceLength = allTokens.count
-            let activation = composeEmbeddingInput(tokens: allTokens, spatial: activeBucket)
+            let sequenceLength = emission.allTokensCount
+            let activation = composeEmbeddingInput(tokens: emission.allTokens, spatial: activeBucket)
             try activation.withUnsafeBufferPointer { buffer in
                 try Self.writeFP32(to: inputSurface, data: buffer)
             }
@@ -2056,51 +2057,21 @@ public struct RealModelInferenceEngine: ~Copyable {
                 using: &rng
             )
 
-            if !firstTokenRecorded {
-                firstTokenLatencyMs = Self.milliseconds(from: DispatchTime.now().uptimeNanoseconds - generationStart)
-                firstTokenRecorded = true
-            }
+            let emissionNow = DispatchTime.now().uptimeNanoseconds
+            emission.recordFirstTokenIfFirst(at: emissionNow)
 
-            if nextToken == Self.gpt2EOSToken {
+            if emission.terminatesDecoding(nextToken) {
                 break
             }
 
-            generatedTokens.append(nextToken)
-            allTokens.append(nextToken)
-            let elapsedMs = Self.milliseconds(from: DispatchTime.now().uptimeNanoseconds - generationStart)
-            let tokenLatencyMs = Self.milliseconds(from: DispatchTime.now().uptimeNanoseconds - stepStart)
-            tokenLatenciesMs.append(tokenLatencyMs)
-            let tokensPerSecond = Double(generatedTokens.count) / max(elapsedMs / 1_000, 1e-9)
-            onStep?(
-                GenerationStep(
-                    token: nextToken,
-                    generatedTokens: generatedTokens,
-                    text: tokenizer.decode(allTokens.map(Int.init)),
-                    tokenLatencyMs: tokenLatencyMs,
-                    elapsedMs: elapsedMs,
-                    firstTokenLatencyMs: firstTokenLatencyMs,
-                    tokensPerSecond: tokensPerSecond
-                )
-            )
-            if allTokens.count >= config.maxSeq {
+            emission.emit(nextToken, at: emissionNow)
+            if emission.allTokensCount >= config.maxSeq {
                 break
             }
         }
 
-        let generationEnd = DispatchTime.now().uptimeNanoseconds
-        let generationTimeMs = Self.milliseconds(from: generationEnd - generationStart)
-        let tokensPerSecond = generatedTokens.isEmpty
-            ? 0
-            : Double(generatedTokens.count) / max(generationTimeMs / 1_000, 1e-9)
-
-        return GenerationResult(
-            text: tokenizer.decode(allTokens.map(Int.init)),
-            tokens: generatedTokens,
-            promptTokens: promptTokens,
-            tokenLatenciesMs: tokenLatenciesMs,
-            tokensPerSecond: tokensPerSecond,
+        return emission.makeResult(
             compileTimeMs: compileTimeMs,
-            firstTokenLatencyMs: firstTokenLatencyMs,
             exactHeadBackend: classifierStrategy.exactHeadBackendLabel,
             cachedBindingsEnabled: false
         )
@@ -5122,21 +5093,21 @@ public struct RealModelInferenceEngine: ~Copyable {
             }
         }
 
-        var allTokens = promptTokens
-        var generatedTokens: [TokenID] = []
-        var tokenLatenciesMs: [Double] = []
-        generatedTokens.reserveCapacity(effectiveMaxTokens)
-        tokenLatenciesMs.reserveCapacity(effectiveMaxTokens)
-
         let generationStart = DispatchTime.now().uptimeNanoseconds
-        var emissionStart = generationStart
-        var firstTokenLatencyMs = 0.0
-        var firstTokenRecorded = false
+        let tokenizer = self.tokenizer
+        var emission = EmissionCore(
+            promptTokens: promptTokens,
+            capacity: effectiveMaxTokens,
+            eos: .fixed(Int(Self.gpt2EOSToken)),
+            onStep: onStep,
+            decodeText: { tokenizer.decode($0) },
+            startNanos: generationStart
+        )
         var rng = SystemRandomNumberGenerator()
         var normalized = [Float](repeating: 0, count: config.dModel)
         let headSpatial = compiledHybridHeadSpatial
 
-        while generatedTokens.count < effectiveMaxTokens {
+        while emission.generatedTokenCount < effectiveMaxTokens {
             try Self.throwIfCancelled(isCancelled)
             let nextToken: TokenID
             if useANEGreedyHead {
@@ -5194,39 +5165,19 @@ public struct RealModelInferenceEngine: ~Copyable {
                 )
             }
             let emissionNow = DispatchTime.now().uptimeNanoseconds
-            let tokenLatencyMs = Self.milliseconds(from: emissionNow - emissionStart)
+            emission.recordFirstTokenIfFirst(at: emissionNow)
 
-            if !firstTokenRecorded {
-                firstTokenLatencyMs = Self.milliseconds(from: emissionNow - generationStart)
-                firstTokenRecorded = true
-            }
-
-            if nextToken == Self.gpt2EOSToken {
+            if emission.terminatesDecoding(nextToken) {
                 break
             }
 
-            generatedTokens.append(nextToken)
-            allTokens.append(nextToken)
-            let elapsedMs = Self.milliseconds(from: emissionNow - generationStart)
-            let tokensPerSecond = Double(generatedTokens.count) / max(elapsedMs / 1_000, 1e-9)
-            tokenLatenciesMs.append(tokenLatencyMs)
-            onStep?(
-                GenerationStep(
-                    token: nextToken,
-                    generatedTokens: generatedTokens,
-                    text: tokenizer.decode(allTokens.map(Int.init)),
-                    tokenLatencyMs: tokenLatencyMs,
-                    elapsedMs: elapsedMs,
-                    firstTokenLatencyMs: firstTokenLatencyMs,
-                    tokensPerSecond: tokensPerSecond
-                )
-            )
+            emission.emit(nextToken, at: emissionNow)
 
-            if generatedTokens.count >= effectiveMaxTokens || allTokens.count >= config.maxSeq {
+            if emission.generatedTokenCount >= effectiveMaxTokens || emission.allTokensCount >= config.maxSeq {
                 break
             }
 
-            try writeIncrementalEmbedding(token: nextToken, position: allTokens.count - 1, into: xCur)
+            try writeIncrementalEmbedding(token: nextToken, position: emission.allTokensCount - 1, into: xCur)
             do {
                 try ForwardPass.runHybridDecodeTimed(
                     xCur: xCur,
@@ -5245,26 +5196,13 @@ public struct RealModelInferenceEngine: ~Copyable {
                 )
             } catch {
                 throw RealModelInferenceError.runtimeFailure(
-                    "Hybrid decode failed at generated token \(generatedTokens.count - 1): \(error)"
+                    "Hybrid decode failed at generated token \(emission.generatedTokenCount - 1): \(error)"
                 )
             }
-            emissionStart = emissionNow
         }
 
-        let generationEnd = DispatchTime.now().uptimeNanoseconds
-        let generationTimeMs = Self.milliseconds(from: generationEnd - generationStart)
-        let tokensPerSecond = generatedTokens.isEmpty
-            ? 0
-            : Double(generatedTokens.count) / max(generationTimeMs / 1_000, 1e-9)
-
-        return GenerationResult(
-            text: tokenizer.decode(allTokens.map(Int.init)),
-            tokens: generatedTokens,
-            promptTokens: promptTokens,
-            tokenLatenciesMs: tokenLatenciesMs,
-            tokensPerSecond: tokensPerSecond,
+        return emission.makeResult(
             compileTimeMs: compileTimeMs,
-            firstTokenLatencyMs: firstTokenLatencyMs,
             exactHeadBackend: classifierStrategy.exactHeadBackendLabel,
             cachedBindingsEnabled: false
         )
@@ -5301,47 +5239,23 @@ public struct RealModelInferenceEngine: ~Copyable {
             }
         }
 
-        var allTokens = promptTokens
-        var generatedTokens: [TokenID] = []
-        var tokenLatenciesMs: [Double] = []
-        generatedTokens.reserveCapacity(effectiveMaxTokens)
-        tokenLatenciesMs.reserveCapacity(effectiveMaxTokens)
-
         let generationStart = DispatchTime.now().uptimeNanoseconds
-        var emissionStart = generationStart
-        var firstTokenLatencyMs = 0.0
-        var firstTokenRecorded = false
+        let tokenizer = self.tokenizer
+        var emission = EmissionCore(
+            promptTokens: promptTokens,
+            capacity: effectiveMaxTokens,
+            eos: .fixed(Int(Self.gpt2EOSToken)),
+            onStep: onStep,
+            decodeText: { tokenizer.decode($0) },
+            startNanos: generationStart
+        )
 
-        func emitToken(_ token: TokenID, at emissionNow: UInt64) {
-            generatedTokens.append(token)
-            allTokens.append(token)
-            let elapsedMs = Self.milliseconds(from: emissionNow - generationStart)
-            let tokenLatencyMs = Self.milliseconds(from: emissionNow - emissionStart)
-            tokenLatenciesMs.append(tokenLatencyMs)
-            if !firstTokenRecorded {
-                firstTokenLatencyMs = Self.milliseconds(from: emissionNow - generationStart)
-                firstTokenRecorded = true
-            }
-            let tokensPerSecond = Double(generatedTokens.count) / max(elapsedMs / 1_000, 1e-9)
-            onStep?(
-                GenerationStep(
-                    token: token,
-                    generatedTokens: generatedTokens,
-                    text: tokenizer.decode(allTokens.map(Int.init)),
-                    tokenLatencyMs: tokenLatencyMs,
-                    elapsedMs: elapsedMs,
-                    firstTokenLatencyMs: firstTokenLatencyMs,
-                    tokensPerSecond: tokensPerSecond
-                )
-            )
-        }
-
-        while generatedTokens.count < effectiveMaxTokens {
+        while emission.generatedTokenCount < effectiveMaxTokens {
             let checkpoint = try cachedRuntimePair.draftRuntime.captureCheckpoint(dim: config.dModel)
             let proposedToken0: TokenID
             do {
                 proposedToken0 = try cachedRuntimePair.draftRuntime.selectGreedyToken(vocab: config.vocab)
-                try writeIncrementalEmbedding(token: proposedToken0, position: allTokens.count, into: xCur)
+                try writeIncrementalEmbedding(token: proposedToken0, position: emission.allTokensCount, into: xCur)
                 try cachedRuntimePair.draftRuntime.advanceFromBuffer(
                     xCur,
                     metalAttention: metalAttention,
@@ -5349,7 +5263,7 @@ public struct RealModelInferenceEngine: ~Copyable {
                 )
             } catch {
                 throw RealModelInferenceError.runtimeFailure(
-                    "Hybrid speculative draft proposal-0 failed at generated token \(generatedTokens.count): \(error)"
+                    "Hybrid speculative draft proposal-0 failed at generated token \(emission.generatedTokenCount): \(error)"
                 )
             }
 
@@ -5358,7 +5272,7 @@ public struct RealModelInferenceEngine: ~Copyable {
                 proposedToken1 = try cachedRuntimePair.draftRuntime.selectGreedyToken(vocab: config.vocab)
             } catch {
                 throw RealModelInferenceError.runtimeFailure(
-                    "Hybrid speculative draft proposal-1 failed at generated token \(generatedTokens.count): \(error)"
+                    "Hybrid speculative draft proposal-1 failed at generated token \(emission.generatedTokenCount): \(error)"
                 )
             }
 
@@ -5367,10 +5281,10 @@ public struct RealModelInferenceEngine: ~Copyable {
                 exactToken0 = try cachedRuntimePair.verifierRuntime.selectGreedyToken(vocab: config.vocab)
             } catch {
                 throw RealModelInferenceError.runtimeFailure(
-                    "Hybrid speculative verifier token-0 failed at generated token \(generatedTokens.count): \(error)"
+                    "Hybrid speculative verifier token-0 failed at generated token \(emission.generatedTokenCount): \(error)"
                 )
             }
-            if exactToken0 == Self.gpt2EOSToken {
+            if emission.terminatesDecoding(exactToken0) {
                 break
             }
 
@@ -5381,7 +5295,7 @@ public struct RealModelInferenceEngine: ~Copyable {
                         mutatedTokenCount: 1,
                         dim: config.dModel
                     )
-                    try writeIncrementalEmbedding(token: exactToken0, position: allTokens.count, into: xCur)
+                    try writeIncrementalEmbedding(token: exactToken0, position: emission.allTokensCount, into: xCur)
                     try cachedRuntimePair.draftRuntime.advanceFromBuffer(
                         xCur,
                         metalAttention: metalAttention,
@@ -5394,14 +5308,13 @@ public struct RealModelInferenceEngine: ~Copyable {
                     )
                 } catch {
                     throw RealModelInferenceError.runtimeFailure(
-                        "Hybrid speculative verifier rollback failed at generated token \(generatedTokens.count): \(error)"
+                        "Hybrid speculative verifier rollback failed at generated token \(emission.generatedTokenCount): \(error)"
                     )
                 }
 
                 let emissionNow = DispatchTime.now().uptimeNanoseconds
-                emitToken(exactToken0, at: emissionNow)
-                emissionStart = emissionNow
-                if generatedTokens.count >= effectiveMaxTokens || allTokens.count >= config.maxSeq {
+                emission.emit(exactToken0, at: emissionNow)
+                if emission.generatedTokenCount >= effectiveMaxTokens || emission.allTokensCount >= config.maxSeq {
                     break
                 }
                 continue
@@ -5415,15 +5328,14 @@ public struct RealModelInferenceEngine: ~Copyable {
                 )
             } catch {
                 throw RealModelInferenceError.runtimeFailure(
-                    "Hybrid speculative verifier promotion failed at generated token \(generatedTokens.count): \(error)"
+                    "Hybrid speculative verifier promotion failed at generated token \(emission.generatedTokenCount): \(error)"
                 )
             }
 
             let emissionAfterFirst = DispatchTime.now().uptimeNanoseconds
-            emitToken(exactToken0, at: emissionAfterFirst)
-            emissionStart = emissionAfterFirst
+            emission.emit(exactToken0, at: emissionAfterFirst)
 
-            if generatedTokens.count >= effectiveMaxTokens || allTokens.count >= config.maxSeq {
+            if emission.generatedTokenCount >= effectiveMaxTokens || emission.allTokensCount >= config.maxSeq {
                 break
             }
 
@@ -5432,16 +5344,16 @@ public struct RealModelInferenceEngine: ~Copyable {
                 exactToken1 = try cachedRuntimePair.verifierRuntime.selectGreedyToken(vocab: config.vocab)
             } catch {
                 throw RealModelInferenceError.runtimeFailure(
-                    "Hybrid speculative verifier token-1 failed at generated token \(generatedTokens.count): \(error)"
+                    "Hybrid speculative verifier token-1 failed at generated token \(emission.generatedTokenCount): \(error)"
                 )
             }
-            if exactToken1 == Self.gpt2EOSToken {
+            if emission.terminatesDecoding(exactToken1) {
                 break
             }
 
             do {
                 let committedSecondToken = exactToken1 == proposedToken1 ? proposedToken1 : exactToken1
-                try writeIncrementalEmbedding(token: committedSecondToken, position: allTokens.count, into: xCur)
+                try writeIncrementalEmbedding(token: committedSecondToken, position: emission.allTokensCount, into: xCur)
                 try cachedRuntimePair.draftRuntime.advanceFromBuffer(
                     xCur,
                     metalAttention: metalAttention,
@@ -5454,34 +5366,19 @@ public struct RealModelInferenceEngine: ~Copyable {
                 )
             } catch {
                 throw RealModelInferenceError.runtimeFailure(
-                    "Hybrid speculative commit failed at generated token \(generatedTokens.count): \(error)"
+                    "Hybrid speculative commit failed at generated token \(emission.generatedTokenCount): \(error)"
                 )
             }
 
             let emissionAfterSecond = DispatchTime.now().uptimeNanoseconds
-            emitToken(exactToken1, at: emissionAfterSecond)
-            emissionStart = emissionAfterSecond
+            emission.emit(exactToken1, at: emissionAfterSecond)
 
-            if allTokens.count >= config.maxSeq {
+            if emission.allTokensCount >= config.maxSeq {
                 break
             }
         }
 
-        let generationEnd = DispatchTime.now().uptimeNanoseconds
-        let generationTimeMs = Self.milliseconds(from: generationEnd - generationStart)
-        let tokensPerSecond = generatedTokens.isEmpty
-            ? 0
-            : Double(generatedTokens.count) / max(generationTimeMs / 1_000, 1e-9)
-
-        return GenerationResult(
-            text: tokenizer.decode(allTokens.map(Int.init)),
-            tokens: generatedTokens,
-            promptTokens: promptTokens,
-            tokenLatenciesMs: tokenLatenciesMs,
-            tokensPerSecond: tokensPerSecond,
-            compileTimeMs: compileTimeMs,
-            firstTokenLatencyMs: firstTokenLatencyMs
-        )
+        return emission.makeResult(compileTimeMs: compileTimeMs)
     }
 
     private mutating func cachedSpeculativeRuntimePair(
@@ -5921,23 +5818,24 @@ public struct RealModelInferenceEngine: ~Copyable {
             }
         }
 
-        var allTokens = promptTokens
-        var generatedTokens: [TokenID] = []
-        var tokenLatenciesMs: [Double] = []
         var decodeProfileTokens: [HybridDecodeTimingBreakdown] = []
-        generatedTokens.reserveCapacity(effectiveMaxTokens)
-        tokenLatenciesMs.reserveCapacity(effectiveMaxTokens)
         decodeProfileTokens.reserveCapacity(effectiveMaxTokens)
         var pendingDecode = HybridDecodeTimingBreakdown()
 
         let generationStart = DispatchTime.now().uptimeNanoseconds
-        var emissionStart = generationStart
-        var firstTokenLatencyMs = 0.0
-        var firstTokenRecorded = false
+        let tokenizer = self.tokenizer
+        var emission = EmissionCore(
+            promptTokens: promptTokens,
+            capacity: effectiveMaxTokens,
+            eos: .fromConfig(config.eosToken.map(Int.init)),
+            onStep: onStep,
+            decodeText: { tokenizer.decode($0) },
+            startNanos: generationStart
+        )
         var rng = SystemRandomNumberGenerator()
         var normalized = [Float](repeating: 0, count: config.dModel)
 
-        while generatedTokens.count < effectiveMaxTokens {
+        while emission.generatedTokenCount < effectiveMaxTokens {
             try Self.throwIfCancelled(isCancelled)
             let headStart = DispatchTime.now().uptimeNanoseconds
             normalized = xCur.withUnsafeBufferPointer {
@@ -5955,35 +5853,15 @@ public struct RealModelInferenceEngine: ~Copyable {
             )
             decodeProfileTokens.append(tokenProfile)
             let emissionNow = DispatchTime.now().uptimeNanoseconds
-            let tokenLatencyMs = Self.milliseconds(from: emissionNow - emissionStart)
+            emission.recordFirstTokenIfFirst(at: emissionNow)
 
-            if !firstTokenRecorded {
-                firstTokenLatencyMs = Self.milliseconds(from: emissionNow - generationStart)
-                firstTokenRecorded = true
-            }
-
-            if let eosToken = config.eosToken, nextToken == eosToken {
-                generatedTokens.append(nextToken)
+            if emission.terminatesDecoding(nextToken) {
+                emission.recordTerminalToken(nextToken)
                 break
             }
-            generatedTokens.append(nextToken)
-            allTokens.append(nextToken)
-            let elapsedMs = Self.milliseconds(from: emissionNow - generationStart)
-            let tokensPerSecond = Double(generatedTokens.count) / max(elapsedMs / 1_000, 1e-9)
-            tokenLatenciesMs.append(tokenLatencyMs)
-            onStep?(
-                GenerationStep(
-                    token: nextToken,
-                    generatedTokens: generatedTokens,
-                    text: tokenizer.decode(allTokens.map(Int.init)),
-                    tokenLatencyMs: tokenLatencyMs,
-                    elapsedMs: elapsedMs,
-                    firstTokenLatencyMs: firstTokenLatencyMs,
-                    tokensPerSecond: tokensPerSecond
-                )
-            )
+            emission.emit(nextToken, at: emissionNow)
 
-            if generatedTokens.count >= effectiveMaxTokens || allTokens.count >= config.maxSeq {
+            if emission.generatedTokenCount >= effectiveMaxTokens || emission.allTokensCount >= config.maxSeq {
                 break
             }
 
@@ -6001,11 +5879,10 @@ public struct RealModelInferenceEngine: ~Copyable {
                 )
             } catch {
                 throw Self.fusedHybridFallbackError(
-                    reason: "fused N=1 decode failed at generated token \(generatedTokens.count - 1): \(error)"
+                    reason: "fused N=1 decode failed at generated token \(emission.generatedTokenCount - 1): \(error)"
                 )
             }
             pendingDecode = timings
-            emissionStart = emissionNow
         }
 
         let decodeProfileReport = decodeProfileTokens.isEmpty
@@ -6015,22 +5892,9 @@ public struct RealModelInferenceEngine: ~Copyable {
             fputs(decodeProfileReport + "\n", stderr)
         }
 
-        let generationEnd = DispatchTime.now().uptimeNanoseconds
-        let generationTimeMs = Self.milliseconds(from: generationEnd - generationStart)
-        let tokensPerSecond = generatedTokens.isEmpty
-            ? 0
-            : Double(generatedTokens.count) / max(generationTimeMs / 1_000, 1e-9)
-
-        return GenerationResult(
-            text: tokenizer.decode(allTokens.map(Int.init)),
-            tokens: generatedTokens,
-            promptTokens: promptTokens,
-            tokenLatenciesMs: tokenLatenciesMs,
-            tokensPerSecond: tokensPerSecond,
+        return emission.makeResult(
             compileTimeMs: compileTimeMs,
-            firstTokenLatencyMs: firstTokenLatencyMs,
             exactHeadBackend: classifierStrategy.exactHeadBackendLabel,
-            cachedBindingsEnabled: false,
             trunk: .fusedHybrid,
             hopsPerToken: hopsPerToken,
             decodeProfileReport: decodeProfileReport
@@ -6361,24 +6225,25 @@ public struct RealModelInferenceEngine: ~Copyable {
             }
         }
 
-        var allTokens = promptTokens
-        var generatedTokens: [TokenID] = []
-        var tokenLatenciesMs: [Double] = []
         var decodeProfileTokens: [HybridDecodeTimingBreakdown] = []
-        generatedTokens.reserveCapacity(effectiveMaxTokens)
-        tokenLatenciesMs.reserveCapacity(effectiveMaxTokens)
         decodeProfileTokens.reserveCapacity(effectiveMaxTokens)
         var pendingDecode = HybridDecodeTimingBreakdown()
 
         let generationStart = DispatchTime.now().uptimeNanoseconds
-        var emissionStart = generationStart
-        var firstTokenLatencyMs = 0.0
-        var firstTokenRecorded = false
+        let tokenizer = self.tokenizer
+        var emission = EmissionCore(
+            promptTokens: promptTokens,
+            capacity: effectiveMaxTokens,
+            eos: .fromConfig(config.eosToken.map(Int.init)),
+            onStep: onStep,
+            decodeText: { tokenizer.decode($0) },
+            startNanos: generationStart
+        )
         var rng = SystemRandomNumberGenerator()
         var normalized = [Float](repeating: 0, count: config.dModel)
         let headSpatial = compiledHybridHeadSpatial
 
-        while generatedTokens.count < effectiveMaxTokens {
+        while emission.generatedTokenCount < effectiveMaxTokens {
             try Self.throwIfCancelled(isCancelled)
             let headStart = DispatchTime.now().uptimeNanoseconds
             let nextToken: TokenID
@@ -6447,35 +6312,15 @@ public struct RealModelInferenceEngine: ~Copyable {
             )
             decodeProfileTokens.append(tokenProfile)
             let emissionNow = DispatchTime.now().uptimeNanoseconds
-            let tokenLatencyMs = Self.milliseconds(from: emissionNow - emissionStart)
+            emission.recordFirstTokenIfFirst(at: emissionNow)
 
-            if !firstTokenRecorded {
-                firstTokenLatencyMs = Self.milliseconds(from: emissionNow - generationStart)
-                firstTokenRecorded = true
-            }
-
-            if let eosToken = config.eosToken, nextToken == eosToken {
-                generatedTokens.append(nextToken)
+            if emission.terminatesDecoding(nextToken) {
+                emission.recordTerminalToken(nextToken)
                 break
             }
-            generatedTokens.append(nextToken)
-            allTokens.append(nextToken)
-            let elapsedMs = Self.milliseconds(from: emissionNow - generationStart)
-            let tokensPerSecond = Double(generatedTokens.count) / max(elapsedMs / 1_000, 1e-9)
-            tokenLatenciesMs.append(tokenLatencyMs)
-            onStep?(
-                GenerationStep(
-                    token: nextToken,
-                    generatedTokens: generatedTokens,
-                    text: tokenizer.decode(allTokens.map(Int.init)),
-                    tokenLatencyMs: tokenLatencyMs,
-                    elapsedMs: elapsedMs,
-                    firstTokenLatencyMs: firstTokenLatencyMs,
-                    tokensPerSecond: tokensPerSecond
-                )
-            )
+            emission.emit(nextToken, at: emissionNow)
 
-            if generatedTokens.count >= effectiveMaxTokens || allTokens.count >= config.maxSeq {
+            if emission.generatedTokenCount >= effectiveMaxTokens || emission.allTokensCount >= config.maxSeq {
                 break
             }
 
@@ -6505,11 +6350,10 @@ public struct RealModelInferenceEngine: ~Copyable {
                 )
             } catch {
                 throw RealModelInferenceError.runtimeFailure(
-                    "Llama hybrid decode failed at generated token \(generatedTokens.count - 1): \(error)"
+                    "Llama hybrid decode failed at generated token \(emission.generatedTokenCount - 1): \(error)"
                 )
             }
             pendingDecode = timings
-            emissionStart = emissionNow
         }
 
         let decodeProfileReport = decodeProfileTokens.isEmpty
@@ -6519,20 +6363,8 @@ public struct RealModelInferenceEngine: ~Copyable {
             fputs(decodeProfileReport + "\n", stderr)
         }
 
-        let generationEnd = DispatchTime.now().uptimeNanoseconds
-        let generationTimeMs = Self.milliseconds(from: generationEnd - generationStart)
-        let tokensPerSecond = generatedTokens.isEmpty
-            ? 0
-            : Double(generatedTokens.count) / max(generationTimeMs / 1_000, 1e-9)
-
-        return GenerationResult(
-            text: tokenizer.decode(allTokens.map(Int.init)),
-            tokens: generatedTokens,
-            promptTokens: promptTokens,
-            tokenLatenciesMs: tokenLatenciesMs,
-            tokensPerSecond: tokensPerSecond,
+        return emission.makeResult(
             compileTimeMs: compileTimeMs,
-            firstTokenLatencyMs: firstTokenLatencyMs,
             exactHeadBackend: greedyHeadMode == .classifierOnlyFactored && useANEGreedyHead
                 ? "ane_factored_classifier"
                 : classifierStrategy.exactHeadBackendLabel,
@@ -6594,80 +6426,37 @@ public struct RealModelInferenceEngine: ~Copyable {
         try fullRuntime.prefill(promptTokens: promptTokens)
         try draftRuntime.prefill(promptTokens: promptTokens)
 
-        var allTokens = promptTokens
-        var generatedTokens: [TokenID] = []
-        var tokenLatenciesMs: [Double] = []
-        generatedTokens.reserveCapacity(effectiveMaxTokens)
-        tokenLatenciesMs.reserveCapacity(effectiveMaxTokens)
-
         let generationStart = DispatchTime.now().uptimeNanoseconds
-        var emissionStart = generationStart
-        var firstTokenLatencyMs = 0.0
-        var firstTokenRecorded = false
+        let tokenizer = self.tokenizer
+        var emission = EmissionCore(
+            promptTokens: promptTokens,
+            capacity: effectiveMaxTokens,
+            eos: .fromConfig(config.eosToken.map(Int.init)),
+            onStep: onStep,
+            decodeText: { tokenizer.decode($0) },
+            startNanos: generationStart
+        )
         var committedExactTokensTotal = 0
         var acceptedFutureTokensTotal = 0
         var speculativePassCount = 0
 
-        func emit(_ token: TokenID, at emissionNow: UInt64) {
-            generatedTokens.append(token)
-            allTokens.append(token)
-            let elapsedMs = Self.milliseconds(from: emissionNow - generationStart)
-            let tokenLatencyMs = Self.milliseconds(from: emissionNow - emissionStart)
-            tokenLatenciesMs.append(tokenLatencyMs)
-            if !firstTokenRecorded {
-                firstTokenLatencyMs = Self.milliseconds(from: emissionNow - generationStart)
-                firstTokenRecorded = true
-            }
-            let tokensPerSecond = Double(generatedTokens.count) / max(elapsedMs / 1_000, 1e-9)
-            onStep?(
-                GenerationStep(
-                    token: token,
-                    generatedTokens: generatedTokens,
-                    text: tokenizer.decode(allTokens.map(Int.init)),
-                    tokenLatencyMs: tokenLatencyMs,
-                    elapsedMs: elapsedMs,
-                    firstTokenLatencyMs: firstTokenLatencyMs,
-                    tokensPerSecond: tokensPerSecond
-                )
-            )
-            emissionStart = emissionNow
-        }
-
         let firstToken = fullRuntime.selectGreedyToken()
-        if let eosToken = config.eosToken, firstToken == eosToken {
-            generatedTokens.append(firstToken)
-            return GenerationResult(
-                text: tokenizer.decode((promptTokens + generatedTokens).map(Int.init)),
-                tokens: generatedTokens,
-                promptTokens: promptTokens,
-                tokenLatenciesMs: tokenLatenciesMs,
-                tokensPerSecond: 0,
+        if emission.terminatesDecoding(firstToken) {
+            emission.recordTerminalToken(firstToken)
+            return emission.makeResult(
                 compileTimeMs: compileTimeMs,
-                firstTokenLatencyMs: 0,
                 exactHeadBackend: "cpu_exact_two_token_draft",
-                cachedBindingsEnabled: false,
-                committedExactTokensPerPass: nil,
-                acceptedFutureTokensPerPass: nil,
-                trunk: .exactCPU
+                trunk: .exactCPU,
+                tokensPerSecondOverride: 0,
+                textOverride: tokenizer.decode((promptTokens + [firstToken]).map(Int.init))
             )
         }
         let firstEmission = DispatchTime.now().uptimeNanoseconds
-        emit(firstToken, at: firstEmission)
-        if generatedTokens.count >= effectiveMaxTokens || allTokens.count >= config.maxSeq {
-            let totalMs = Self.milliseconds(from: DispatchTime.now().uptimeNanoseconds - generationStart)
-            let tps = generatedTokens.isEmpty ? 0 : Double(generatedTokens.count) / max(totalMs / 1_000, 1e-9)
-            return GenerationResult(
-                text: tokenizer.decode(allTokens.map(Int.init)),
-                tokens: generatedTokens,
-                promptTokens: promptTokens,
-                tokenLatenciesMs: tokenLatenciesMs,
-                tokensPerSecond: tps,
+        emission.emit(firstToken, at: firstEmission)
+        if emission.generatedTokenCount >= effectiveMaxTokens || emission.allTokensCount >= config.maxSeq {
+            return emission.makeResult(
                 compileTimeMs: compileTimeMs,
-                firstTokenLatencyMs: firstTokenLatencyMs,
                 exactHeadBackend: "cpu_exact_two_token_draft",
-                cachedBindingsEnabled: false,
-                committedExactTokensPerPass: nil,
-                acceptedFutureTokensPerPass: nil,
                 trunk: .exactCPU
             )
         }
@@ -6675,9 +6464,12 @@ public struct RealModelInferenceEngine: ~Copyable {
         try fullRuntime.advance(token: firstToken)
         try draftRuntime.advance(token: firstToken)
 
-        while generatedTokens.count < effectiveMaxTokens, allTokens.count < config.maxSeq {
+        while emission.generatedTokenCount < effectiveMaxTokens, emission.allTokensCount < config.maxSeq {
             speculativePassCount += 1
-            let remainingTokenBudget = min(effectiveMaxTokens - generatedTokens.count, config.maxSeq - allTokens.count)
+            let remainingTokenBudget = min(
+                effectiveMaxTokens - emission.generatedTokenCount,
+                config.maxSeq - emission.allTokensCount
+            )
             let draftCheckpoint = draftRuntime.captureCheckpoint()
             let proposedToken0 = draftRuntime.selectGreedyToken()
             try draftRuntime.advance(token: proposedToken0)
@@ -6693,9 +6485,9 @@ public struct RealModelInferenceEngine: ~Copyable {
             }
 
             let firstRoundEmission = DispatchTime.now().uptimeNanoseconds
-            emit(exactToken0, at: firstRoundEmission)
+            emission.emit(exactToken0, at: firstRoundEmission)
             committedInPass += 1
-            if let eosToken = config.eosToken, exactToken0 == eosToken {
+            if emission.terminatesDecoding(exactToken0) {
                 committedExactTokensTotal += committedInPass
                 acceptedFutureTokensTotal += acceptedInPass
                 break
@@ -6705,7 +6497,7 @@ public struct RealModelInferenceEngine: ~Copyable {
                 try draftRuntime.advance(token: exactToken0)
             }
 
-            if generatedTokens.count >= effectiveMaxTokens || allTokens.count >= config.maxSeq || remainingTokenBudget <= 1 {
+            if emission.generatedTokenCount >= effectiveMaxTokens || emission.allTokensCount >= config.maxSeq || remainingTokenBudget <= 1 {
                 committedExactTokensTotal += committedInPass
                 acceptedFutureTokensTotal += acceptedInPass
                 continue
@@ -6717,9 +6509,9 @@ public struct RealModelInferenceEngine: ~Copyable {
                 acceptedInPass += 1
             }
             let secondRoundEmission = DispatchTime.now().uptimeNanoseconds
-            emit(exactToken1, at: secondRoundEmission)
+            emission.emit(exactToken1, at: secondRoundEmission)
             committedInPass += 1
-            if let eosToken = config.eosToken, exactToken1 == eosToken {
+            if emission.terminatesDecoding(exactToken1) {
                 committedExactTokensTotal += committedInPass
                 acceptedFutureTokensTotal += acceptedInPass
                 break
@@ -6731,11 +6523,6 @@ public struct RealModelInferenceEngine: ~Copyable {
             acceptedFutureTokensTotal += acceptedInPass
         }
 
-        let generationEnd = DispatchTime.now().uptimeNanoseconds
-        let generationTimeMs = Self.milliseconds(from: generationEnd - generationStart)
-        let tokensPerSecond = generatedTokens.isEmpty
-            ? 0
-            : Double(generatedTokens.count) / max(generationTimeMs / 1_000, 1e-9)
         let committedExactTokensPerPass = speculativePassCount == 0
             ? nil
             : Double(committedExactTokensTotal) / Double(speculativePassCount)
@@ -6743,16 +6530,9 @@ public struct RealModelInferenceEngine: ~Copyable {
             ? nil
             : Double(acceptedFutureTokensTotal) / Double(speculativePassCount)
 
-        return GenerationResult(
-            text: tokenizer.decode(allTokens.map(Int.init)),
-            tokens: generatedTokens,
-            promptTokens: promptTokens,
-            tokenLatenciesMs: tokenLatenciesMs,
-            tokensPerSecond: tokensPerSecond,
+        return emission.makeResult(
             compileTimeMs: compileTimeMs,
-            firstTokenLatencyMs: firstTokenLatencyMs,
             exactHeadBackend: "cpu_exact_two_token_draft",
-            cachedBindingsEnabled: false,
             committedExactTokensPerPass: committedExactTokensPerPass,
             acceptedFutureTokensPerPass: acceptedFutureTokensPerPass,
             trunk: .exactCPU
@@ -6811,23 +6591,24 @@ public struct RealModelInferenceEngine: ~Copyable {
             return hidden
         }
 
-        var allTokens = promptTokens
         var lastHidden = [Float](repeating: 0, count: config.dModel)
         for (position, token) in promptTokens.enumerated() {
             lastHidden = try forwardToken(token, position: position)
         }
 
         let generationStart = DispatchTime.now().uptimeNanoseconds
-        var emissionStart = generationStart
-        var firstTokenLatencyMs = 0.0
-        var firstTokenRecorded = false
-        var generatedTokens: [TokenID] = []
-        var tokenLatenciesMs: [Double] = []
-        generatedTokens.reserveCapacity(effectiveMaxTokens)
-        tokenLatenciesMs.reserveCapacity(effectiveMaxTokens)
+        let tokenizer = self.tokenizer
+        var emission = EmissionCore(
+            promptTokens: promptTokens,
+            capacity: effectiveMaxTokens,
+            eos: .fromConfig(config.eosToken.map(Int.init)),
+            onStep: onStep,
+            decodeText: { tokenizer.decode($0) },
+            startNanos: generationStart
+        )
         var rng = SystemRandomNumberGenerator()
 
-        while generatedTokens.count < effectiveMaxTokens {
+        while emission.generatedTokenCount < effectiveMaxTokens {
             try Self.throwIfCancelled(isCancelled)
             let normalized = Self.rmsNorm(lastHidden, weight: finalNormGamma, eps: Float(config.normEps))
             let nextToken: TokenID
@@ -6843,56 +6624,24 @@ public struct RealModelInferenceEngine: ~Copyable {
             }
 
             let emissionNow = DispatchTime.now().uptimeNanoseconds
-            let tokenLatencyMs = Self.milliseconds(from: emissionNow - emissionStart)
-            if !firstTokenRecorded {
-                firstTokenLatencyMs = Self.milliseconds(from: emissionNow - generationStart)
-                firstTokenRecorded = true
-            }
+            emission.recordFirstTokenIfFirst(at: emissionNow)
 
-            if let eosToken = config.eosToken, nextToken == eosToken {
-                generatedTokens.append(nextToken)
+            if emission.terminatesDecoding(nextToken) {
+                emission.recordTerminalToken(nextToken)
                 break
             }
 
-            generatedTokens.append(nextToken)
-            allTokens.append(nextToken)
-            let elapsedMs = Self.milliseconds(from: emissionNow - generationStart)
-            let tokensPerSecond = Double(generatedTokens.count) / max(elapsedMs / 1_000, 1e-9)
-            tokenLatenciesMs.append(tokenLatencyMs)
-            onStep?(
-                GenerationStep(
-                    token: nextToken,
-                    generatedTokens: generatedTokens,
-                    text: tokenizer.decode(allTokens.map(Int.init)),
-                    tokenLatencyMs: tokenLatencyMs,
-                    elapsedMs: elapsedMs,
-                    firstTokenLatencyMs: firstTokenLatencyMs,
-                    tokensPerSecond: tokensPerSecond
-                )
-            )
+            emission.emit(nextToken, at: emissionNow)
 
-            if generatedTokens.count >= effectiveMaxTokens || allTokens.count >= maxSeq {
+            if emission.generatedTokenCount >= effectiveMaxTokens || emission.allTokensCount >= maxSeq {
                 break
             }
 
-            lastHidden = try forwardToken(nextToken, position: allTokens.count - 1)
-            emissionStart = emissionNow
+            lastHidden = try forwardToken(nextToken, position: emission.allTokensCount - 1)
         }
 
-        let generationEnd = DispatchTime.now().uptimeNanoseconds
-        let generationTimeMs = Self.milliseconds(from: generationEnd - generationStart)
-        let tokensPerSecond = generatedTokens.isEmpty
-            ? 0
-            : Double(generatedTokens.count) / max(generationTimeMs / 1_000, 1e-9)
-
-        return GenerationResult(
-            text: tokenizer.decode(allTokens.map(Int.init)),
-            tokens: generatedTokens,
-            promptTokens: promptTokens,
-            tokenLatenciesMs: tokenLatenciesMs,
-            tokensPerSecond: tokensPerSecond,
+        return emission.makeResult(
             compileTimeMs: compileTimeMs,
-            firstTokenLatencyMs: firstTokenLatencyMs,
             exactHeadBackend: classifierStrategy.exactHeadBackendLabel,
             trunk: .exactCPU
         )
