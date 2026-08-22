@@ -829,7 +829,7 @@ func cliUsageText() -> String {
           --benchmark-generate Reuse one Espresso engine and report warm generate metrics using --compare-warmup/--compare-iterations
           --raw-prompt         Encode the prompt verbatim (skip the Qwen2.5-Instruct chat wrap)
           --no-hybrid-fallback Fail instead of falling back from the ANE hybrid decode path
-                           Chat always sets ESPRESSO_REALMODEL_DISABLE_HYBRID_FALLBACK=1
+                           Chat never falls back to CPU decode
       -h, --help               Show this help
 
     Environment:

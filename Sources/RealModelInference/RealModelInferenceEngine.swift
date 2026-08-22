@@ -1666,7 +1666,6 @@ public struct RealModelInferenceEngine: ~Copyable {
     /// One unit of llama serving work routed through the single ``Trunk`` dispatch point.
     private struct LlamaDecodeRequest {
         let trunk: Trunk
-        let plan: ResolvedDecodePlan
         let bucket: Int
         /// Names the caller in attention-unavailability errors ("llama" vs "llama testing helper").
         let sessionKind: String
@@ -1797,7 +1796,6 @@ public struct RealModelInferenceEngine: ~Copyable {
                 compileTimeMs: sessionCompileTimeMs,
                 maxSeq: request.maxSeq ?? max(request.bucket, compiledHybridBucket),
                 metalAttention: metalAttention,
-                plan: request.plan,
                 onStep: request.onStep,
                 isCancelled: request.isCancelled
             )
@@ -1909,7 +1907,6 @@ public struct RealModelInferenceEngine: ~Copyable {
             )
             return try dispatchLlamaTrunkDecode(LlamaDecodeRequest(
                 trunk: trunk,
-                plan: plan,
                 bucket: bucket,
                 sessionKind: "llama",
                 promptTokens: promptTokens,
@@ -2255,7 +2252,6 @@ public struct RealModelInferenceEngine: ~Copyable {
         )
 
         let seam = Self.resolveDecodePlanSeam(config: config, options: decodeOptions)
-        let plan = seam.plan
         let trunk = try DecodePathPolicy.resolvedTrunk(
             config: config,
             fusedHybridPreferred: seam.fusedHybridPreferred,
@@ -2287,7 +2283,6 @@ public struct RealModelInferenceEngine: ~Copyable {
             results.append(
                 try engine.dispatchLlamaTrunkDecode(LlamaDecodeRequest(
                     trunk: trunk,
-                    plan: plan,
                     bucket: bucket,
                     sessionKind: "llama testing helper",
                     promptTokens: prompt,
@@ -2788,8 +2783,11 @@ public struct RealModelInferenceEngine: ~Copyable {
         weightDir: String,
         layer: Int = 0,
         spatials: [Int] = [64, 128, 256],
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        environment: [String: String]? = nil
     ) throws -> [GPT2AttentionCompileProbeResult] {
+        // Public declarations cannot reference internal symbols in default arguments,
+        // so the bootstrap seam is applied here instead of in the parameter default.
+        let environment = environment ?? Self.processEnvironment
         guard config.architecture == .gpt2 else {
             throw RealModelInferenceError.unsupportedArchitecture(
                 "GPT-2 attention compile probe supports GPT-2 architectures only."
@@ -6261,7 +6259,6 @@ public struct RealModelInferenceEngine: ~Copyable {
         compileTimeMs: Double,
         maxSeq: Int,
         metalAttention: MetalAttentionKernel,
-        plan: ResolvedDecodePlan,
         onStep: ((GenerationStep) -> Void)?,
         isCancelled: (() -> Bool)? = nil
     ) throws -> GenerationResult {
@@ -6273,23 +6270,6 @@ public struct RealModelInferenceEngine: ~Copyable {
             throw RealModelInferenceError.runtimeFailure(
                 "Llama hybrid decode state is unavailable: layers=\(compiledHybridLayers.count)/\(config.nLayer) surfaces=\(compiledHybridSurfaceHandles.count)/\(config.nLayer) qkNorms=\(compiledHybridLlamaQKNormWeights.count)/\(config.nLayer) head=\(compiledHybridHead.count) headSpatial=\(compiledHybridHeadSpatial)"
             )
-        }
-
-        if plan.trunk == .exactCPU {
-            return try dispatchLlamaTrunkDecode(LlamaDecodeRequest(
-                trunk: .exactCPU,
-                plan: plan,
-                bucket: maxSeq,
-                sessionKind: "llama",
-                promptTokens: promptTokens,
-                effectiveMaxTokens: effectiveMaxTokens,
-                temperature: temperature,
-                topP: topP,
-                compileTimeMs: compileTimeMs,
-                maxSeq: maxSeq,
-                onStep: onStep,
-                isCancelled: isCancelled
-            ))
         }
 
         try ForwardPass.initializeHybridDecodeCaches(
