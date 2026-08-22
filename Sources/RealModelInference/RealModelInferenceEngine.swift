@@ -1515,6 +1515,7 @@ public struct RealModelInferenceEngine: ~Copyable {
     private let classifierBlockMaxNorms: [Float]
     private var classifierLogitsScratch: [Float]
     private let classifierStrategy: ClassifierStrategy
+    private let policies: EnginePolicies
     private var cachedExactCPULlamaWeights: CachedExactCPULlamaWeights?
 
     private init(
@@ -1522,7 +1523,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         weightDirURL: URL,
         tokenizer: LoadedTokenizer,
         assets: TopLevelAssets,
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        policies: EnginePolicies = .resolve()
     ) {
         let lmHead: [Float]
         let hasExactFloat32LMHead: Bool
@@ -1573,15 +1574,21 @@ public struct RealModelInferenceEngine: ~Copyable {
         self.classifierStrategy = Self.resolveClassifierStrategy(
             config: config,
             hasExactFloat32LMHead: hasExactFloat32LMHead,
-            environment: environment
+            environment: policies.environment
         )
+        self.policies = policies
         self.cachedExactCPULlamaWeights = nil
     }
 
+    /// Builds an engine. `environment` is the single configuration seam:
+    /// everything the process environment would have steered is resolved from
+    /// this dictionary once, here. Callers embedding Espresso pass values;
+    /// only the default reads the live process environment.
     public static func build(
         config: MultiModelConfig,
         weightDir: String,
-        tokenizerDir: String
+        tokenizerDir: String,
+        environment: [String: String] = ProcessInfo.processInfo.environment
     ) throws -> RealModelInferenceEngine {
         try validateConfig(config)
 
@@ -1592,17 +1599,20 @@ public struct RealModelInferenceEngine: ~Copyable {
         try validateMetadataIfPresent(config: config, weightDirURL: weightDirURL)
 
         let tokenizer = try loadTokenizer(config: config, tokenizerDirURL: tokenizerDirURL)
+        let policies = EnginePolicies(environment: environment)
 
         let topLevelAssets = try TopLevelAssetLoader.load(
             config: config,
             weightDir: weightDir,
-            weightDirURL: weightDirURL
+            weightDirURL: weightDirURL,
+            environment: environment
         )
         return RealModelInferenceEngine(
             config: config,
             weightDirURL: weightDirURL,
             tokenizer: tokenizer,
-            assets: topLevelAssets
+            assets: topLevelAssets,
+            policies: policies
         )
     }
 
@@ -1620,7 +1630,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         case .llama:
             switch Self.selectTrunk(
                 config: config,
-                environment: ProcessInfo.processInfo.environment
+                environment: policies.environment
             ) {
             case .fusedHybrid:
                 do {
@@ -1671,7 +1681,7 @@ public struct RealModelInferenceEngine: ~Copyable {
 
         let remainingContext = config.maxSeq - promptTokens.count
         let effectiveMaxTokens = min(maxTokens, max(remainingContext, 0))
-        let environment = ProcessInfo.processInfo.environment
+        let environment = policies.environment
         if effectiveMaxTokens == 0 {
             let text = tokenizer.decode(promptTokens.map(Int.init))
             let trunk: Trunk?
@@ -1848,7 +1858,7 @@ public struct RealModelInferenceEngine: ~Copyable {
                         onStep: onStep
                     )
                 } catch {
-                    if ProcessInfo.processInfo.environment["ESPRESSO_REALMODEL_DISABLE_HYBRID_FALLBACK"] == "1" {
+                    if policies.disableHybridFallback {
                         throw RealModelInferenceError.runtimeFailure("Hybrid speculative fast path failed: \(error)")
                     }
                     fputs(
@@ -1882,7 +1892,7 @@ public struct RealModelInferenceEngine: ~Copyable {
                     isCancelled: isCancelled
                 )
             } catch {
-                if ProcessInfo.processInfo.environment["ESPRESSO_REALMODEL_DISABLE_HYBRID_FALLBACK"] == "1" {
+                if policies.disableHybridFallback {
                     throw RealModelInferenceError.runtimeFailure("Hybrid fast path failed: \(error)")
                 }
                 useHybridFastPath = false
@@ -4616,7 +4626,8 @@ public struct RealModelInferenceEngine: ~Copyable {
             let newLayers = try Self.compileHybridLayers(
                 config: config,
                 weightDirURL: weightDirURL,
-                maxSeq: bucket
+                maxSeq: bucket,
+                environment: policies.environment
             )
             let newQKNormWeights = try Self.loadHybridLlamaQKNormWeights(
                 config: config,
@@ -4641,7 +4652,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             if newLayers.count > 1,
                Self.usesHybridLayerInputRebinding(
                    architecture: config.architecture,
-                   environment: ProcessInfo.processInfo.environment
+                   environment: policies.environment
                ) {
                 for layerIndex in 1..<newLayers.count {
                     do {
@@ -4745,7 +4756,8 @@ public struct RealModelInferenceEngine: ~Copyable {
             let newLayers = try Self.compileHybridLayers(
                 config: config,
                 weightDirURL: weightDirURL,
-                maxSeq: bucket
+                maxSeq: bucket,
+                environment: policies.environment
             )
             let newQKNormWeights = try Self.loadHybridLlamaQKNormWeights(
                 config: config,
@@ -4773,7 +4785,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             if newLayers.count > 1,
                Self.usesHybridLayerInputRebinding(
                    architecture: config.architecture,
-                   environment: ProcessInfo.processInfo.environment
+                   environment: policies.environment
                ) {
                 for layerIndex in 1..<newLayers.count {
                     do {
@@ -4962,7 +4974,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         // Pre-create cached Metal bindings for all layers (GPT-2 path)
         let cachedBindings: [MetalAttentionKernel.CachedLayerBindings]? = try Self.makeHybridCachedBindingsOrFallback(
             config: config,
-            environment: ProcessInfo.processInfo.environment
+            environment: policies.environment
         ) {
             try compiledHybridSurfaceHandles.map { handles in
                 try metalAttention.createCachedLayerBindings(
@@ -4980,14 +4992,14 @@ public struct RealModelInferenceEngine: ~Copyable {
             }
         }
 
-        if ProcessInfo.processInfo.environment["ESPRESSO_REALMODEL_DEBUG_HYBRID_CACHE"] == "1",
+        if policies.debugHybridCacheDumps,
            let firstHandles = compiledHybridSurfaceHandles.first {
             fputs(
                 "[hybrid-surface] qkvIn_row=\(IOSurfaceGetBytesPerRow(firstHandles.qkvIn)) qOut_row=\(IOSurfaceGetBytesPerRow(firstHandles.qOut)) ffnIn_row=\(IOSurfaceGetBytesPerRow(firstHandles.ffnIn)) ffnOut_row=\(IOSurfaceGetBytesPerRow(firstHandles.ffnOut)) laneSpatial=\(firstHandles.laneSpatial) maxSeq=\(firstHandles.maxSeq)\n",
                 stderr
             )
         }
-        let shouldDebugHybridCache = ProcessInfo.processInfo.environment["ESPRESSO_REALMODEL_DEBUG_HYBRID_CACHE"] == "1"
+        let shouldDebugHybridCache = policies.debugHybridCacheDumps
 
         let xCur = TensorBuffer(count: config.dModel, zeroed: true)
         var decodeState: DecodeState
@@ -5024,7 +5036,7 @@ public struct RealModelInferenceEngine: ~Copyable {
                     dim: config.dModel,
                     preferCPUDecodeAttention: Self.prefersCPUDecodeAttention(
                         config: config,
-                        environment: ProcessInfo.processInfo.environment
+                        environment: policies.environment
                     ),
                     readFinalOutputIntoXCur: !useANEGreedyHead,
                     cachedBindings: cachedBindings,
@@ -5183,7 +5195,7 @@ public struct RealModelInferenceEngine: ~Copyable {
                     dim: config.dModel,
                     preferCPUDecodeAttention: Self.prefersCPUDecodeAttention(
                         config: config,
-                        environment: ProcessInfo.processInfo.environment
+                        environment: policies.environment
                     ),
                     readFinalOutputIntoXCur: !useANEGreedyHead,
                     cachedBindings: cachedBindings,
@@ -5652,7 +5664,7 @@ public struct RealModelInferenceEngine: ~Copyable {
     }
 
     private func encodePrompt(_ prompt: String) throws -> [TokenID] {
-        let environment = ProcessInfo.processInfo.environment
+        let environment = policies.environment
         let textToEncode: String
         // CLI `preparedGeneratePrompt` may already apply the same wrap.
         if environment["ESPRESSO_RAW_PROMPT"] == "1" || prompt.hasPrefix("<|im_start|>") {
@@ -6003,7 +6015,7 @@ public struct RealModelInferenceEngine: ~Copyable {
 
         if try Self.resolvedTrunk(
             config: config,
-            environment: ProcessInfo.processInfo.environment
+            environment: policies.environment
         ) == .exactCPU {
             return try generateIncrementalExactCPULlama(
                 promptTokens: promptTokens,
@@ -6025,7 +6037,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         // Pre-create cached decode-surface metadata for all layers.
         let cachedBindings: [MetalAttentionKernel.CachedLayerBindings]? = try Self.makeHybridCachedBindingsOrFallback(
             config: config,
-            environment: ProcessInfo.processInfo.environment
+            environment: policies.environment
         ) {
             try compiledHybridSurfaceHandles.map { handles in
                 try metalAttention.createCachedLayerBindings(
@@ -6169,7 +6181,7 @@ public struct RealModelInferenceEngine: ~Copyable {
 
         let useCPUExactQKV = Self.prefersCPUExactQKV(
             config: config,
-            environment: ProcessInfo.processInfo.environment
+            environment: policies.environment
         )
         let cpuExactQKVLayerWeights: [LlamaCPUQKVWeights]? = if useCPUExactQKV {
             try (0..<config.nLayer).map { layerIndex in
@@ -6304,7 +6316,7 @@ public struct RealModelInferenceEngine: ~Copyable {
                     headDim: headDim,
                     preferCPUDecodeAttention: Self.prefersCPUDecodeAttention(
                         config: config,
-                        environment: ProcessInfo.processInfo.environment
+                        environment: policies.environment
                     ),
                     qkvOverride: cpuExactQKV,
                     postQKVHook: metalRoPEConfig != nil ? nil : ropeHook,
@@ -6453,7 +6465,7 @@ public struct RealModelInferenceEngine: ~Copyable {
                     headDim: headDim,
                     preferCPUDecodeAttention: Self.prefersCPUDecodeAttention(
                         config: config,
-                        environment: ProcessInfo.processInfo.environment
+                        environment: policies.environment
                     ),
                     qkvOverride: cpuExactQKV,
                     postQKVHook: metalRoPEConfig != nil ? nil : ropeHook,
@@ -6861,12 +6873,13 @@ public struct RealModelInferenceEngine: ~Copyable {
         config: MultiModelConfig,
         weightDirURL: URL,
         sourceLayerRange: Range<Int>? = nil,
-        maxSeq: Int
+        maxSeq: Int,
+        environment: [String: String] = ProcessInfo.processInfo.environment
     ) throws -> LayerStorage<HybridDecodeKernelSet> {
         let layerRange = sourceLayerRange ?? (0..<config.nLayer)
         let useDonorDelta = supportsHybridDonorDelta(
             config: config,
-            environment: ProcessInfo.processInfo.environment
+            environment: environment
         )
         var donorHexIDs: HybridDecodeKernelSet.DonorHexIDs? = nil
         return try LayerStorage<HybridDecodeKernelSet>(count: layerRange.count, throwingInitializer: { localLayerIndex in
@@ -8722,7 +8735,7 @@ public struct RealModelInferenceEngine: ~Copyable {
 
     private mutating func exactClassifierArgmax(_ hidden: [Float]) -> Int {
         precondition(hidden.count == config.dModel)
-        if let dumpPath = ProcessInfo.processInfo.environment["ESPRESSO_DUMP_LM_HEAD_HIDDEN"],
+        if let dumpPath = policies.lmHeadHiddenDumpPath,
            !dumpPath.isEmpty {
             Self.appendLMHeadHiddenDump(hidden, to: dumpPath)
         }

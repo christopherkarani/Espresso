@@ -57,25 +57,31 @@ public enum ESPRuntimeRunner {
             maxTokens: maxTokens
         )
         let selection = try resolve(bundle: bundle, requestedContextTokens: requestedContextTokens)
-        return try withTemporaryEnvironment(environmentOverrides(for: selection)) {
-            switch selection.backend {
-            case .anePrivate:
-                var engine = try RealModelInferenceEngine.build(
-                    config: bundle.config,
-                    weightDir: bundle.archive.weightsURL.path,
-                    tokenizerDir: bundle.archive.tokenizerURL.path
-                )
-                return try engine.generate(prompt: prompt, maxTokens: maxTokens, temperature: temperature)
-            case .cpuSafe:
-                return try withTemporaryEnvironment(["ESPRESSO_USE_CPU_EXACT_DECODE": "1"]) {
-                    var engine = try RealModelInferenceEngine.build(
-                        config: bundle.config,
-                        weightDir: bundle.archive.weightsURL.path,
-                        tokenizerDir: bundle.archive.tokenizerURL.path
-                    )
-                    return try engine.generate(prompt: prompt, maxTokens: maxTokens, temperature: temperature)
-                }
-            }
+        // Manifest metadata crosses into the engine as parameters, not as
+        // process-global mutation: merge overrides into one dictionary and
+        // hand it to build(), which resolves everything once.
+        var environment = ProcessInfo.processInfo.environment
+        for (key, value) in environmentOverrides(for: selection) {
+            environment[key] = value
+        }
+        switch selection.backend {
+        case .anePrivate:
+            var engine = try RealModelInferenceEngine.build(
+                config: bundle.config,
+                weightDir: bundle.archive.weightsURL.path,
+                tokenizerDir: bundle.archive.tokenizerURL.path,
+                environment: environment
+            )
+            return try engine.generate(prompt: prompt, maxTokens: maxTokens, temperature: temperature)
+        case .cpuSafe:
+            environment["ESPRESSO_USE_CPU_EXACT_DECODE"] = "1"
+            var engine = try RealModelInferenceEngine.build(
+                config: bundle.config,
+                weightDir: bundle.archive.weightsURL.path,
+                tokenizerDir: bundle.archive.tokenizerURL.path,
+                environment: environment
+            )
+            return try engine.generate(prompt: prompt, maxTokens: maxTokens, temperature: temperature)
         }
     }
 
@@ -179,32 +185,3 @@ public enum ESPRuntimeRunner {
     }
 }
 
-private func withTemporaryEnvironment<T>(
-    _ overrides: [String: String],
-    operation: () throws -> T
-) throws -> T {
-    var original: [String: String?] = [:]
-    for key in overrides.keys {
-        if let pointer = getenv(key) {
-            original[key] = String(cString: pointer)
-        } else {
-            original[key] = nil
-        }
-    }
-
-    for (key, value) in overrides {
-        setenv(key, value, 1)
-    }
-
-    defer {
-        for (key, originalValue) in original {
-            if let originalValue {
-                setenv(key, originalValue, 1)
-            } else {
-                unsetenv(key)
-            }
-        }
-    }
-
-    return try operation()
-}
