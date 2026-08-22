@@ -5753,7 +5753,8 @@ public struct RealModelInferenceEngine: ~Copyable {
             newLayers = try Self.compileFusedHybridLayers(
                 config: config,
                 weightDirURL: weightDirURL,
-                maxSeq: bucket
+                maxSeq: bucket,
+                environment: policies.environment
             )
         } catch let error as RealModelInferenceError {
             if case .hybridFallbackDisabled = error { throw error }
@@ -5785,7 +5786,8 @@ public struct RealModelInferenceEngine: ~Copyable {
     private static func compileFusedHybridLayers(
         config: MultiModelConfig,
         weightDirURL: URL,
-        maxSeq: Int
+        maxSeq: Int,
+        environment: [String: String] = ProcessInfo.processInfo.environment
     ) throws -> LayerStorage<FusedHybridDecodeLayerKernelSet> {
         guard config.nHead > 0, config.nKVHead > 0, config.headDim > 0,
               config.nHead % config.nKVHead == 0 else {
@@ -5811,7 +5813,8 @@ public struct RealModelInferenceEngine: ~Copyable {
                 nHeads: config.nHead,
                 nKVHeads: config.nKVHead,
                 headDim: config.headDim,
-                donorHexIDs: donor
+                donorHexIDs: donor,
+                options: HybridDecodeKernelOptions.resolve(environment: environment)
             )
             donor = compiled.donorHexIDs
             return compiled
@@ -6877,6 +6880,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) throws -> LayerStorage<HybridDecodeKernelSet> {
         let layerRange = sourceLayerRange ?? (0..<config.nLayer)
+        let kernelOptions = HybridDecodeKernelOptions.resolve(environment: environment)
         let useDonorDelta = supportsHybridDonorDelta(
             config: config,
             environment: environment
@@ -6893,7 +6897,8 @@ public struct RealModelInferenceEngine: ~Copyable {
                 let kernels = try HybridDecodeKernelSet(
                     weights: weights,
                     maxSeq: maxSeq,
-                    donorHexIDs: useDonorDelta ? donorHexIDs : nil
+                    donorHexIDs: useDonorDelta ? donorHexIDs : nil,
+                    options: kernelOptions
                 )
                 if useDonorDelta {
                     donorHexIDs = kernels.donorHexIDs

@@ -1,6 +1,14 @@
 # Espresso — Current Plan
 
-Last updated: 2026-08-13 (productization ship)
+Last updated: 2026-08-22 (architecture deepening stack)
+
+## Architecture deepening PRs (2026-08-22, stacked)
+
+- [x] #31 `arch/artifact-loader`: one top-level weight loader (`TopLevelAssetLoader`), misnamed `loadTestingTopLevelAssets` deleted
+- [x] #32 `arch/hybrid-step-assembler`: split/fused-hybrid surface bindings moved into ANERuntime; `evalPostAttention()` replaces fusion branching at call sites
+- [x] #35 `arch/resolved-engine-policies`: `EnginePolicies` resolved once at `build(environment:)`; serving paths stop reading live process state; runner setenv channel deleted
+
+Follow-ups (not started): kernel-set compile options threaded from policies; DecodeRuntimeOptions statics; CLI env seeding for compile-cache policy.
 
 ## What Espresso is today
 
