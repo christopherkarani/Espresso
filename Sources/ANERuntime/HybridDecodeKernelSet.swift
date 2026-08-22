@@ -63,6 +63,22 @@ public struct HybridDecodeKernelSet: ~Copyable {
     public let laneSpatial: Int
     package let donorHexIDs: DonorHexIDs
 
+    /// Runs the post-attention stage for one decode step: projection+FFN as a
+    /// single fused kernel when fusion compiled, otherwise projection then FFN.
+    /// Consumers eval stages through here instead of branching on fusion.
+    @inline(__always)
+    public func evalPostAttention() throws(ANEError) {
+        try decodeProjection.eval()
+        if !usesFusedPostAttention {
+            try decodeFFN.eval()
+        }
+    }
+
+    /// Stage label for diagnostics naming which post-attention shape ran.
+    public var postAttentionStageName: String {
+        usesFusedPostAttention ? "decodeProjectionFFN" : "decodeProjection+decodeFFN"
+    }
+
     @inline(__always)
     private static func buildBlob(from buffer: borrowing TensorBuffer, rows: Int, cols: Int) -> Data {
         buffer.withUnsafeBufferPointer { ptr in
