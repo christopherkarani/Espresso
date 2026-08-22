@@ -606,44 +606,6 @@ public struct RealModelInferenceEngine: ~Copyable {
         let lmHead: String
     }
 
-    private struct GPT2TopLevelAssets {
-        let tokenEmbedding: [Float]
-        let positionEmbedding: [Float]
-        let finalNormGamma: [Float]
-        let finalNormBeta: [Float]
-        let lmHead: [Float]
-        let finalNormGammaPath: String
-        let finalNormBetaPath: String
-        let finalNormGammaCompilePath: String
-        let finalNormBetaCompilePath: String
-        let finalNormGammaData: Data
-        let finalNormBetaData: Data
-    }
-
-    private struct LlamaTopLevelAssets {
-        struct FactoredOutputHead: Sendable, Equatable {
-            let projection: [Float]
-            let expansion: [Float]
-            let bottleneck: Int
-            let groups: Int
-        }
-
-        let tokenEmbedding: [Float]
-        let finalNormGamma: [Float]
-        let lmHead: [Float]
-        let lmHeadFP16: [UInt16]?
-        let lmHeadHasExactFloat32Sidecar: Bool
-        let factoredOutputHead: FactoredOutputHead?
-        let finalNormGammaPath: String
-        let finalNormGammaCompilePath: String
-        let finalNormGammaData: Data
-    }
-
-    private enum TopLevelAssets {
-        case gpt2(GPT2TopLevelAssets)
-        case llama(LlamaTopLevelAssets)
-    }
-
     struct AttentionTestingOutputs {
         let hidden: [Float]
         let kCache: [Float]
@@ -804,18 +766,13 @@ public struct RealModelInferenceEngine: ~Copyable {
             )
             self.config = config
             self.roundIntermediatesToFP16 = RealModelInferenceEngine.shouldRoundCPUExactDecodeIntermediatesToFP16()
-            self.tokenEmbedding = try RealModelInferenceEngine.loadWeightTablePreferringFloat32Sidecar(
-                at: topLevelPaths.tokenEmbedding,
-                expectedCount: config.vocab * config.dModel
+            let coreWeights = try TopLevelAssetLoader.loadLlamaCoreWeights(
+                config: config,
+                topLevelPaths: topLevelPaths
             )
-            self.finalNormGamma = try RealModelInferenceEngine.loadWeightTablePreferringFloat32Sidecar(
-                at: topLevelPaths.finalNormGamma,
-                expectedCount: config.dModel
-            )
-            self.lmHead = try RealModelInferenceEngine.loadWeightTablePreferringFloat32Sidecar(
-                at: topLevelPaths.lmHead,
-                expectedCount: config.vocab * config.dModel
-            )
+            self.tokenEmbedding = coreWeights.tokenEmbedding
+            self.finalNormGamma = coreWeights.finalNormGamma
+            self.lmHead = coreWeights.lmHead
             self.layers = try (0..<config.nLayer).map { layerIndex in
                 let paths = LayerWeightPaths.forLayer(
                     layerIndex,
@@ -1636,7 +1593,7 @@ public struct RealModelInferenceEngine: ~Copyable {
 
         let tokenizer = try loadTokenizer(config: config, tokenizerDirURL: tokenizerDirURL)
 
-        let topLevelAssets = try loadTestingTopLevelAssets(
+        let topLevelAssets = try TopLevelAssetLoader.load(
             config: config,
             weightDir: weightDir,
             weightDirURL: weightDirURL
@@ -2088,51 +2045,11 @@ public struct RealModelInferenceEngine: ~Copyable {
         try validateDirectory(weightDirURL)
         try validateMetadataIfPresent(config: config, weightDirURL: weightDirURL)
 
-        let topLevelAssets: TopLevelAssets
-        switch config.architecture {
-        case .gpt2:
-            let topLevelPaths = try resolveTopLevelWeightPaths(config: config, weightDir: weightDir)
-            let tokenEmbedding = try loadWeightTablePreferringFloat32Sidecar(
-                at: topLevelPaths.tokenEmbedding,
-                expectedCount: config.vocab * config.dModel
-            )
-            let positionEmbedding = try loadWeightTable(
-                at: topLevelPaths.positionEmbedding,
-                expectedCount: config.maxSeq * config.dModel
-            )
-            let finalNormGamma = try loadWeightTablePreferringFloat32Sidecar(
-                at: topLevelPaths.finalNormGamma,
-                expectedCount: config.dModel
-            )
-            let finalNormBeta = try loadWeightTable(
-                at: topLevelPaths.finalNormBeta,
-                expectedCount: config.dModel
-            )
-            let lmHead = try loadWeightTablePreferringFloat32Sidecar(
-                at: topLevelPaths.lmHead,
-                expectedCount: config.vocab * config.dModel
-            )
-            topLevelAssets = .gpt2(GPT2TopLevelAssets(
-                tokenEmbedding: tokenEmbedding,
-                positionEmbedding: positionEmbedding,
-                finalNormGamma: finalNormGamma,
-                finalNormBeta: finalNormBeta,
-                lmHead: lmHead,
-                finalNormGammaPath: topLevelPaths.finalNormGamma,
-                finalNormBetaPath: topLevelPaths.finalNormBeta,
-                finalNormGammaCompilePath: compileBlobPath(actualPath: topLevelPaths.finalNormGamma, rootDir: weightDirURL),
-                finalNormBetaCompilePath: compileBlobPath(actualPath: topLevelPaths.finalNormBeta, rootDir: weightDirURL),
-                finalNormGammaData: WeightBlob.build(from: finalNormGamma, rows: 1, cols: finalNormGamma.count),
-                finalNormBetaData: WeightBlob.build(from: finalNormBeta, rows: 1, cols: finalNormBeta.count)
-            ))
-        case .llama:
-            let topLevelPaths = try resolveLlamaTopLevelWeightPaths(config: config, weightDir: weightDir)
-            topLevelAssets = .llama(try loadLlamaTopLevelAssets(
-                config: config,
-                topLevelPaths: topLevelPaths,
-                weightDirURL: weightDirURL
-            ))
-        }
+        let topLevelAssets = try TopLevelAssetLoader.load(
+            config: config,
+            weightDir: weightDir,
+            weightDirURL: weightDirURL
+        )
 
         var engine = RealModelInferenceEngine(
             config: config,
@@ -2273,7 +2190,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         try validateDirectory(weightDirURL)
         try validateMetadataIfPresent(config: config, weightDirURL: weightDirURL)
 
-        let topLevelAssets = try loadTestingTopLevelAssets(
+        let topLevelAssets = try TopLevelAssetLoader.load(
             config: config,
             weightDir: weightDir,
             weightDirURL: weightDirURL
@@ -2316,7 +2233,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         try validateDirectory(weightDirURL)
         try validateMetadataIfPresent(config: config, weightDirURL: weightDirURL)
 
-        let topLevelAssets = try loadTestingTopLevelAssets(
+        let topLevelAssets = try TopLevelAssetLoader.load(
             config: config,
             weightDir: weightDir,
             weightDirURL: weightDirURL
@@ -2336,152 +2253,6 @@ public struct RealModelInferenceEngine: ~Copyable {
             onStep: nil
         )
         return result.tokens
-    }
-
-    private static func loadTestingTopLevelAssets(
-        config: MultiModelConfig,
-        weightDir: String,
-        weightDirURL: URL
-    ) throws -> TopLevelAssets {
-        switch config.architecture {
-        case .gpt2:
-            let topLevelPaths = try resolveTopLevelWeightPaths(config: config, weightDir: weightDir)
-            let tokenEmbedding = try loadWeightTablePreferringFloat32Sidecar(
-                at: topLevelPaths.tokenEmbedding,
-                expectedCount: config.vocab * config.dModel
-            )
-            let positionEmbedding = try loadWeightTable(
-                at: topLevelPaths.positionEmbedding,
-                expectedCount: config.maxSeq * config.dModel
-            )
-            let finalNormGamma = try loadWeightTablePreferringFloat32Sidecar(
-                at: topLevelPaths.finalNormGamma,
-                expectedCount: config.dModel
-            )
-            let finalNormBeta = try loadWeightTable(
-                at: topLevelPaths.finalNormBeta,
-                expectedCount: config.dModel
-            )
-            let lmHead = try loadWeightTablePreferringFloat32Sidecar(
-                at: topLevelPaths.lmHead,
-                expectedCount: config.vocab * config.dModel
-            )
-            return .gpt2(GPT2TopLevelAssets(
-                tokenEmbedding: tokenEmbedding,
-                positionEmbedding: positionEmbedding,
-                finalNormGamma: finalNormGamma,
-                finalNormBeta: finalNormBeta,
-                lmHead: lmHead,
-                finalNormGammaPath: topLevelPaths.finalNormGamma,
-                finalNormBetaPath: topLevelPaths.finalNormBeta,
-                finalNormGammaCompilePath: compileBlobPath(actualPath: topLevelPaths.finalNormGamma, rootDir: weightDirURL),
-                finalNormBetaCompilePath: compileBlobPath(actualPath: topLevelPaths.finalNormBeta, rootDir: weightDirURL),
-                finalNormGammaData: WeightBlob.build(from: finalNormGamma, rows: 1, cols: finalNormGamma.count),
-                finalNormBetaData: WeightBlob.build(from: finalNormBeta, rows: 1, cols: finalNormBeta.count)
-            ))
-        case .llama:
-            let topLevelPaths = try resolveLlamaTopLevelWeightPaths(config: config, weightDir: weightDir)
-            return .llama(try loadLlamaTopLevelAssets(
-                config: config,
-                topLevelPaths: topLevelPaths,
-                weightDirURL: weightDirURL
-            ))
-        }
-    }
-
-    private static func loadLlamaTopLevelAssets(
-        config: MultiModelConfig,
-        topLevelPaths: LlamaTopLevelWeightPaths,
-        weightDirURL: URL,
-        environment: [String: String] = ProcessInfo.processInfo.environment
-    ) throws -> LlamaTopLevelAssets {
-        let tokenEmbedding = try loadWeightTablePreferringFloat32Sidecar(
-            at: topLevelPaths.tokenEmbedding,
-            expectedCount: config.vocab * config.dModel
-        )
-        let finalNormGamma = try loadWeightTablePreferringFloat32Sidecar(
-            at: topLevelPaths.finalNormGamma,
-            expectedCount: config.dModel
-        )
-        let lmHead = try loadWeightTablePreferringFloat32Sidecar(
-            at: topLevelPaths.lmHead,
-            expectedCount: config.vocab * config.dModel
-        )
-        let lmHeadFP16 = try loadRawFP16WeightTableIfNoExactFloat32Sidecar(
-            at: topLevelPaths.lmHead,
-            expectedCount: config.vocab * config.dModel
-        )
-        let factoredOutputHead = try loadLlamaFactoredOutputHead(
-            config: config,
-            weightDirURL: weightDirURL,
-            environment: environment
-        )
-        return LlamaTopLevelAssets(
-            tokenEmbedding: tokenEmbedding,
-            finalNormGamma: finalNormGamma,
-            lmHead: lmHead,
-            lmHeadFP16: lmHeadFP16,
-            lmHeadHasExactFloat32Sidecar: lmHeadFP16 == nil,
-            factoredOutputHead: factoredOutputHead,
-            finalNormGammaPath: topLevelPaths.finalNormGamma,
-            finalNormGammaCompilePath: compileBlobPath(actualPath: topLevelPaths.finalNormGamma, rootDir: weightDirURL),
-            finalNormGammaData: WeightBlob.build(from: finalNormGamma, rows: 1, cols: finalNormGamma.count)
-        )
-    }
-
-    private static func loadLlamaFactoredOutputHead(
-        config: MultiModelConfig,
-        weightDirURL: URL,
-        environment: [String: String]
-    ) throws -> LlamaTopLevelAssets.FactoredOutputHead? {
-        guard config.architecture == .llama,
-              environment["ESPRESSO_BUNDLE_OUTPUT_HEAD_KIND"] == "factored" else {
-            return nil
-        }
-
-        guard let bottleneckRaw = environment["ESPRESSO_BUNDLE_OUTPUT_HEAD_BOTTLENECK"],
-              let bottleneck = Int(bottleneckRaw),
-              bottleneck > 0 else {
-            throw RealModelInferenceError.invalidConfig(
-                "Factored output head requires ESPRESSO_BUNDLE_OUTPUT_HEAD_BOTTLENECK > 0"
-            )
-        }
-        guard let groupsRaw = environment["ESPRESSO_BUNDLE_OUTPUT_HEAD_GROUPS"],
-              let groups = Int(groupsRaw),
-              groups > 0 else {
-            throw RealModelInferenceError.invalidConfig(
-                "Factored output head requires ESPRESSO_BUNDLE_OUTPUT_HEAD_GROUPS > 0"
-            )
-        }
-
-        let projectionPath = try resolveBundleWeightReference(
-            environment["ESPRESSO_BUNDLE_OUTPUT_HEAD_PROJECTION_REF"] ?? "cls_proj.bin",
-            weightDirURL: weightDirURL
-        )
-        let expansionPath = try resolveBundleWeightReference(
-            environment["ESPRESSO_BUNDLE_OUTPUT_HEAD_EXPANSION_REF"] ?? "cls_expand.bin",
-            weightDirURL: weightDirURL
-        )
-
-        let projectionCompactCount = bottleneck * (config.dModel / groups)
-        let projectionDenseCount = bottleneck * config.dModel
-        let expansionCompactCount = config.vocab * (bottleneck / groups)
-        let expansionDenseCount = config.vocab * bottleneck
-        let projection = try loadWeightTable(
-            at: projectionPath,
-            allowedCounts: [projectionCompactCount, projectionDenseCount]
-        )
-        let expansion = try loadWeightTable(
-            at: expansionPath,
-            allowedCounts: [expansionCompactCount, expansionDenseCount]
-        )
-
-        return LlamaTopLevelAssets.FactoredOutputHead(
-            projection: projection,
-            expansion: expansion,
-            bottleneck: bottleneck,
-            groups: groups
-        )
     }
 
     static func spatialBucket(for tokenCount: Int, maxSeq: Int) -> Int {
@@ -6739,17 +6510,9 @@ public struct RealModelInferenceEngine: ~Copyable {
             config: config,
             weightDir: weightDirURL.path
         )
-        let tokenEmbedding = try Self.loadWeightTablePreferringFloat32Sidecar(
-            at: topLevelPaths.tokenEmbedding,
-            expectedCount: config.vocab * config.dModel
-        )
-        let finalNormGamma = try Self.loadWeightTablePreferringFloat32Sidecar(
-            at: topLevelPaths.finalNormGamma,
-            expectedCount: config.dModel
-        )
-        let lmHead = try Self.loadWeightTablePreferringFloat32Sidecar(
-            at: topLevelPaths.lmHead,
-            expectedCount: config.vocab * config.dModel
+        let coreWeights = try TopLevelAssetLoader.loadLlamaCoreWeights(
+            config: config,
+            topLevelPaths: topLevelPaths
         )
         let lmHeadFP16 = try Self.loadRawFP16WeightTableIfNoExactFloat32Sidecar(
             at: topLevelPaths.lmHead,
@@ -6764,9 +6527,9 @@ public struct RealModelInferenceEngine: ~Copyable {
             return try Self.loadExactCPULlamaLayerWeights(config: config, paths: paths)
         }
         let loadedWeights = CachedExactCPULlamaWeights(
-            tokenEmbedding: tokenEmbedding,
-            finalNormGamma: finalNormGamma,
-            lmHead: lmHead,
+            tokenEmbedding: coreWeights.tokenEmbedding,
+            finalNormGamma: coreWeights.finalNormGamma,
+            lmHead: coreWeights.lmHead,
             lmHeadFP16: lmHeadFP16,
             layers: layers
         )
@@ -8818,7 +8581,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         return FileManager.default.fileExists(atPath: path)
     }
 
-    private static func resolveBundleWeightReference(
+    static func resolveBundleWeightReference(
         _ reference: String,
         weightDirURL: URL
     ) throws -> String {
@@ -8836,7 +8599,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         return resolved
     }
 
-    private static func compileBlobPath(actualPath: String, rootDir: URL) -> String {
+    static func compileBlobPath(actualPath: String, rootDir: URL) -> String {
         let rootPath = rootDir.standardizedFileURL.path
         let filePath = URL(fileURLWithPath: actualPath).standardizedFileURL.path
         let relativePath: String
