@@ -1128,7 +1128,8 @@ public struct RealModelInferenceEngine: ~Copyable {
             key: SpeculativeRuntimeKey,
             config: MultiModelConfig,
             weightDirURL: URL,
-            assets: GPT2TopLevelAssets
+            assets: GPT2TopLevelAssets,
+            environment: [String: String]
         ) throws {
             self.key = key
             self.draftRuntime = try HybridLayerRangeRuntime(
@@ -1136,14 +1137,16 @@ public struct RealModelInferenceEngine: ~Copyable {
                 weightDirURL: weightDirURL,
                 assets: assets,
                 layerRange: 0..<key.draftLayerCount,
-                maxSeq: key.maxSeq
+                maxSeq: key.maxSeq,
+                environment: environment
             )
             self.verifierRuntime = try HybridLayerRangeRuntime(
                 config: config,
                 weightDirURL: weightDirURL,
                 assets: assets,
                 layerRange: key.draftLayerCount..<config.nLayer,
-                maxSeq: key.maxSeq
+                maxSeq: key.maxSeq,
+                environment: environment
             )
         }
 
@@ -1176,7 +1179,8 @@ public struct RealModelInferenceEngine: ~Copyable {
             weightDirURL: URL,
             assets: GPT2TopLevelAssets,
             layerRange: Range<Int>,
-            maxSeq: Int
+            maxSeq: Int,
+            environment: [String: String]
         ) throws {
             precondition(!layerRange.isEmpty)
 
@@ -1184,7 +1188,8 @@ public struct RealModelInferenceEngine: ~Copyable {
                 config: config,
                 weightDirURL: weightDirURL,
                 sourceLayerRange: layerRange,
-                maxSeq: maxSeq
+                maxSeq: maxSeq,
+                environment: environment
             )
 
             var surfaceHandles: [HybridDecodeSurfaceHandles] = []
@@ -1208,7 +1213,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             if layers.count > 1,
                RealModelInferenceEngine.usesHybridLayerInputRebinding(
                    architecture: config.architecture,
-                   environment: RealModelInferenceEngine.processEnvironment
+                   environment: environment
                ) {
                 for localLayerIndex in 1..<layers.count {
                     do {
@@ -1279,7 +1284,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             self.zeroSlice = zeroSlice
             self.preferCPUDecodeAttention = RealModelInferenceEngine.prefersCPUDecodeAttention(
                 config: config,
-                environment: RealModelInferenceEngine.processEnvironment
+                environment: environment
             )
             self.decodeState = decodeState
         }
@@ -1946,7 +1951,8 @@ public struct RealModelInferenceEngine: ~Copyable {
                 do {
                     let (cachedRuntimePair, speculativeCompileTimeMs) = try cachedSpeculativeRuntimePair(
                         draftLayerCount: speculativeDraftLayerCount,
-                        maxSeq: bucket
+                        maxSeq: bucket,
+                        environment: policies.environment
                     )
                     speculativeAttemptCompileTimeMs = speculativeCompileTimeMs
                     return try generateIncrementalHybridSpeculative(
@@ -5344,7 +5350,8 @@ public struct RealModelInferenceEngine: ~Copyable {
 
     private mutating func cachedSpeculativeRuntimePair(
         draftLayerCount: Int,
-        maxSeq: Int
+        maxSeq: Int,
+        environment: [String: String]
     ) throws -> (CachedSpeculativeRuntimePair, Double) {
         let key = SpeculativeRuntimeKey(
             draftLayerCount: draftLayerCount,
@@ -5366,7 +5373,8 @@ public struct RealModelInferenceEngine: ~Copyable {
             key: key,
             config: config,
             weightDirURL: weightDirURL,
-            assets: gpt2Assets
+            assets: gpt2Assets,
+            environment: environment
         )
         let orderUpdate = Self.boundedSpeculativeCacheOrder(
             currentOrder: speculativeRuntimeCacheOrder,
