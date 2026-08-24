@@ -1238,7 +1238,8 @@ public struct RealModelInferenceEngine: ~Copyable {
                     assets: assets,
                     spatial: headSpatial,
                     inputDType: .fp16,
-                    outputDType: .fp16
+                    outputDType: .fp16,
+                    environment: environment
                 )
             })
             let greedyClassifier = try LayerStorage<CompiledClassifier>(count: 1, throwingInitializer: { _ in
@@ -1945,14 +1946,15 @@ public struct RealModelInferenceEngine: ~Copyable {
             let compileTimeMs = compileDidRun ? Self.milliseconds(from: compileEnd - compileStart) : 0
             if let speculativeDraftLayerCount = Self.resolvedSpeculativeDraftLayerCount(
                 config: config,
-                temperature: temperature
+                temperature: temperature,
+                environment: environment
             ) {
                 var speculativeAttemptCompileTimeMs = 0.0
                 do {
                     let (cachedRuntimePair, speculativeCompileTimeMs) = try cachedSpeculativeRuntimePair(
                         draftLayerCount: speculativeDraftLayerCount,
                         maxSeq: bucket,
-                        environment: policies.environment
+                        environment: environment
                     )
                     speculativeAttemptCompileTimeMs = speculativeCompileTimeMs
                     return try generateIncrementalHybridSpeculative(
@@ -2317,7 +2319,7 @@ public struct RealModelInferenceEngine: ~Copyable {
     static func resolvedSpeculativeDraftLayerCount(
         config: MultiModelConfig,
         temperature: Float,
-        environment: [String: String] = Self.processEnvironment
+        environment: [String: String]
     ) -> Int? {
         guard config.architecture == .gpt2,
               temperature == 0,
@@ -4569,7 +4571,8 @@ public struct RealModelInferenceEngine: ~Copyable {
 
     static func compileHeadForTesting(
         config: MultiModelConfig,
-        weightDir: String
+        weightDir: String,
+        environment: [String: String] = Self.processEnvironment
     ) throws {
         let weightDirURL = URL(fileURLWithPath: weightDir, isDirectory: true)
         try validateDirectory(weightDirURL)
@@ -4597,7 +4600,8 @@ public struct RealModelInferenceEngine: ~Copyable {
             config: config,
             weightDirURL: weightDirURL,
             assets: assets,
-            spatial: spatial
+            spatial: spatial,
+            environment: environment
         )
     }
 
@@ -4635,7 +4639,8 @@ public struct RealModelInferenceEngine: ~Copyable {
                 config: config,
                 weightDirURL: weightDirURL,
                 assets: gpt2Assets,
-                spatial: bucket
+                spatial: bucket,
+                environment: policies.environment
             )
         })
         do {
@@ -4757,7 +4762,8 @@ public struct RealModelInferenceEngine: ~Copyable {
                     config: config,
                     weightDirURL: weightDirURL,
                     assets: gpt2Assets,
-                    spatial: hybridHeadSpatial
+                    spatial: hybridHeadSpatial,
+                    environment: policies.environment
                 )
             })
             compiledHybridHeadSpatial = hybridHeadSpatial
@@ -4879,7 +4885,8 @@ public struct RealModelInferenceEngine: ~Copyable {
                             assets: gpt2Assets,
                             spatial: hybridHeadSpatial,
                             inputDType: .fp16,
-                            outputDType: .fp16
+                            outputDType: .fp16,
+                            environment: policies.environment
                         )
                     })
                     compiledHybridGreedyClassifier = try LayerStorage<CompiledClassifier>(count: 1, throwingInitializer: { _ in
@@ -7453,7 +7460,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         spatial: Int,
         inputDType: ANEDType = .fp32,
         outputDType: ANEDType = .fp32,
-        environment: [String: String] = Self.processEnvironment
+        environment: [String: String]
     ) throws -> CompiledHead {
         var graph = buildGPT2HeadGraph(
             config: config,

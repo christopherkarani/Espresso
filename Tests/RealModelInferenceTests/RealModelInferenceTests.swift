@@ -470,6 +470,26 @@ private func shouldRunLegacyQwenExperimentTests(
             environment: ["ESPRESSO_ENABLE_GPT2_SPECULATIVE": "1"]
         ) == nil
     )
+
+    let frozenAtBuild: [String: String] = [:]
+    let afterBuildMutation: [String: String] = [
+        "ESPRESSO_ENABLE_GPT2_SPECULATIVE": "1",
+        "ESPRESSO_GPT2_SPECULATIVE_DRAFT_LAYERS": "4",
+    ]
+    #expect(
+        RealModelInferenceEngine.resolvedSpeculativeDraftLayerCount(
+            config: gpt2Config,
+            temperature: 0,
+            environment: frozenAtBuild
+        ) == nil
+    )
+    #expect(
+        RealModelInferenceEngine.resolvedSpeculativeDraftLayerCount(
+            config: gpt2Config,
+            temperature: 0,
+            environment: afterBuildMutation
+        ) == 4
+    )
 }
 
 @Test func test_resolvedSpeculativeDraftLayerCountDefaultsAndClamps() {
