@@ -1128,7 +1128,8 @@ public struct RealModelInferenceEngine: ~Copyable {
             key: SpeculativeRuntimeKey,
             config: MultiModelConfig,
             weightDirURL: URL,
-            assets: GPT2TopLevelAssets
+            assets: GPT2TopLevelAssets,
+            environment: [String: String]
         ) throws {
             self.key = key
             self.draftRuntime = try HybridLayerRangeRuntime(
@@ -1136,14 +1137,16 @@ public struct RealModelInferenceEngine: ~Copyable {
                 weightDirURL: weightDirURL,
                 assets: assets,
                 layerRange: 0..<key.draftLayerCount,
-                maxSeq: key.maxSeq
+                maxSeq: key.maxSeq,
+                environment: environment
             )
             self.verifierRuntime = try HybridLayerRangeRuntime(
                 config: config,
                 weightDirURL: weightDirURL,
                 assets: assets,
                 layerRange: key.draftLayerCount..<config.nLayer,
-                maxSeq: key.maxSeq
+                maxSeq: key.maxSeq,
+                environment: environment
             )
         }
 
@@ -1176,7 +1179,8 @@ public struct RealModelInferenceEngine: ~Copyable {
             weightDirURL: URL,
             assets: GPT2TopLevelAssets,
             layerRange: Range<Int>,
-            maxSeq: Int
+            maxSeq: Int,
+            environment: [String: String]
         ) throws {
             precondition(!layerRange.isEmpty)
 
@@ -1184,7 +1188,8 @@ public struct RealModelInferenceEngine: ~Copyable {
                 config: config,
                 weightDirURL: weightDirURL,
                 sourceLayerRange: layerRange,
-                maxSeq: maxSeq
+                maxSeq: maxSeq,
+                environment: environment
             )
 
             var surfaceHandles: [HybridDecodeSurfaceHandles] = []
@@ -1208,7 +1213,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             if layers.count > 1,
                RealModelInferenceEngine.usesHybridLayerInputRebinding(
                    architecture: config.architecture,
-                   environment: RealModelInferenceEngine.processEnvironment
+                   environment: environment
                ) {
                 for localLayerIndex in 1..<layers.count {
                     do {
@@ -1233,7 +1238,8 @@ public struct RealModelInferenceEngine: ~Copyable {
                     assets: assets,
                     spatial: headSpatial,
                     inputDType: .fp16,
-                    outputDType: .fp16
+                    outputDType: .fp16,
+                    environment: environment
                 )
             })
             let greedyClassifier = try LayerStorage<CompiledClassifier>(count: 1, throwingInitializer: { _ in
@@ -1279,7 +1285,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             self.zeroSlice = zeroSlice
             self.preferCPUDecodeAttention = RealModelInferenceEngine.prefersCPUDecodeAttention(
                 config: config,
-                environment: RealModelInferenceEngine.processEnvironment
+                environment: environment
             )
             self.decodeState = decodeState
         }
@@ -1940,13 +1946,15 @@ public struct RealModelInferenceEngine: ~Copyable {
             let compileTimeMs = compileDidRun ? Self.milliseconds(from: compileEnd - compileStart) : 0
             if let speculativeDraftLayerCount = Self.resolvedSpeculativeDraftLayerCount(
                 config: config,
-                temperature: temperature
+                temperature: temperature,
+                environment: environment
             ) {
                 var speculativeAttemptCompileTimeMs = 0.0
                 do {
                     let (cachedRuntimePair, speculativeCompileTimeMs) = try cachedSpeculativeRuntimePair(
                         draftLayerCount: speculativeDraftLayerCount,
-                        maxSeq: bucket
+                        maxSeq: bucket,
+                        environment: environment
                     )
                     speculativeAttemptCompileTimeMs = speculativeCompileTimeMs
                     return try generateIncrementalHybridSpeculative(
@@ -2311,7 +2319,7 @@ public struct RealModelInferenceEngine: ~Copyable {
     static func resolvedSpeculativeDraftLayerCount(
         config: MultiModelConfig,
         temperature: Float,
-        environment: [String: String] = Self.processEnvironment
+        environment: [String: String]
     ) -> Int? {
         guard config.architecture == .gpt2,
               temperature == 0,
@@ -4563,7 +4571,8 @@ public struct RealModelInferenceEngine: ~Copyable {
 
     static func compileHeadForTesting(
         config: MultiModelConfig,
-        weightDir: String
+        weightDir: String,
+        environment: [String: String] = Self.processEnvironment
     ) throws {
         let weightDirURL = URL(fileURLWithPath: weightDir, isDirectory: true)
         try validateDirectory(weightDirURL)
@@ -4591,7 +4600,8 @@ public struct RealModelInferenceEngine: ~Copyable {
             config: config,
             weightDirURL: weightDirURL,
             assets: assets,
-            spatial: spatial
+            spatial: spatial,
+            environment: environment
         )
     }
 
@@ -4629,7 +4639,8 @@ public struct RealModelInferenceEngine: ~Copyable {
                 config: config,
                 weightDirURL: weightDirURL,
                 assets: gpt2Assets,
-                spatial: bucket
+                spatial: bucket,
+                environment: policies.environment
             )
         })
         do {
@@ -4751,7 +4762,8 @@ public struct RealModelInferenceEngine: ~Copyable {
                     config: config,
                     weightDirURL: weightDirURL,
                     assets: gpt2Assets,
-                    spatial: hybridHeadSpatial
+                    spatial: hybridHeadSpatial,
+                    environment: policies.environment
                 )
             })
             compiledHybridHeadSpatial = hybridHeadSpatial
@@ -4873,7 +4885,8 @@ public struct RealModelInferenceEngine: ~Copyable {
                             assets: gpt2Assets,
                             spatial: hybridHeadSpatial,
                             inputDType: .fp16,
-                            outputDType: .fp16
+                            outputDType: .fp16,
+                            environment: policies.environment
                         )
                     })
                     compiledHybridGreedyClassifier = try LayerStorage<CompiledClassifier>(count: 1, throwingInitializer: { _ in
@@ -5344,7 +5357,8 @@ public struct RealModelInferenceEngine: ~Copyable {
 
     private mutating func cachedSpeculativeRuntimePair(
         draftLayerCount: Int,
-        maxSeq: Int
+        maxSeq: Int,
+        environment: [String: String]
     ) throws -> (CachedSpeculativeRuntimePair, Double) {
         let key = SpeculativeRuntimeKey(
             draftLayerCount: draftLayerCount,
@@ -5366,7 +5380,8 @@ public struct RealModelInferenceEngine: ~Copyable {
             key: key,
             config: config,
             weightDirURL: weightDirURL,
-            assets: gpt2Assets
+            assets: gpt2Assets,
+            environment: environment
         )
         let orderUpdate = Self.boundedSpeculativeCacheOrder(
             currentOrder: speculativeRuntimeCacheOrder,
@@ -7445,7 +7460,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         spatial: Int,
         inputDType: ANEDType = .fp32,
         outputDType: ANEDType = .fp32,
-        environment: [String: String] = Self.processEnvironment
+        environment: [String: String]
     ) throws -> CompiledHead {
         var graph = buildGPT2HeadGraph(
             config: config,

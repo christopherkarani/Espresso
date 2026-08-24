@@ -136,7 +136,7 @@ enum TopLevelAssetLoader {
         )
     }
 
-    static func loadLlamaTopLevelAssets(
+    private static func loadLlamaTopLevelAssets(
         config: MultiModelConfig,
         topLevelPaths: RealModelInferenceEngine.LlamaTopLevelWeightPaths,
         weightDirURL: URL,

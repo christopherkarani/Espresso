@@ -1,21 +1,8 @@
 import ANERuntime
 import ANETypes
 
-/// Bridges untyped `rethrows` boundaries (`withUnsafeBufferPointer` and friends)
-/// into `throws(ANEError)` contexts. The stdlib buffer accessors erase typed
-/// throws to `any Error`, so SurfaceIO failures must be re-mapped at the boundary.
-@inline(__always)
-func mapSurfaceIOToANEError<R>(_ body: () throws -> R) throws(ANEError) -> R {
-    do {
-        return try body()
-    } catch let error as SurfaceIOError {
-        throw .surfaceIO(error)
-    } catch let error as ANEError {
-        throw error
-    } catch {
-        throw .surfaceIO(.interopCallFailed)
-    }
-}
+// `mapSurfaceIOToANEError` lives in ANERuntime (public, beside the kernel sets
+// that own surface bindings); Espresso call sites bind to it directly.
 
 @inline(__always)
 func mapSurfaceIOToGenerationError<R>(_ body: () throws -> R) throws(GenerationError) -> R {
