@@ -149,7 +149,7 @@ enum GoldenTraceRunner {
             return (results[0].tokens.map(Int.init), results[0].decodePath)
 
         default:
-            throw CaseUnavailable("unknown model kind \(traceCase.model)")
+            throw UnknownModel("unknown model kind \(traceCase.model)")
         }
     }
 
@@ -159,7 +159,7 @@ enum GoldenTraceRunner {
             GoldenTraceCase(
                 id: "synthetic-exact-cpu",
                 model: SyntheticLlamaMicro.name,
-                trunkLabel: "cpu_exact",
+                trunkLabel: "exact_cpu",
                 promptTokens: syntheticPrompt,
                 maxTokens: syntheticMaxTokens,
                 expectedTokens: []
@@ -195,6 +195,12 @@ enum GoldenTraceRunner {
     }
 
     struct CaseUnavailable: Error, CustomStringConvertible {
+        let description: String
+        init(_ description: String) { self.description = description }
+    }
+
+    /// Fixture typos must fail replay, not skip like missing ANE artifacts.
+    struct UnknownModel: Error, CustomStringConvertible, Equatable {
         let description: String
         init(_ description: String) { self.description = description }
     }
@@ -244,6 +250,20 @@ enum GoldenTraceRunner {
     print("[golden-traces] wrote \(cases.count) cases to \(fixtureURL().path)")
 }
 
+@Test func goldenUnknownModelIsNotSkipped() {
+    let bogus = GoldenTraceCase(
+        id: "bogus",
+        model: "not-a-real-model",
+        trunkLabel: "exact_cpu",
+        promptTokens: [1],
+        maxTokens: 1,
+        expectedTokens: []
+    )
+    #expect(throws: GoldenTraceRunner.UnknownModel.self) {
+        _ = try GoldenTraceRunner.run(case: bogus)
+    }
+}
+
 @Test func goldenTraceReplay() throws {
     guard let fixture = try loadFixture() else {
         throw GoldenTraceRunner.CaseUnavailable(
@@ -251,6 +271,7 @@ enum GoldenTraceRunner {
         )
     }
 
+    var replayed = 0
     for traceCase in fixture.cases {
         let isSynthetic = traceCase.model == SyntheticLlamaMicro.name
         if !isSynthetic {
@@ -264,11 +285,16 @@ enum GoldenTraceRunner {
         do {
             result = try GoldenTraceRunner.run(case: traceCase)
         } catch let unavailable as GoldenTraceRunner.CaseUnavailable {
-            // Real-artifact cases skip when weights are absent (hosted CI).
+            // Synthetic traces must run in hosted CI. Only real-artifact
+            // absence is a loud skip.
+            if isSynthetic {
+                throw unavailable
+            }
             skipCase(traceCase.id, unavailable.description)
             continue
         }
 
+        replayed += 1
         #expect(result.tokens == traceCase.expectedTokens, """
         golden trace drift in \(traceCase.id):
           expected \(traceCase.expectedTokens.prefix(12))…
@@ -281,4 +307,5 @@ enum GoldenTraceRunner {
             """)
         }
     }
+    #expect(replayed > 0, "goldenTraceReplay replayed zero traces")
 }

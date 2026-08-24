@@ -3577,7 +3577,8 @@ public struct RealModelInferenceEngine: ~Copyable {
         let kernels = try Self.compileHybridLayers(
             config: config,
             weightDirURL: weightDirURL,
-            maxSeq: maxSeq
+            maxSeq: maxSeq,
+            environment: Self.processEnvironment
         )
         let handles = try (0..<config.nLayer).map { layerIndex in
             try HybridDecodeSurfaceHandles(
