@@ -37,6 +37,7 @@ let package = Package(
                 .linkedFramework("Foundation"),
                 .linkedFramework("CoreML"),
                 .linkedFramework("IOSurface"),
+                .linkedFramework("Accelerate"),
                 .linkedLibrary("dl"),
             ]
         ),
@@ -125,7 +126,7 @@ let package = Package(
         ),
         .testTarget(
             name: "EspressoTests",
-            dependencies: ["Espresso", "CPUOps", "ANEInterop", "ANETypes"],
+            dependencies: ["Espresso", "CPUOps", "ANEInterop", "ANETypes", "ANERuntime"],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         .testTarget(

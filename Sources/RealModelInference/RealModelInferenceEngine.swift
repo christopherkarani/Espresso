@@ -21,7 +21,10 @@ public struct GenerationResult: Sendable {
     public let tokenLatenciesMs: [Double]
     public let tokensPerSecond: Double
     public let compileTimeMs: Double
+    /// Wall from prompt submit through the first emitted token, **including prefill**.
     public let firstTokenLatencyMs: Double
+    /// Wall of the prefill phase only (submit → last prefill step). Compile is excluded.
+    public let prefillMs: Double
     public let exactHeadBackend: String
     public let cachedBindingsEnabled: Bool
     public let committedExactTokensPerPass: Double?
@@ -39,6 +42,9 @@ public struct GenerationResult: Sendable {
         trunk?.telemetryLabel ?? "unknown"
     }
 
+    /// Published TTFT: submit through first token, including prefill.
+    public var ttftIncludingPrefillMs: Double { firstTokenLatencyMs }
+
     public init(
         text: String,
         tokens: [TokenID],
@@ -47,6 +53,7 @@ public struct GenerationResult: Sendable {
         tokensPerSecond: Double,
         compileTimeMs: Double,
         firstTokenLatencyMs: Double,
+        prefillMs: Double = 0,
         exactHeadBackend: String = "unknown",
         cachedBindingsEnabled: Bool = false,
         committedExactTokensPerPass: Double? = nil,
@@ -62,6 +69,7 @@ public struct GenerationResult: Sendable {
         self.tokensPerSecond = tokensPerSecond
         self.compileTimeMs = compileTimeMs
         self.firstTokenLatencyMs = firstTokenLatencyMs
+        self.prefillMs = prefillMs
         self.exactHeadBackend = exactHeadBackend
         self.cachedBindingsEnabled = cachedBindingsEnabled
         self.committedExactTokensPerPass = committedExactTokensPerPass
@@ -124,6 +132,7 @@ public struct GenerationResult: Sendable {
             tokensPerSecond: tokensPerSecond,
             compileTimeMs: compileTimeMs,
             firstTokenLatencyMs: firstTokenLatencyMs,
+            prefillMs: prefillMs,
             exactHeadBackend: exactHeadBackend,
             cachedBindingsEnabled: cachedBindingsEnabled,
             committedExactTokensPerPass: committedExactTokensPerPass,
@@ -152,6 +161,7 @@ public struct GenerationStep: Sendable {
     public let tokenLatencyMs: Double
     public let elapsedMs: Double
     public let firstTokenLatencyMs: Double
+    public let prefillMs: Double
     public let tokensPerSecond: Double
 
     public init(
@@ -161,6 +171,7 @@ public struct GenerationStep: Sendable {
         tokenLatencyMs: Double,
         elapsedMs: Double,
         firstTokenLatencyMs: Double,
+        prefillMs: Double = 0,
         tokensPerSecond: Double
     ) {
         self.token = token
@@ -169,6 +180,7 @@ public struct GenerationStep: Sendable {
         self.tokenLatencyMs = tokenLatencyMs
         self.elapsedMs = elapsedMs
         self.firstTokenLatencyMs = firstTokenLatencyMs
+        self.prefillMs = prefillMs
         self.tokensPerSecond = tokensPerSecond
     }
 }
@@ -4973,8 +4985,12 @@ public struct RealModelInferenceEngine: ~Copyable {
         var fullRuntime = try CPUExactLlamaRuntime(config: config, weightDirURL: weightDirURL)
         var draftRuntime = try CPUExactLlamaRuntime(config: draft.config, weightDirURL: draft.weightDirURL)
 
+        var clock = GenerateClock()
         try fullRuntime.prefill(promptTokens: promptTokens)
         try draftRuntime.prefill(promptTokens: promptTokens)
+        clock.markPrefillEnd()
+        let prefillMs = clock.prefillMs()
+        let submitNS = clock.submitNS
 
         let generationStart = DispatchTime.now().uptimeNanoseconds
         let tokenizer = self.tokenizer

@@ -174,6 +174,8 @@ public struct HybridDecodeKernelSet: ~Copyable {
         try self.init(weights: weights, maxSeq: maxSeq, donorHexIDs: nil, options: options)
     }
 
+    public static let prefillSequenceLengths: [Int] = [64, 256]
+
     package init(
         weights: borrowing LayerWeights,
         maxSeq: Int = ModelConfig.seqLen,
@@ -185,6 +187,9 @@ public struct HybridDecodeKernelSet: ~Copyable {
         }
         let resolvedOptions = options ?? .resolve()
         let laneSpatial = resolvedOptions.laneSpatial ?? DecodeKernelSet.defaultLaneSpatial
+        guard laneSpatial > 0 else {
+            throw .invalidArguments("hybrid decode laneSpatial must be > 0")
+        }
         let compiledQKV = try Self.compileDecodeQKVOnly(
             weights: weights,
             laneSpatial: laneSpatial,
@@ -237,6 +242,33 @@ public struct HybridDecodeKernelSet: ~Copyable {
             makeDecodeProjectionSpec(weights: weights, laneSpatial: laneSpatial),
             makeDecodeFFNSpec(weights: weights, laneSpatial: laneSpatial),
         ]
+    }
+
+    /// Fixed-shape Qwen prefill QKV/projection/FFN kernels at seq=64 and seq=256.
+    internal static func prefillCompileSpecs(
+        weights: borrowing LayerWeights,
+        sequenceLength: Int
+    ) -> [CompileSpec] {
+        precondition(prefillSequenceLengths.contains(sequenceLength))
+        return [
+            makeDecodeQKVOnlySpec(weights: weights, laneSpatial: sequenceLength),
+            makeDecodeProjectionSpec(weights: weights, laneSpatial: sequenceLength),
+            makeDecodeFFNSpec(weights: weights, laneSpatial: sequenceLength),
+        ]
+    }
+
+    public init(prefillWeights weights: borrowing LayerWeights, sequenceLength: Int) throws(ANEError) {
+        guard Self.prefillSequenceLengths.contains(sequenceLength) else {
+            throw .invalidArguments(
+                "Qwen prefill sequenceLength must be 64 or 256, got \(sequenceLength)"
+            )
+        }
+        try self.init(
+            weights: weights,
+            maxSeq: sequenceLength,
+            donorHexIDs: nil,
+            options: HybridDecodeKernelOptions(laneSpatial: sequenceLength)
+        )
     }
 
     private static func compileDecodeQKVOnly(

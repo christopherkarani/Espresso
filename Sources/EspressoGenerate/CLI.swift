@@ -502,6 +502,7 @@ struct BackendRunMetrics: Sendable {
     let promptTokens: [TokenID]
     let compileTimeMs: Double
     let firstTokenLatencyMs: Double
+    let prefillMs: Double
     let tokensPerSecond: Double
     let medianTokenMs: Double
     let p95TokenMs: Double
@@ -525,6 +526,7 @@ struct BackendRunMetrics: Sendable {
         promptTokens: [TokenID],
         compileTimeMs: Double,
         firstTokenLatencyMs: Double,
+        prefillMs: Double = 0,
         tokensPerSecond: Double,
         medianTokenMs: Double,
         p95TokenMs: Double,
@@ -547,6 +549,7 @@ struct BackendRunMetrics: Sendable {
         self.promptTokens = promptTokens
         self.compileTimeMs = compileTimeMs
         self.firstTokenLatencyMs = firstTokenLatencyMs
+        self.prefillMs = prefillMs
         self.tokensPerSecond = tokensPerSecond
         self.medianTokenMs = medianTokenMs
         self.p95TokenMs = p95TokenMs
@@ -1351,6 +1354,7 @@ private func makeBundleRuntimeMetrics(bundle: ESPRuntimeBundle, invocation: Reso
         promptTokens: result.promptTokens,
         compileTimeMs: result.compileTimeMs,
         firstTokenLatencyMs: result.firstTokenLatencyMs,
+        prefillMs: result.prefillMs,
         tokensPerSecond: result.tokensPerSecond,
         medianTokenMs: percentile(tokenLatenciesMs, percentile: 0.5),
         p95TokenMs: percentile(tokenLatenciesMs, percentile: 0.95),
@@ -1437,6 +1441,7 @@ private func runEspressoGeneration(
         promptTokens: result.promptTokens,
         compileTimeMs: result.compileTimeMs,
         firstTokenLatencyMs: result.firstTokenLatencyMs,
+        prefillMs: result.prefillMs,
         tokensPerSecond: result.tokensPerSecond,
         medianTokenMs: percentile(tokenLatenciesMs, percentile: 0.5),
         p95TokenMs: percentile(tokenLatenciesMs, percentile: 0.95),
@@ -1508,6 +1513,7 @@ func aggregateBenchmarkRuns(
         promptTokens: lastMeasured.promptTokens,
         compileTimeMs: compileTimeMs,
         firstTokenLatencyMs: lastMeasured.firstTokenLatencyMs,
+        prefillMs: lastMeasured.prefillMs,
         tokensPerSecond: lastMeasured.tokensPerSecond,
         medianTokenMs: percentile(aggregatedLatencySamples, percentile: 0.5),
         p95TokenMs: percentile(aggregatedLatencySamples, percentile: 0.95),
@@ -1676,7 +1682,7 @@ private func compareReport(
 private func printGenerateStats(_ invocation: ResolvedInvocation, result: BackendRunMetrics) {
     stderrLine(
         String(
-            format: "model=%@ prompt_tokens=%d generated_tokens=%d compile_ms=%.2f compile_retries=%d compile_failures=%d first_token_ms=%.2f tok_per_s=%.2f median_token_ms=%.2f p95_token_ms=%.2f",
+            format: "model=%@ prompt_tokens=%d generated_tokens=%d compile_ms=%.2f compile_retries=%d compile_failures=%d prefill_ms=%.2f first_token_ms=%.2f tok_per_s=%.2f median_token_ms=%.2f p95_token_ms=%.2f",
             locale: posixLocale,
             invocation.config.name,
             result.promptTokens.count,
@@ -1684,6 +1690,7 @@ private func printGenerateStats(_ invocation: ResolvedInvocation, result: Backen
             result.compileTimeMs,
             result.compileRetryCount,
             result.compileFailureCount,
+            result.prefillMs,
             result.firstTokenLatencyMs,
             result.tokensPerSecond,
             result.medianTokenMs,
@@ -1923,13 +1930,24 @@ private func writeGenerateArtifacts(
     return outputDir.path
 }
 
+func generateTimingJSONFields(from metrics: BackendRunMetrics) -> [String: Double] {
+    [
+        "prefill_ms": metrics.prefillMs,
+        "first_token_latency_ms": metrics.firstTokenLatencyMs,
+        "ttft_including_prefill_ms": metrics.firstTokenLatencyMs,
+    ]
+}
+
 private func backendPayload(_ backend: BackendRunMetrics) -> [String: Any] {
     let fingerprint = benchmarkFingerprint(for: backend)
+    let timing = generateTimingJSONFields(from: backend)
     return [
         "compile_time_ms": backend.compileTimeMs,
         "compile_retry_count": backend.compileRetryCount,
         "compile_failure_count": backend.compileFailureCount,
-        "first_token_latency_ms": backend.firstTokenLatencyMs,
+        "prefill_ms": timing["prefill_ms"] as Any,
+        "first_token_latency_ms": timing["first_token_latency_ms"] as Any,
+        "ttft_including_prefill_ms": timing["ttft_including_prefill_ms"] as Any,
         "tokens_per_second": backend.tokensPerSecond,
         "median_token_ms": backend.medianTokenMs,
         "p95_token_ms": backend.p95TokenMs,
@@ -3488,7 +3506,11 @@ private func runChat(invocation: ResolvedInvocation, options: Options, powerEnab
                                 cancel.requestCancel()
                             }
                             footer.tokensPerSecond = step.tokensPerSecond
-                            footer.ttftMs = step.firstTokenLatencyMs
+                            applyPublishedGenerateTiming(
+                                prefillMs: step.prefillMs,
+                                ttftIncludingPrefillMs: step.firstTokenLatencyMs,
+                                to: &footer
+                            )
                             footer.contextUsed = promptTokenCount + step.generatedTokens.count
                             if useTUI {
                                 renderTUI(status: .generating)
@@ -3504,7 +3526,11 @@ private func runChat(invocation: ResolvedInvocation, options: Options, powerEnab
                 try assertChatDecodePathIsHybrid(result.decodePath)
                 footer.decodePath = result.decodePath
                 footer.tokensPerSecond = result.tokensPerSecond
-                footer.ttftMs = result.firstTokenLatencyMs
+                applyPublishedGenerateTiming(
+                    prefillMs: result.prefillMs,
+                    ttftIncludingPrefillMs: result.firstTokenLatencyMs,
+                    to: &footer
+                )
                 footer.contextUsed = result.promptTokens.count + result.tokens.count
                 footer.power = chatPowerFooter(
                     capability: powerCapability,

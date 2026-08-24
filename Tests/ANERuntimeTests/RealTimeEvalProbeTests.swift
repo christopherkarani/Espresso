@@ -83,6 +83,21 @@ final class RealTimeEvalProbeTests: XCTestCase {
 
     // MARK: - Hardware-gated tests
 
+    func test_eval_records_wall_next_to_lastHWExecutionTimeNS() throws {
+        try requireANEHardwareTests()
+        let kernel = try identityKernel()
+        do {
+            try kernel.eval()
+        } catch {
+            throw XCTSkip("ANE eval unavailable for identity kernel: \(error)")
+        }
+        XCTAssertGreaterThan(kernel.lastEvalWallMicroseconds, 0)
+        XCTAssertEqual(kernel.lastEvalHWExecutionTimeNS, kernel.lastHWExecutionTimeNS())
+        if kernel.lastEvalHWExecutionTimeNS > 0 {
+            XCTAssertGreaterThanOrEqual(kernel.lastEvalWallNanoseconds, kernel.lastEvalHWExecutionTimeNS)
+        }
+    }
+
     func test_realtime_selector_discovery() throws {
         try requireANEHardwareTests()
         let kernel = try identityKernel()

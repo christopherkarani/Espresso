@@ -59,6 +59,25 @@ private func makeEmission(
         #expect(emission.firstTokenLatencyMs == 4)
     }
 
+    @Test func emitPublishesGenerateClockPrefillAndTTFT() throws {
+        var steps: [GenerationStep] = []
+        var emission = EmissionCore(
+            promptTokens: [10],
+            capacity: 4,
+            eos: .fixed(50_256),
+            onStep: { steps.append($0) },
+            decodeText: { $0.map(String.init).joined() },
+            clock: GenerateClock(submitNS: 1_000_000_000)
+        )
+        emission.emit(7, at: 1_080_000_000)
+        let step = try #require(steps.first)
+        #expect(abs(step.prefillMs - 80) < 1e-9)
+        #expect(abs(step.firstTokenLatencyMs - 80) < 1e-9)
+        let result = emission.makeResult(compileTimeMs: 0)
+        #expect(abs(result.prefillMs - 80) < 1e-9)
+        #expect(result.firstTokenLatencyMs == result.ttftIncludingPrefillMs)
+    }
+
     // MARK: Concerns 1–3 — emit bookkeeping and step construction
 
     @Test func emitAppendsTokensRecordsLatenciesAndFiresSteps() throws {

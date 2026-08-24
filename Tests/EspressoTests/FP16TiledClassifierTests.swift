@@ -196,4 +196,73 @@ final class FP16TiledClassifierTests: XCTestCase {
         XCTAssertEqual(streaming, tiled)
         XCTAssertEqual(streaming, 137)
     }
+
+    func testBNNSEightShardArgmaxMatchesTiledAndStreamingIncludingFirstMaxTie() {
+        XCTAssertEqual(FP16TiledClassifier.eightShardCount, 8)
+
+        func run(vocabSize: Int, dim: Int, dominantRow: Int?, tieRows: (Int, Int)?) {
+            let classifierFP32 = TensorBuffer(count: vocabSize * dim, zeroed: true)
+            let input = UnsafeMutablePointer<Float>.allocate(capacity: dim)
+            defer { input.deallocate() }
+            for i in 0..<dim { input[i] = 1.0 }
+            classifierFP32.withUnsafeMutablePointer { ptr in
+                for r in 0..<vocabSize {
+                    for c in 0..<dim {
+                        ptr[r * dim + c] = Float(r) * 0.01 + Float(c) * 0.001
+                    }
+                }
+                if let dominantRow {
+                    for c in 0..<dim {
+                        ptr[dominantRow * dim + c] = 10.0
+                    }
+                }
+                if let tieRows {
+                    for c in 0..<dim {
+                        ptr[tieRows.0 * dim + c] = 7.0
+                        ptr[tieRows.1 * dim + c] = 7.0
+                    }
+                }
+            }
+            let fp16Weights = TensorBufferFP16(quantizing: classifierFP32, rows: vocabSize, cols: dim)
+            let tiled = fp16Weights.withUnsafePointer { fp16Ptr in
+                FP16TiledClassifier.tiledMatvecArgmax(
+                    weights: fp16Ptr,
+                    input: UnsafePointer(input),
+                    vocabSize: vocabSize,
+                    dim: dim,
+                    tileRows: 7
+                )
+            }
+            let streaming = fp16Weights.withUnsafePointer { fp16Ptr in
+                FP16TiledClassifier.streamingMatvecArgmax(
+                    weights: fp16Ptr,
+                    input: UnsafePointer(input),
+                    vocabSize: vocabSize,
+                    dim: dim
+                )
+            }
+            let bnns = fp16Weights.withUnsafePointer { fp16Ptr in
+                FP16TiledClassifier.bnnsEightShardMatvecArgmax(
+                    weights: fp16Ptr,
+                    input: UnsafePointer(input),
+                    vocabSize: vocabSize,
+                    dim: dim
+                )
+            }
+            print(
+                "bnns_8shard shards=\(FP16TiledClassifier.eightShardCount) vocab=\(vocabSize) dim=\(dim) tiled=\(tiled) streaming=\(streaming) bnns=\(bnns) dominant=\(String(describing: dominantRow)) tie=\(String(describing: tieRows))"
+            )
+            XCTAssertEqual(bnns, tiled)
+            XCTAssertEqual(bnns, streaming)
+            if let dominantRow {
+                XCTAssertEqual(bnns, dominantRow)
+            }
+            if let tieRows {
+                XCTAssertEqual(bnns, min(tieRows.0, tieRows.1))
+            }
+        }
+
+        run(vocabSize: 24, dim: 16, dominantRow: 19, tieRows: nil)
+        run(vocabSize: 24, dim: 16, dominantRow: nil, tieRows: (3, 20))
+    }
 }

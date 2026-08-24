@@ -69,6 +69,16 @@ public struct ANEKernel: ~Copyable {
 
     private let handle: OpaquePointer
     internal let hexId: String
+    private let evalTiming = ANEEvalTimingRecorder()
+
+    /// Host wall of the last successful `eval()`, microseconds.
+    public var lastEvalWallMicroseconds: Double { evalTiming.lastWallMicroseconds }
+    /// Host wall of the last successful `eval()`, nanoseconds.
+    public var lastEvalWallNanoseconds: UInt64 { evalTiming.lastWallNanoseconds }
+    /// Driver `lastHWExecutionTimeNS` captured with the last `eval()` (0 if perf stats off).
+    public var lastEvalHWExecutionTimeNS: UInt64 { evalTiming.lastHWExecutionTimeNS }
+    /// Same recorder `eval()` writes. Always-on tests drive this type without compiling a kernel.
+    public var evalTimingRecorder: ANEEvalTimingRecorder { evalTiming }
 
     @inline(__always)
     private static func checkedSurfaceIndex(_ index: Int) throws(ANEError) -> Int32 {
@@ -442,10 +452,17 @@ public struct ANEKernel: ~Copyable {
     /// Run the compiled kernel on ANE.
     /// Input data must be written to inputSurface before calling.
     /// Output data is available on outputSurface after return.
+    ///
+    /// Records host wall next to `lastHWExecutionTimeNS` on every successful eval.
     public func eval() throws(ANEError) {
+        let start = DispatchTime.now().uptimeNanoseconds
         guard ane_interop_eval(handle) else {
             throw .evaluationFailed
         }
+        evalTiming.record(
+            wallNanoseconds: DispatchTime.now().uptimeNanoseconds - start,
+            hardwareNanoseconds: lastHWExecutionTimeNS()
+        )
     }
 
     /// Last reported on-chip execution time from `_ANEPerformanceStats` (nanoseconds).
