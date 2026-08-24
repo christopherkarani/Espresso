@@ -25,6 +25,48 @@ public struct HybridOutputProjectionWeights: Sendable {
     }
 }
 
+/// Compile-time knobs for the hybrid trunk kernel sets, supplied by the
+/// caller instead of read from process state mid-compile.
+///
+/// Shared by both hybrid trunks: split (`HybridDecodeKernelSet`) and fused
+/// (`FusedHybridDecodeLayerKernelSet`). Fields a set doesn't use are ignored
+/// by that set. `resolve(environment:)` preserves the historical
+/// environment-driven defaults; embedded hosts pass values instead.
+public struct HybridDecodeKernelOptions: Sendable {
+    /// `ESPRESSO_DECODE_LANE_SPATIAL`, floored at the default lane spatial.
+    public var laneSpatial: Int?
+    /// `ESPRESSO_DISABLE_HYBRID_FUSED_POST_ATTENTION=1` (split trunk only).
+    public var disableFusedPostAttention: Bool
+    /// `ESPRESSO_ENABLE_HYBRID_FUSED_POST_ATTENTION=1` (GPT-2 opt-in, split trunk only).
+    public var enableFusedPostAttention: Bool
+    /// `ESPRESSO_DISABLE_HYBRID_DONOR_DELTA=1` (both trunks).
+    public var disableDonorDelta: Bool
+
+    public init(
+        laneSpatial: Int? = nil,
+        disableFusedPostAttention: Bool = false,
+        enableFusedPostAttention: Bool = false,
+        disableDonorDelta: Bool = false
+    ) {
+        self.laneSpatial = laneSpatial
+        self.disableFusedPostAttention = disableFusedPostAttention
+        self.enableFusedPostAttention = enableFusedPostAttention
+        self.disableDonorDelta = disableDonorDelta
+    }
+
+    public static func resolve(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> HybridDecodeKernelOptions {
+        let envSpatial = environment["ESPRESSO_DECODE_LANE_SPATIAL"].flatMap(Int.init)
+        return HybridDecodeKernelOptions(
+            laneSpatial: envSpatial.map { max(DecodeKernelSet.defaultLaneSpatial, $0) },
+            disableFusedPostAttention: environment["ESPRESSO_DISABLE_HYBRID_FUSED_POST_ATTENTION"] == "1",
+            enableFusedPostAttention: environment["ESPRESSO_ENABLE_HYBRID_FUSED_POST_ATTENTION"] == "1",
+            disableDonorDelta: environment["ESPRESSO_DISABLE_HYBRID_DONOR_DELTA"] == "1"
+        )
+    }
+}
+
 /// Owns the split decode path for ANE QKV-only + Metal attention + ANE FFN.
 public struct HybridDecodeKernelSet: ~Copyable {
     package struct DonorHexIDs {
@@ -62,6 +104,22 @@ public struct HybridDecodeKernelSet: ~Copyable {
     public let maxSeq: Int
     public let laneSpatial: Int
     package let donorHexIDs: DonorHexIDs
+
+    /// Runs the post-attention stage for one decode step: projection+FFN as a
+    /// single fused kernel when fusion compiled, otherwise projection then FFN.
+    /// Consumers eval stages through here instead of branching on fusion.
+    @inline(__always)
+    public func evalPostAttention() throws(ANEError) {
+        try decodeProjection.eval()
+        if !usesFusedPostAttention {
+            try decodeFFN.eval()
+        }
+    }
+
+    /// Stage label for diagnostics naming which post-attention shape ran.
+    public var postAttentionStageName: String {
+        usesFusedPostAttention ? "decodeProjectionFFN" : "decodeProjection+decodeFFN"
+    }
 
     @inline(__always)
     private static func buildBlob(from buffer: borrowing TensorBuffer, rows: Int, cols: Int) -> Data {
@@ -108,29 +166,37 @@ public struct HybridDecodeKernelSet: ~Copyable {
         self.donorHexIDs = donorHexIDs
     }
 
-    public init(weights: borrowing LayerWeights, maxSeq: Int = ModelConfig.seqLen) throws(ANEError) {
-        try self.init(weights: weights, maxSeq: maxSeq, donorHexIDs: nil)
+    public init(
+        weights: borrowing LayerWeights,
+        maxSeq: Int = ModelConfig.seqLen,
+        options: HybridDecodeKernelOptions? = nil
+    ) throws(ANEError) {
+        try self.init(weights: weights, maxSeq: maxSeq, donorHexIDs: nil, options: options)
     }
 
     package init(
         weights: borrowing LayerWeights,
         maxSeq: Int = ModelConfig.seqLen,
-        donorHexIDs: DonorHexIDs? = nil
+        donorHexIDs: DonorHexIDs? = nil,
+        options: HybridDecodeKernelOptions? = nil
     ) throws(ANEError) {
         guard maxSeq > 0 else {
             throw .invalidArguments("hybrid decode maxSeq must be > 0")
         }
-        let laneSpatial = Self.resolvedLaneSpatialForCurrentProcess()
+        let resolvedOptions = options ?? .resolve()
+        let laneSpatial = resolvedOptions.laneSpatial ?? DecodeKernelSet.defaultLaneSpatial
         let compiledQKV = try Self.compileDecodeQKVOnly(
             weights: weights,
             laneSpatial: laneSpatial,
-            donorHexId: donorHexIDs?.decodeQKVOnly
+            donorHexId: donorHexIDs?.decodeQKVOnly,
+            options: resolvedOptions
         )
         let compiledPostAttention = try Self.compilePostAttention(
             weights: weights,
             laneSpatial: laneSpatial,
             donorProjectionHexId: donorHexIDs?.decodeProjection,
-            donorFFNHexId: donorHexIDs?.decodeFFN
+            donorFFNHexId: donorHexIDs?.decodeFFN,
+            options: resolvedOptions
         )
         let donorHexIDs = DonorHexIDs(
             decodeQKVOnly: compiledQKV.hexId,
@@ -158,9 +224,14 @@ public struct HybridDecodeKernelSet: ~Copyable {
         )
     }
 
-    internal static func compileSpecs(weights: borrowing LayerWeights, maxSeq: Int) -> [CompileSpec] {
+    internal static func compileSpecs(
+        weights: borrowing LayerWeights,
+        maxSeq: Int,
+        options: HybridDecodeKernelOptions? = nil
+    ) -> [CompileSpec] {
         precondition(maxSeq > 0)
-        let laneSpatial = resolvedLaneSpatialForCurrentProcess()
+        let resolvedOptions = options ?? .resolve()
+        let laneSpatial = resolvedOptions.laneSpatial ?? DecodeKernelSet.defaultLaneSpatial
         return [
             makeDecodeQKVOnlySpec(weights: weights, laneSpatial: laneSpatial),
             makeDecodeProjectionSpec(weights: weights, laneSpatial: laneSpatial),
@@ -171,10 +242,11 @@ public struct HybridDecodeKernelSet: ~Copyable {
     private static func compileDecodeQKVOnly(
         weights: borrowing LayerWeights,
         laneSpatial: Int,
-        donorHexId: String?
+        donorHexId: String?,
+        options: HybridDecodeKernelOptions
     ) throws(ANEError) -> ANEKernel {
         let spec = makeDecodeQKVOnlySpec(weights: weights, laneSpatial: laneSpatial)
-        return try compile(spec: spec, donorHexId: donorHexId)
+        return try compile(spec: spec, donorHexId: donorHexId, options: options)
     }
 
     private static func makeDecodeQKVOnlySpec(
@@ -244,19 +316,21 @@ public struct HybridDecodeKernelSet: ~Copyable {
     private static func compileDecodeFFN(
         weights: borrowing LayerWeights,
         laneSpatial: Int,
-        donorHexId: String?
+        donorHexId: String?,
+        options: HybridDecodeKernelOptions
     ) throws(ANEError) -> ANEKernel {
         let spec = makeDecodeFFNSpec(weights: weights, laneSpatial: laneSpatial)
-        return try compile(spec: spec, donorHexId: donorHexId)
+        return try compile(spec: spec, donorHexId: donorHexId, options: options)
     }
 
     private static func compileDecodeProjectionFFN(
         weights: borrowing LayerWeights,
         laneSpatial: Int,
-        donorHexId: String?
+        donorHexId: String?,
+        options: HybridDecodeKernelOptions
     ) throws(ANEError) -> ANEKernel {
         let spec = makeDecodeProjectionFFNSpec(weights: weights, laneSpatial: laneSpatial)
-        return try compile(spec: spec, donorHexId: donorHexId)
+        return try compile(spec: spec, donorHexId: donorHexId, options: options)
     }
 
     private static let fusedPostAttentionLock = NSLock()
@@ -269,11 +343,12 @@ public struct HybridDecodeKernelSet: ~Copyable {
         weights: borrowing LayerWeights,
         laneSpatial: Int,
         donorProjectionHexId: String?,
-        donorFFNHexId: String?
+        donorFFNHexId: String?,
+        options: HybridDecodeKernelOptions
     ) throws(ANEError) -> CompiledPostAttention {
-        // Fusion is enabled by default for rmsNormSwiGLU (LLaMA-family).
-        // Set ESPRESSO_DISABLE_HYBRID_FUSED_POST_ATTENTION=1 to force the split path.
-        let fusionDisabled = ProcessInfo.processInfo.environment["ESPRESSO_DISABLE_HYBRID_FUSED_POST_ATTENTION"] == "1"
+        // Fusion is enabled by default for rmsNormSwiGLU (LLaMA-family);
+        // disableFusedPostAttention forces the split path.
+        let fusionDisabled = options.disableFusedPostAttention
         let skipFused: Bool = {
             fusedPostAttentionLock.lock()
             defer { fusedPostAttentionLock.unlock() }
@@ -281,7 +356,7 @@ public struct HybridDecodeKernelSet: ~Copyable {
         }()
         let fusionEnabled = !fusionDisabled && !skipFused && (
             weights.architecture == .rmsNormSwiGLU ||
-            ProcessInfo.processInfo.environment["ESPRESSO_ENABLE_HYBRID_FUSED_POST_ATTENTION"] == "1"
+            options.enableFusedPostAttention
         )
         if fusionEnabled {
             do {
@@ -289,12 +364,14 @@ public struct HybridDecodeKernelSet: ~Copyable {
                     decodeProjection: try compileDecodeProjectionFFN(
                         weights: weights,
                         laneSpatial: laneSpatial,
-                        donorHexId: donorProjectionHexId
+                        donorHexId: donorProjectionHexId,
+                        options: options
                     ),
                     decodeFFN: try compileDecodeFFN(
                         weights: weights,
                         laneSpatial: laneSpatial,
-                        donorHexId: donorFFNHexId
+                        donorHexId: donorFFNHexId,
+                        options: options
                     ),
                     usesFusedPostAttention: true
                 )
@@ -315,12 +392,14 @@ public struct HybridDecodeKernelSet: ~Copyable {
             decodeProjection: try compileDecodeProjection(
                 weights: weights,
                 laneSpatial: laneSpatial,
-                donorHexId: donorProjectionHexId
+                donorHexId: donorProjectionHexId,
+                options: options
             ),
             decodeFFN: try compileDecodeFFN(
                 weights: weights,
                 laneSpatial: laneSpatial,
-                donorHexId: donorFFNHexId
+                donorHexId: donorFFNHexId,
+                options: options
             ),
             usesFusedPostAttention: false
         )
@@ -329,14 +408,19 @@ public struct HybridDecodeKernelSet: ~Copyable {
     private static func compileDecodeProjection(
         weights: borrowing LayerWeights,
         laneSpatial: Int,
-        donorHexId: String?
+        donorHexId: String?,
+        options: HybridDecodeKernelOptions
     ) throws(ANEError) -> ANEKernel {
         let spec = makeDecodeProjectionSpec(weights: weights, laneSpatial: laneSpatial)
-        return try compile(spec: spec, donorHexId: donorHexId)
+        return try compile(spec: spec, donorHexId: donorHexId, options: options)
     }
 
-    private static func compile(spec: CompileSpec, donorHexId: String?) throws(ANEError) -> ANEKernel {
-        let donorDisabled = ProcessInfo.processInfo.environment["ESPRESSO_DISABLE_HYBRID_DONOR_DELTA"] == "1"
+    private static func compile(
+        spec: CompileSpec,
+        donorHexId: String?,
+        options: HybridDecodeKernelOptions
+    ) throws(ANEError) -> ANEKernel {
+        let donorDisabled = options.disableDonorDelta
         let compileLabelPrefix = "hybrid.\(spec.kind.rawValue)"
         if !donorDisabled, let donorHexId, !donorHexId.isEmpty {
             do {

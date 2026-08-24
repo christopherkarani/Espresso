@@ -218,9 +218,38 @@ public enum RealModelInferenceError: Error, Sendable, Equatable, LocalizedError 
     }
 }
 
+extension GenerationResult {
+    /// Copy of the result with the decode profile report dropped, used by the
+    /// token-suite helper so a profile string cannot outlive its ANE surfaces.
+    func strippingDecodeProfileReport() -> GenerationResult {
+        GenerationResult(
+            text: text,
+            tokens: tokens,
+            promptTokens: promptTokens,
+            tokenLatenciesMs: tokenLatenciesMs,
+            tokensPerSecond: tokensPerSecond,
+            compileTimeMs: compileTimeMs,
+            firstTokenLatencyMs: firstTokenLatencyMs,
+            exactHeadBackend: exactHeadBackend,
+            cachedBindingsEnabled: cachedBindingsEnabled,
+            committedExactTokensPerPass: committedExactTokensPerPass,
+            acceptedFutureTokensPerPass: acceptedFutureTokensPerPass,
+            trunk: trunk,
+            hopsPerToken: hopsPerToken,
+            decodeProfileReport: nil
+        )
+    }
+}
+
 public struct RealModelInferenceEngine: ~Copyable {
     private static let minimumANEIOSurfaceBytes = 49_152
     private static let classifierArgmaxBlockSize = 4_000
+
+    /// Single process-environment seam for this file: every read flows through
+    /// here so global-state access stays auditable in one place.
+    static var processEnvironment: [String: String] {
+        ProcessInfo.processInfo.environment
+    }
 
     public struct GPT2AttentionCompileProbeResult: Sendable, Equatable {
         public let spatial: Int
@@ -463,7 +492,7 @@ public struct RealModelInferenceEngine: ~Copyable {
     }
 
     static func shouldRoundCPUExactDecodeIntermediatesToFP16(
-        env: [String: String] = ProcessInfo.processInfo.environment
+        env: [String: String] = Self.processEnvironment
     ) -> Bool {
         guard let rawValue = env["ESPRESSO_DEBUG_CPU_EXACT_DECODE_KEEP_FP32_INTERMEDIATES"] else {
             return false
@@ -480,26 +509,10 @@ public struct RealModelInferenceEngine: ~Copyable {
         config: MultiModelConfig,
         environment: [String: String]
     ) -> Bool {
-        if environment["ESPRESSO_FORCE_HYBRID_DECODE"] == "1" {
-            return false
-        }
-        if environment["ESPRESSO_USE_CPU_EXACT_DECODE"] == "1" {
-            return true
-        }
-        guard config.architecture == .llama else {
-            return false
-        }
-        // An artifact that states where it decodes is trusted over the name heuristic below.
-        if let declared = config.preferredDecodePath {
-            return declared == .exactCPU
-        }
-        // Legacy routing: early Qwen artifacts predate a working ANE path at these widths
-        // and are kept on the CPU oracle so old bundles do not change behaviour.
-        return ModelFamily.isQwenVariant(config)
-    }
-
-    static func isHybridFallbackDisabled(environment: [String: String]) -> Bool {
-        environment["ESPRESSO_REALMODEL_DISABLE_HYBRID_FALLBACK"] == "1"
+        DecodePathPolicy.prefersCPUExactDecode(
+            config: config,
+            options: DecodePathPolicy.optionsFromEnvironment(environment)
+        )
     }
 
     /// Resolves the llama serving ``Trunk``, refusing to leave the ANE silently.
@@ -511,30 +524,15 @@ public struct RealModelInferenceEngine: ~Copyable {
         config: MultiModelConfig,
         environment: [String: String]
     ) throws -> Trunk {
-        let trunk = selectTrunk(config: config, environment: environment)
-        guard trunk == .exactCPU, isHybridFallbackDisabled(environment: environment) else {
-            return trunk
-        }
-        let reason: String
-        if environment["ESPRESSO_USE_CPU_EXACT_DECODE"] == "1" {
-            reason = "ESPRESSO_USE_CPU_EXACT_DECODE=1 explicitly requests the pure-CPU decode path"
-        } else if config.preferredDecodePath == .exactCPU {
-            reason = "the artifact declares preferredDecodePath=exact_cpu in metadata.json"
-        } else {
-            reason = """
-                model name "\(config.name)" matches the legacy Qwen CPU-exact routing policy \
-                and metadata.json does not declare preferredDecodePath; set \
-                preferredDecodePath=hybrid or ESPRESSO_FORCE_HYBRID_DECODE=1 to decode on the ANE
-                """
-        }
-        throw RealModelInferenceError.hybridFallbackDisabled(
-            stage: "llama trunk selection",
-            reason: reason
+        try DecodePathPolicy.resolvedTrunk(
+            config: config,
+            fusedHybridPreferred: prefersFusedHybridDecode(config: config, environment: environment),
+            options: DecodePathPolicy.optionsFromEnvironment(environment)
         )
     }
 
     static func milDeploymentTarget(
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        environment: [String: String] = Self.processEnvironment
     ) -> String {
         let rawValue = environment["ESPRESSO_MIL_DEPLOYMENT_TARGET"]?
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -542,7 +540,7 @@ public struct RealModelInferenceEngine: ~Copyable {
     }
 
     static func gpt2NormKind(
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        environment: [String: String] = Self.processEnvironment
     ) -> GPT2NormKind {
         if environment["ESPRESSO_GPT2_USE_RMS_NORM"] == "1" {
             return .rmsNorm
@@ -561,7 +559,7 @@ public struct RealModelInferenceEngine: ~Copyable {
     static func hybridGreedyHeadMode(
         config: MultiModelConfig,
         hasFactoredOutputHead: Bool,
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        environment: [String: String] = Self.processEnvironment
     ) -> HybridGreedyHeadMode {
         guard config.architecture == .llama else {
             return .normThenClassifier
@@ -580,22 +578,11 @@ public struct RealModelInferenceEngine: ~Copyable {
         config: MultiModelConfig,
         environment: [String: String]
     ) -> Trunk {
-        if prefersCPUExactDecode(config: config, environment: environment) {
-            return .exactCPU
-        }
-        if prefersFusedHybridDecode(config: config, environment: environment) {
-            return .fusedHybrid
-        }
-        return .splitHybrid
-    }
-
-    static func hopsPerToken(for trunk: Trunk, nLayer: Int) -> Int? {
-        switch trunk {
-        case .fusedHybrid:
-            return fusedHopsPerToken(nLayer: nLayer)
-        case .splitHybrid, .exactCPU:
-            return nil
-        }
+        DecodePathPolicy.resolve(
+            config: config,
+            fusedHybridPreferred: prefersFusedHybridDecode(config: config, environment: environment),
+            options: DecodePathPolicy.optionsFromEnvironment(environment)
+        ).trunk
     }
 
     struct TopLevelWeightPaths: Sendable, Equatable {
@@ -604,44 +591,6 @@ public struct RealModelInferenceEngine: ~Copyable {
         let finalNormGamma: String
         let finalNormBeta: String
         let lmHead: String
-    }
-
-    private struct GPT2TopLevelAssets {
-        let tokenEmbedding: [Float]
-        let positionEmbedding: [Float]
-        let finalNormGamma: [Float]
-        let finalNormBeta: [Float]
-        let lmHead: [Float]
-        let finalNormGammaPath: String
-        let finalNormBetaPath: String
-        let finalNormGammaCompilePath: String
-        let finalNormBetaCompilePath: String
-        let finalNormGammaData: Data
-        let finalNormBetaData: Data
-    }
-
-    private struct LlamaTopLevelAssets {
-        struct FactoredOutputHead: Sendable, Equatable {
-            let projection: [Float]
-            let expansion: [Float]
-            let bottleneck: Int
-            let groups: Int
-        }
-
-        let tokenEmbedding: [Float]
-        let finalNormGamma: [Float]
-        let lmHead: [Float]
-        let lmHeadFP16: [UInt16]?
-        let lmHeadHasExactFloat32Sidecar: Bool
-        let factoredOutputHead: FactoredOutputHead?
-        let finalNormGammaPath: String
-        let finalNormGammaCompilePath: String
-        let finalNormGammaData: Data
-    }
-
-    private enum TopLevelAssets {
-        case gpt2(GPT2TopLevelAssets)
-        case llama(LlamaTopLevelAssets)
     }
 
     struct AttentionTestingOutputs {
@@ -804,18 +753,13 @@ public struct RealModelInferenceEngine: ~Copyable {
             )
             self.config = config
             self.roundIntermediatesToFP16 = RealModelInferenceEngine.shouldRoundCPUExactDecodeIntermediatesToFP16()
-            self.tokenEmbedding = try RealModelInferenceEngine.loadWeightTablePreferringFloat32Sidecar(
-                at: topLevelPaths.tokenEmbedding,
-                expectedCount: config.vocab * config.dModel
+            let coreWeights = try TopLevelAssetLoader.loadLlamaCoreWeights(
+                config: config,
+                topLevelPaths: topLevelPaths
             )
-            self.finalNormGamma = try RealModelInferenceEngine.loadWeightTablePreferringFloat32Sidecar(
-                at: topLevelPaths.finalNormGamma,
-                expectedCount: config.dModel
-            )
-            self.lmHead = try RealModelInferenceEngine.loadWeightTablePreferringFloat32Sidecar(
-                at: topLevelPaths.lmHead,
-                expectedCount: config.vocab * config.dModel
-            )
+            self.tokenEmbedding = coreWeights.tokenEmbedding
+            self.finalNormGamma = coreWeights.finalNormGamma
+            self.lmHead = coreWeights.lmHead
             self.layers = try (0..<config.nLayer).map { layerIndex in
                 let paths = LayerWeightPaths.forLayer(
                     layerIndex,
@@ -1264,7 +1208,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             if layers.count > 1,
                RealModelInferenceEngine.usesHybridLayerInputRebinding(
                    architecture: config.architecture,
-                   environment: ProcessInfo.processInfo.environment
+                   environment: RealModelInferenceEngine.processEnvironment
                ) {
                 for localLayerIndex in 1..<layers.count {
                     do {
@@ -1335,7 +1279,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             self.zeroSlice = zeroSlice
             self.preferCPUDecodeAttention = RealModelInferenceEngine.prefersCPUDecodeAttention(
                 config: config,
-                environment: ProcessInfo.processInfo.environment
+                environment: RealModelInferenceEngine.processEnvironment
             )
             self.decodeState = decodeState
         }
@@ -1512,7 +1456,7 @@ public struct RealModelInferenceEngine: ~Copyable {
     }
 
     private func hybridGreedyHeadMode(
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        environment: [String: String] = Self.processEnvironment
     ) -> HybridGreedyHeadMode {
         let hasFactoredOutputHead: Bool
         if config.architecture == .llama {
@@ -1536,11 +1480,19 @@ public struct RealModelInferenceEngine: ~Copyable {
         }
     }
 
-    private var compiledBucket: Int
+    /// Per-trunk compile readiness; the ensure functions below are the only writers.
+    private var baselineReadiness = CompiledReadiness<BaselineCompiledRuntime>.notCompiled
+    private var splitHybridReadiness = CompiledReadiness<SplitHybridCompiledRuntime>.notCompiled
+    private var fusedHybridReadiness = CompiledReadiness<FusedHybridCompiledRuntime>.notCompiled
+    /// Bucket of the last fully resident split-hybrid layer-program set.
+    ///
+    /// Incremental-compile watermark consulted only by ``ensureHybridCompiled``
+    /// (so a mid-compile failure never recompiles finished layers) and by the
+    /// dispatch max-sequence defaults; loop readiness itself is carried by
+    /// ``splitHybridReadiness``.
+    private var splitHybridLayerBucket = 0
     private var compiledLayers: LayerStorage<CompiledLayer>
-    private var firstLayerInputSurface: IOSurfaceRef?
     private var compiledHead: LayerStorage<CompiledHead>
-    private var compiledHybridBucket: Int
     private var compiledHybridLayers: LayerStorage<HybridDecodeKernelSet>
     private var compiledHybridSurfaceHandles: [HybridDecodeSurfaceHandles]
     private var compiledHybridLlamaQKNormWeights: [LlamaQKNormWeights?]
@@ -1549,7 +1501,6 @@ public struct RealModelInferenceEngine: ~Copyable {
     private var compiledHybridGreedyNorm: LayerStorage<CompiledHead>
     private var compiledHybridGreedyClassifier: LayerStorage<CompiledClassifier>
     private var compiledHybridGreedySpatial: Int
-    private var compiledFusedHybridBucket: Int
     private var compiledFusedHybridLayers: LayerStorage<FusedHybridDecodeLayerKernelSet>
     private var compiledFusedHybridSurfaceHandles: [FusedHybridDecodeSurfaceHandles]
     private var hybridMetalAttention: MetalAttentionKernel?
@@ -1558,6 +1509,7 @@ public struct RealModelInferenceEngine: ~Copyable {
     private let classifierBlockMaxNorms: [Float]
     private var classifierLogitsScratch: [Float]
     private let classifierStrategy: ClassifierStrategy
+    private let policies: EnginePolicies
     private var cachedExactCPULlamaWeights: CachedExactCPULlamaWeights?
 
     private init(
@@ -1565,7 +1517,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         weightDirURL: URL,
         tokenizer: LoadedTokenizer,
         assets: TopLevelAssets,
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        policies: EnginePolicies = .resolve()
     ) {
         let lmHead: [Float]
         let hasExactFloat32LMHead: Bool
@@ -1589,11 +1541,8 @@ public struct RealModelInferenceEngine: ~Copyable {
         self.weightDirURL = weightDirURL
         self.tokenizer = tokenizer
         self.assets = assets
-        self.compiledBucket = 0
         self.compiledLayers = Self.emptyStorage(CompiledLayer.self)
-        self.firstLayerInputSurface = nil
         self.compiledHead = Self.emptyStorage(CompiledHead.self)
-        self.compiledHybridBucket = 0
         self.compiledHybridLayers = Self.emptyStorage(HybridDecodeKernelSet.self)
         self.compiledHybridSurfaceHandles = []
         self.compiledHybridLlamaQKNormWeights = []
@@ -1602,7 +1551,6 @@ public struct RealModelInferenceEngine: ~Copyable {
         self.compiledHybridGreedyNorm = Self.emptyStorage(CompiledHead.self)
         self.compiledHybridGreedyClassifier = Self.emptyStorage(CompiledClassifier.self)
         self.compiledHybridGreedySpatial = 0
-        self.compiledFusedHybridBucket = 0
         self.compiledFusedHybridLayers = Self.emptyStorage(FusedHybridDecodeLayerKernelSet.self)
         self.compiledFusedHybridSurfaceHandles = []
         self.hybridMetalAttention = nil
@@ -1616,15 +1564,21 @@ public struct RealModelInferenceEngine: ~Copyable {
         self.classifierStrategy = Self.resolveClassifierStrategy(
             config: config,
             hasExactFloat32LMHead: hasExactFloat32LMHead,
-            environment: environment
+            environment: policies.environment
         )
+        self.policies = policies
         self.cachedExactCPULlamaWeights = nil
     }
 
+    /// Builds an engine. `environment` is the single configuration seam:
+    /// everything the process environment would have steered is resolved from
+    /// this dictionary once, here. Callers embedding Espresso pass values;
+    /// only the default reads the live process environment.
     public static func build(
         config: MultiModelConfig,
         weightDir: String,
-        tokenizerDir: String
+        tokenizerDir: String,
+        environment: [String: String] = ProcessInfo.processInfo.environment
     ) throws -> RealModelInferenceEngine {
         try validateConfig(config)
 
@@ -1635,24 +1589,192 @@ public struct RealModelInferenceEngine: ~Copyable {
         try validateMetadataIfPresent(config: config, weightDirURL: weightDirURL)
 
         let tokenizer = try loadTokenizer(config: config, tokenizerDirURL: tokenizerDirURL)
+        let policies = EnginePolicies(environment: environment)
 
-        let topLevelAssets = try loadTestingTopLevelAssets(
+        let topLevelAssets = try TopLevelAssetLoader.load(
             config: config,
             weightDir: weightDir,
-            weightDirURL: weightDirURL
+            weightDirURL: weightDirURL,
+            environment: environment
         )
         return RealModelInferenceEngine(
             config: config,
             weightDirURL: weightDirURL,
             tokenizer: tokenizer,
-            assets: topLevelAssets
+            assets: topLevelAssets,
+            policies: policies
         )
+    }
+
+    /// The decode-path bootstrap seam: resolves the serving plan from explicit options
+    /// when provided, otherwise from the bounded decode-path environment variables.
+    private static func resolveDecodePlanSeam(
+        config: MultiModelConfig,
+        options: DecodePathOptions?,
+        environment: [String: String] = Self.processEnvironment
+    ) -> (plan: ResolvedDecodePlan, options: DecodePathOptions, fusedHybridPreferred: Bool) {
+        let decodeOptions = options ?? DecodePathPolicy.optionsFromEnvironment(environment)
+        let fusedHybridPreferred = Self.prefersFusedHybridDecode(config: config, environment: environment)
+        let plan = DecodePathPolicy.resolve(
+            config: config,
+            fusedHybridPreferred: fusedHybridPreferred,
+            options: decodeOptions
+        )
+        return (plan, decodeOptions, fusedHybridPreferred)
+    }
+
+    /// Compile-and-prepare state for one llama trunk's decode programs.
+    private struct LlamaTrunkPreparation {
+        let compileTimeMs: Double
+        let metalAttention: MetalAttentionKernel?
+    }
+
+    /// One unit of llama serving work routed through the single ``Trunk`` dispatch point.
+    private struct LlamaDecodeRequest {
+        let trunk: Trunk
+        let bucket: Int
+        /// Names the caller in attention-unavailability errors ("llama" vs "llama testing helper").
+        let sessionKind: String
+        let promptTokens: [TokenID]
+        let effectiveMaxTokens: Int
+        let temperature: Float
+        var topP: Float = 1.0
+        var compileTimeMs: Double = 0
+        /// Precomputed `prepareLlamaTrunkDecode` output; when nil the dispatcher prepares.
+        var preparation: LlamaTrunkPreparation?
+        /// Explicit decode-session context length; per-trunk defaults apply when nil.
+        var maxSeq: Int? = nil
+        var onStep: ((GenerationStep) -> Void)? = nil
+        var isCancelled: (() -> Bool)? = nil
+        var dropsDecodeProfileReport = false
+    }
+
+    /// Compiles decode programs for a selected llama trunk without decoding anything.
+    ///
+    /// Shared by chat precompile and the token-suite warmup; the fused error-wrapping and
+    /// Metal-attention guards live here so every entry point behaves identically.
+    private mutating func prepareLlamaTrunkDecode(
+        _ trunk: Trunk,
+        bucket: Int,
+        sessionKind: String
+    ) throws -> LlamaTrunkPreparation {
+        if trunk == .fusedHybrid {
+            let compileStart = DispatchTime.now().uptimeNanoseconds
+            let compileDidRun: Bool
+            do {
+                compileDidRun = try ensureFusedHybridCompiled(bucket: bucket)
+            } catch let error as RealModelInferenceError {
+                if case .hybridFallbackDisabled = error { throw error }
+                throw Self.fusedHybridFallbackError(
+                    reason: error.errorDescription ?? "\(error)"
+                )
+            } catch {
+                throw Self.fusedHybridFallbackError(reason: "\(error)")
+            }
+            let compileEnd = DispatchTime.now().uptimeNanoseconds
+            return LlamaTrunkPreparation(
+                compileTimeMs: compileDidRun ? Self.milliseconds(from: compileEnd - compileStart) : 0,
+                metalAttention: nil
+            )
+        }
+        if trunk == .splitHybrid {
+            let compileStart = DispatchTime.now().uptimeNanoseconds
+            let compileDidRun = try ensureHybridCompiled(bucket: bucket)
+            guard let metalAttention = hybridMetalAttention else {
+                throw RealModelInferenceError.runtimeFailure("Hybrid Metal attention unavailable for \(sessionKind)")
+            }
+            let compileEnd = DispatchTime.now().uptimeNanoseconds
+            return LlamaTrunkPreparation(
+                compileTimeMs: compileDidRun ? Self.milliseconds(from: compileEnd - compileStart) : 0,
+                metalAttention: metalAttention
+            )
+        }
+        return LlamaTrunkPreparation(compileTimeMs: 0, metalAttention: nil)
+    }
+
+    /// THE single ``Trunk`` dispatch point for llama serving sessions (REQ-004): every
+    /// decode path funnels its per-trunk preparation and session work through this switch.
+    private mutating func dispatchLlamaTrunkDecode(
+        _ request: LlamaDecodeRequest
+    ) throws -> GenerationResult {
+        switch request.trunk {
+        case .exactCPU:
+            return try generateIncrementalExactCPULlama(
+                promptTokens: request.promptTokens,
+                effectiveMaxTokens: request.effectiveMaxTokens,
+                temperature: request.temperature,
+                topP: request.topP,
+                compileTimeMs: request.compileTimeMs,
+                maxSeq: request.maxSeq ?? request.bucket,
+                onStep: request.onStep,
+                isCancelled: request.isCancelled
+            )
+        case .fusedHybrid:
+            let prepared: LlamaTrunkPreparation
+            let sessionCompileTimeMs: Double
+            if let provided = request.preparation {
+                prepared = provided
+                sessionCompileTimeMs = request.compileTimeMs
+            } else {
+                prepared = try prepareLlamaTrunkDecode(
+                    .fusedHybrid,
+                    bucket: request.bucket,
+                    sessionKind: request.sessionKind
+                )
+                sessionCompileTimeMs = prepared.compileTimeMs
+            }
+            let result = try generateIncrementalFusedHybridLlama(
+                promptTokens: request.promptTokens,
+                effectiveMaxTokens: request.effectiveMaxTokens,
+                temperature: request.temperature,
+                topP: request.topP,
+                compileTimeMs: sessionCompileTimeMs,
+                maxSeq: request.maxSeq ?? max(request.bucket, fusedHybridReadiness.runtime?.bucket ?? request.bucket),
+                onStep: request.onStep,
+                isCancelled: request.isCancelled
+            )
+            if request.dropsDecodeProfileReport {
+                return result.strippingDecodeProfileReport()
+            }
+            return result
+        case .splitHybrid:
+            let prepared: LlamaTrunkPreparation
+            let sessionCompileTimeMs: Double
+            if let provided = request.preparation {
+                prepared = provided
+                sessionCompileTimeMs = request.compileTimeMs
+            } else {
+                prepared = try prepareLlamaTrunkDecode(
+                    .splitHybrid,
+                    bucket: request.bucket,
+                    sessionKind: request.sessionKind
+                )
+                sessionCompileTimeMs = prepared.compileTimeMs
+            }
+            guard let metalAttention = prepared.metalAttention else {
+                throw RealModelInferenceError.runtimeFailure("Hybrid Metal attention unavailable for \(request.sessionKind)")
+            }
+            return try generateIncrementalHybridLlama(
+                promptTokens: request.promptTokens,
+                effectiveMaxTokens: request.effectiveMaxTokens,
+                temperature: request.temperature,
+                topP: request.topP,
+                compileTimeMs: sessionCompileTimeMs,
+                maxSeq: request.maxSeq ?? max(request.bucket, splitHybridLayerBucket),
+                metalAttention: metalAttention,
+                onStep: request.onStep,
+                isCancelled: request.isCancelled
+            )
+        }
     }
 
     /// Compile hybrid decode kernels once for a context that covers later turns.
     /// Chat re-prefills growing history; compiling per-turn at a larger bucket
     /// exhausts the per-process ANE compile budget.
-    public mutating func precompileHybridDecode(covering tokenCount: Int? = nil) throws {
+    public mutating func precompileHybridDecode(
+        covering tokenCount: Int? = nil,
+        options decodeOptions: DecodePathOptions? = nil
+    ) throws {
         let target = min(max(tokenCount ?? config.maxSeq, 1), config.maxSeq)
         let bucket = try Self.compileBucket(
             for: target,
@@ -1661,26 +1783,12 @@ public struct RealModelInferenceEngine: ~Copyable {
         )
         switch config.architecture {
         case .llama:
-            switch Self.selectTrunk(
+            let seam = Self.resolveDecodePlanSeam(
                 config: config,
-                environment: ProcessInfo.processInfo.environment
-            ) {
-            case .fusedHybrid:
-                do {
-                    _ = try ensureFusedHybridCompiled(bucket: bucket)
-                } catch let error as RealModelInferenceError {
-                    if case .hybridFallbackDisabled = error { throw error }
-                    throw Self.fusedHybridFallbackError(
-                        reason: error.errorDescription ?? "\(error)"
-                    )
-                } catch {
-                    throw Self.fusedHybridFallbackError(reason: "\(error)")
-                }
-            case .splitHybrid:
-                _ = try ensureHybridCompiledLlama(bucket: bucket)
-            case .exactCPU:
-                break
-            }
+                options: decodeOptions,
+                environment: policies.environment
+            )
+            _ = try prepareLlamaTrunkDecode(seam.plan.trunk, bucket: bucket, sessionKind: "llama")
         case .gpt2:
             _ = try ensureHybridCompiled(bucket: bucket)
         }
@@ -1692,7 +1800,8 @@ public struct RealModelInferenceEngine: ~Copyable {
         temperature: Float = 0.0,
         topP: Float = 1.0,
         onStep: ((GenerationStep) -> Void)? = nil,
-        isCancelled: (() -> Bool)? = nil
+        isCancelled: (() -> Bool)? = nil,
+        options decodeOptions: DecodePathOptions? = nil
     ) throws -> GenerationResult {
         guard maxTokens >= 0 else {
             throw RealModelInferenceError.invalidGenerationParameters("maxTokens must be >= 0")
@@ -1714,29 +1823,30 @@ public struct RealModelInferenceEngine: ~Copyable {
 
         let remainingContext = config.maxSeq - promptTokens.count
         let effectiveMaxTokens = min(maxTokens, max(remainingContext, 0))
-        let environment = ProcessInfo.processInfo.environment
+        let environment = policies.environment
+        let seam = Self.resolveDecodePlanSeam(config: config, options: decodeOptions, environment: environment)
+        let plan = seam.plan
         if effectiveMaxTokens == 0 {
-            let text = tokenizer.decode(promptTokens.map(Int.init))
-            let trunk: Trunk?
-            let hopsPerToken: Int?
-            if config.architecture == .llama {
-                let selected = Self.selectTrunk(config: config, environment: environment)
-                trunk = selected
-                hopsPerToken = Self.hopsPerToken(for: selected, nLayer: config.nLayer)
-            } else {
-                trunk = nil
-                hopsPerToken = nil
-            }
-            return GenerationResult(
-                text: text,
-                tokens: [],
+            let tokenizer = self.tokenizer
+            let eosPolicy: EOSPolicy = config.architecture == .llama
+                ? .fromConfig(config.eosToken.map(Int.init))
+                : .fixed(Int(Self.gpt2EOSToken))
+            let emission = EmissionCore(
                 promptTokens: promptTokens,
-                tokensPerSecond: 0,
-                compileTimeMs: 0,
-                firstTokenLatencyMs: 0,
-                trunk: trunk,
-                hopsPerToken: hopsPerToken
+                capacity: 0,
+                eos: eosPolicy,
+                onStep: nil,
+                decodeText: { tokenizer.decode($0) }
             )
+            var trunk: Trunk?
+            var hopsPerToken: Int?
+            if config.architecture == .llama {
+                trunk = plan.trunk
+                hopsPerToken = plan.trunk == .fusedHybrid
+                    ? Self.fusedHopsPerToken(nLayer: config.nLayer)
+                    : nil
+            }
+            return emission.makeResult(compileTimeMs: 0, trunk: trunk, hopsPerToken: hopsPerToken)
         }
 
         let targetTokenCount = min(config.maxSeq, promptTokens.count + effectiveMaxTokens)
@@ -1761,66 +1871,22 @@ public struct RealModelInferenceEngine: ~Copyable {
                     onStep: onStep
                 )
             }
-            switch try Self.resolvedTrunk(
+            let trunk = try DecodePathPolicy.resolvedTrunk(
                 config: config,
-                environment: environment
-            ) {
-            case .exactCPU:
-                return try generateIncrementalExactCPULlama(
-                    promptTokens: promptTokens,
-                    effectiveMaxTokens: effectiveMaxTokens,
-                    temperature: temperature,
-                    topP: topP,
-                    compileTimeMs: 0,
-                    maxSeq: bucket,
-                    onStep: onStep,
-                    isCancelled: isCancelled
-                )
-            case .fusedHybrid:
-                let compileStart = DispatchTime.now().uptimeNanoseconds
-                let compileDidRun: Bool
-                do {
-                    compileDidRun = try ensureFusedHybridCompiled(bucket: bucket)
-                } catch let error as RealModelInferenceError {
-                    if case .hybridFallbackDisabled = error { throw error }
-                    throw Self.fusedHybridFallbackError(
-                        reason: error.errorDescription ?? "\(error)"
-                    )
-                } catch {
-                    throw Self.fusedHybridFallbackError(reason: "\(error)")
-                }
-                let compileEnd = DispatchTime.now().uptimeNanoseconds
-                let compileTimeMs = compileDidRun ? Self.milliseconds(from: compileEnd - compileStart) : 0
-                return try generateIncrementalFusedHybridLlama(
-                    promptTokens: promptTokens,
-                    effectiveMaxTokens: effectiveMaxTokens,
-                    temperature: temperature,
-                    topP: topP,
-                    compileTimeMs: compileTimeMs,
-                    maxSeq: max(bucket, compiledFusedHybridBucket),
-                    onStep: onStep,
-                    isCancelled: isCancelled
-                )
-            case .splitHybrid:
-                let compileStart = DispatchTime.now().uptimeNanoseconds
-                let compileDidRun = try ensureHybridCompiledLlama(bucket: bucket)
-                guard let metalAttention = hybridMetalAttention else {
-                    throw RealModelInferenceError.runtimeFailure("Hybrid Metal attention unavailable for llama")
-                }
-                let compileEnd = DispatchTime.now().uptimeNanoseconds
-                let compileTimeMs = compileDidRun ? Self.milliseconds(from: compileEnd - compileStart) : 0
-                return try generateIncrementalHybridLlama(
-                    promptTokens: promptTokens,
-                    effectiveMaxTokens: effectiveMaxTokens,
-                    temperature: temperature,
-                    topP: topP,
-                    compileTimeMs: compileTimeMs,
-                    maxSeq: max(bucket, compiledHybridBucket),
-                    metalAttention: metalAttention,
-                    onStep: onStep,
-                    isCancelled: isCancelled
-                )
-            }
+                fusedHybridPreferred: seam.fusedHybridPreferred,
+                options: seam.options
+            )
+            return try dispatchLlamaTrunkDecode(LlamaDecodeRequest(
+                trunk: trunk,
+                bucket: bucket,
+                sessionKind: "llama",
+                promptTokens: promptTokens,
+                effectiveMaxTokens: effectiveMaxTokens,
+                temperature: temperature,
+                topP: topP,
+                onStep: onStep,
+                isCancelled: isCancelled
+            ))
         }
 
         let compileStart = DispatchTime.now().uptimeNanoseconds
@@ -1830,28 +1896,29 @@ public struct RealModelInferenceEngine: ~Copyable {
         do {
             let hybridDidRun = try ensureHybridCompiled(bucket: bucket)
             compileDidRun = compileDidRun || hybridDidRun
-            useHybridFastPath =
-                compiledHybridLayers.count == config.nLayer &&
-                compiledHybridSurfaceHandles.count == config.nLayer &&
-                compiledHybridHead.count == 1 &&
-                hybridMetalAttention != nil
-            if !useHybridFastPath, Self.isHybridFallbackDisabled(environment: environment) {
-                throw RealModelInferenceError.hybridFallbackDisabled(
-                    stage: "hybrid decode compile",
-                    reason: """
-                        hybrid decode state is incomplete: layers=\(compiledHybridLayers.count)/\(config.nLayer) \
-                        surfaces=\(compiledHybridSurfaceHandles.count)/\(config.nLayer) \
-                        head=\(compiledHybridHead.count)/1 \
-                        metalAttention=\(hybridMetalAttention != nil)
-                        """
-                )
+            switch splitHybridReadiness {
+            case .compiled:
+                useHybridFastPath = true
+            case .notCompiled:
+                useHybridFastPath = false
+                guard plan.allowsHybridFallback else {
+                    throw RealModelInferenceError.hybridFallbackDisabled(
+                        stage: "hybrid decode compile",
+                        reason: """
+                            hybrid decode state is incomplete: layers=\(compiledHybridLayers.count)/\(config.nLayer) \
+                            surfaces=\(compiledHybridSurfaceHandles.count)/\(config.nLayer) \
+                            head=\(compiledHybridHead.count)/1 \
+                            metalAttention=\(hybridMetalAttention != nil)
+                            """
+                    )
+                }
             }
         } catch let error as RealModelInferenceError {
             // A disabled-fallback error is the answer, not something to recover from.
             if case .hybridFallbackDisabled = error {
                 throw error
             }
-            if Self.isHybridFallbackDisabled(environment: environment) {
+            if !plan.allowsHybridFallback {
                 throw RealModelInferenceError.hybridFallbackDisabled(
                     stage: "hybrid decode compile",
                     reason: "\(error.errorDescription ?? "\(error)")"
@@ -1859,7 +1926,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             }
             useHybridFastPath = false
         } catch {
-            if Self.isHybridFallbackDisabled(environment: environment) {
+            if !plan.allowsHybridFallback {
                 throw RealModelInferenceError.hybridFallbackDisabled(
                     stage: "hybrid decode compile",
                     reason: "\(error)"
@@ -1891,7 +1958,7 @@ public struct RealModelInferenceEngine: ~Copyable {
                         onStep: onStep
                     )
                 } catch {
-                    if ProcessInfo.processInfo.environment["ESPRESSO_REALMODEL_DISABLE_HYBRID_FALLBACK"] == "1" {
+                    if !plan.allowsHybridFallback {
                         throw RealModelInferenceError.runtimeFailure("Hybrid speculative fast path failed: \(error)")
                     }
                     fputs(
@@ -1925,7 +1992,7 @@ public struct RealModelInferenceEngine: ~Copyable {
                     isCancelled: isCancelled
                 )
             } catch {
-                if ProcessInfo.processInfo.environment["ESPRESSO_REALMODEL_DISABLE_HYBRID_FALLBACK"] == "1" {
+                if !plan.allowsHybridFallback {
                     throw RealModelInferenceError.runtimeFailure("Hybrid fast path failed: \(error)")
                 }
                 useHybridFastPath = false
@@ -1937,26 +2004,31 @@ public struct RealModelInferenceEngine: ~Copyable {
         let compileEnd = DispatchTime.now().uptimeNanoseconds
         let compileTimeMs = compileDidRun ? Self.milliseconds(from: compileEnd - compileStart) : 0
 
-        guard let inputSurface = firstLayerInputSurface, compiledLayers.count == config.nLayer, compiledHead.count == 1 else {
+        let baseline: BaselineCompiledRuntime
+        switch baselineReadiness {
+        case .compiled(let runtime):
+            baseline = runtime
+        case .notCompiled:
             throw RealModelInferenceError.runtimeFailure("Compiled ANE surfaces are unavailable")
         }
-
-        var allTokens = promptTokens
-        var generatedTokens: [TokenID] = []
-        var tokenLatenciesMs: [Double] = []
-        generatedTokens.reserveCapacity(effectiveMaxTokens)
-        tokenLatenciesMs.reserveCapacity(effectiveMaxTokens)
+        let inputSurface = baseline.inputSurface
 
         let generationStart = DispatchTime.now().uptimeNanoseconds
-        var firstTokenLatencyMs = 0.0
-        var firstTokenRecorded = false
+        let tokenizer = self.tokenizer
+        var emission = EmissionCore(
+            promptTokens: promptTokens,
+            capacity: effectiveMaxTokens,
+            eos: .fixed(Int(Self.gpt2EOSToken)),
+            onStep: onStep,
+            decodeText: { tokenizer.decode($0) },
+            startNanos: generationStart
+        )
         var rng = SystemRandomNumberGenerator()
-        let activeBucket = compiledBucket
+        let activeBucket = baseline.bucket
 
         for _ in 0..<effectiveMaxTokens {
-            let stepStart = DispatchTime.now().uptimeNanoseconds
-            let sequenceLength = allTokens.count
-            let activation = composeEmbeddingInput(tokens: allTokens, spatial: activeBucket)
+            let sequenceLength = emission.allTokensCount
+            let activation = composeEmbeddingInput(tokens: emission.allTokens, spatial: activeBucket)
             try activation.withUnsafeBufferPointer { buffer in
                 try Self.writeFP32(to: inputSurface, data: buffer)
             }
@@ -1994,51 +2066,21 @@ public struct RealModelInferenceEngine: ~Copyable {
                 using: &rng
             )
 
-            if !firstTokenRecorded {
-                firstTokenLatencyMs = Self.milliseconds(from: DispatchTime.now().uptimeNanoseconds - generationStart)
-                firstTokenRecorded = true
-            }
+            let emissionNow = DispatchTime.now().uptimeNanoseconds
+            emission.recordFirstTokenIfFirst(at: emissionNow)
 
-            if nextToken == Self.gpt2EOSToken {
+            if emission.terminatesDecoding(nextToken) {
                 break
             }
 
-            generatedTokens.append(nextToken)
-            allTokens.append(nextToken)
-            let elapsedMs = Self.milliseconds(from: DispatchTime.now().uptimeNanoseconds - generationStart)
-            let tokenLatencyMs = Self.milliseconds(from: DispatchTime.now().uptimeNanoseconds - stepStart)
-            tokenLatenciesMs.append(tokenLatencyMs)
-            let tokensPerSecond = Double(generatedTokens.count) / max(elapsedMs / 1_000, 1e-9)
-            onStep?(
-                GenerationStep(
-                    token: nextToken,
-                    generatedTokens: generatedTokens,
-                    text: tokenizer.decode(allTokens.map(Int.init)),
-                    tokenLatencyMs: tokenLatencyMs,
-                    elapsedMs: elapsedMs,
-                    firstTokenLatencyMs: firstTokenLatencyMs,
-                    tokensPerSecond: tokensPerSecond
-                )
-            )
-            if allTokens.count >= config.maxSeq {
+            emission.emit(nextToken, at: emissionNow)
+            if emission.allTokensCount >= config.maxSeq {
                 break
             }
         }
 
-        let generationEnd = DispatchTime.now().uptimeNanoseconds
-        let generationTimeMs = Self.milliseconds(from: generationEnd - generationStart)
-        let tokensPerSecond = generatedTokens.isEmpty
-            ? 0
-            : Double(generatedTokens.count) / max(generationTimeMs / 1_000, 1e-9)
-
-        return GenerationResult(
-            text: tokenizer.decode(allTokens.map(Int.init)),
-            tokens: generatedTokens,
-            promptTokens: promptTokens,
-            tokenLatenciesMs: tokenLatenciesMs,
-            tokensPerSecond: tokensPerSecond,
+        return emission.makeResult(
             compileTimeMs: compileTimeMs,
-            firstTokenLatencyMs: firstTokenLatencyMs,
             exactHeadBackend: classifierStrategy.exactHeadBackendLabel,
             cachedBindingsEnabled: false
         )
@@ -2070,7 +2112,8 @@ public struct RealModelInferenceEngine: ~Copyable {
         config: MultiModelConfig,
         weightDir: String,
         promptTokenSuite: [[TokenID]],
-        maxTokens: Int
+        maxTokens: Int,
+        options decodeOptions: DecodePathOptions? = nil
     ) throws -> [GenerationResult] {
         guard !promptTokenSuite.isEmpty else {
             throw RealModelInferenceError.invalidGenerationParameters("Testing prompt suite must not be empty")
@@ -2088,51 +2131,11 @@ public struct RealModelInferenceEngine: ~Copyable {
         try validateDirectory(weightDirURL)
         try validateMetadataIfPresent(config: config, weightDirURL: weightDirURL)
 
-        let topLevelAssets: TopLevelAssets
-        switch config.architecture {
-        case .gpt2:
-            let topLevelPaths = try resolveTopLevelWeightPaths(config: config, weightDir: weightDir)
-            let tokenEmbedding = try loadWeightTablePreferringFloat32Sidecar(
-                at: topLevelPaths.tokenEmbedding,
-                expectedCount: config.vocab * config.dModel
-            )
-            let positionEmbedding = try loadWeightTable(
-                at: topLevelPaths.positionEmbedding,
-                expectedCount: config.maxSeq * config.dModel
-            )
-            let finalNormGamma = try loadWeightTablePreferringFloat32Sidecar(
-                at: topLevelPaths.finalNormGamma,
-                expectedCount: config.dModel
-            )
-            let finalNormBeta = try loadWeightTable(
-                at: topLevelPaths.finalNormBeta,
-                expectedCount: config.dModel
-            )
-            let lmHead = try loadWeightTablePreferringFloat32Sidecar(
-                at: topLevelPaths.lmHead,
-                expectedCount: config.vocab * config.dModel
-            )
-            topLevelAssets = .gpt2(GPT2TopLevelAssets(
-                tokenEmbedding: tokenEmbedding,
-                positionEmbedding: positionEmbedding,
-                finalNormGamma: finalNormGamma,
-                finalNormBeta: finalNormBeta,
-                lmHead: lmHead,
-                finalNormGammaPath: topLevelPaths.finalNormGamma,
-                finalNormBetaPath: topLevelPaths.finalNormBeta,
-                finalNormGammaCompilePath: compileBlobPath(actualPath: topLevelPaths.finalNormGamma, rootDir: weightDirURL),
-                finalNormBetaCompilePath: compileBlobPath(actualPath: topLevelPaths.finalNormBeta, rootDir: weightDirURL),
-                finalNormGammaData: WeightBlob.build(from: finalNormGamma, rows: 1, cols: finalNormGamma.count),
-                finalNormBetaData: WeightBlob.build(from: finalNormBeta, rows: 1, cols: finalNormBeta.count)
-            ))
-        case .llama:
-            let topLevelPaths = try resolveLlamaTopLevelWeightPaths(config: config, weightDir: weightDir)
-            topLevelAssets = .llama(try loadLlamaTopLevelAssets(
-                config: config,
-                topLevelPaths: topLevelPaths,
-                weightDirURL: weightDirURL
-            ))
-        }
+        let topLevelAssets = try TopLevelAssetLoader.load(
+            config: config,
+            weightDir: weightDir,
+            weightDirURL: weightDirURL
+        )
 
         var engine = RealModelInferenceEngine(
             config: config,
@@ -2155,38 +2158,22 @@ public struct RealModelInferenceEngine: ~Copyable {
             maxSeq: config.maxSeq
         )
 
-        let environment = ProcessInfo.processInfo.environment
-        let trunk = try resolvedTrunk(
+        let seam = Self.resolveDecodePlanSeam(config: config, options: decodeOptions)
+        let trunk = try DecodePathPolicy.resolvedTrunk(
             config: config,
-            environment: environment
+            fusedHybridPreferred: seam.fusedHybridPreferred,
+            options: seam.options
         )
         var compileTimeMs = 0.0
-        var metalAttention: MetalAttentionKernel?
-        switch trunk {
-        case .fusedHybrid:
-            let compileStart = DispatchTime.now().uptimeNanoseconds
-            let compileDidRun: Bool
-            do {
-                compileDidRun = try engine.ensureFusedHybridCompiled(bucket: bucket)
-            } catch let error as RealModelInferenceError {
-                if case .hybridFallbackDisabled = error { throw error }
-                throw fusedHybridFallbackError(reason: error.errorDescription ?? "\(error)")
-            } catch {
-                throw fusedHybridFallbackError(reason: "\(error)")
-            }
-            let compileEnd = DispatchTime.now().uptimeNanoseconds
-            compileTimeMs = compileDidRun ? milliseconds(from: compileEnd - compileStart) : 0
-        case .splitHybrid:
-            let compileStart = DispatchTime.now().uptimeNanoseconds
-            let compileDidRun = try engine.ensureHybridCompiledLlama(bucket: bucket)
-            guard let attention = engine.hybridMetalAttention else {
-                throw RealModelInferenceError.runtimeFailure("Hybrid Metal attention unavailable for llama testing helper")
-            }
-            metalAttention = attention
-            let compileEnd = DispatchTime.now().uptimeNanoseconds
-            compileTimeMs = compileDidRun ? milliseconds(from: compileEnd - compileStart) : 0
-        case .exactCPU:
-            break
+        var preparation: LlamaTrunkPreparation?
+        if trunk != .exactCPU {
+            // Compile once for the longest prompt so no prompt triggers a second compile.
+            preparation = try engine.prepareLlamaTrunkDecode(
+                trunk,
+                bucket: bucket,
+                sessionKind: "llama testing helper"
+            )
+            compileTimeMs = preparation?.compileTimeMs ?? 0
         }
 
         var results: [GenerationResult] = []
@@ -2198,63 +2185,22 @@ public struct RealModelInferenceEngine: ~Copyable {
                     "Prompt of \(prompt.count) tokens leaves no room to generate within context \(config.maxSeq)"
                 )
             }
-            switch trunk {
-            case .exactCPU:
-                results.append(
-                    try engine.generateIncrementalExactCPULlama(
-                        promptTokens: prompt,
-                        effectiveMaxTokens: effectiveMaxTokens,
-                        temperature: 0,
-                        compileTimeMs: 0,
-                        maxSeq: bucket,
-                        onStep: nil
-                    )
-                )
-            case .fusedHybrid:
-                let result = try engine.generateIncrementalFusedHybridLlama(
+            // Drop the profile string so the next ANE eval cannot smash a
+            // heap object that must survive the whole suite.
+            results.append(
+                try engine.dispatchLlamaTrunkDecode(LlamaDecodeRequest(
+                    trunk: trunk,
+                    bucket: bucket,
+                    sessionKind: "llama testing helper",
                     promptTokens: prompt,
                     effectiveMaxTokens: effectiveMaxTokens,
                     temperature: 0,
                     compileTimeMs: results.isEmpty ? compileTimeMs : 0,
-                    maxSeq: max(bucket, engine.compiledFusedHybridBucket),
-                    onStep: nil
-                )
-                // Drop the profile string so the next ANE eval cannot smash a
-                // heap object that must survive the whole suite.
-                results.append(
-                    GenerationResult(
-                        text: result.text,
-                        tokens: result.tokens,
-                        promptTokens: result.promptTokens,
-                        tokenLatenciesMs: result.tokenLatenciesMs,
-                        tokensPerSecond: result.tokensPerSecond,
-                        compileTimeMs: result.compileTimeMs,
-                        firstTokenLatencyMs: result.firstTokenLatencyMs,
-                        exactHeadBackend: result.exactHeadBackend,
-                        cachedBindingsEnabled: result.cachedBindingsEnabled,
-                        committedExactTokensPerPass: result.committedExactTokensPerPass,
-                        acceptedFutureTokensPerPass: result.acceptedFutureTokensPerPass,
-                        trunk: result.trunk,
-                        hopsPerToken: result.hopsPerToken,
-                        decodeProfileReport: nil
-                    )
-                )
-            case .splitHybrid:
-                guard let attention = metalAttention else {
-                    throw RealModelInferenceError.runtimeFailure("Hybrid Metal attention unavailable for llama testing helper")
-                }
-                results.append(
-                    try engine.generateIncrementalHybridLlama(
-                        promptTokens: prompt,
-                        effectiveMaxTokens: effectiveMaxTokens,
-                        temperature: 0,
-                        compileTimeMs: results.isEmpty ? compileTimeMs : 0,
-                        maxSeq: bucket,
-                        metalAttention: attention,
-                        onStep: nil
-                    )
-                )
-            }
+                    preparation: preparation,
+                    maxSeq: trunk == .splitHybrid ? bucket : nil,
+                    dropsDecodeProfileReport: true
+                ))
+            )
         }
         return results
     }
@@ -2273,7 +2219,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         try validateDirectory(weightDirURL)
         try validateMetadataIfPresent(config: config, weightDirURL: weightDirURL)
 
-        let topLevelAssets = try loadTestingTopLevelAssets(
+        let topLevelAssets = try TopLevelAssetLoader.load(
             config: config,
             weightDir: weightDir,
             weightDirURL: weightDirURL
@@ -2316,7 +2262,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         try validateDirectory(weightDirURL)
         try validateMetadataIfPresent(config: config, weightDirURL: weightDirURL)
 
-        let topLevelAssets = try loadTestingTopLevelAssets(
+        let topLevelAssets = try TopLevelAssetLoader.load(
             config: config,
             weightDir: weightDir,
             weightDirURL: weightDirURL
@@ -2336,152 +2282,6 @@ public struct RealModelInferenceEngine: ~Copyable {
             onStep: nil
         )
         return result.tokens
-    }
-
-    private static func loadTestingTopLevelAssets(
-        config: MultiModelConfig,
-        weightDir: String,
-        weightDirURL: URL
-    ) throws -> TopLevelAssets {
-        switch config.architecture {
-        case .gpt2:
-            let topLevelPaths = try resolveTopLevelWeightPaths(config: config, weightDir: weightDir)
-            let tokenEmbedding = try loadWeightTablePreferringFloat32Sidecar(
-                at: topLevelPaths.tokenEmbedding,
-                expectedCount: config.vocab * config.dModel
-            )
-            let positionEmbedding = try loadWeightTable(
-                at: topLevelPaths.positionEmbedding,
-                expectedCount: config.maxSeq * config.dModel
-            )
-            let finalNormGamma = try loadWeightTablePreferringFloat32Sidecar(
-                at: topLevelPaths.finalNormGamma,
-                expectedCount: config.dModel
-            )
-            let finalNormBeta = try loadWeightTable(
-                at: topLevelPaths.finalNormBeta,
-                expectedCount: config.dModel
-            )
-            let lmHead = try loadWeightTablePreferringFloat32Sidecar(
-                at: topLevelPaths.lmHead,
-                expectedCount: config.vocab * config.dModel
-            )
-            return .gpt2(GPT2TopLevelAssets(
-                tokenEmbedding: tokenEmbedding,
-                positionEmbedding: positionEmbedding,
-                finalNormGamma: finalNormGamma,
-                finalNormBeta: finalNormBeta,
-                lmHead: lmHead,
-                finalNormGammaPath: topLevelPaths.finalNormGamma,
-                finalNormBetaPath: topLevelPaths.finalNormBeta,
-                finalNormGammaCompilePath: compileBlobPath(actualPath: topLevelPaths.finalNormGamma, rootDir: weightDirURL),
-                finalNormBetaCompilePath: compileBlobPath(actualPath: topLevelPaths.finalNormBeta, rootDir: weightDirURL),
-                finalNormGammaData: WeightBlob.build(from: finalNormGamma, rows: 1, cols: finalNormGamma.count),
-                finalNormBetaData: WeightBlob.build(from: finalNormBeta, rows: 1, cols: finalNormBeta.count)
-            ))
-        case .llama:
-            let topLevelPaths = try resolveLlamaTopLevelWeightPaths(config: config, weightDir: weightDir)
-            return .llama(try loadLlamaTopLevelAssets(
-                config: config,
-                topLevelPaths: topLevelPaths,
-                weightDirURL: weightDirURL
-            ))
-        }
-    }
-
-    private static func loadLlamaTopLevelAssets(
-        config: MultiModelConfig,
-        topLevelPaths: LlamaTopLevelWeightPaths,
-        weightDirURL: URL,
-        environment: [String: String] = ProcessInfo.processInfo.environment
-    ) throws -> LlamaTopLevelAssets {
-        let tokenEmbedding = try loadWeightTablePreferringFloat32Sidecar(
-            at: topLevelPaths.tokenEmbedding,
-            expectedCount: config.vocab * config.dModel
-        )
-        let finalNormGamma = try loadWeightTablePreferringFloat32Sidecar(
-            at: topLevelPaths.finalNormGamma,
-            expectedCount: config.dModel
-        )
-        let lmHead = try loadWeightTablePreferringFloat32Sidecar(
-            at: topLevelPaths.lmHead,
-            expectedCount: config.vocab * config.dModel
-        )
-        let lmHeadFP16 = try loadRawFP16WeightTableIfNoExactFloat32Sidecar(
-            at: topLevelPaths.lmHead,
-            expectedCount: config.vocab * config.dModel
-        )
-        let factoredOutputHead = try loadLlamaFactoredOutputHead(
-            config: config,
-            weightDirURL: weightDirURL,
-            environment: environment
-        )
-        return LlamaTopLevelAssets(
-            tokenEmbedding: tokenEmbedding,
-            finalNormGamma: finalNormGamma,
-            lmHead: lmHead,
-            lmHeadFP16: lmHeadFP16,
-            lmHeadHasExactFloat32Sidecar: lmHeadFP16 == nil,
-            factoredOutputHead: factoredOutputHead,
-            finalNormGammaPath: topLevelPaths.finalNormGamma,
-            finalNormGammaCompilePath: compileBlobPath(actualPath: topLevelPaths.finalNormGamma, rootDir: weightDirURL),
-            finalNormGammaData: WeightBlob.build(from: finalNormGamma, rows: 1, cols: finalNormGamma.count)
-        )
-    }
-
-    private static func loadLlamaFactoredOutputHead(
-        config: MultiModelConfig,
-        weightDirURL: URL,
-        environment: [String: String]
-    ) throws -> LlamaTopLevelAssets.FactoredOutputHead? {
-        guard config.architecture == .llama,
-              environment["ESPRESSO_BUNDLE_OUTPUT_HEAD_KIND"] == "factored" else {
-            return nil
-        }
-
-        guard let bottleneckRaw = environment["ESPRESSO_BUNDLE_OUTPUT_HEAD_BOTTLENECK"],
-              let bottleneck = Int(bottleneckRaw),
-              bottleneck > 0 else {
-            throw RealModelInferenceError.invalidConfig(
-                "Factored output head requires ESPRESSO_BUNDLE_OUTPUT_HEAD_BOTTLENECK > 0"
-            )
-        }
-        guard let groupsRaw = environment["ESPRESSO_BUNDLE_OUTPUT_HEAD_GROUPS"],
-              let groups = Int(groupsRaw),
-              groups > 0 else {
-            throw RealModelInferenceError.invalidConfig(
-                "Factored output head requires ESPRESSO_BUNDLE_OUTPUT_HEAD_GROUPS > 0"
-            )
-        }
-
-        let projectionPath = try resolveBundleWeightReference(
-            environment["ESPRESSO_BUNDLE_OUTPUT_HEAD_PROJECTION_REF"] ?? "cls_proj.bin",
-            weightDirURL: weightDirURL
-        )
-        let expansionPath = try resolveBundleWeightReference(
-            environment["ESPRESSO_BUNDLE_OUTPUT_HEAD_EXPANSION_REF"] ?? "cls_expand.bin",
-            weightDirURL: weightDirURL
-        )
-
-        let projectionCompactCount = bottleneck * (config.dModel / groups)
-        let projectionDenseCount = bottleneck * config.dModel
-        let expansionCompactCount = config.vocab * (bottleneck / groups)
-        let expansionDenseCount = config.vocab * bottleneck
-        let projection = try loadWeightTable(
-            at: projectionPath,
-            allowedCounts: [projectionCompactCount, projectionDenseCount]
-        )
-        let expansion = try loadWeightTable(
-            at: expansionPath,
-            allowedCounts: [expansionCompactCount, expansionDenseCount]
-        )
-
-        return LlamaTopLevelAssets.FactoredOutputHead(
-            projection: projection,
-            expansion: expansion,
-            bottleneck: bottleneck,
-            groups: groups
-        )
     }
 
     static func spatialBucket(for tokenCount: Int, maxSeq: Int) -> Int {
@@ -2511,7 +2311,7 @@ public struct RealModelInferenceEngine: ~Copyable {
     static func resolvedSpeculativeDraftLayerCount(
         config: MultiModelConfig,
         temperature: Float,
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        environment: [String: String] = Self.processEnvironment
     ) -> Int? {
         guard config.architecture == .gpt2,
               temperature == 0,
@@ -2622,7 +2422,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         layer: Int,
         spatial: Int,
         input: [Float],
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        environment: [String: String] = Self.processEnvironment
     ) throws -> [Float] {
         let weightDirURL = URL(fileURLWithPath: weightDir, isDirectory: true)
         try validateDirectory(weightDirURL)
@@ -2670,7 +2470,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         layer: Int,
         spatial: Int,
         input: [Float],
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        environment: [String: String] = Self.processEnvironment
     ) throws -> [Float] {
         try compileAndEvalSingleLayerAttentionOutputsForTesting(
             config: config,
@@ -2688,7 +2488,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         layer: Int,
         spatial: Int,
         input: [Float],
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        environment: [String: String] = Self.processEnvironment
     ) throws -> AttentionTestingOutputs {
         let weightDirURL = URL(fileURLWithPath: weightDir, isDirectory: true)
         try validateDirectory(weightDirURL)
@@ -2744,8 +2544,11 @@ public struct RealModelInferenceEngine: ~Copyable {
         weightDir: String,
         layer: Int = 0,
         spatials: [Int] = [64, 128, 256],
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        environment: [String: String]? = nil
     ) throws -> [GPT2AttentionCompileProbeResult] {
+        // Public declarations cannot reference internal symbols in default arguments,
+        // so the bootstrap seam is applied here instead of in the parameter default.
+        let environment = environment ?? Self.processEnvironment
         guard config.architecture == .gpt2 else {
             throw RealModelInferenceError.unsupportedArchitecture(
                 "GPT-2 attention compile probe supports GPT-2 architectures only."
@@ -2813,7 +2616,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         weightDir: String,
         layer: Int = 0,
         spatial: Int,
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        environment: [String: String] = Self.processEnvironment
     ) throws -> String {
         let weightDirURL = URL(fileURLWithPath: weightDir, isDirectory: true)
         try validateDirectory(weightDirURL)
@@ -2957,7 +2760,7 @@ public struct RealModelInferenceEngine: ~Copyable {
                 headDim: config.headDim,
                 preferCPUDecodeAttention: Self.prefersCPUDecodeAttention(
                     config: config,
-                    environment: ProcessInfo.processInfo.environment
+                    environment: Self.processEnvironment
                 ),
                 timings: &timings
             )
@@ -3047,7 +2850,7 @@ public struct RealModelInferenceEngine: ~Copyable {
                 headDim: config.headDim,
                 preferCPUDecodeAttention: Self.prefersCPUDecodeAttention(
                     config: config,
-                    environment: ProcessInfo.processInfo.environment
+                    environment: Self.processEnvironment
                 ),
                 timings: &timings
             )
@@ -3257,7 +3060,7 @@ public struct RealModelInferenceEngine: ~Copyable {
                 headDim: config.headDim,
                 preferCPUDecodeAttention: Self.prefersCPUDecodeAttention(
                     config: config,
-                    environment: ProcessInfo.processInfo.environment
+                    environment: Self.processEnvironment
                 ),
                 postQKVHook: ropeHook,
                 timings: &timings
@@ -4119,7 +3922,7 @@ public struct RealModelInferenceEngine: ~Copyable {
                 headDim: config.headDim,
                 preferCPUDecodeAttention: Self.prefersCPUDecodeAttention(
                     config: config,
-                    environment: ProcessInfo.processInfo.environment
+                    environment: Self.processEnvironment
                 ),
                 postQKVHook: ropeHook,
                 timings: &timings
@@ -4333,7 +4136,7 @@ public struct RealModelInferenceEngine: ~Copyable {
                 headDim: config.headDim,
                 preferCPUDecodeAttention: Self.prefersCPUDecodeAttention(
                     config: config,
-                    environment: ProcessInfo.processInfo.environment
+                    environment: Self.processEnvironment
                 ),
                 postQKVHook: ropeHook,
                 timings: &timings
@@ -4532,7 +4335,7 @@ public struct RealModelInferenceEngine: ~Copyable {
                 headDim: config.headDim,
                 preferCPUDecodeAttention: Self.prefersCPUDecodeAttention(
                     config: config,
-                    environment: ProcessInfo.processInfo.environment
+                    environment: Self.processEnvironment
                 ),
                 postQKVHook: ropeHook,
                 timings: &timings
@@ -4685,7 +4488,7 @@ public struct RealModelInferenceEngine: ~Copyable {
                 headDim: config.headDim,
                 preferCPUDecodeAttention: Self.prefersCPUDecodeAttention(
                     config: config,
-                    environment: ProcessInfo.processInfo.environment
+                    environment: Self.processEnvironment
                 ),
                 postQKVHook: ropeHook,
                 timings: &timings
@@ -4793,7 +4596,7 @@ public struct RealModelInferenceEngine: ~Copyable {
     }
 
     static func requireANEHardwareTestsEnabled() throws {
-        guard ProcessInfo.processInfo.environment["ANE_HARDWARE_TESTS"] == "1" else {
+        guard Self.processEnvironment["ANE_HARDWARE_TESTS"] == "1" else {
             throw RealModelInferenceError.runtimeFailure("Set ANE_HARDWARE_TESTS=1 to run ANE hardware tests")
         }
         let handle = dlopen(
@@ -4808,8 +4611,11 @@ public struct RealModelInferenceEngine: ~Copyable {
     }
 
     private mutating func ensureCompiled(bucket: Int) throws -> Bool {
-        guard compiledBucket < bucket else {
+        switch baselineReadiness {
+        case .compiled(let runtime) where runtime.bucket >= bucket:
             return false
+        case .compiled, .notCompiled:
+            break
         }
 
         let newLayers = try Self.compileLayers(
@@ -4833,148 +4639,35 @@ public struct RealModelInferenceEngine: ~Copyable {
         }
         compiledLayers = newLayers
         compiledHead = newHead
-        firstLayerInputSurface = newInputSurface
-        compiledBucket = bucket
+        baselineReadiness = .compiled(BaselineCompiledRuntime(bucket: bucket, inputSurface: newInputSurface))
         return true
     }
 
+    /// Compiles split-hybrid decode programs when the resident set covers less context.
+    ///
+    /// One parameterized implementation serves both model families: the former
+    /// GPT-2/llama ensure twins differed only in surface-handle geometry,
+    /// output-head compilation, and error prefixes. Split-hybrid readiness
+    /// transitions to `.compiled` after the output-head section, before the
+    /// family-specific greedy-classifier section — a greedy-head compile failure
+    /// must not unready the trunk's decode programs, matching the former flag
+    /// semantics where such failures still served hybrid decode via CPU logits.
     private mutating func ensureHybridCompiled(bucket: Int) throws -> Bool {
         var didCompile = false
 
-        if compiledHybridBucket < bucket {
+        // Both flavors share every program up to the output head; only the
+        // surface-handle geometry and head compilation differ.
+        let isLlama = config.architecture == .llama
+        let surfaceDim = isLlama ? config.dModel : ModelConfig.dim
+        let surfaceQDim: Int? = isLlama ? config.attentionDim : nil
+        let surfaceKVDim: Int? = isLlama ? config.nKVHead * config.headDim : nil
+
+        if splitHybridLayerBucket < bucket {
             let newLayers = try Self.compileHybridLayers(
                 config: config,
                 weightDirURL: weightDirURL,
-                maxSeq: bucket
-            )
-            let newQKNormWeights = try Self.loadHybridLlamaQKNormWeights(
-                config: config,
-                weightDirURL: weightDirURL
-            )
-            var newSurfaceHandles: [HybridDecodeSurfaceHandles] = []
-            newSurfaceHandles.reserveCapacity(newLayers.count)
-            for layerIndex in 0..<newLayers.count {
-                do {
-                    newSurfaceHandles.append(
-                        try HybridDecodeSurfaceHandles(
-                            kernels: newLayers[layerIndex],
-                            logicalMaxSeq: bucket
-                        )
-                    )
-                } catch {
-                    throw RealModelInferenceError.runtimeFailure(
-                        "Hybrid decode surfaces unavailable for layer \(layerIndex): \(error)"
-                    )
-                }
-            }
-            if newLayers.count > 1,
-               Self.usesHybridLayerInputRebinding(
-                   architecture: config.architecture,
-                   environment: ProcessInfo.processInfo.environment
-               ) {
-                for layerIndex in 1..<newLayers.count {
-                    do {
-                        try newLayers[layerIndex].decodeQKVOnly.rebindInput(
-                            at: 0,
-                            to: newSurfaceHandles[layerIndex - 1].ffnOut
-                        )
-                    } catch {
-                        throw RealModelInferenceError.runtimeFailure(
-                            "Hybrid decode chaining unavailable for layer \(layerIndex): \(error)"
-                        )
-                    }
-                }
-            }
-
-            compiledHybridLayers = newLayers
-            compiledHybridSurfaceHandles = newSurfaceHandles
-            compiledHybridLlamaQKNormWeights = newQKNormWeights
-            compiledHybridBucket = bucket
-            didCompile = true
-        }
-
-        if compiledHybridLlamaQKNormWeights.count != config.nLayer {
-            compiledHybridLlamaQKNormWeights = try Self.loadHybridLlamaQKNormWeights(
-                config: config,
-                weightDirURL: weightDirURL
-            )
-        }
-
-        if hybridMetalAttention == nil {
-            do {
-                hybridMetalAttention = try MetalAttentionKernel()
-            } catch {
-                throw RealModelInferenceError.runtimeFailure("Hybrid Metal attention initialization failed: \(error)")
-            }
-            didCompile = true
-        }
-
-        let hybridHeadSpatial = Self.incrementalHeadSpatial(channels: config.dModel)
-        if compiledHybridHead.count != 1 || compiledHybridHeadSpatial != hybridHeadSpatial {
-            compiledHybridHead = try LayerStorage<CompiledHead>(count: 1, throwingInitializer: { _ in
-                try Self.compileHead(
-                    config: config,
-                    weightDirURL: weightDirURL,
-                    assets: gpt2Assets,
-                    spatial: hybridHeadSpatial
-                )
-            })
-            compiledHybridHeadSpatial = hybridHeadSpatial
-            try Self.zeroSurface(compiledHybridHead[0].inputSurface)
-            didCompile = true
-        }
-
-        if classifierStrategy.usesANEClassifier {
-            if compiledHybridGreedyNorm.count != 1 ||
-                compiledHybridGreedyClassifier.count != 1 ||
-                compiledHybridGreedySpatial != hybridHeadSpatial {
-                compiledHybridGreedyNorm = try LayerStorage<CompiledHead>(count: 1, throwingInitializer: { _ in
-                    try Self.compileHead(
-                        config: config,
-                        weightDirURL: weightDirURL,
-                        assets: gpt2Assets,
-                        spatial: hybridHeadSpatial,
-                        inputDType: .fp16,
-                        outputDType: .fp16
-                    )
-                })
-                compiledHybridGreedyClassifier = try LayerStorage<CompiledClassifier>(count: 1, throwingInitializer: { _ in
-                    try Self.compileClassifier(
-                        config: config,
-                        assets: gpt2Assets,
-                        spatial: hybridHeadSpatial
-                    )
-                })
-                compiledHybridGreedySpatial = hybridHeadSpatial
-                try compiledHybridGreedyClassifier[0].kernel.rebindInput(
-                    at: 0,
-                    to: compiledHybridGreedyNorm[0].outputSurface
-                )
-                didCompile = true
-            }
-
-            if compiledHybridGreedyNorm.count == 1,
-               compiledHybridGreedyClassifier.count == 1,
-               let finalSurface = compiledHybridSurfaceHandles.last?.ffnOut {
-                try compiledHybridGreedyNorm[0].kernel.rebindInput(at: 0, to: finalSurface)
-                try compiledHybridGreedyClassifier[0].kernel.rebindInput(
-                    at: 0,
-                    to: compiledHybridGreedyNorm[0].outputSurface
-                )
-            }
-        }
-
-        return didCompile
-    }
-
-    private mutating func ensureHybridCompiledLlama(bucket: Int) throws -> Bool {
-        var didCompile = false
-
-        if compiledHybridBucket < bucket {
-            let newLayers = try Self.compileHybridLayers(
-                config: config,
-                weightDirURL: weightDirURL,
-                maxSeq: bucket
+                maxSeq: bucket,
+                environment: policies.environment
             )
             let newQKNormWeights = try Self.loadHybridLlamaQKNormWeights(
                 config: config,
@@ -4988,21 +4681,21 @@ public struct RealModelInferenceEngine: ~Copyable {
                         try HybridDecodeSurfaceHandles(
                             kernels: newLayers[layerIndex],
                             logicalMaxSeq: bucket,
-                            dim: config.dModel,
-                            qDim: config.attentionDim,
-                            kvDim: config.nKVHead * config.headDim
+                            dim: surfaceDim,
+                            qDim: surfaceQDim,
+                            kvDim: surfaceKVDim
                         )
                     )
                 } catch {
                     throw RealModelInferenceError.runtimeFailure(
-                        "Llama hybrid decode surfaces unavailable for layer \(layerIndex): \(error)"
+                        "\(isLlama ? "Llama hybrid" : "Hybrid") decode surfaces unavailable for layer \(layerIndex): \(error)"
                     )
                 }
             }
             if newLayers.count > 1,
                Self.usesHybridLayerInputRebinding(
                    architecture: config.architecture,
-                   environment: ProcessInfo.processInfo.environment
+                   environment: policies.environment
                ) {
                 for layerIndex in 1..<newLayers.count {
                     do {
@@ -5012,7 +4705,7 @@ public struct RealModelInferenceEngine: ~Copyable {
                         )
                     } catch {
                         throw RealModelInferenceError.runtimeFailure(
-                            "Llama hybrid decode chaining unavailable for layer \(layerIndex): \(error)"
+                            "\(isLlama ? "Llama hybrid" : "Hybrid") decode chaining unavailable for layer \(layerIndex): \(error)"
                         )
                     }
                 }
@@ -5021,7 +4714,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             compiledHybridLayers = newLayers
             compiledHybridSurfaceHandles = newSurfaceHandles
             compiledHybridLlamaQKNormWeights = newQKNormWeights
-            compiledHybridBucket = bucket
+            splitHybridLayerBucket = bucket
             didCompile = true
         }
 
@@ -5036,21 +4729,28 @@ public struct RealModelInferenceEngine: ~Copyable {
             do {
                 hybridMetalAttention = try MetalAttentionKernel()
             } catch {
-                throw RealModelInferenceError.runtimeFailure("Llama hybrid Metal attention initialization failed: \(error)")
+                throw RealModelInferenceError.runtimeFailure(
+                    "\(isLlama ? "Llama hybrid" : "Hybrid") Metal attention initialization failed: \(error)"
+                )
             }
             didCompile = true
         }
 
         let hybridHeadSpatial = Self.incrementalHeadSpatial(channels: config.dModel)
-        let greedyHeadMode = hybridGreedyHeadMode()
-
-        // Compile RMSNorm head (no beta) for llama
         if compiledHybridHead.count != 1 || compiledHybridHeadSpatial != hybridHeadSpatial {
             compiledHybridHead = try LayerStorage<CompiledHead>(count: 1, throwingInitializer: { _ in
-                try Self.compileLlamaHead(
+                if isLlama {
+                    return try Self.compileLlamaHead(
+                        config: config,
+                        weightDirURL: weightDirURL,
+                        assets: llamaAssets,
+                        spatial: hybridHeadSpatial
+                    )
+                }
+                return try Self.compileHead(
                     config: config,
                     weightDirURL: weightDirURL,
-                    assets: llamaAssets,
+                    assets: gpt2Assets,
                     spatial: hybridHeadSpatial
                 )
             })
@@ -5059,78 +4759,131 @@ public struct RealModelInferenceEngine: ~Copyable {
             didCompile = true
         }
 
+        // Readiness transition: every program the split-hybrid decode loop
+        // requires is now resident, independent of the greedy head below.
+        if let runtime = SplitHybridCompiledRuntime(
+            bucket: max(bucket, splitHybridLayerBucket),
+            layerCount: compiledHybridLayers.count,
+            surfaceHandleCount: compiledHybridSurfaceHandles.count,
+            expectedLayerCount: config.nLayer,
+            headCount: compiledHybridHead.count,
+            qKNormCount: isLlama ? compiledHybridLlamaQKNormWeights.count : nil,
+            headSpatial: compiledHybridHeadSpatial
+        ) {
+            splitHybridReadiness = .compiled(runtime)
+        } else {
+            splitHybridReadiness = .notCompiled
+        }
+
         if classifierStrategy.usesANEClassifier {
-            switch greedyHeadMode {
-            case .classifierOnlyFactored:
-                if compiledHybridGreedyNorm.count != 0 {
-                    compiledHybridGreedyNorm = Self.emptyStorage(CompiledHead.self)
-                    didCompile = true
-                }
-                if compiledHybridGreedyClassifier.count != 1 {
-                    do {
+            if isLlama {
+                switch hybridGreedyHeadMode() {
+                case .classifierOnlyFactored:
+                    if compiledHybridGreedyNorm.count != 0 {
+                        compiledHybridGreedyNorm = Self.emptyStorage(CompiledHead.self)
+                        didCompile = true
+                    }
+                    if compiledHybridGreedyClassifier.count != 1 {
+                        do {
+                            compiledHybridGreedyClassifier = try LayerStorage<CompiledClassifier>(count: 1, throwingInitializer: { _ in
+                                try Self.compileLlamaFactoredClassifier(
+                                    config: config,
+                                    assets: llamaAssets,
+                                    spatial: hybridHeadSpatial
+                                )
+                            })
+                        } catch {
+                            fputs(
+                                "[RealModelInference] Llama factored classifier compile failed; falling back to dense ANE classifier: \(error)\n",
+                                stderr
+                            )
+                            compiledHybridGreedyClassifier = Self.emptyStorage(CompiledClassifier.self)
+                        }
+                        didCompile = true
+                    }
+                    if compiledHybridGreedyClassifier.count == 1,
+                       let finalSurface = compiledHybridSurfaceHandles.last?.ffnOut {
+                        try compiledHybridGreedyClassifier[0].kernel.rebindInput(at: 0, to: finalSurface)
+                    }
+                case .classifierOnlyFused:
+                    if compiledHybridGreedyNorm.count != 0 {
+                        compiledHybridGreedyNorm = Self.emptyStorage(CompiledHead.self)
+                        didCompile = true
+                    }
+                    if compiledHybridGreedyClassifier.count != 1 {
                         compiledHybridGreedyClassifier = try LayerStorage<CompiledClassifier>(count: 1, throwingInitializer: { _ in
-                            try Self.compileLlamaFactoredClassifier(
+                            try Self.compileLlamaRMSNormClassifier(
                                 config: config,
                                 assets: llamaAssets,
                                 spatial: hybridHeadSpatial
                             )
                         })
-                    } catch {
-                        fputs(
-                            "[RealModelInference] Llama factored classifier compile failed; falling back to dense ANE classifier: \(error)\n",
-                            stderr
-                        )
-                        compiledHybridGreedyClassifier = Self.emptyStorage(CompiledClassifier.self)
+                        didCompile = true
                     }
-                    didCompile = true
-                }
-                if compiledHybridGreedyClassifier.count == 1,
-                   let finalSurface = compiledHybridSurfaceHandles.last?.ffnOut {
-                    try compiledHybridGreedyClassifier[0].kernel.rebindInput(at: 0, to: finalSurface)
-                }
-            case .classifierOnlyFused:
-                if compiledHybridGreedyNorm.count != 0 {
-                    compiledHybridGreedyNorm = Self.emptyStorage(CompiledHead.self)
-                    didCompile = true
-                }
-                if compiledHybridGreedyClassifier.count != 1 {
-                    compiledHybridGreedyClassifier = try LayerStorage<CompiledClassifier>(count: 1, throwingInitializer: { _ in
-                        try Self.compileLlamaRMSNormClassifier(
-                            config: config,
-                            assets: llamaAssets,
-                            spatial: hybridHeadSpatial
+                    if compiledHybridGreedyClassifier.count == 1,
+                       let finalSurface = compiledHybridSurfaceHandles.last?.ffnOut {
+                        try compiledHybridGreedyClassifier[0].kernel.rebindInput(at: 0, to: finalSurface)
+                    }
+                case .normThenClassifier:
+                    if compiledHybridGreedyNorm.count != 1 || compiledHybridGreedySpatial != hybridHeadSpatial {
+                        compiledHybridGreedyNorm = try LayerStorage<CompiledHead>(count: 1, throwingInitializer: { _ in
+                            try Self.compileLlamaHead(
+                                config: config,
+                                weightDirURL: weightDirURL,
+                                assets: llamaAssets,
+                                spatial: hybridHeadSpatial,
+                                inputDType: .fp16,
+                                outputDType: .fp16
+                            )
+                        })
+                        compiledHybridGreedySpatial = hybridHeadSpatial
+                        didCompile = true
+                    }
+
+                    if compiledHybridGreedyClassifier.count != 1 {
+                        compiledHybridGreedyClassifier = try LayerStorage<CompiledClassifier>(count: 1, throwingInitializer: { _ in
+                            try Self.compileLlamaClassifier(
+                                config: config,
+                                assets: llamaAssets,
+                                spatial: hybridHeadSpatial
+                            )
+                        })
+                        try compiledHybridGreedyClassifier[0].kernel.rebindInput(
+                            at: 0,
+                            to: compiledHybridGreedyNorm[0].outputSurface
                         )
-                    })
-                    didCompile = true
+                        didCompile = true
+                    }
+
+                    if compiledHybridGreedyClassifier.count == 1 {
+                        try compiledHybridGreedyClassifier[0].kernel.rebindInput(
+                            at: 0,
+                            to: compiledHybridGreedyNorm[0].outputSurface
+                        )
+                    }
                 }
-                if compiledHybridGreedyClassifier.count == 1,
-                   let finalSurface = compiledHybridSurfaceHandles.last?.ffnOut {
-                    try compiledHybridGreedyClassifier[0].kernel.rebindInput(at: 0, to: finalSurface)
-                }
-            case .normThenClassifier:
-                if compiledHybridGreedyNorm.count != 1 || compiledHybridGreedySpatial != hybridHeadSpatial {
+            } else {
+                if compiledHybridGreedyNorm.count != 1 ||
+                    compiledHybridGreedyClassifier.count != 1 ||
+                    compiledHybridGreedySpatial != hybridHeadSpatial {
                     compiledHybridGreedyNorm = try LayerStorage<CompiledHead>(count: 1, throwingInitializer: { _ in
-                        try Self.compileLlamaHead(
+                        try Self.compileHead(
                             config: config,
                             weightDirURL: weightDirURL,
-                            assets: llamaAssets,
+                            assets: gpt2Assets,
                             spatial: hybridHeadSpatial,
                             inputDType: .fp16,
                             outputDType: .fp16
                         )
                     })
-                    compiledHybridGreedySpatial = hybridHeadSpatial
-                    didCompile = true
-                }
-
-                if compiledHybridGreedyClassifier.count != 1 {
                     compiledHybridGreedyClassifier = try LayerStorage<CompiledClassifier>(count: 1, throwingInitializer: { _ in
-                        try Self.compileLlamaClassifier(
+                        try Self.compileClassifier(
                             config: config,
-                            assets: llamaAssets,
+                            assets: gpt2Assets,
                             spatial: hybridHeadSpatial
                         )
                     })
+                    compiledHybridGreedySpatial = hybridHeadSpatial
                     try compiledHybridGreedyClassifier[0].kernel.rebindInput(
                         at: 0,
                         to: compiledHybridGreedyNorm[0].outputSurface
@@ -5138,7 +4891,10 @@ public struct RealModelInferenceEngine: ~Copyable {
                     didCompile = true
                 }
 
-                if compiledHybridGreedyClassifier.count == 1 {
+                if compiledHybridGreedyNorm.count == 1,
+                   compiledHybridGreedyClassifier.count == 1,
+                   let finalSurface = compiledHybridSurfaceHandles.last?.ffnOut {
+                    try compiledHybridGreedyNorm[0].kernel.rebindInput(at: 0, to: finalSurface)
                     try compiledHybridGreedyClassifier[0].kernel.rebindInput(
                         at: 0,
                         to: compiledHybridGreedyNorm[0].outputSurface
@@ -5147,7 +4903,8 @@ public struct RealModelInferenceEngine: ~Copyable {
             }
         }
 
-        if compiledHybridGreedyNorm.count == 1,
+        if isLlama,
+           compiledHybridGreedyNorm.count == 1,
            let finalSurface = compiledHybridSurfaceHandles.last?.ffnOut {
             try compiledHybridGreedyNorm[0].kernel.rebindInput(at: 0, to: finalSurface)
         }
@@ -5176,10 +4933,10 @@ public struct RealModelInferenceEngine: ~Copyable {
         onStep: ((GenerationStep) -> Void)?,
         isCancelled: (() -> Bool)? = nil
     ) throws -> GenerationResult {
-        guard compiledHybridLayers.count == config.nLayer,
-              compiledHybridSurfaceHandles.count == config.nLayer,
-              compiledHybridHead.count == 1,
-              compiledHybridHeadSpatial > 0 else {
+        switch splitHybridReadiness {
+        case .compiled:
+            break
+        case .notCompiled:
             throw RealModelInferenceError.runtimeFailure("Hybrid decode state is unavailable")
         }
 
@@ -5191,7 +4948,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         // Pre-create cached Metal bindings for all layers (GPT-2 path)
         let cachedBindings: [MetalAttentionKernel.CachedLayerBindings]? = try Self.makeHybridCachedBindingsOrFallback(
             config: config,
-            environment: ProcessInfo.processInfo.environment
+            environment: policies.environment
         ) {
             try compiledHybridSurfaceHandles.map { handles in
                 try metalAttention.createCachedLayerBindings(
@@ -5209,14 +4966,14 @@ public struct RealModelInferenceEngine: ~Copyable {
             }
         }
 
-        if ProcessInfo.processInfo.environment["ESPRESSO_REALMODEL_DEBUG_HYBRID_CACHE"] == "1",
+        if policies.debugHybridCacheDumps,
            let firstHandles = compiledHybridSurfaceHandles.first {
             fputs(
                 "[hybrid-surface] qkvIn_row=\(IOSurfaceGetBytesPerRow(firstHandles.qkvIn)) qOut_row=\(IOSurfaceGetBytesPerRow(firstHandles.qOut)) ffnIn_row=\(IOSurfaceGetBytesPerRow(firstHandles.ffnIn)) ffnOut_row=\(IOSurfaceGetBytesPerRow(firstHandles.ffnOut)) laneSpatial=\(firstHandles.laneSpatial) maxSeq=\(firstHandles.maxSeq)\n",
                 stderr
             )
         }
-        let shouldDebugHybridCache = ProcessInfo.processInfo.environment["ESPRESSO_REALMODEL_DEBUG_HYBRID_CACHE"] == "1"
+        let shouldDebugHybridCache = policies.debugHybridCacheDumps
 
         let xCur = TensorBuffer(count: config.dModel, zeroed: true)
         var decodeState: DecodeState
@@ -5253,7 +5010,7 @@ public struct RealModelInferenceEngine: ~Copyable {
                     dim: config.dModel,
                     preferCPUDecodeAttention: Self.prefersCPUDecodeAttention(
                         config: config,
-                        environment: ProcessInfo.processInfo.environment
+                        environment: policies.environment
                     ),
                     readFinalOutputIntoXCur: !useANEGreedyHead,
                     cachedBindings: cachedBindings,
@@ -5297,21 +5054,21 @@ public struct RealModelInferenceEngine: ~Copyable {
             }
         }
 
-        var allTokens = promptTokens
-        var generatedTokens: [TokenID] = []
-        var tokenLatenciesMs: [Double] = []
-        generatedTokens.reserveCapacity(effectiveMaxTokens)
-        tokenLatenciesMs.reserveCapacity(effectiveMaxTokens)
-
         let generationStart = DispatchTime.now().uptimeNanoseconds
-        var emissionStart = generationStart
-        var firstTokenLatencyMs = 0.0
-        var firstTokenRecorded = false
+        let tokenizer = self.tokenizer
+        var emission = EmissionCore(
+            promptTokens: promptTokens,
+            capacity: effectiveMaxTokens,
+            eos: .fixed(Int(Self.gpt2EOSToken)),
+            onStep: onStep,
+            decodeText: { tokenizer.decode($0) },
+            startNanos: generationStart
+        )
         var rng = SystemRandomNumberGenerator()
         var normalized = [Float](repeating: 0, count: config.dModel)
         let headSpatial = compiledHybridHeadSpatial
 
-        while generatedTokens.count < effectiveMaxTokens {
+        while emission.generatedTokenCount < effectiveMaxTokens {
             try Self.throwIfCancelled(isCancelled)
             let nextToken: TokenID
             if useANEGreedyHead {
@@ -5369,39 +5126,19 @@ public struct RealModelInferenceEngine: ~Copyable {
                 )
             }
             let emissionNow = DispatchTime.now().uptimeNanoseconds
-            let tokenLatencyMs = Self.milliseconds(from: emissionNow - emissionStart)
+            emission.recordFirstTokenIfFirst(at: emissionNow)
 
-            if !firstTokenRecorded {
-                firstTokenLatencyMs = Self.milliseconds(from: emissionNow - generationStart)
-                firstTokenRecorded = true
-            }
-
-            if nextToken == Self.gpt2EOSToken {
+            if emission.terminatesDecoding(nextToken) {
                 break
             }
 
-            generatedTokens.append(nextToken)
-            allTokens.append(nextToken)
-            let elapsedMs = Self.milliseconds(from: emissionNow - generationStart)
-            let tokensPerSecond = Double(generatedTokens.count) / max(elapsedMs / 1_000, 1e-9)
-            tokenLatenciesMs.append(tokenLatencyMs)
-            onStep?(
-                GenerationStep(
-                    token: nextToken,
-                    generatedTokens: generatedTokens,
-                    text: tokenizer.decode(allTokens.map(Int.init)),
-                    tokenLatencyMs: tokenLatencyMs,
-                    elapsedMs: elapsedMs,
-                    firstTokenLatencyMs: firstTokenLatencyMs,
-                    tokensPerSecond: tokensPerSecond
-                )
-            )
+            emission.emit(nextToken, at: emissionNow)
 
-            if generatedTokens.count >= effectiveMaxTokens || allTokens.count >= config.maxSeq {
+            if emission.generatedTokenCount >= effectiveMaxTokens || emission.allTokensCount >= config.maxSeq {
                 break
             }
 
-            try writeIncrementalEmbedding(token: nextToken, position: allTokens.count - 1, into: xCur)
+            try writeIncrementalEmbedding(token: nextToken, position: emission.allTokensCount - 1, into: xCur)
             do {
                 try ForwardPass.runHybridDecodeTimed(
                     xCur: xCur,
@@ -5412,7 +5149,7 @@ public struct RealModelInferenceEngine: ~Copyable {
                     dim: config.dModel,
                     preferCPUDecodeAttention: Self.prefersCPUDecodeAttention(
                         config: config,
-                        environment: ProcessInfo.processInfo.environment
+                        environment: policies.environment
                     ),
                     readFinalOutputIntoXCur: !useANEGreedyHead,
                     cachedBindings: cachedBindings,
@@ -5420,26 +5157,13 @@ public struct RealModelInferenceEngine: ~Copyable {
                 )
             } catch {
                 throw RealModelInferenceError.runtimeFailure(
-                    "Hybrid decode failed at generated token \(generatedTokens.count - 1): \(error)"
+                    "Hybrid decode failed at generated token \(emission.generatedTokenCount - 1): \(error)"
                 )
             }
-            emissionStart = emissionNow
         }
 
-        let generationEnd = DispatchTime.now().uptimeNanoseconds
-        let generationTimeMs = Self.milliseconds(from: generationEnd - generationStart)
-        let tokensPerSecond = generatedTokens.isEmpty
-            ? 0
-            : Double(generatedTokens.count) / max(generationTimeMs / 1_000, 1e-9)
-
-        return GenerationResult(
-            text: tokenizer.decode(allTokens.map(Int.init)),
-            tokens: generatedTokens,
-            promptTokens: promptTokens,
-            tokenLatenciesMs: tokenLatenciesMs,
-            tokensPerSecond: tokensPerSecond,
+        return emission.makeResult(
             compileTimeMs: compileTimeMs,
-            firstTokenLatencyMs: firstTokenLatencyMs,
             exactHeadBackend: classifierStrategy.exactHeadBackendLabel,
             cachedBindingsEnabled: false
         )
@@ -5476,47 +5200,23 @@ public struct RealModelInferenceEngine: ~Copyable {
             }
         }
 
-        var allTokens = promptTokens
-        var generatedTokens: [TokenID] = []
-        var tokenLatenciesMs: [Double] = []
-        generatedTokens.reserveCapacity(effectiveMaxTokens)
-        tokenLatenciesMs.reserveCapacity(effectiveMaxTokens)
-
         let generationStart = DispatchTime.now().uptimeNanoseconds
-        var emissionStart = generationStart
-        var firstTokenLatencyMs = 0.0
-        var firstTokenRecorded = false
+        let tokenizer = self.tokenizer
+        var emission = EmissionCore(
+            promptTokens: promptTokens,
+            capacity: effectiveMaxTokens,
+            eos: .fixed(Int(Self.gpt2EOSToken)),
+            onStep: onStep,
+            decodeText: { tokenizer.decode($0) },
+            startNanos: generationStart
+        )
 
-        func emitToken(_ token: TokenID, at emissionNow: UInt64) {
-            generatedTokens.append(token)
-            allTokens.append(token)
-            let elapsedMs = Self.milliseconds(from: emissionNow - generationStart)
-            let tokenLatencyMs = Self.milliseconds(from: emissionNow - emissionStart)
-            tokenLatenciesMs.append(tokenLatencyMs)
-            if !firstTokenRecorded {
-                firstTokenLatencyMs = Self.milliseconds(from: emissionNow - generationStart)
-                firstTokenRecorded = true
-            }
-            let tokensPerSecond = Double(generatedTokens.count) / max(elapsedMs / 1_000, 1e-9)
-            onStep?(
-                GenerationStep(
-                    token: token,
-                    generatedTokens: generatedTokens,
-                    text: tokenizer.decode(allTokens.map(Int.init)),
-                    tokenLatencyMs: tokenLatencyMs,
-                    elapsedMs: elapsedMs,
-                    firstTokenLatencyMs: firstTokenLatencyMs,
-                    tokensPerSecond: tokensPerSecond
-                )
-            )
-        }
-
-        while generatedTokens.count < effectiveMaxTokens {
+        while emission.generatedTokenCount < effectiveMaxTokens {
             let checkpoint = try cachedRuntimePair.draftRuntime.captureCheckpoint(dim: config.dModel)
             let proposedToken0: TokenID
             do {
                 proposedToken0 = try cachedRuntimePair.draftRuntime.selectGreedyToken(vocab: config.vocab)
-                try writeIncrementalEmbedding(token: proposedToken0, position: allTokens.count, into: xCur)
+                try writeIncrementalEmbedding(token: proposedToken0, position: emission.allTokensCount, into: xCur)
                 try cachedRuntimePair.draftRuntime.advanceFromBuffer(
                     xCur,
                     metalAttention: metalAttention,
@@ -5524,7 +5224,7 @@ public struct RealModelInferenceEngine: ~Copyable {
                 )
             } catch {
                 throw RealModelInferenceError.runtimeFailure(
-                    "Hybrid speculative draft proposal-0 failed at generated token \(generatedTokens.count): \(error)"
+                    "Hybrid speculative draft proposal-0 failed at generated token \(emission.generatedTokenCount): \(error)"
                 )
             }
 
@@ -5533,7 +5233,7 @@ public struct RealModelInferenceEngine: ~Copyable {
                 proposedToken1 = try cachedRuntimePair.draftRuntime.selectGreedyToken(vocab: config.vocab)
             } catch {
                 throw RealModelInferenceError.runtimeFailure(
-                    "Hybrid speculative draft proposal-1 failed at generated token \(generatedTokens.count): \(error)"
+                    "Hybrid speculative draft proposal-1 failed at generated token \(emission.generatedTokenCount): \(error)"
                 )
             }
 
@@ -5542,10 +5242,10 @@ public struct RealModelInferenceEngine: ~Copyable {
                 exactToken0 = try cachedRuntimePair.verifierRuntime.selectGreedyToken(vocab: config.vocab)
             } catch {
                 throw RealModelInferenceError.runtimeFailure(
-                    "Hybrid speculative verifier token-0 failed at generated token \(generatedTokens.count): \(error)"
+                    "Hybrid speculative verifier token-0 failed at generated token \(emission.generatedTokenCount): \(error)"
                 )
             }
-            if exactToken0 == Self.gpt2EOSToken {
+            if emission.terminatesDecoding(exactToken0) {
                 break
             }
 
@@ -5556,7 +5256,7 @@ public struct RealModelInferenceEngine: ~Copyable {
                         mutatedTokenCount: 1,
                         dim: config.dModel
                     )
-                    try writeIncrementalEmbedding(token: exactToken0, position: allTokens.count, into: xCur)
+                    try writeIncrementalEmbedding(token: exactToken0, position: emission.allTokensCount, into: xCur)
                     try cachedRuntimePair.draftRuntime.advanceFromBuffer(
                         xCur,
                         metalAttention: metalAttention,
@@ -5569,14 +5269,13 @@ public struct RealModelInferenceEngine: ~Copyable {
                     )
                 } catch {
                     throw RealModelInferenceError.runtimeFailure(
-                        "Hybrid speculative verifier rollback failed at generated token \(generatedTokens.count): \(error)"
+                        "Hybrid speculative verifier rollback failed at generated token \(emission.generatedTokenCount): \(error)"
                     )
                 }
 
                 let emissionNow = DispatchTime.now().uptimeNanoseconds
-                emitToken(exactToken0, at: emissionNow)
-                emissionStart = emissionNow
-                if generatedTokens.count >= effectiveMaxTokens || allTokens.count >= config.maxSeq {
+                emission.emit(exactToken0, at: emissionNow)
+                if emission.generatedTokenCount >= effectiveMaxTokens || emission.allTokensCount >= config.maxSeq {
                     break
                 }
                 continue
@@ -5590,15 +5289,14 @@ public struct RealModelInferenceEngine: ~Copyable {
                 )
             } catch {
                 throw RealModelInferenceError.runtimeFailure(
-                    "Hybrid speculative verifier promotion failed at generated token \(generatedTokens.count): \(error)"
+                    "Hybrid speculative verifier promotion failed at generated token \(emission.generatedTokenCount): \(error)"
                 )
             }
 
             let emissionAfterFirst = DispatchTime.now().uptimeNanoseconds
-            emitToken(exactToken0, at: emissionAfterFirst)
-            emissionStart = emissionAfterFirst
+            emission.emit(exactToken0, at: emissionAfterFirst)
 
-            if generatedTokens.count >= effectiveMaxTokens || allTokens.count >= config.maxSeq {
+            if emission.generatedTokenCount >= effectiveMaxTokens || emission.allTokensCount >= config.maxSeq {
                 break
             }
 
@@ -5607,16 +5305,16 @@ public struct RealModelInferenceEngine: ~Copyable {
                 exactToken1 = try cachedRuntimePair.verifierRuntime.selectGreedyToken(vocab: config.vocab)
             } catch {
                 throw RealModelInferenceError.runtimeFailure(
-                    "Hybrid speculative verifier token-1 failed at generated token \(generatedTokens.count): \(error)"
+                    "Hybrid speculative verifier token-1 failed at generated token \(emission.generatedTokenCount): \(error)"
                 )
             }
-            if exactToken1 == Self.gpt2EOSToken {
+            if emission.terminatesDecoding(exactToken1) {
                 break
             }
 
             do {
                 let committedSecondToken = exactToken1 == proposedToken1 ? proposedToken1 : exactToken1
-                try writeIncrementalEmbedding(token: committedSecondToken, position: allTokens.count, into: xCur)
+                try writeIncrementalEmbedding(token: committedSecondToken, position: emission.allTokensCount, into: xCur)
                 try cachedRuntimePair.draftRuntime.advanceFromBuffer(
                     xCur,
                     metalAttention: metalAttention,
@@ -5629,34 +5327,19 @@ public struct RealModelInferenceEngine: ~Copyable {
                 )
             } catch {
                 throw RealModelInferenceError.runtimeFailure(
-                    "Hybrid speculative commit failed at generated token \(generatedTokens.count): \(error)"
+                    "Hybrid speculative commit failed at generated token \(emission.generatedTokenCount): \(error)"
                 )
             }
 
             let emissionAfterSecond = DispatchTime.now().uptimeNanoseconds
-            emitToken(exactToken1, at: emissionAfterSecond)
-            emissionStart = emissionAfterSecond
+            emission.emit(exactToken1, at: emissionAfterSecond)
 
-            if allTokens.count >= config.maxSeq {
+            if emission.allTokensCount >= config.maxSeq {
                 break
             }
         }
 
-        let generationEnd = DispatchTime.now().uptimeNanoseconds
-        let generationTimeMs = Self.milliseconds(from: generationEnd - generationStart)
-        let tokensPerSecond = generatedTokens.isEmpty
-            ? 0
-            : Double(generatedTokens.count) / max(generationTimeMs / 1_000, 1e-9)
-
-        return GenerationResult(
-            text: tokenizer.decode(allTokens.map(Int.init)),
-            tokens: generatedTokens,
-            promptTokens: promptTokens,
-            tokenLatenciesMs: tokenLatenciesMs,
-            tokensPerSecond: tokensPerSecond,
-            compileTimeMs: compileTimeMs,
-            firstTokenLatencyMs: firstTokenLatencyMs
-        )
+        return emission.makeResult(compileTimeMs: compileTimeMs)
     }
 
     private mutating func cachedSpeculativeRuntimePair(
@@ -5881,7 +5564,7 @@ public struct RealModelInferenceEngine: ~Copyable {
     }
 
     private func encodePrompt(_ prompt: String) throws -> [TokenID] {
-        let environment = ProcessInfo.processInfo.environment
+        let environment = policies.environment
         let textToEncode: String
         // CLI `preparedGeneratePrompt` may already apply the same wrap.
         if environment["ESPRESSO_RAW_PROMPT"] == "1" || prompt.hasPrefix("<|im_start|>") {
@@ -5959,10 +5642,11 @@ public struct RealModelInferenceEngine: ~Copyable {
     }
 
     private mutating func ensureFusedHybridCompiled(bucket: Int) throws -> Bool {
-        if compiledFusedHybridBucket >= bucket,
-           compiledFusedHybridLayers.count == config.nLayer,
-           compiledFusedHybridSurfaceHandles.count == config.nLayer {
+        switch fusedHybridReadiness {
+        case .compiled(let runtime) where runtime.bucket >= bucket:
             return false
+        case .compiled, .notCompiled:
+            break
         }
 
         let newLayers: LayerStorage<FusedHybridDecodeLayerKernelSet>
@@ -5970,7 +5654,8 @@ public struct RealModelInferenceEngine: ~Copyable {
             newLayers = try Self.compileFusedHybridLayers(
                 config: config,
                 weightDirURL: weightDirURL,
-                maxSeq: bucket
+                maxSeq: bucket,
+                environment: policies.environment
             )
         } catch let error as RealModelInferenceError {
             if case .hybridFallbackDisabled = error { throw error }
@@ -5995,14 +5680,24 @@ public struct RealModelInferenceEngine: ~Copyable {
 
         compiledFusedHybridLayers = newLayers
         compiledFusedHybridSurfaceHandles = newSurfaceHandles
-        compiledFusedHybridBucket = bucket
+        if let runtime = FusedHybridCompiledRuntime(
+            bucket: bucket,
+            layerCount: compiledFusedHybridLayers.count,
+            surfaceHandleCount: compiledFusedHybridSurfaceHandles.count,
+            expectedLayerCount: config.nLayer
+        ) {
+            fusedHybridReadiness = .compiled(runtime)
+        } else {
+            fusedHybridReadiness = .notCompiled
+        }
         return true
     }
 
     private static func compileFusedHybridLayers(
         config: MultiModelConfig,
         weightDirURL: URL,
-        maxSeq: Int
+        maxSeq: Int,
+        environment: [String: String] = ProcessInfo.processInfo.environment
     ) throws -> LayerStorage<FusedHybridDecodeLayerKernelSet> {
         guard config.nHead > 0, config.nKVHead > 0, config.headDim > 0,
               config.nHead % config.nKVHead == 0 else {
@@ -6028,7 +5723,8 @@ public struct RealModelInferenceEngine: ~Copyable {
                 nHeads: config.nHead,
                 nKVHeads: config.nKVHead,
                 headDim: config.headDim,
-                donorHexIDs: donor
+                donorHexIDs: donor,
+                options: HybridDecodeKernelOptions.resolve(environment: environment)
             )
             donor = compiled.donorHexIDs
             return compiled
@@ -6086,13 +5782,15 @@ public struct RealModelInferenceEngine: ~Copyable {
             do {
                 self.decodeState = try DecodeState(maxSeq: decodeMaxSeq)
             } catch {
-                throw RealModelInferenceError.runtimeFailure("fused N=1 decode state initialization failed: \(error)")
+                throw RealModelInferenceEngine.fusedHybridFallbackError(reason: "fused decode state initialization failed: \(error)")
             }
         }
 
         func begin(host: inout RealModelInferenceEngine, promptTokens: [TokenID]) throws {
-            guard host.compiledFusedHybridLayers.count == expectedNLayer,
-                  host.compiledFusedHybridSurfaceHandles.count == expectedNLayer else {
+            switch host.fusedHybridReadiness {
+            case .compiled:
+                break
+            case .notCompiled:
                 throw RealModelInferenceEngine.fusedHybridFallbackError(
                     reason: """
                         fused N=1 state is incomplete: \
@@ -6164,8 +5862,8 @@ public struct RealModelInferenceEngine: ~Copyable {
             selector.selectToken(hidden: hidden, temperature: temperature, topP: topP)
         }
 
-        func decodeText(_ tokens: [TokenID]) -> String {
-            tokenizerRef.decode(tokens.map(Int.init))
+        func decodeText(_ tokens: [Int]) -> String {
+            tokenizerRef.decode(tokens)
         }
 
         func throwIfCancelled() throws {
@@ -6206,7 +5904,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             selector: makeLlamaTokenSelector(),
             isCancelled: isCancelled
         )
-        var session = LlamaServingSession(
+        let session = LlamaServingSession(
             stepper: stepper,
             effectiveMaxTokens: effectiveMaxTokens,
             endOfSequenceToken: config.eosToken,
@@ -6214,20 +5912,14 @@ public struct RealModelInferenceEngine: ~Copyable {
             topP: topP,
             onStep: onStep
         )
-        let transcript = try session.run(host: &self, promptTokens: promptTokens)
-        return GenerationResult(
-            text: transcript.text,
-            tokens: transcript.generatedTokens,
-            promptTokens: transcript.promptTokens,
-            tokenLatenciesMs: transcript.tokenLatenciesMs,
-            tokensPerSecond: transcript.tokensPerSecond,
+        let (emission, decodeProfileReport) = try session.run(host: &self, promptTokens: promptTokens)
+        return emission.makeResult(
             compileTimeMs: compileTimeMs,
-            firstTokenLatencyMs: transcript.firstTokenLatencyMs,
             exactHeadBackend: classifierStrategy.exactHeadBackendLabel,
             cachedBindingsEnabled: false,
             trunk: .fusedHybrid,
             hopsPerToken: Self.fusedHopsPerToken(nLayer: config.nLayer),
-            decodeProfileReport: transcript.decodeProfileReport
+            decodeProfileReport: decodeProfileReport
         )
     }
 
@@ -6336,11 +6028,10 @@ public struct RealModelInferenceEngine: ~Copyable {
         }
 
         func begin(host: inout RealModelInferenceEngine, promptTokens: [TokenID]) throws {
-            guard host.compiledHybridLayers.count == expectedNLayer,
-                  host.compiledHybridSurfaceHandles.count == expectedNLayer,
-                  host.compiledHybridLlamaQKNormWeights.count == expectedNLayer,
-                  host.compiledHybridHead.count == 1,
-                  host.compiledHybridHeadSpatial > 0 else {
+            switch host.splitHybridReadiness {
+            case .compiled:
+                break
+            case .notCompiled:
                 throw RealModelInferenceError.runtimeFailure(
                     "Llama hybrid decode state is unavailable: layers=\(host.compiledHybridLayers.count)/\(expectedNLayer) surfaces=\(host.compiledHybridSurfaceHandles.count)/\(expectedNLayer) qkNorms=\(host.compiledHybridLlamaQKNormWeights.count)/\(expectedNLayer) head=\(host.compiledHybridHead.count) headSpatial=\(host.compiledHybridHeadSpatial)"
                 )
@@ -6482,8 +6173,8 @@ public struct RealModelInferenceEngine: ~Copyable {
             selector.selectToken(hidden: hidden, temperature: temperature, topP: topP)
         }
 
-        func decodeText(_ tokens: [TokenID]) -> String {
-            tokenizerRef.decode(tokens.map(Int.init))
+        func decodeText(_ tokens: [Int]) -> String {
+            tokenizerRef.decode(tokens)
         }
 
         func throwIfCancelled() throws {
@@ -6713,7 +6404,7 @@ public struct RealModelInferenceEngine: ~Copyable {
     ) throws -> GenerationResult {
         let cachedBindings: [MetalAttentionKernel.CachedLayerBindings]? = try Self.makeHybridCachedBindingsOrFallback(
             config: config,
-            environment: ProcessInfo.processInfo.environment
+            environment: policies.environment
         ) {
             try compiledHybridSurfaceHandles.map { handles in
                 try metalAttention.createCachedLayerBindings(
@@ -6731,7 +6422,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             }
         }
 
-        let environment = ProcessInfo.processInfo.environment
+        let environment = policies.environment
         let greedyHeadMode = hybridGreedyHeadMode(environment: environment)
         let useANEGreedyHead =
             temperature == 0 &&
@@ -6769,7 +6460,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             selector: makeLlamaTokenSelector(),
             isCancelled: isCancelled
         )
-        var session = LlamaServingSession(
+        let session = LlamaServingSession(
             stepper: stepper,
             effectiveMaxTokens: effectiveMaxTokens,
             endOfSequenceToken: config.eosToken,
@@ -6777,21 +6468,15 @@ public struct RealModelInferenceEngine: ~Copyable {
             topP: topP,
             onStep: onStep
         )
-        let transcript = try session.run(host: &self, promptTokens: promptTokens)
-        return GenerationResult(
-            text: transcript.text,
-            tokens: transcript.generatedTokens,
-            promptTokens: transcript.promptTokens,
-            tokenLatenciesMs: transcript.tokenLatenciesMs,
-            tokensPerSecond: transcript.tokensPerSecond,
+        let (emission, decodeProfileReport) = try session.run(host: &self, promptTokens: promptTokens)
+        return emission.makeResult(
             compileTimeMs: compileTimeMs,
-            firstTokenLatencyMs: transcript.firstTokenLatencyMs,
             exactHeadBackend: greedyHeadMode == .classifierOnlyFactored && useANEGreedyHead
                 ? "ane_factored_classifier"
                 : classifierStrategy.exactHeadBackendLabel,
             cachedBindingsEnabled: cachedBindings != nil,
             trunk: .splitHybrid,
-            decodeProfileReport: transcript.decodeProfileReport
+            decodeProfileReport: decodeProfileReport
         )
     }
 
@@ -6804,17 +6489,9 @@ public struct RealModelInferenceEngine: ~Copyable {
             config: config,
             weightDir: weightDirURL.path
         )
-        let tokenEmbedding = try Self.loadWeightTablePreferringFloat32Sidecar(
-            at: topLevelPaths.tokenEmbedding,
-            expectedCount: config.vocab * config.dModel
-        )
-        let finalNormGamma = try Self.loadWeightTablePreferringFloat32Sidecar(
-            at: topLevelPaths.finalNormGamma,
-            expectedCount: config.dModel
-        )
-        let lmHead = try Self.loadWeightTablePreferringFloat32Sidecar(
-            at: topLevelPaths.lmHead,
-            expectedCount: config.vocab * config.dModel
+        let coreWeights = try TopLevelAssetLoader.loadLlamaCoreWeights(
+            config: config,
+            topLevelPaths: topLevelPaths
         )
         let lmHeadFP16 = try Self.loadRawFP16WeightTableIfNoExactFloat32Sidecar(
             at: topLevelPaths.lmHead,
@@ -6829,9 +6506,9 @@ public struct RealModelInferenceEngine: ~Copyable {
             return try Self.loadExactCPULlamaLayerWeights(config: config, paths: paths)
         }
         let loadedWeights = CachedExactCPULlamaWeights(
-            tokenEmbedding: tokenEmbedding,
-            finalNormGamma: finalNormGamma,
-            lmHead: lmHead,
+            tokenEmbedding: coreWeights.tokenEmbedding,
+            finalNormGamma: coreWeights.finalNormGamma,
+            lmHead: coreWeights.lmHead,
             lmHeadFP16: lmHeadFP16,
             layers: layers
         )
@@ -6856,53 +6533,36 @@ public struct RealModelInferenceEngine: ~Copyable {
         try draftRuntime.prefill(promptTokens: promptTokens)
 
         let generationStart = DispatchTime.now().uptimeNanoseconds
-        let sessionTokenizer = tokenizer
-        var emitter = TokenEmitter(
+        let tokenizer = self.tokenizer
+        var emission = EmissionCore(
             promptTokens: promptTokens,
-            maxTokens: effectiveMaxTokens,
-            generationStart: generationStart,
-            decodeText: { tokens in sessionTokenizer.decode(tokens.map(Int.init)) },
-            onStep: onStep
+            capacity: effectiveMaxTokens,
+            eos: .fromConfig(config.eosToken.map(Int.init)),
+            onStep: onStep,
+            decodeText: { tokenizer.decode($0) },
+            startNanos: generationStart
         )
         var committedExactTokensTotal = 0
         var acceptedFutureTokensTotal = 0
         var speculativePassCount = 0
 
         let firstToken = fullRuntime.selectGreedyToken()
-        if let eosToken = config.eosToken, firstToken == eosToken {
-            emitter.commitEndOfSequence(firstToken)
-            return GenerationResult(
-                text: sessionTokenizer.decode((promptTokens + emitter.generatedTokens).map(Int.init)),
-                tokens: emitter.generatedTokens,
-                promptTokens: promptTokens,
-                tokenLatenciesMs: emitter.tokenLatenciesMs,
-                tokensPerSecond: 0,
+        if emission.terminatesDecoding(firstToken) {
+            emission.recordTerminalToken(firstToken)
+            return emission.makeResult(
                 compileTimeMs: compileTimeMs,
-                firstTokenLatencyMs: 0,
                 exactHeadBackend: "cpu_exact_two_token_draft",
-                cachedBindingsEnabled: false,
-                committedExactTokensPerPass: nil,
-                acceptedFutureTokensPerPass: nil,
-                trunk: .exactCPU
+                trunk: .exactCPU,
+                tokensPerSecondOverride: 0,
+                textOverride: tokenizer.decode((promptTokens + [firstToken]).map(Int.init))
             )
         }
         let firstEmission = DispatchTime.now().uptimeNanoseconds
-        emitter.emit(firstToken, at: firstEmission)
-        if emitter.generatedCount >= effectiveMaxTokens || emitter.totalTokenCount >= config.maxSeq {
-            let totalMs = Self.milliseconds(from: DispatchTime.now().uptimeNanoseconds &- generationStart)
-            let tps = emitter.generatedCount == 0 ? 0 : Double(emitter.generatedCount) / max(totalMs / 1_000, 1e-9)
-            return GenerationResult(
-                text: sessionTokenizer.decode(emitter.allTokens.map(Int.init)),
-                tokens: emitter.generatedTokens,
-                promptTokens: promptTokens,
-                tokenLatenciesMs: emitter.tokenLatenciesMs,
-                tokensPerSecond: tps,
+        emission.emit(firstToken, at: firstEmission)
+        if emission.generatedTokenCount >= effectiveMaxTokens || emission.allTokensCount >= config.maxSeq {
+            return emission.makeResult(
                 compileTimeMs: compileTimeMs,
-                firstTokenLatencyMs: emitter.firstTokenLatencyMs,
                 exactHeadBackend: "cpu_exact_two_token_draft",
-                cachedBindingsEnabled: false,
-                committedExactTokensPerPass: nil,
-                acceptedFutureTokensPerPass: nil,
                 trunk: .exactCPU
             )
         }
@@ -6910,9 +6570,12 @@ public struct RealModelInferenceEngine: ~Copyable {
         try fullRuntime.advance(token: firstToken)
         try draftRuntime.advance(token: firstToken)
 
-        while emitter.generatedCount < effectiveMaxTokens, emitter.totalTokenCount < config.maxSeq {
+        while emission.generatedTokenCount < effectiveMaxTokens, emission.allTokensCount < config.maxSeq {
             speculativePassCount += 1
-            let remainingTokenBudget = min(effectiveMaxTokens - emitter.generatedCount, config.maxSeq - emitter.totalTokenCount)
+            let remainingTokenBudget = min(
+                effectiveMaxTokens - emission.generatedTokenCount,
+                config.maxSeq - emission.allTokensCount
+            )
             let draftCheckpoint = draftRuntime.captureCheckpoint()
             let proposedToken0 = draftRuntime.selectGreedyToken()
             try draftRuntime.advance(token: proposedToken0)
@@ -6928,9 +6591,9 @@ public struct RealModelInferenceEngine: ~Copyable {
             }
 
             let firstRoundEmission = DispatchTime.now().uptimeNanoseconds
-            emitter.emit(exactToken0, at: firstRoundEmission)
+            emission.emit(exactToken0, at: firstRoundEmission)
             committedInPass += 1
-            if let eosToken = config.eosToken, exactToken0 == eosToken {
+            if emission.terminatesDecoding(exactToken0) {
                 committedExactTokensTotal += committedInPass
                 acceptedFutureTokensTotal += acceptedInPass
                 break
@@ -6940,7 +6603,7 @@ public struct RealModelInferenceEngine: ~Copyable {
                 try draftRuntime.advance(token: exactToken0)
             }
 
-            if emitter.generatedCount >= effectiveMaxTokens || emitter.totalTokenCount >= config.maxSeq || remainingTokenBudget <= 1 {
+            if emission.generatedTokenCount >= effectiveMaxTokens || emission.allTokensCount >= config.maxSeq || remainingTokenBudget <= 1 {
                 committedExactTokensTotal += committedInPass
                 acceptedFutureTokensTotal += acceptedInPass
                 continue
@@ -6952,9 +6615,9 @@ public struct RealModelInferenceEngine: ~Copyable {
                 acceptedInPass += 1
             }
             let secondRoundEmission = DispatchTime.now().uptimeNanoseconds
-            emitter.emit(exactToken1, at: secondRoundEmission)
+            emission.emit(exactToken1, at: secondRoundEmission)
             committedInPass += 1
-            if let eosToken = config.eosToken, exactToken1 == eosToken {
+            if emission.terminatesDecoding(exactToken1) {
                 committedExactTokensTotal += committedInPass
                 acceptedFutureTokensTotal += acceptedInPass
                 break
@@ -6966,7 +6629,6 @@ public struct RealModelInferenceEngine: ~Copyable {
             acceptedFutureTokensTotal += acceptedInPass
         }
 
-        let generationEnd = DispatchTime.now().uptimeNanoseconds
         let committedExactTokensPerPass = speculativePassCount == 0
             ? nil
             : Double(committedExactTokensTotal) / Double(speculativePassCount)
@@ -6974,16 +6636,9 @@ public struct RealModelInferenceEngine: ~Copyable {
             ? nil
             : Double(acceptedFutureTokensTotal) / Double(speculativePassCount)
 
-        return GenerationResult(
-            text: sessionTokenizer.decode(emitter.allTokens.map(Int.init)),
-            tokens: emitter.generatedTokens,
-            promptTokens: promptTokens,
-            tokenLatenciesMs: emitter.tokenLatenciesMs,
-            tokensPerSecond: emitter.tokensPerSecond(until: generationEnd),
+        return emission.makeResult(
             compileTimeMs: compileTimeMs,
-            firstTokenLatencyMs: emitter.firstTokenLatencyMs,
             exactHeadBackend: "cpu_exact_two_token_draft",
-            cachedBindingsEnabled: false,
             committedExactTokensPerPass: committedExactTokensPerPass,
             acceptedFutureTokensPerPass: acceptedFutureTokensPerPass,
             trunk: .exactCPU
@@ -7064,8 +6719,8 @@ public struct RealModelInferenceEngine: ~Copyable {
             selector.selectToken(hidden: hidden, temperature: temperature, topP: topP)
         }
 
-        func decodeText(_ tokens: [TokenID]) -> String {
-            tokenizerRef.decode(tokens.map(Int.init))
+        func decodeText(_ tokens: [Int]) -> String {
+            tokenizerRef.decode(tokens)
         }
 
         func throwIfCancelled() throws {
@@ -7082,7 +6737,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             }
             var hidden = Array(weights.tokenEmbedding[tokenIndex * config.dModel..<tokenEnd])
             for layerIndex in 0..<config.nLayer {
-                hidden = try RealModelInferenceEngine.exactCPULlamaLayerForward(
+                hidden = RealModelInferenceEngine.exactCPULlamaLayerForward(
                     hidden: hidden,
                     layer: weights.layers[layerIndex],
                     config: config,
@@ -7119,7 +6774,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             selector: makeLlamaTokenSelector(),
             isCancelled: isCancelled
         )
-        var session = LlamaServingSession(
+        let session = LlamaServingSession(
             stepper: stepper,
             effectiveMaxTokens: effectiveMaxTokens,
             endOfSequenceToken: config.eosToken,
@@ -7127,15 +6782,9 @@ public struct RealModelInferenceEngine: ~Copyable {
             topP: topP,
             onStep: onStep
         )
-        let transcript = try session.run(host: &self, promptTokens: promptTokens)
-        return GenerationResult(
-            text: transcript.text,
-            tokens: transcript.generatedTokens,
-            promptTokens: transcript.promptTokens,
-            tokenLatenciesMs: transcript.tokenLatenciesMs,
-            tokensPerSecond: transcript.tokensPerSecond,
+        let (emission, _) = try session.run(host: &self, promptTokens: promptTokens)
+        return emission.makeResult(
             compileTimeMs: compileTimeMs,
-            firstTokenLatencyMs: transcript.firstTokenLatencyMs,
             exactHeadBackend: classifierStrategy.exactHeadBackendLabel,
             trunk: .exactCPU
         )
@@ -7145,12 +6794,14 @@ public struct RealModelInferenceEngine: ~Copyable {
         config: MultiModelConfig,
         weightDirURL: URL,
         sourceLayerRange: Range<Int>? = nil,
-        maxSeq: Int
+        maxSeq: Int,
+        environment: [String: String] = ProcessInfo.processInfo.environment
     ) throws -> LayerStorage<HybridDecodeKernelSet> {
         let layerRange = sourceLayerRange ?? (0..<config.nLayer)
+        let kernelOptions = HybridDecodeKernelOptions.resolve(environment: environment)
         let useDonorDelta = supportsHybridDonorDelta(
             config: config,
-            environment: ProcessInfo.processInfo.environment
+            environment: environment
         )
         var donorHexIDs: HybridDecodeKernelSet.DonorHexIDs? = nil
         return try LayerStorage<HybridDecodeKernelSet>(count: layerRange.count, throwingInitializer: { localLayerIndex in
@@ -7164,7 +6815,8 @@ public struct RealModelInferenceEngine: ~Copyable {
                 let kernels = try HybridDecodeKernelSet(
                     weights: weights,
                     maxSeq: maxSeq,
-                    donorHexIDs: useDonorDelta ? donorHexIDs : nil
+                    donorHexIDs: useDonorDelta ? donorHexIDs : nil,
+                    options: kernelOptions
                 )
                 if useDonorDelta {
                     donorHexIDs = kernels.donorHexIDs
@@ -7182,7 +6834,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         config: MultiModelConfig,
         weightDirURL: URL,
         bucket: Int,
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        environment: [String: String] = Self.processEnvironment
     ) throws -> LayerStorage<CompiledLayer> {
         try LayerStorage<CompiledLayer>(count: config.nLayer, throwingInitializer: { layerIndex in
             try compileLayer(
@@ -7768,7 +7420,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         config: MultiModelConfig,
         weightDirURL: URL,
         spatial: Int,
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        environment: [String: String] = Self.processEnvironment
     ) throws -> CompiledLayer {
         let paths = LayerWeightPaths.forLayer(layerIndex, config: config, blobDir: weightDirURL.path)
         let ioBytes = try ANEShape(channels: config.dModel, spatial: spatial).byteSize(for: .fp32)
@@ -7855,7 +7507,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         outputBytes: [Int],
         weightDirURL: URL,
         spatial: Int,
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        environment: [String: String] = Self.processEnvironment
     ) throws -> ANEKernel {
         var optimized = graph
         ANEOptimizationPipeline.optimize(&optimized)
@@ -7964,7 +7616,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         spatial: Int,
         inputDType: ANEDType = .fp32,
         outputDType: ANEDType = .fp32,
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        environment: [String: String] = Self.processEnvironment
     ) throws -> CompiledHead {
         var graph = buildGPT2HeadGraph(
             config: config,
@@ -8287,7 +7939,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         config: MultiModelConfig,
         paths: LayerWeightPaths,
         spatial: Int,
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        environment: [String: String] = Self.processEnvironment
     ) -> ANEGraph {
         var graph = ANEGraph()
         let prefix = "layer\(layerIndex)"
@@ -8380,7 +8032,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         config: MultiModelConfig,
         paths: LayerWeightPaths,
         spatial: Int,
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        environment: [String: String] = Self.processEnvironment
     ) -> ANEGraph {
         var graph = ANEGraph()
         let prefix = "layer\(layerIndex)"
@@ -8436,7 +8088,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         spatial: Int,
         inputDType: ANEDType = .fp32,
         outputDType: ANEDType = .fp32,
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        environment: [String: String] = Self.processEnvironment
     ) -> ANEGraph {
         var graph = ANEGraph()
         let input = try! graph.input(
@@ -8865,7 +8517,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         return FileManager.default.fileExists(atPath: path)
     }
 
-    private static func resolveBundleWeightReference(
+    static func resolveBundleWeightReference(
         _ reference: String,
         weightDirURL: URL
     ) throws -> String {
@@ -8883,7 +8535,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         return resolved
     }
 
-    private static func compileBlobPath(actualPath: String, rootDir: URL) -> String {
+    static func compileBlobPath(actualPath: String, rootDir: URL) -> String {
         let rootPath = rootDir.standardizedFileURL.path
         let filePath = URL(fileURLWithPath: actualPath).standardizedFileURL.path
         let relativePath: String
@@ -9006,7 +8658,7 @@ public struct RealModelInferenceEngine: ~Copyable {
 
     private mutating func exactClassifierArgmax(_ hidden: [Float]) -> Int {
         precondition(hidden.count == config.dModel)
-        if let dumpPath = ProcessInfo.processInfo.environment["ESPRESSO_DUMP_LM_HEAD_HIDDEN"],
+        if let dumpPath = policies.lmHeadHiddenDumpPath,
            !dumpPath.isEmpty {
             Self.appendLMHeadHiddenDump(hidden, to: dumpPath)
         }
@@ -9581,7 +9233,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         ) throws
         func takePendingTimings() -> HybridDecodeTimingBreakdown?
         func resolveToken(hidden: [Float], temperature: Float, topP: Float) -> TokenID
-        func decodeText(_ tokens: [TokenID]) -> String
+        func decodeText(_ tokens: [Int]) -> String
         func throwIfCancelled() throws
     }
 
@@ -9612,17 +9264,21 @@ public struct RealModelInferenceEngine: ~Copyable {
             self.onStep = onStep
         }
 
-        func run(host: inout RealModelInferenceEngine, promptTokens: [TokenID]) throws -> SessionTranscript {
+        func run(
+            host: inout RealModelInferenceEngine,
+            promptTokens: [TokenID]
+        ) throws -> (emission: EmissionCore, decodeProfileReport: String?) {
             try stepper.begin(host: &host, promptTokens: promptTokens)
 
-            let generationStart = TokenEmitter.now()
+            let generationStart = DispatchTime.now().uptimeNanoseconds
             let stepperBox = stepper
-            var emitter = TokenEmitter(
+            var emission = EmissionCore(
                 promptTokens: promptTokens,
-                maxTokens: effectiveMaxTokens,
-                generationStart: generationStart,
-                decodeText: { tokens in stepperBox.decodeText(tokens) },
-                onStep: onStep
+                capacity: effectiveMaxTokens,
+                eos: .fromConfig(endOfSequenceToken.map(Int.init)),
+                onStep: onStep,
+                decodeText: { stepperBox.decodeText($0) },
+                startNanos: generationStart
             )
 
             var decodeProfileTokens: [HybridDecodeTimingBreakdown] = []
@@ -9630,10 +9286,10 @@ public struct RealModelInferenceEngine: ~Copyable {
                 decodeProfileTokens.reserveCapacity(effectiveMaxTokens)
             }
 
-            while emitter.generatedCount < effectiveMaxTokens {
+            while emission.generatedTokenCount < effectiveMaxTokens {
                 try stepper.throwIfCancelled()
 
-                let headStart = TokenEmitter.now()
+                let headStart = DispatchTime.now().uptimeNanoseconds
                 let proposal = try stepper.proposal(host: &host)
                 let nextToken: TokenID
                 switch proposal {
@@ -9645,29 +9301,31 @@ public struct RealModelInferenceEngine: ~Copyable {
 
                 if stepper.tracksDecodeProfile {
                     var entry = stepper.takePendingTimings() ?? HybridDecodeTimingBreakdown()
-                    entry.tLMHead = TokenEmitter.milliseconds(from: TokenEmitter.now() &- headStart)
+                    entry.tLMHead = RealModelInferenceEngine.milliseconds(
+                        from: DispatchTime.now().uptimeNanoseconds &- headStart
+                    )
                     decodeProfileTokens.append(entry)
                 }
 
-                let emissionNow = TokenEmitter.now()
-                let tokenLatencyMs = emitter.noteResolution(at: emissionNow)
+                let emissionNow = DispatchTime.now().uptimeNanoseconds
+                emission.recordFirstTokenIfFirst(at: emissionNow)
 
-                if isEndOfSequence(nextToken) {
-                    emitter.commitEndOfSequence(nextToken)
+                if emission.terminatesDecoding(nextToken) {
+                    emission.recordTerminalToken(nextToken)
                     break
                 }
 
-                emitter.commit(nextToken, tokenLatencyMs: tokenLatencyMs, at: emissionNow)
+                emission.emit(nextToken, at: emissionNow)
 
-                if emitter.generatedCount >= effectiveMaxTokens
-                    || emitter.totalTokenCount >= stepper.contextLimit {
+                if emission.generatedTokenCount >= effectiveMaxTokens
+                    || emission.allTokensCount >= stepper.contextLimit {
                     break
                 }
 
                 try stepper.advance(
                     host: &host,
                     consuming: nextToken,
-                    generatedCount: emitter.generatedCount
+                    generatedCount: emission.generatedTokenCount
                 )
             }
 
@@ -9678,12 +9336,7 @@ public struct RealModelInferenceEngine: ~Copyable {
                 fputs(decodeProfileReport + "\n", stderr)
             }
 
-            return emitter.makeTranscript(decodeProfileReport: decodeProfileReport)
-        }
-
-        private func isEndOfSequence(_ token: TokenID) -> Bool {
-            guard let endOfSequenceToken else { return false }
-            return token == endOfSequenceToken
+            return (emission, decodeProfileReport)
         }
     }
 
