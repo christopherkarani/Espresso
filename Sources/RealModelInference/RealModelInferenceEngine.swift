@@ -243,7 +243,7 @@ extension GenerationResult {
 
 public struct RealModelInferenceEngine: ~Copyable {
     private static let minimumANEIOSurfaceBytes = 49_152
-    private static let classifierArgmaxBlockSize = 4_000
+    static let classifierArgmaxBlockSize = 4_000
 
     /// Single process-environment seam for this file: every read flows through
     /// here so global-state access stays auditable in one place.
@@ -660,53 +660,9 @@ public struct RealModelInferenceEngine: ~Copyable {
         let vCache: [Float]
     }
 
-    struct LlamaQKNormWeights: Sendable {
-        let q: [Float]
-        let k: [Float]
-    }
 
-    /// Q/K/V projection biases for llama-family layers that have them (Qwen2 does; plain
-    /// llama does not). Always all three or none.
-    struct LlamaQKVBiasWeights: Sendable {
-        let q: [Float]
-        let k: [Float]
-        let v: [Float]
-    }
 
-    struct LlamaCPUQKVWeights: Sendable {
-        let rmsAtt: [Float]
-        let wq: [Float]
-        let wk: [Float]
-        let wv: [Float]
-        let qNorm: [Float]?
-        let kNorm: [Float]?
-        let qkvBias: LlamaQKVBiasWeights?
-    }
-
-    struct ExactCPULlamaLayerWeights: Sendable {
-        let rmsAtt: [Float]
-        let wq: [Float]
-        let wk: [Float]
-        let wv: [Float]
-        let wo: [Float]
-        let rmsFfn: [Float]
-        let w1: [Float]
-        let w2: [Float]
-        let w3: [Float]
-        let qNorm: [Float]?
-        let kNorm: [Float]?
-        let qkvBias: LlamaQKVBiasWeights?
-    }
-
-    private struct CachedExactCPULlamaWeights: Sendable {
-        let tokenEmbedding: [Float]
-        let finalNormGamma: [Float]
-        let lmHead: [Float]
-        let lmHeadFP16: [UInt16]?
-        let layers: [ExactCPULlamaLayerWeights]
-    }
-
-    private struct ExactTwoTokenDraftDescriptor: Sendable, Decodable {
+    struct ExactTwoTokenDraftDescriptor: Sendable, Decodable {
         let modelDir: String
         let tokenizerDir: String?
         let modelID: String?
@@ -718,323 +674,15 @@ public struct RealModelInferenceEngine: ~Copyable {
         }
     }
 
-    private struct ResolvedExactTwoTokenDraft: Sendable {
+    struct ResolvedExactTwoTokenDraft: Sendable {
         let descriptor: ExactTwoTokenDraftDescriptor
         let descriptorURL: URL
         let weightDirURL: URL
         let config: MultiModelConfig
     }
 
-    private struct CPUExactLlamaCheckpoint: Sendable {
-        let visibleTokenCount: Int
-        let lastHidden: [Float]
-        let kCaches: [[Float]]
-        let vCaches: [[Float]]
-    }
 
-    private struct CPUExactLlamaRuntime: Sendable {
-        let config: MultiModelConfig
-        let roundIntermediatesToFP16: Bool
-        let tokenEmbedding: [Float]
-        let finalNormGamma: [Float]
-        let lmHead: [Float]
-        let layers: [ExactCPULlamaLayerWeights]
-        let classifierBlockMaxNorms: [Float]
-        var classifierLogitsScratch: [Float]
-        var kCaches: [[Float]]
-        var vCaches: [[Float]]
-        var lastHidden: [Float]
-        var visibleTokenCount: Int
-
-        init(config: MultiModelConfig, weightDirURL: URL) throws {
-            let topLevelPaths = try RealModelInferenceEngine.resolveLlamaTopLevelWeightPaths(
-                config: config,
-                weightDir: weightDirURL.path
-            )
-            self.config = config
-            self.roundIntermediatesToFP16 = RealModelInferenceEngine.shouldRoundCPUExactDecodeIntermediatesToFP16()
-            let coreWeights = try TopLevelAssetLoader.loadLlamaCoreWeights(
-                config: config,
-                topLevelPaths: topLevelPaths
-            )
-            self.tokenEmbedding = coreWeights.tokenEmbedding
-            self.finalNormGamma = coreWeights.finalNormGamma
-            self.lmHead = coreWeights.lmHead
-            self.layers = try (0..<config.nLayer).map { layerIndex in
-                let paths = LayerWeightPaths.forLayer(
-                    layerIndex,
-                    config: config,
-                    blobDir: weightDirURL.path
-                )
-                return try RealModelInferenceEngine.loadExactCPULlamaLayerWeights(
-                    config: config,
-                    paths: paths
-                )
-            }
-            self.classifierBlockMaxNorms = lmHead.withUnsafeBufferPointer { weightBuffer in
-                RealModelInferenceEngine.precomputeClassifierBlockMaxNorms(
-                    classifier: weightBuffer.baseAddress!,
-                    vocabSize: config.vocab,
-                    dim: config.dModel,
-                    blockSize: RealModelInferenceEngine.classifierArgmaxBlockSize
-                )
-            }
-            self.classifierLogitsScratch = [Float](
-                repeating: 0,
-                count: min(RealModelInferenceEngine.classifierArgmaxBlockSize, config.vocab)
-            )
-            self.kCaches = Array(
-                repeating: [Float](repeating: 0, count: config.kvDim * config.maxSeq),
-                count: config.nLayer
-            )
-            self.vCaches = Array(
-                repeating: [Float](repeating: 0, count: config.kvDim * config.maxSeq),
-                count: config.nLayer
-            )
-            self.lastHidden = [Float](repeating: 0, count: config.dModel)
-            self.visibleTokenCount = 0
-        }
-
-        mutating func reset() {
-            for layerIndex in 0..<config.nLayer {
-                kCaches[layerIndex].withUnsafeMutableBufferPointer { pointer in
-                    for index in pointer.indices {
-                        pointer[index] = 0
-                    }
-                }
-                vCaches[layerIndex].withUnsafeMutableBufferPointer { pointer in
-                    for index in pointer.indices {
-                        pointer[index] = 0
-                    }
-                }
-            }
-            lastHidden.withUnsafeMutableBufferPointer { pointer in
-                for index in pointer.indices {
-                    pointer[index] = 0
-                }
-            }
-            visibleTokenCount = 0
-        }
-
-        mutating func prefill(promptTokens: [TokenID]) throws {
-            guard !promptTokens.isEmpty else {
-                throw RealModelInferenceError.invalidGenerationParameters("Prompt tokens must not be empty")
-            }
-            reset()
-            for token in promptTokens {
-                try advance(token: token)
-            }
-        }
-
-        mutating func captureCheckpoint() -> CPUExactLlamaCheckpoint {
-            CPUExactLlamaCheckpoint(
-                visibleTokenCount: visibleTokenCount,
-                lastHidden: lastHidden,
-                kCaches: kCaches,
-                vCaches: vCaches
-            )
-        }
-
-        mutating func rollback(to checkpoint: CPUExactLlamaCheckpoint) {
-            visibleTokenCount = checkpoint.visibleTokenCount
-            lastHidden = checkpoint.lastHidden
-            kCaches = checkpoint.kCaches
-            vCaches = checkpoint.vCaches
-        }
-
-        mutating func selectGreedyToken() -> TokenID {
-            let normalized = RealModelInferenceEngine.rmsNorm(
-                lastHidden,
-                weight: finalNormGamma,
-                eps: Float(config.normEps)
-            )
-            return TokenID(exactClassifierArgmax(normalized))
-        }
-
-        mutating func advance(token: TokenID) throws {
-            guard visibleTokenCount < config.maxSeq else {
-                throw RealModelInferenceError.runtimeFailure(
-                    "Draft runtime position \(visibleTokenCount) exceeds context \(config.maxSeq)"
-                )
-            }
-            lastHidden = maybeRound(try forwardToken(token, position: visibleTokenCount))
-            visibleTokenCount += 1
-        }
-
-        private func maybeRound(_ values: [Float]) -> [Float] {
-            roundIntermediatesToFP16 ? RealModelInferenceEngine.roundFloat16Vector(values) : values
-        }
-
-        private mutating func forwardToken(_ token: TokenID, position: Int) throws -> [Float] {
-            guard Int(token) >= 0, Int(token) < config.vocab else {
-                throw RealModelInferenceError.runtimeFailure("Draft runtime token \(token) is outside vocab \(config.vocab)")
-            }
-            var hidden = Array(tokenEmbedding[Int(token) * config.dModel..<(Int(token) + 1) * config.dModel])
-            for layerIndex in 0..<config.nLayer {
-                let layer = layers[layerIndex]
-                let attnNormed = RealModelInferenceEngine.rmsNorm(
-                    hidden,
-                    weight: layer.rmsAtt,
-                    eps: Float(config.normEps)
-                )
-                var q = maybeRound(
-                    RealModelInferenceEngine.projectRowMajorMatrix(
-                        matrix: layer.wq,
-                        rows: config.attentionDim,
-                        cols: config.dModel,
-                        vector: attnNormed,
-                        bias: layer.qkvBias?.q
-                    )
-                )
-                var k = maybeRound(
-                    RealModelInferenceEngine.projectRowMajorMatrix(
-                        matrix: layer.wk,
-                        rows: config.kvDim,
-                        cols: config.dModel,
-                        vector: attnNormed,
-                        bias: layer.qkvBias?.k
-                    )
-                )
-                let vRounded = maybeRound(
-                    RealModelInferenceEngine.projectRowMajorMatrix(
-                        matrix: layer.wv,
-                        rows: config.kvDim,
-                        cols: config.dModel,
-                        vector: attnNormed,
-                        bias: layer.qkvBias?.v
-                    )
-                )
-
-                if let qNorm = layer.qNorm {
-                    q.withUnsafeMutableBufferPointer { values in
-                        qNorm.withUnsafeBufferPointer { weights in
-                            RealModelInferenceEngine.applyPerHeadRMSNormInPlace(
-                                values: values,
-                                weights: weights,
-                                headCount: config.nHead,
-                                headDim: config.headDim,
-                                epsilon: Float(config.normEps)
-                            )
-                        }
-                    }
-                }
-                if let kNorm = layer.kNorm {
-                    k.withUnsafeMutableBufferPointer { values in
-                        kNorm.withUnsafeBufferPointer { weights in
-                            RealModelInferenceEngine.applyPerHeadRMSNormInPlace(
-                                values: values,
-                                weights: weights,
-                                headCount: config.nKVHead,
-                                headDim: config.headDim,
-                                epsilon: Float(config.normEps)
-                            )
-                        }
-                    }
-                }
-
-                q = maybeRound(
-                    RealModelInferenceEngine.applyHalfSplitRoPEPerHead(
-                        q,
-                        heads: config.nHead,
-                        headDim: config.headDim,
-                        position: position,
-                        theta: config.ropeTheta
-                    )
-                )
-                k = maybeRound(
-                    RealModelInferenceEngine.applyHalfSplitRoPEPerHead(
-                        k,
-                        heads: config.nKVHead,
-                        headDim: config.headDim,
-                        position: position,
-                        theta: config.ropeTheta
-                    )
-                )
-
-                for channel in 0..<config.kvDim {
-                    kCaches[layerIndex][channel * config.maxSeq + position] = k[channel]
-                    vCaches[layerIndex][channel * config.maxSeq + position] = vRounded[channel]
-                }
-
-                let context = RealModelInferenceEngine.decodeContextFromCaches(
-                    qOut: q,
-                    kCache: kCaches[layerIndex],
-                    vCache: vCaches[layerIndex],
-                    heads: config.nHead,
-                    kvHeads: config.nKVHead,
-                    headDim: config.headDim,
-                    visibleTokenCount: position + 1,
-                    cacheStride: config.maxSeq
-                )
-
-                let projected = maybeRound(
-                    zip(
-                        hidden,
-                        RealModelInferenceEngine.multiplyRowMajorMatrix(
-                            matrix: layer.wo,
-                            rows: config.dModel,
-                            cols: config.attentionDim,
-                            vector: context
-                        )
-                    ).map(+)
-                )
-                let ffnNormed = RealModelInferenceEngine.rmsNorm(
-                    projected,
-                    weight: layer.rmsFfn,
-                    eps: Float(config.normEps)
-                )
-                let gate = RealModelInferenceEngine.multiplyRowMajorMatrix(
-                    matrix: layer.w1,
-                    rows: config.hiddenDim,
-                    cols: config.dModel,
-                    vector: ffnNormed
-                )
-                let up = RealModelInferenceEngine.multiplyRowMajorMatrix(
-                    matrix: layer.w3,
-                    rows: config.hiddenDim,
-                    cols: config.dModel,
-                    vector: ffnNormed
-                )
-                let activated = zip(gate, up).map { RealModelInferenceEngine.silu($0) * $1 }
-                let down = RealModelInferenceEngine.multiplyRowMajorMatrix(
-                    matrix: layer.w2,
-                    rows: config.dModel,
-                    cols: config.hiddenDim,
-                    vector: activated
-                )
-                hidden = maybeRound(zip(projected, down).map(+))
-            }
-            return hidden
-        }
-
-        private mutating func exactClassifierArgmax(_ hidden: [Float]) -> Int {
-            hidden.withUnsafeBufferPointer { hiddenBuffer in
-                lmHead.withUnsafeBufferPointer { weightBuffer in
-                    classifierBlockMaxNorms.withUnsafeBufferPointer { normsBuffer in
-                        classifierLogitsScratch.withUnsafeMutableBufferPointer { scratchBuffer in
-                            guard let hiddenBase = hiddenBuffer.baseAddress,
-                                  let weightBase = weightBuffer.baseAddress,
-                                  let normsBase = normsBuffer.baseAddress,
-                                  let scratchBase = scratchBuffer.baseAddress else {
-                                return 0
-                            }
-                            return RealModelInferenceEngine.partitionedArgmax(
-                                classifier: weightBase,
-                                input: hiddenBase,
-                                logitsScratch: scratchBase,
-                                blockMaxNorms: normsBase,
-                                vocabSize: config.vocab,
-                                dim: config.dModel,
-                                blockSize: RealModelInferenceEngine.classifierArgmaxBlockSize
-                            )
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    private enum LoadedTokenizer {
+    enum LoadedTokenizer {
         case gpt2(GPT2BPETokenizer)
         case sentencePiece(SentencePieceTokenizer)
         case debugIdentity
@@ -1114,12 +762,12 @@ public struct RealModelInferenceEngine: ~Copyable {
         }
     }
 
-    private struct SpeculativeRuntimeKey: Hashable {
+    struct SpeculativeRuntimeKey: Hashable {
         let draftLayerCount: Int
         let maxSeq: Int
     }
 
-    private final class CachedSpeculativeRuntimePair {
+    final class CachedSpeculativeRuntimePair {
         let key: SpeculativeRuntimeKey
         var draftRuntime: HybridLayerRangeRuntime
         var verifierRuntime: HybridLayerRangeRuntime
@@ -1128,7 +776,8 @@ public struct RealModelInferenceEngine: ~Copyable {
             key: SpeculativeRuntimeKey,
             config: MultiModelConfig,
             weightDirURL: URL,
-            assets: GPT2TopLevelAssets
+            assets: GPT2TopLevelAssets,
+            environment: [String: String]
         ) throws {
             self.key = key
             self.draftRuntime = try HybridLayerRangeRuntime(
@@ -1136,14 +785,16 @@ public struct RealModelInferenceEngine: ~Copyable {
                 weightDirURL: weightDirURL,
                 assets: assets,
                 layerRange: 0..<key.draftLayerCount,
-                maxSeq: key.maxSeq
+                maxSeq: key.maxSeq,
+                environment: environment
             )
             self.verifierRuntime = try HybridLayerRangeRuntime(
                 config: config,
                 weightDirURL: weightDirURL,
                 assets: assets,
                 layerRange: key.draftLayerCount..<config.nLayer,
-                maxSeq: key.maxSeq
+                maxSeq: key.maxSeq,
+                environment: environment
             )
         }
 
@@ -1153,11 +804,11 @@ public struct RealModelInferenceEngine: ~Copyable {
         }
     }
 
-    private struct HybridRuntimeCheckpoint: Sendable {
+    struct HybridRuntimeCheckpoint: Sendable {
         let step: Int
     }
 
-    private struct HybridLayerRangeRuntime: ~Copyable {
+    struct HybridLayerRangeRuntime: ~Copyable {
         let layerRange: Range<Int>
         let maxSeq: Int
         let laneSpatial: Int
@@ -1176,7 +827,8 @@ public struct RealModelInferenceEngine: ~Copyable {
             weightDirURL: URL,
             assets: GPT2TopLevelAssets,
             layerRange: Range<Int>,
-            maxSeq: Int
+            maxSeq: Int,
+            environment: [String: String]
         ) throws {
             precondition(!layerRange.isEmpty)
 
@@ -1184,7 +836,8 @@ public struct RealModelInferenceEngine: ~Copyable {
                 config: config,
                 weightDirURL: weightDirURL,
                 sourceLayerRange: layerRange,
-                maxSeq: maxSeq
+                maxSeq: maxSeq,
+                environment: environment
             )
 
             var surfaceHandles: [HybridDecodeSurfaceHandles] = []
@@ -1208,7 +861,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             if layers.count > 1,
                RealModelInferenceEngine.usesHybridLayerInputRebinding(
                    architecture: config.architecture,
-                   environment: RealModelInferenceEngine.processEnvironment
+                   environment: environment
                ) {
                 for localLayerIndex in 1..<layers.count {
                     do {
@@ -1233,7 +886,8 @@ public struct RealModelInferenceEngine: ~Copyable {
                     assets: assets,
                     spatial: headSpatial,
                     inputDType: .fp16,
-                    outputDType: .fp16
+                    outputDType: .fp16,
+                    environment: environment
                 )
             })
             let greedyClassifier = try LayerStorage<CompiledClassifier>(count: 1, throwingInitializer: { _ in
@@ -1279,7 +933,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             self.zeroSlice = zeroSlice
             self.preferCPUDecodeAttention = RealModelInferenceEngine.prefersCPUDecodeAttention(
                 config: config,
-                environment: RealModelInferenceEngine.processEnvironment
+                environment: environment
             )
             self.decodeState = decodeState
         }
@@ -1433,29 +1087,29 @@ public struct RealModelInferenceEngine: ~Copyable {
         }
     }
 
-    private static let gpt2EOSToken: TokenID = 50_256
-    private static let speculativeRuntimeCacheLimit = 4
+    static let gpt2EOSToken: TokenID = 50_256
+    static let speculativeRuntimeCacheLimit = 4
 
-    private let config: MultiModelConfig
-    private let weightDirURL: URL
-    private let tokenizer: LoadedTokenizer
+    let config: MultiModelConfig
+    var weightDirURL: URL
+    let tokenizer: LoadedTokenizer
     private let assets: TopLevelAssets
 
-    private var gpt2Assets: GPT2TopLevelAssets {
+    var gpt2Assets: GPT2TopLevelAssets {
         guard case let .gpt2(a) = assets else {
             preconditionFailure("Attempted to access GPT-2 assets on a non-GPT-2 model")
         }
         return a
     }
 
-    private var llamaAssets: LlamaTopLevelAssets {
+    var llamaAssets: LlamaTopLevelAssets {
         guard case let .llama(a) = assets else {
             preconditionFailure("Attempted to access Llama assets on a non-Llama model")
         }
         return a
     }
 
-    private func hybridGreedyHeadMode(
+    func hybridGreedyHeadMode(
         environment: [String: String] = Self.processEnvironment
     ) -> HybridGreedyHeadMode {
         let hasFactoredOutputHead: Bool
@@ -1481,35 +1135,35 @@ public struct RealModelInferenceEngine: ~Copyable {
     }
 
     /// Per-trunk compile readiness; the ensure functions below are the only writers.
-    private var baselineReadiness = CompiledReadiness<BaselineCompiledRuntime>.notCompiled
-    private var splitHybridReadiness = CompiledReadiness<SplitHybridCompiledRuntime>.notCompiled
-    private var fusedHybridReadiness = CompiledReadiness<FusedHybridCompiledRuntime>.notCompiled
+    var baselineReadiness = CompiledReadiness<BaselineCompiledRuntime>.notCompiled
+    var splitHybridReadiness = CompiledReadiness<SplitHybridCompiledRuntime>.notCompiled
+    var fusedHybridReadiness = CompiledReadiness<FusedHybridCompiledRuntime>.notCompiled
     /// Bucket of the last fully resident split-hybrid layer-program set.
     ///
     /// Incremental-compile watermark consulted only by ``ensureHybridCompiled``
     /// (so a mid-compile failure never recompiles finished layers) and by the
     /// dispatch max-sequence defaults; loop readiness itself is carried by
     /// ``splitHybridReadiness``.
-    private var splitHybridLayerBucket = 0
-    private var compiledLayers: LayerStorage<CompiledLayer>
-    private var compiledHead: LayerStorage<CompiledHead>
-    private var compiledHybridLayers: LayerStorage<HybridDecodeKernelSet>
-    private var compiledHybridSurfaceHandles: [HybridDecodeSurfaceHandles]
-    private var compiledHybridLlamaQKNormWeights: [LlamaQKNormWeights?]
-    private var compiledHybridHead: LayerStorage<CompiledHead>
-    private var compiledHybridHeadSpatial: Int
-    private var compiledHybridGreedyNorm: LayerStorage<CompiledHead>
-    private var compiledHybridGreedyClassifier: LayerStorage<CompiledClassifier>
-    private var compiledHybridGreedySpatial: Int
-    private var compiledFusedHybridLayers: LayerStorage<FusedHybridDecodeLayerKernelSet>
-    private var compiledFusedHybridSurfaceHandles: [FusedHybridDecodeSurfaceHandles]
-    private var hybridMetalAttention: MetalAttentionKernel?
-    private var speculativeRuntimeCache: [SpeculativeRuntimeKey: CachedSpeculativeRuntimePair]
-    private var speculativeRuntimeCacheOrder: [SpeculativeRuntimeKey]
+    var splitHybridLayerBucket = 0
+    var compiledLayers: LayerStorage<CompiledLayer>
+    var compiledHead: LayerStorage<CompiledHead>
+    var compiledHybridLayers: LayerStorage<HybridDecodeKernelSet>
+    var compiledHybridSurfaceHandles: [HybridDecodeSurfaceHandles]
+    var compiledHybridLlamaQKNormWeights: [LlamaQKNormWeights?]
+    var compiledHybridHead: LayerStorage<CompiledHead>
+    var compiledHybridHeadSpatial: Int
+    var compiledHybridGreedyNorm: LayerStorage<CompiledHead>
+    var compiledHybridGreedyClassifier: LayerStorage<CompiledClassifier>
+    var compiledHybridGreedySpatial: Int
+    var compiledFusedHybridLayers: LayerStorage<FusedHybridDecodeLayerKernelSet>
+    var compiledFusedHybridSurfaceHandles: [FusedHybridDecodeSurfaceHandles]
+    var hybridMetalAttention: MetalAttentionKernel?
+    var speculativeRuntimeCache: [SpeculativeRuntimeKey: CachedSpeculativeRuntimePair]
+    var speculativeRuntimeCacheOrder: [SpeculativeRuntimeKey]
     private let classifierBlockMaxNorms: [Float]
     private var classifierLogitsScratch: [Float]
-    private let classifierStrategy: ClassifierStrategy
-    private let policies: EnginePolicies
+    let classifierStrategy: ClassifierStrategy
+    let policies: EnginePolicies
     private var cachedExactCPULlamaWeights: CachedExactCPULlamaWeights?
 
     private init(
@@ -1940,13 +1594,15 @@ public struct RealModelInferenceEngine: ~Copyable {
             let compileTimeMs = compileDidRun ? Self.milliseconds(from: compileEnd - compileStart) : 0
             if let speculativeDraftLayerCount = Self.resolvedSpeculativeDraftLayerCount(
                 config: config,
-                temperature: temperature
+                temperature: temperature,
+                environment: environment
             ) {
                 var speculativeAttemptCompileTimeMs = 0.0
                 do {
                     let (cachedRuntimePair, speculativeCompileTimeMs) = try cachedSpeculativeRuntimePair(
                         draftLayerCount: speculativeDraftLayerCount,
-                        maxSeq: bucket
+                        maxSeq: bucket,
+                        environment: environment
                     )
                     speculativeAttemptCompileTimeMs = speculativeCompileTimeMs
                     return try generateIncrementalHybridSpeculative(
@@ -2311,7 +1967,7 @@ public struct RealModelInferenceEngine: ~Copyable {
     static func resolvedSpeculativeDraftLayerCount(
         config: MultiModelConfig,
         temperature: Float,
-        environment: [String: String] = Self.processEnvironment
+        environment: [String: String]
     ) -> Int? {
         guard config.architecture == .gpt2,
               temperature == 0,
@@ -2324,96 +1980,6 @@ public struct RealModelInferenceEngine: ~Copyable {
         let requestedDraftLayerCount = environment["ESPRESSO_GPT2_SPECULATIVE_DRAFT_LAYERS"].flatMap(Int.init)
             ?? defaultDraftLayerCount
         return min(max(requestedDraftLayerCount, 1), config.nLayer - 1)
-    }
-
-    static func resolveTopLevelWeightPaths(
-        config: MultiModelConfig,
-        weightDir: String
-    ) throws -> TopLevelWeightPaths {
-        let root = URL(fileURLWithPath: weightDir, isDirectory: true)
-        try validateDirectory(root)
-
-        switch config.architecture {
-        case .gpt2:
-            return TopLevelWeightPaths(
-                tokenEmbedding: try requiredFile(
-                    root: root,
-                    candidates: ["embeddings/token.bin", "embeddings/token_embeddings.bin"],
-                    label: "token embedding"
-                ),
-                positionEmbedding: try requiredFile(
-                    root: root,
-                    candidates: ["embeddings/position.bin", "embeddings/position_embeddings.bin"],
-                    label: "position embedding"
-                ),
-                finalNormGamma: try requiredFile(
-                    root: root,
-                    candidates: ["final_norm_gamma.bin", "ln_f_gamma.bin", "rms_final.bin"],
-                    label: "final norm gamma"
-                ),
-                finalNormBeta: try requiredFile(
-                    root: root,
-                    candidates: ["final_norm_beta.bin", "ln_f_beta.bin", "rms_final_beta.bin"],
-                    label: "final norm beta"
-                ),
-                lmHead: try requiredFile(
-                    root: root,
-                    candidates: ["lm_head.bin", "classifier.bin"],
-                    label: "lm head"
-                )
-            )
-        case .llama:
-            return TopLevelWeightPaths(
-                tokenEmbedding: try requiredFile(
-                    root: root,
-                    candidates: ["embeddings/token.bin", "embeddings/token_embeddings.bin"],
-                    label: "token embedding"
-                ),
-                positionEmbedding: "",
-                finalNormGamma: try requiredFile(
-                    root: root,
-                    candidates: ["rms_final.bin", "final_norm_gamma.bin"],
-                    label: "final norm gamma"
-                ),
-                finalNormBeta: "",
-                lmHead: try requiredFile(
-                    root: root,
-                    candidates: ["lm_head.bin", "classifier.bin"],
-                    label: "lm head"
-                )
-            )
-        }
-    }
-
-    struct LlamaTopLevelWeightPaths: Sendable, Equatable {
-        let tokenEmbedding: String
-        let finalNormGamma: String
-        let lmHead: String
-    }
-
-    static func resolveLlamaTopLevelWeightPaths(
-        config: MultiModelConfig,
-        weightDir: String
-    ) throws -> LlamaTopLevelWeightPaths {
-        let root = URL(fileURLWithPath: weightDir, isDirectory: true)
-        try validateDirectory(root)
-        return LlamaTopLevelWeightPaths(
-            tokenEmbedding: try requiredFile(
-                root: root,
-                candidates: ["embeddings/token.bin", "embeddings/token_embeddings.bin"],
-                label: "token embedding"
-            ),
-            finalNormGamma: try requiredFile(
-                root: root,
-                candidates: ["rms_final.bin", "final_norm_gamma.bin", "final_norm.bin"],
-                label: "final norm gamma"
-            ),
-            lmHead: try requiredFile(
-                root: root,
-                candidates: ["lm_head.bin", "classifier.bin"],
-                label: "lm head"
-            )
-        )
     }
 
     static func compileAndEvalSingleLayerForTesting(
@@ -4011,7 +3577,8 @@ public struct RealModelInferenceEngine: ~Copyable {
         let kernels = try Self.compileHybridLayers(
             config: config,
             weightDirURL: weightDirURL,
-            maxSeq: maxSeq
+            maxSeq: maxSeq,
+            environment: Self.processEnvironment
         )
         let handles = try (0..<config.nLayer).map { layerIndex in
             try HybridDecodeSurfaceHandles(
@@ -4563,7 +4130,8 @@ public struct RealModelInferenceEngine: ~Copyable {
 
     static func compileHeadForTesting(
         config: MultiModelConfig,
-        weightDir: String
+        weightDir: String,
+        environment: [String: String] = Self.processEnvironment
     ) throws {
         let weightDirURL = URL(fileURLWithPath: weightDir, isDirectory: true)
         try validateDirectory(weightDirURL)
@@ -4591,7 +4159,8 @@ public struct RealModelInferenceEngine: ~Copyable {
             config: config,
             weightDirURL: weightDirURL,
             assets: assets,
-            spatial: spatial
+            spatial: spatial,
+            environment: environment
         )
     }
 
@@ -4610,1131 +4179,6 @@ public struct RealModelInferenceEngine: ~Copyable {
         ane_interop_init()
     }
 
-    private mutating func ensureCompiled(bucket: Int) throws -> Bool {
-        switch baselineReadiness {
-        case .compiled(let runtime) where runtime.bucket >= bucket:
-            return false
-        case .compiled, .notCompiled:
-            break
-        }
-
-        let newLayers = try Self.compileLayers(
-            config: config,
-            weightDirURL: weightDirURL,
-            bucket: bucket
-        )
-        let newInputSurface = try Self.firstInputSurface(from: newLayers)
-        let newHead = try LayerStorage<CompiledHead>(count: 1, throwingInitializer: { _ in
-            try Self.compileHead(
-                config: config,
-                weightDirURL: weightDirURL,
-                assets: gpt2Assets,
-                spatial: bucket
-            )
-        })
-        do {
-            try newHead[0].kernel.rebindInput(at: 0, to: newLayers[newLayers.count - 1].outputSurface)
-        } catch {
-            throw RealModelInferenceError.runtimeFailure("Failed to chain final norm input: \(error)")
-        }
-        compiledLayers = newLayers
-        compiledHead = newHead
-        baselineReadiness = .compiled(BaselineCompiledRuntime(bucket: bucket, inputSurface: newInputSurface))
-        return true
-    }
-
-    /// Compiles split-hybrid decode programs when the resident set covers less context.
-    ///
-    /// One parameterized implementation serves both model families: the former
-    /// GPT-2/llama ensure twins differed only in surface-handle geometry,
-    /// output-head compilation, and error prefixes. Split-hybrid readiness
-    /// transitions to `.compiled` after the output-head section, before the
-    /// family-specific greedy-classifier section — a greedy-head compile failure
-    /// must not unready the trunk's decode programs, matching the former flag
-    /// semantics where such failures still served hybrid decode via CPU logits.
-    private mutating func ensureHybridCompiled(bucket: Int) throws -> Bool {
-        var didCompile = false
-
-        // Both flavors share every program up to the output head; only the
-        // surface-handle geometry and head compilation differ.
-        let isLlama = config.architecture == .llama
-        let surfaceDim = isLlama ? config.dModel : ModelConfig.dim
-        let surfaceQDim: Int? = isLlama ? config.attentionDim : nil
-        let surfaceKVDim: Int? = isLlama ? config.nKVHead * config.headDim : nil
-
-        if splitHybridLayerBucket < bucket {
-            let newLayers = try Self.compileHybridLayers(
-                config: config,
-                weightDirURL: weightDirURL,
-                maxSeq: bucket,
-                environment: policies.environment
-            )
-            let newQKNormWeights = try Self.loadHybridLlamaQKNormWeights(
-                config: config,
-                weightDirURL: weightDirURL
-            )
-            var newSurfaceHandles: [HybridDecodeSurfaceHandles] = []
-            newSurfaceHandles.reserveCapacity(newLayers.count)
-            for layerIndex in 0..<newLayers.count {
-                do {
-                    newSurfaceHandles.append(
-                        try HybridDecodeSurfaceHandles(
-                            kernels: newLayers[layerIndex],
-                            logicalMaxSeq: bucket,
-                            dim: surfaceDim,
-                            qDim: surfaceQDim,
-                            kvDim: surfaceKVDim
-                        )
-                    )
-                } catch {
-                    throw RealModelInferenceError.runtimeFailure(
-                        "\(isLlama ? "Llama hybrid" : "Hybrid") decode surfaces unavailable for layer \(layerIndex): \(error)"
-                    )
-                }
-            }
-            if newLayers.count > 1,
-               Self.usesHybridLayerInputRebinding(
-                   architecture: config.architecture,
-                   environment: policies.environment
-               ) {
-                for layerIndex in 1..<newLayers.count {
-                    do {
-                        try newLayers[layerIndex].decodeQKVOnly.rebindInput(
-                            at: 0,
-                            to: newSurfaceHandles[layerIndex - 1].ffnOut
-                        )
-                    } catch {
-                        throw RealModelInferenceError.runtimeFailure(
-                            "\(isLlama ? "Llama hybrid" : "Hybrid") decode chaining unavailable for layer \(layerIndex): \(error)"
-                        )
-                    }
-                }
-            }
-
-            compiledHybridLayers = newLayers
-            compiledHybridSurfaceHandles = newSurfaceHandles
-            compiledHybridLlamaQKNormWeights = newQKNormWeights
-            splitHybridLayerBucket = bucket
-            didCompile = true
-        }
-
-        if compiledHybridLlamaQKNormWeights.count != config.nLayer {
-            compiledHybridLlamaQKNormWeights = try Self.loadHybridLlamaQKNormWeights(
-                config: config,
-                weightDirURL: weightDirURL
-            )
-        }
-
-        if hybridMetalAttention == nil {
-            do {
-                hybridMetalAttention = try MetalAttentionKernel()
-            } catch {
-                throw RealModelInferenceError.runtimeFailure(
-                    "\(isLlama ? "Llama hybrid" : "Hybrid") Metal attention initialization failed: \(error)"
-                )
-            }
-            didCompile = true
-        }
-
-        let hybridHeadSpatial = Self.incrementalHeadSpatial(channels: config.dModel)
-        if compiledHybridHead.count != 1 || compiledHybridHeadSpatial != hybridHeadSpatial {
-            compiledHybridHead = try LayerStorage<CompiledHead>(count: 1, throwingInitializer: { _ in
-                if isLlama {
-                    return try Self.compileLlamaHead(
-                        config: config,
-                        weightDirURL: weightDirURL,
-                        assets: llamaAssets,
-                        spatial: hybridHeadSpatial
-                    )
-                }
-                return try Self.compileHead(
-                    config: config,
-                    weightDirURL: weightDirURL,
-                    assets: gpt2Assets,
-                    spatial: hybridHeadSpatial
-                )
-            })
-            compiledHybridHeadSpatial = hybridHeadSpatial
-            try Self.zeroSurface(compiledHybridHead[0].inputSurface)
-            didCompile = true
-        }
-
-        // Readiness transition: every program the split-hybrid decode loop
-        // requires is now resident, independent of the greedy head below.
-        if let runtime = SplitHybridCompiledRuntime(
-            bucket: max(bucket, splitHybridLayerBucket),
-            layerCount: compiledHybridLayers.count,
-            surfaceHandleCount: compiledHybridSurfaceHandles.count,
-            expectedLayerCount: config.nLayer,
-            headCount: compiledHybridHead.count,
-            qKNormCount: isLlama ? compiledHybridLlamaQKNormWeights.count : nil,
-            headSpatial: compiledHybridHeadSpatial
-        ) {
-            splitHybridReadiness = .compiled(runtime)
-        } else {
-            splitHybridReadiness = .notCompiled
-        }
-
-        if classifierStrategy.usesANEClassifier {
-            if isLlama {
-                switch hybridGreedyHeadMode() {
-                case .classifierOnlyFactored:
-                    if compiledHybridGreedyNorm.count != 0 {
-                        compiledHybridGreedyNorm = Self.emptyStorage(CompiledHead.self)
-                        didCompile = true
-                    }
-                    if compiledHybridGreedyClassifier.count != 1 {
-                        do {
-                            compiledHybridGreedyClassifier = try LayerStorage<CompiledClassifier>(count: 1, throwingInitializer: { _ in
-                                try Self.compileLlamaFactoredClassifier(
-                                    config: config,
-                                    assets: llamaAssets,
-                                    spatial: hybridHeadSpatial
-                                )
-                            })
-                        } catch {
-                            fputs(
-                                "[RealModelInference] Llama factored classifier compile failed; falling back to dense ANE classifier: \(error)\n",
-                                stderr
-                            )
-                            compiledHybridGreedyClassifier = Self.emptyStorage(CompiledClassifier.self)
-                        }
-                        didCompile = true
-                    }
-                    if compiledHybridGreedyClassifier.count == 1,
-                       let finalSurface = compiledHybridSurfaceHandles.last?.ffnOut {
-                        try compiledHybridGreedyClassifier[0].kernel.rebindInput(at: 0, to: finalSurface)
-                    }
-                case .classifierOnlyFused:
-                    if compiledHybridGreedyNorm.count != 0 {
-                        compiledHybridGreedyNorm = Self.emptyStorage(CompiledHead.self)
-                        didCompile = true
-                    }
-                    if compiledHybridGreedyClassifier.count != 1 {
-                        compiledHybridGreedyClassifier = try LayerStorage<CompiledClassifier>(count: 1, throwingInitializer: { _ in
-                            try Self.compileLlamaRMSNormClassifier(
-                                config: config,
-                                assets: llamaAssets,
-                                spatial: hybridHeadSpatial
-                            )
-                        })
-                        didCompile = true
-                    }
-                    if compiledHybridGreedyClassifier.count == 1,
-                       let finalSurface = compiledHybridSurfaceHandles.last?.ffnOut {
-                        try compiledHybridGreedyClassifier[0].kernel.rebindInput(at: 0, to: finalSurface)
-                    }
-                case .normThenClassifier:
-                    if compiledHybridGreedyNorm.count != 1 || compiledHybridGreedySpatial != hybridHeadSpatial {
-                        compiledHybridGreedyNorm = try LayerStorage<CompiledHead>(count: 1, throwingInitializer: { _ in
-                            try Self.compileLlamaHead(
-                                config: config,
-                                weightDirURL: weightDirURL,
-                                assets: llamaAssets,
-                                spatial: hybridHeadSpatial,
-                                inputDType: .fp16,
-                                outputDType: .fp16
-                            )
-                        })
-                        compiledHybridGreedySpatial = hybridHeadSpatial
-                        didCompile = true
-                    }
-
-                    if compiledHybridGreedyClassifier.count != 1 {
-                        compiledHybridGreedyClassifier = try LayerStorage<CompiledClassifier>(count: 1, throwingInitializer: { _ in
-                            try Self.compileLlamaClassifier(
-                                config: config,
-                                assets: llamaAssets,
-                                spatial: hybridHeadSpatial
-                            )
-                        })
-                        try compiledHybridGreedyClassifier[0].kernel.rebindInput(
-                            at: 0,
-                            to: compiledHybridGreedyNorm[0].outputSurface
-                        )
-                        didCompile = true
-                    }
-
-                    if compiledHybridGreedyClassifier.count == 1 {
-                        try compiledHybridGreedyClassifier[0].kernel.rebindInput(
-                            at: 0,
-                            to: compiledHybridGreedyNorm[0].outputSurface
-                        )
-                    }
-                }
-            } else {
-                if compiledHybridGreedyNorm.count != 1 ||
-                    compiledHybridGreedyClassifier.count != 1 ||
-                    compiledHybridGreedySpatial != hybridHeadSpatial {
-                    compiledHybridGreedyNorm = try LayerStorage<CompiledHead>(count: 1, throwingInitializer: { _ in
-                        try Self.compileHead(
-                            config: config,
-                            weightDirURL: weightDirURL,
-                            assets: gpt2Assets,
-                            spatial: hybridHeadSpatial,
-                            inputDType: .fp16,
-                            outputDType: .fp16
-                        )
-                    })
-                    compiledHybridGreedyClassifier = try LayerStorage<CompiledClassifier>(count: 1, throwingInitializer: { _ in
-                        try Self.compileClassifier(
-                            config: config,
-                            assets: gpt2Assets,
-                            spatial: hybridHeadSpatial
-                        )
-                    })
-                    compiledHybridGreedySpatial = hybridHeadSpatial
-                    try compiledHybridGreedyClassifier[0].kernel.rebindInput(
-                        at: 0,
-                        to: compiledHybridGreedyNorm[0].outputSurface
-                    )
-                    didCompile = true
-                }
-
-                if compiledHybridGreedyNorm.count == 1,
-                   compiledHybridGreedyClassifier.count == 1,
-                   let finalSurface = compiledHybridSurfaceHandles.last?.ffnOut {
-                    try compiledHybridGreedyNorm[0].kernel.rebindInput(at: 0, to: finalSurface)
-                    try compiledHybridGreedyClassifier[0].kernel.rebindInput(
-                        at: 0,
-                        to: compiledHybridGreedyNorm[0].outputSurface
-                    )
-                }
-            }
-        }
-
-        if isLlama,
-           compiledHybridGreedyNorm.count == 1,
-           let finalSurface = compiledHybridSurfaceHandles.last?.ffnOut {
-            try compiledHybridGreedyNorm[0].kernel.rebindInput(at: 0, to: finalSurface)
-        }
-
-        return didCompile
-    }
-
-    private static func loadHybridLlamaQKNormWeights(
-        config: MultiModelConfig,
-        weightDirURL: URL
-    ) throws -> [LlamaQKNormWeights?] {
-        try (0..<config.nLayer).map { layerIndex in
-            let paths = LayerWeightPaths.forLayer(layerIndex, config: config, blobDir: weightDirURL.path)
-            return try Self.loadLlamaQKNormWeights(config: config, paths: paths)
-        }
-    }
-
-    private mutating func generateIncrementalHybrid(
-        promptTokens: [TokenID],
-        effectiveMaxTokens: Int,
-        temperature: Float,
-        topP: Float = 1.0,
-        compileTimeMs: Double,
-        maxSeq: Int,
-        metalAttention: MetalAttentionKernel,
-        onStep: ((GenerationStep) -> Void)?,
-        isCancelled: (() -> Bool)? = nil
-    ) throws -> GenerationResult {
-        switch splitHybridReadiness {
-        case .compiled:
-            break
-        case .notCompiled:
-            throw RealModelInferenceError.runtimeFailure("Hybrid decode state is unavailable")
-        }
-
-        try ForwardPass.initializeHybridDecodeCaches(
-            surfaceHandles: compiledHybridSurfaceHandles,
-            dim: config.dModel
-        )
-
-        // Pre-create cached Metal bindings for all layers (GPT-2 path)
-        let cachedBindings: [MetalAttentionKernel.CachedLayerBindings]? = try Self.makeHybridCachedBindingsOrFallback(
-            config: config,
-            environment: policies.environment
-        ) {
-            try compiledHybridSurfaceHandles.map { handles in
-                try metalAttention.createCachedLayerBindings(
-                    qSurface: handles.qOut,
-                    kOutputSurface: handles.kOut,
-                    vOutputSurface: handles.vOut,
-                    kCacheSurface: handles.kCacheFull,
-                    vCacheSurface: handles.vCacheFull,
-                    contextSurface: handles.projectionContextIn,
-                    dim: handles.qDim,
-                    kvDim: handles.kvDim,
-                    laneStride: handles.laneSpatial,
-                    cacheStride: maxSeq
-                )
-            }
-        }
-
-        if policies.debugHybridCacheDumps,
-           let firstHandles = compiledHybridSurfaceHandles.first {
-            fputs(
-                "[hybrid-surface] qkvIn_row=\(IOSurfaceGetBytesPerRow(firstHandles.qkvIn)) qOut_row=\(IOSurfaceGetBytesPerRow(firstHandles.qOut)) ffnIn_row=\(IOSurfaceGetBytesPerRow(firstHandles.ffnIn)) ffnOut_row=\(IOSurfaceGetBytesPerRow(firstHandles.ffnOut)) laneSpatial=\(firstHandles.laneSpatial) maxSeq=\(firstHandles.maxSeq)\n",
-                stderr
-            )
-        }
-        let shouldDebugHybridCache = policies.debugHybridCacheDumps
-
-        let xCur = TensorBuffer(count: config.dModel, zeroed: true)
-        var decodeState: DecodeState
-        do {
-            decodeState = try DecodeState(maxSeq: maxSeq)
-        } catch {
-            throw RealModelInferenceError.runtimeFailure("Hybrid decode state initialization failed: \(error)")
-        }
-        var timings = HybridDecodeTimingBreakdown()
-        let greedyHeadMode = hybridGreedyHeadMode()
-        let useANEGreedyHead =
-            temperature == 0 &&
-            classifierStrategy.usesANEClassifier &&
-            compiledHybridGreedyClassifier.count == 1 &&
-            (greedyHeadMode == .normThenClassifier
-                ? compiledHybridGreedyNorm.count == 1
-                : compiledHybridGreedyNorm.count == 0)
-
-        for (position, token) in promptTokens.enumerated() {
-            try writeIncrementalEmbedding(token: token, position: position, into: xCur)
-            let debugInput: [Float]?
-            if shouldDebugHybridCache, position < 2 {
-                debugInput = xCur.withUnsafeBufferPointer { Array($0) }
-            } else {
-                debugInput = nil
-            }
-            do {
-                try ForwardPass.runHybridDecodeTimed(
-                    xCur: xCur,
-                    kernels: compiledHybridLayers,
-                    surfaceHandles: compiledHybridSurfaceHandles,
-                    metalAttention: metalAttention,
-                    decodeState: &decodeState,
-                    dim: config.dModel,
-                    preferCPUDecodeAttention: Self.prefersCPUDecodeAttention(
-                        config: config,
-                        environment: policies.environment
-                    ),
-                    readFinalOutputIntoXCur: !useANEGreedyHead,
-                    cachedBindings: cachedBindings,
-                    timings: &timings
-                )
-            } catch {
-                throw RealModelInferenceError.runtimeFailure(
-                    "Hybrid prefill failed at prompt position \(position): \(error)"
-                )
-            }
-            if shouldDebugHybridCache,
-               position < 2,
-               let firstHandles = compiledHybridSurfaceHandles.first {
-                try Self.debugLogHybridCache(
-                    label: "prefill_\(position)",
-                    surface: firstHandles.kCacheFull,
-                    maxSeq: maxSeq,
-                    channels: min(8, config.dModel),
-                    tokenCount: min(position + 1, 2)
-                )
-                if let debugInput {
-                    let layer0Paths = LayerWeightPaths.forLayer(0, config: config, blobDir: weightDirURL.path)
-                    let debugLayer0Weights = try Self.loadHybridLayerWeights(config: config, paths: layer0Paths)
-                    let expectedK = Self.debugExpectedGPT2KPrefix(
-                        input: debugInput,
-                        weights: debugLayer0Weights,
-                        eps: config.normEps,
-                        prefixChannels: min(8, config.dModel)
-                    )
-                    let expectedKTransposed = Self.debugExpectedGPT2KPrefixTransposed(
-                        input: debugInput,
-                        weights: debugLayer0Weights,
-                        eps: config.normEps,
-                        prefixChannels: min(8, config.dModel)
-                    )
-                    let values = expectedK.map { String(format: "%.4f", $0) }.joined(separator: ",")
-                    let transposedValues = expectedKTransposed.map { String(format: "%.4f", $0) }.joined(separator: ",")
-                    fputs("[hybrid-kref] prefill_\(position) [\(values)]\n", stderr)
-                    fputs("[hybrid-kref-t] prefill_\(position) [\(transposedValues)]\n", stderr)
-                }
-            }
-        }
-
-        let generationStart = DispatchTime.now().uptimeNanoseconds
-        let tokenizer = self.tokenizer
-        var emission = EmissionCore(
-            promptTokens: promptTokens,
-            capacity: effectiveMaxTokens,
-            eos: .fixed(Int(Self.gpt2EOSToken)),
-            onStep: onStep,
-            decodeText: { tokenizer.decode($0) },
-            startNanos: generationStart
-        )
-        var rng = SystemRandomNumberGenerator()
-        var normalized = [Float](repeating: 0, count: config.dModel)
-        let headSpatial = compiledHybridHeadSpatial
-
-        while emission.generatedTokenCount < effectiveMaxTokens {
-            try Self.throwIfCancelled(isCancelled)
-            let nextToken: TokenID
-            if useANEGreedyHead {
-                do {
-                    if greedyHeadMode == .normThenClassifier {
-                        try compiledHybridGreedyNorm[0].kernel.eval()
-                    }
-                    try compiledHybridGreedyClassifier[0].kernel.eval()
-                    let argmax = try Self.greedyArgmax(
-                        classifier: compiledHybridGreedyClassifier[0],
-                        headSpatial: headSpatial,
-                        vocab: config.vocab
-                    )
-                    guard let token = TokenID(exactly: argmax.index) else {
-                        throw RealModelInferenceError.runtimeFailure(
-                            "Greedy ANE classifier selected out-of-range token \(argmax.index)"
-                        )
-                    }
-                    nextToken = token
-                } catch let error as RealModelInferenceError {
-                    throw error
-                } catch {
-                    throw RealModelInferenceError.runtimeFailure("Hybrid greedy ANE head evaluation failed: \(error)")
-                }
-            } else {
-                do {
-                    try xCur.withUnsafeBufferPointer { buffer in
-                        try Self.writeFP32SpatialSlice(
-                            to: compiledHybridHead[0].inputSurface,
-                            spatialIndex: 0,
-                            spatial: headSpatial,
-                            data: buffer,
-                            channels: config.dModel
-                        )
-                    }
-                    try compiledHybridHead[0].kernel.eval()
-                    try normalized.withUnsafeMutableBufferPointer { buffer in
-                        try Self.readFP32SpatialSlice(
-                            from: compiledHybridHead[0].outputSurface,
-                            spatialIndex: 0,
-                            spatial: headSpatial,
-                            into: buffer,
-                            channels: config.dModel
-                        )
-                    }
-                } catch {
-                    throw RealModelInferenceError.runtimeFailure("Hybrid step head evaluation failed: \(error)")
-                }
-
-                nextToken = selectTokenFromNormalizedHidden(
-                    normalized,
-                    temperature: temperature,
-                    topP: topP,
-                    using: &rng
-                )
-            }
-            let emissionNow = DispatchTime.now().uptimeNanoseconds
-            emission.recordFirstTokenIfFirst(at: emissionNow)
-
-            if emission.terminatesDecoding(nextToken) {
-                break
-            }
-
-            emission.emit(nextToken, at: emissionNow)
-
-            if emission.generatedTokenCount >= effectiveMaxTokens || emission.allTokensCount >= config.maxSeq {
-                break
-            }
-
-            try writeIncrementalEmbedding(token: nextToken, position: emission.allTokensCount - 1, into: xCur)
-            do {
-                try ForwardPass.runHybridDecodeTimed(
-                    xCur: xCur,
-                    kernels: compiledHybridLayers,
-                    surfaceHandles: compiledHybridSurfaceHandles,
-                    metalAttention: metalAttention,
-                    decodeState: &decodeState,
-                    dim: config.dModel,
-                    preferCPUDecodeAttention: Self.prefersCPUDecodeAttention(
-                        config: config,
-                        environment: policies.environment
-                    ),
-                    readFinalOutputIntoXCur: !useANEGreedyHead,
-                    cachedBindings: cachedBindings,
-                    timings: &timings
-                )
-            } catch {
-                throw RealModelInferenceError.runtimeFailure(
-                    "Hybrid decode failed at generated token \(emission.generatedTokenCount - 1): \(error)"
-                )
-            }
-        }
-
-        return emission.makeResult(
-            compileTimeMs: compileTimeMs,
-            exactHeadBackend: classifierStrategy.exactHeadBackendLabel,
-            cachedBindingsEnabled: false
-        )
-    }
-
-    private mutating func generateIncrementalHybridSpeculative(
-        promptTokens: [TokenID],
-        effectiveMaxTokens: Int,
-        compileTimeMs: Double,
-        metalAttention: MetalAttentionKernel,
-        cachedRuntimePair: CachedSpeculativeRuntimePair,
-        onStep: ((GenerationStep) -> Void)?
-    ) throws -> GenerationResult {
-        try cachedRuntimePair.resetAll(dim: config.dModel)
-
-        let xCur = TensorBuffer(count: config.dModel, zeroed: true)
-        for (position, token) in promptTokens.enumerated() {
-            try writeIncrementalEmbedding(token: token, position: position, into: xCur)
-            do {
-                try cachedRuntimePair.draftRuntime.advanceFromBuffer(
-                    xCur,
-                    metalAttention: metalAttention,
-                    dim: config.dModel
-                )
-                try cachedRuntimePair.verifierRuntime.advanceFromSurface(
-                    cachedRuntimePair.draftRuntime.finalSurface,
-                    metalAttention: metalAttention,
-                    dim: config.dModel
-                )
-            } catch {
-                throw RealModelInferenceError.runtimeFailure(
-                    "Hybrid speculative prefill failed at prompt position \(position): \(error)"
-                )
-            }
-        }
-
-        let generationStart = DispatchTime.now().uptimeNanoseconds
-        let tokenizer = self.tokenizer
-        var emission = EmissionCore(
-            promptTokens: promptTokens,
-            capacity: effectiveMaxTokens,
-            eos: .fixed(Int(Self.gpt2EOSToken)),
-            onStep: onStep,
-            decodeText: { tokenizer.decode($0) },
-            startNanos: generationStart
-        )
-
-        while emission.generatedTokenCount < effectiveMaxTokens {
-            let checkpoint = try cachedRuntimePair.draftRuntime.captureCheckpoint(dim: config.dModel)
-            let proposedToken0: TokenID
-            do {
-                proposedToken0 = try cachedRuntimePair.draftRuntime.selectGreedyToken(vocab: config.vocab)
-                try writeIncrementalEmbedding(token: proposedToken0, position: emission.allTokensCount, into: xCur)
-                try cachedRuntimePair.draftRuntime.advanceFromBuffer(
-                    xCur,
-                    metalAttention: metalAttention,
-                    dim: config.dModel
-                )
-            } catch {
-                throw RealModelInferenceError.runtimeFailure(
-                    "Hybrid speculative draft proposal-0 failed at generated token \(emission.generatedTokenCount): \(error)"
-                )
-            }
-
-            let proposedToken1: TokenID
-            do {
-                proposedToken1 = try cachedRuntimePair.draftRuntime.selectGreedyToken(vocab: config.vocab)
-            } catch {
-                throw RealModelInferenceError.runtimeFailure(
-                    "Hybrid speculative draft proposal-1 failed at generated token \(emission.generatedTokenCount): \(error)"
-                )
-            }
-
-            let exactToken0: TokenID
-            do {
-                exactToken0 = try cachedRuntimePair.verifierRuntime.selectGreedyToken(vocab: config.vocab)
-            } catch {
-                throw RealModelInferenceError.runtimeFailure(
-                    "Hybrid speculative verifier token-0 failed at generated token \(emission.generatedTokenCount): \(error)"
-                )
-            }
-            if emission.terminatesDecoding(exactToken0) {
-                break
-            }
-
-            if exactToken0 != proposedToken0 {
-                do {
-                    try cachedRuntimePair.draftRuntime.rollback(
-                        to: checkpoint,
-                        mutatedTokenCount: 1,
-                        dim: config.dModel
-                    )
-                    try writeIncrementalEmbedding(token: exactToken0, position: emission.allTokensCount, into: xCur)
-                    try cachedRuntimePair.draftRuntime.advanceFromBuffer(
-                        xCur,
-                        metalAttention: metalAttention,
-                        dim: config.dModel
-                    )
-                    try cachedRuntimePair.verifierRuntime.advanceFromSurface(
-                        cachedRuntimePair.draftRuntime.finalSurface,
-                        metalAttention: metalAttention,
-                        dim: config.dModel
-                    )
-                } catch {
-                    throw RealModelInferenceError.runtimeFailure(
-                        "Hybrid speculative verifier rollback failed at generated token \(emission.generatedTokenCount): \(error)"
-                    )
-                }
-
-                let emissionNow = DispatchTime.now().uptimeNanoseconds
-                emission.emit(exactToken0, at: emissionNow)
-                if emission.generatedTokenCount >= effectiveMaxTokens || emission.allTokensCount >= config.maxSeq {
-                    break
-                }
-                continue
-            }
-
-            do {
-                try cachedRuntimePair.verifierRuntime.advanceFromSurface(
-                    cachedRuntimePair.draftRuntime.finalSurface,
-                    metalAttention: metalAttention,
-                    dim: config.dModel
-                )
-            } catch {
-                throw RealModelInferenceError.runtimeFailure(
-                    "Hybrid speculative verifier promotion failed at generated token \(emission.generatedTokenCount): \(error)"
-                )
-            }
-
-            let emissionAfterFirst = DispatchTime.now().uptimeNanoseconds
-            emission.emit(exactToken0, at: emissionAfterFirst)
-
-            if emission.generatedTokenCount >= effectiveMaxTokens || emission.allTokensCount >= config.maxSeq {
-                break
-            }
-
-            let exactToken1: TokenID
-            do {
-                exactToken1 = try cachedRuntimePair.verifierRuntime.selectGreedyToken(vocab: config.vocab)
-            } catch {
-                throw RealModelInferenceError.runtimeFailure(
-                    "Hybrid speculative verifier token-1 failed at generated token \(emission.generatedTokenCount): \(error)"
-                )
-            }
-            if emission.terminatesDecoding(exactToken1) {
-                break
-            }
-
-            do {
-                let committedSecondToken = exactToken1 == proposedToken1 ? proposedToken1 : exactToken1
-                try writeIncrementalEmbedding(token: committedSecondToken, position: emission.allTokensCount, into: xCur)
-                try cachedRuntimePair.draftRuntime.advanceFromBuffer(
-                    xCur,
-                    metalAttention: metalAttention,
-                    dim: config.dModel
-                )
-                try cachedRuntimePair.verifierRuntime.advanceFromSurface(
-                    cachedRuntimePair.draftRuntime.finalSurface,
-                    metalAttention: metalAttention,
-                    dim: config.dModel
-                )
-            } catch {
-                throw RealModelInferenceError.runtimeFailure(
-                    "Hybrid speculative commit failed at generated token \(emission.generatedTokenCount): \(error)"
-                )
-            }
-
-            let emissionAfterSecond = DispatchTime.now().uptimeNanoseconds
-            emission.emit(exactToken1, at: emissionAfterSecond)
-
-            if emission.allTokensCount >= config.maxSeq {
-                break
-            }
-        }
-
-        return emission.makeResult(compileTimeMs: compileTimeMs)
-    }
-
-    private mutating func cachedSpeculativeRuntimePair(
-        draftLayerCount: Int,
-        maxSeq: Int
-    ) throws -> (CachedSpeculativeRuntimePair, Double) {
-        let key = SpeculativeRuntimeKey(
-            draftLayerCount: draftLayerCount,
-            maxSeq: maxSeq
-        )
-        if let cached = speculativeRuntimeCache[key] {
-            let orderUpdate = Self.boundedSpeculativeCacheOrder(
-                currentOrder: speculativeRuntimeCacheOrder,
-                accessedKey: key,
-                limit: Self.speculativeRuntimeCacheLimit,
-                insertingNewEntry: false
-            )
-            speculativeRuntimeCacheOrder = orderUpdate.order
-            return (cached, 0)
-        }
-
-        let compileStart = DispatchTime.now().uptimeNanoseconds
-        let cached = try CachedSpeculativeRuntimePair(
-            key: key,
-            config: config,
-            weightDirURL: weightDirURL,
-            assets: gpt2Assets
-        )
-        let orderUpdate = Self.boundedSpeculativeCacheOrder(
-            currentOrder: speculativeRuntimeCacheOrder,
-            accessedKey: key,
-            limit: Self.speculativeRuntimeCacheLimit,
-            insertingNewEntry: true
-        )
-        if let evictedKey = orderUpdate.evictedKey {
-            speculativeRuntimeCache.removeValue(forKey: evictedKey)
-        }
-        speculativeRuntimeCache[key] = cached
-        speculativeRuntimeCacheOrder = orderUpdate.order
-        let compileTimeMs = Self.milliseconds(from: DispatchTime.now().uptimeNanoseconds - compileStart)
-        return (cached, compileTimeMs)
-    }
-
-    static func boundedSpeculativeCacheOrder<Key: Equatable>(
-        currentOrder: [Key],
-        accessedKey: Key,
-        limit: Int,
-        insertingNewEntry: Bool
-    ) -> (order: [Key], evictedKey: Key?) {
-        precondition(limit > 0)
-
-        var order = currentOrder.filter { $0 != accessedKey }
-        var evictedKey: Key?
-        if insertingNewEntry, order.count >= limit {
-            evictedKey = order.removeFirst()
-        }
-        order.append(accessedKey)
-        return (order, evictedKey)
-    }
-
-    static func loadConfigFromMetadataFile(at metadataURL: URL) throws -> MultiModelConfig {
-        let data: Data
-        do {
-            data = try Data(contentsOf: metadataURL)
-        } catch {
-            throw RealModelInferenceError.runtimeFailure("Failed to read metadata.json: \(error)")
-        }
-
-        let object: Any
-        do {
-            object = try JSONSerialization.jsonObject(with: data)
-        } catch {
-            throw RealModelInferenceError.runtimeFailure("metadata.json is not valid JSON: \(error)")
-        }
-
-        guard let metadata = object as? [String: Any] else {
-            throw RealModelInferenceError.runtimeFailure("metadata.json must be a JSON object")
-        }
-
-        func requiredInt(_ key: String) throws -> Int {
-            guard let number = metadata[key] as? NSNumber else {
-                throw RealModelInferenceError.runtimeFailure("metadata.json missing numeric field \(key)")
-            }
-            return number.intValue
-        }
-
-        func requiredDouble(_ key: String) throws -> Double {
-            guard let number = metadata[key] as? NSNumber else {
-                throw RealModelInferenceError.runtimeFailure("metadata.json missing numeric field \(key)")
-            }
-            return number.doubleValue
-        }
-
-        guard let name = metadata["name"] as? String, !name.isEmpty else {
-            throw RealModelInferenceError.runtimeFailure("metadata.json missing string field name")
-        }
-        let architecture: MultiModelConfig.Architecture
-        switch (metadata["architecture"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-        case "gpt2":
-            architecture = .gpt2
-        case "llama":
-            architecture = .llama
-        default:
-            throw RealModelInferenceError.runtimeFailure("metadata.json missing supported architecture")
-        }
-
-        let preferredDecodePath: MultiModelConfig.PreferredDecodePath?
-        if let value = metadata["preferredDecodePath"] {
-            let raw: String
-            if let string = value as? String {
-                raw = string
-            } else {
-                raw = String(describing: value)
-            }
-            do {
-                preferredDecodePath = try MultiModelConfig.PreferredDecodePath.parse(raw)
-            } catch {
-                throw RealModelInferenceError.runtimeFailure(
-                    "metadata.json has unsupported preferredDecodePath \"\(raw)\" (expected \"hybrid\" or \"exact_cpu\")"
-                )
-            }
-        } else {
-            preferredDecodePath = nil
-        }
-
-        return MultiModelConfig(
-            name: name,
-            nLayer: try requiredInt("nLayer"),
-            nHead: try requiredInt("nHead"),
-            nKVHead: try requiredInt("nKVHead"),
-            dModel: try requiredInt("dModel"),
-            headDim: try requiredInt("headDim"),
-            hiddenDim: try requiredInt("hiddenDim"),
-            vocab: try requiredInt("vocab"),
-            maxSeq: try requiredInt("maxSeq"),
-            normEps: Float(try requiredDouble("normEps")),
-            ropeTheta: Float((metadata["ropeTheta"] as? NSNumber)?.doubleValue ?? 10_000),
-            eosToken: (metadata["eosToken"] as? NSNumber)?.uint32Value,
-            architecture: architecture,
-            preferredDecodePath: preferredDecodePath
-        )
-    }
-
-    private static func resolveExactTwoTokenDraft(
-        config: MultiModelConfig,
-        weightDirURL: URL,
-        environment: [String: String]
-    ) throws -> ResolvedExactTwoTokenDraft? {
-        guard environment["ESPRESSO_BUNDLE_DRAFT_KIND"] == "exact_two_token" else {
-            return nil
-        }
-        if let rawHorizon = environment["ESPRESSO_BUNDLE_DRAFT_HORIZON"],
-           Int(rawHorizon) != 2 {
-            throw RealModelInferenceError.runtimeFailure(
-                "exact two-token draft requires horizon == 2, got \(rawHorizon)"
-            )
-        }
-        guard let artifactRef = environment["ESPRESSO_BUNDLE_DRAFT_ARTIFACT_REF"],
-              !artifactRef.isEmpty else {
-            throw RealModelInferenceError.runtimeFailure("exact two-token draft requires ESPRESSO_BUNDLE_DRAFT_ARTIFACT_REF")
-        }
-
-        let bundleRootURL = weightDirURL.deletingLastPathComponent()
-        let descriptorURL = bundleRootURL.appendingPathComponent(artifactRef).standardizedFileURL
-        let bundleRootPath = bundleRootURL.path
-        guard descriptorURL.path == bundleRootPath || descriptorURL.path.hasPrefix(bundleRootPath + "/") else {
-            throw RealModelInferenceError.runtimeFailure("Draft artifact ref escapes bundle root: \(artifactRef)")
-        }
-        guard FileManager.default.fileExists(atPath: descriptorURL.path) else {
-            throw RealModelInferenceError.runtimeFailure("Draft artifact file is missing: \(descriptorURL.path)")
-        }
-
-        let descriptorData = try Data(contentsOf: descriptorURL)
-        let descriptor: ExactTwoTokenDraftDescriptor
-        do {
-            descriptor = try JSONDecoder().decode(ExactTwoTokenDraftDescriptor.self, from: descriptorData)
-        } catch {
-            throw RealModelInferenceError.runtimeFailure("Failed to decode draft descriptor \(descriptorURL.path): \(error)")
-        }
-        guard !descriptor.modelDir.isEmpty else {
-            throw RealModelInferenceError.runtimeFailure("Draft descriptor is missing model_dir")
-        }
-
-        let draftWeightDirURL = weightDirURL.appendingPathComponent(
-            descriptor.modelDir,
-            isDirectory: true
-        ).standardizedFileURL
-        let weightRootPath = weightDirURL.path
-        guard draftWeightDirURL.path == weightRootPath || draftWeightDirURL.path.hasPrefix(weightRootPath + "/") else {
-            throw RealModelInferenceError.runtimeFailure("Draft model_dir escapes weights root: \(descriptor.modelDir)")
-        }
-        try validateDirectory(draftWeightDirURL)
-        let draftConfig = try loadConfigFromMetadataFile(
-            at: draftWeightDirURL.appendingPathComponent("metadata.json")
-        )
-        guard draftConfig.architecture == .llama else {
-            throw RealModelInferenceError.runtimeFailure("exact two-token draft currently supports llama draft models only")
-        }
-        guard draftConfig.vocab == config.vocab else {
-            throw RealModelInferenceError.runtimeFailure(
-                "draft/full vocab mismatch: draft=\(draftConfig.vocab) full=\(config.vocab)"
-            )
-        }
-        return ResolvedExactTwoTokenDraft(
-            descriptor: descriptor,
-            descriptorURL: descriptorURL,
-            weightDirURL: draftWeightDirURL,
-            config: draftConfig
-        )
-    }
-
-    static func resolveExactTwoTokenDraftWeightDirForTesting(
-        config: MultiModelConfig,
-        weightDirURL: URL,
-        environment: [String: String]
-    ) throws -> String? {
-        try resolveExactTwoTokenDraft(
-            config: config,
-            weightDirURL: weightDirURL,
-            environment: environment
-        )?.weightDirURL.path
-    }
-
-    private func encodePrompt(_ prompt: String) throws -> [TokenID] {
-        let environment = policies.environment
-        let textToEncode: String
-        // CLI `preparedGeneratePrompt` may already apply the same wrap.
-        if environment["ESPRESSO_RAW_PROMPT"] == "1" || prompt.hasPrefix("<|im_start|>") {
-            textToEncode = prompt
-        } else if QwenInstructPrompt.shouldWrap(config: config) {
-            textToEncode = QwenInstructPrompt.wrapUserTurn(prompt)
-        } else {
-            textToEncode = prompt
-        }
-        let rawTokens = tokenizer.encode(textToEncode)
-        guard !rawTokens.isEmpty else {
-            throw RealModelInferenceError.invalidPrompt("Prompt produced no tokens")
-        }
-        var tokens: [TokenID] = []
-        tokens.reserveCapacity(rawTokens.count)
-        for token in rawTokens {
-            guard token >= 0, token <= Int(TokenID.max) else {
-                throw RealModelInferenceError.invalidPrompt("Token \(token) does not fit TokenID")
-            }
-            tokens.append(TokenID(token))
-        }
-        return tokens
-    }
-
-    private func composeEmbeddingInput(tokens: [TokenID], spatial: Int) -> [Float] {
-        var output = [Float](repeating: 0, count: config.dModel * spatial)
-        for tokenIndex in 0..<tokens.count {
-            let token = Int(tokens[tokenIndex])
-            let tokenBase = token * config.dModel
-            let positionBase = tokenIndex * config.dModel
-            for channel in 0..<config.dModel {
-                output[channel * spatial + tokenIndex] =
-                    gpt2Assets.tokenEmbedding[tokenBase + channel] +
-                    gpt2Assets.positionEmbedding[positionBase + channel]
-            }
-        }
-        return output
-    }
-
-    private func writeIncrementalEmbedding(
-        token: TokenID,
-        position: Int,
-        into buffer: borrowing TensorBuffer
-    ) throws {
-        guard position >= 0, position < config.maxSeq else {
-            throw RealModelInferenceError.runtimeFailure("Position \(position) exceeds context \(config.maxSeq)")
-        }
-
-        let tokenBase = Int(token) * config.dModel
-        let positionBase = position * config.dModel
-        buffer.withUnsafeMutableBufferPointer { dst in
-            for channel in 0..<config.dModel {
-                dst[channel] =
-                    gpt2Assets.tokenEmbedding[tokenBase + channel] +
-                    gpt2Assets.positionEmbedding[positionBase + channel]
-            }
-        }
-    }
-
-    private func writeIncrementalEmbeddingLlama(
-        token: TokenID,
-        into buffer: borrowing TensorBuffer
-    ) throws {
-        let tokenBase = Int(token) * config.dModel
-        guard tokenBase + config.dModel <= llamaAssets.tokenEmbedding.count else {
-            throw RealModelInferenceError.runtimeFailure(
-                "Llama embedding OOB: token=\(token), base=\(tokenBase), embeddingCount=\(llamaAssets.tokenEmbedding.count), dModel=\(config.dModel)"
-            )
-        }
-        buffer.withUnsafeMutableBufferPointer { dst in
-            for channel in 0..<config.dModel {
-                dst[channel] = llamaAssets.tokenEmbedding[tokenBase + channel]
-            }
-        }
-    }
-
-    private mutating func ensureFusedHybridCompiled(bucket: Int) throws -> Bool {
-        switch fusedHybridReadiness {
-        case .compiled(let runtime) where runtime.bucket >= bucket:
-            return false
-        case .compiled, .notCompiled:
-            break
-        }
-
-        let newLayers: LayerStorage<FusedHybridDecodeLayerKernelSet>
-        do {
-            newLayers = try Self.compileFusedHybridLayers(
-                config: config,
-                weightDirURL: weightDirURL,
-                maxSeq: bucket,
-                environment: policies.environment
-            )
-        } catch let error as RealModelInferenceError {
-            if case .hybridFallbackDisabled = error { throw error }
-            throw Self.fusedHybridFallbackError(reason: error.errorDescription ?? "\(error)")
-        } catch {
-            throw Self.fusedHybridFallbackError(reason: "\(error)")
-        }
-
-        var newSurfaceHandles: [FusedHybridDecodeSurfaceHandles] = []
-        newSurfaceHandles.reserveCapacity(newLayers.count)
-        for layerIndex in 0..<newLayers.count {
-            do {
-                newSurfaceHandles.append(
-                    try FusedHybridDecodeSurfaceHandles(kernels: newLayers[layerIndex])
-                )
-            } catch {
-                throw Self.fusedHybridFallbackError(
-                    reason: "fused N=1 surfaces unavailable for layer \(layerIndex): \(error)"
-                )
-            }
-        }
-
-        compiledFusedHybridLayers = newLayers
-        compiledFusedHybridSurfaceHandles = newSurfaceHandles
-        if let runtime = FusedHybridCompiledRuntime(
-            bucket: bucket,
-            layerCount: compiledFusedHybridLayers.count,
-            surfaceHandleCount: compiledFusedHybridSurfaceHandles.count,
-            expectedLayerCount: config.nLayer
-        ) {
-            fusedHybridReadiness = .compiled(runtime)
-        } else {
-            fusedHybridReadiness = .notCompiled
-        }
-        return true
-    }
-
-    private static func compileFusedHybridLayers(
-        config: MultiModelConfig,
-        weightDirURL: URL,
-        maxSeq: Int,
-        environment: [String: String] = ProcessInfo.processInfo.environment
-    ) throws -> LayerStorage<FusedHybridDecodeLayerKernelSet> {
-        guard config.nHead > 0, config.nKVHead > 0, config.headDim > 0,
-              config.nHead % config.nKVHead == 0 else {
-            throw fusedHybridFallbackError(
-                reason: "invalid fused N=1 head geometry nHead=\(config.nHead) nKVHead=\(config.nKVHead) headDim=\(config.headDim)"
-            )
-        }
-        var donor: FusedHybridDecodeLayerKernelSet.DonorHexIDs?
-        return try LayerStorage(count: config.nLayer, throwingInitializer: { layerIndex in
-            fputs(
-                "[FusedHybridDecode] compiling layer \(layerIndex)/\(config.nLayer) maxSeq=\(maxSeq) n=1\n",
-                stderr
-            )
-            let paths = LayerWeightPaths.forLayer(
-                layerIndex,
-                config: config,
-                blobDir: weightDirURL.path
-            )
-            let weights = try loadHybridLayerWeightsLlama(config: config, paths: paths)
-            let compiled = try FusedHybridDecodeLayerKernelSet(
-                weights: weights,
-                maxSeq: maxSeq,
-                nHeads: config.nHead,
-                nKVHeads: config.nKVHead,
-                headDim: config.headDim,
-                donorHexIDs: donor,
-                options: HybridDecodeKernelOptions.resolve(environment: environment)
-            )
-            donor = compiled.donorHexIDs
-            return compiled
-        })
-    }
-
-    /// Fused hybrid Trunk stepper: one ANE program per transformer layer, attention included.
-    ///
-    /// Holds per-run hidden buffer and decode state; compiled programs stay on the
-    /// host engine and are borrowed through it on every decode step.
     private final class FusedHybridStepper: LlamaStepping {
 
         let contextLimit: Int
@@ -6790,47 +5234,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         )
     }
 
-    private static func compileHybridLayers(
-        config: MultiModelConfig,
-        weightDirURL: URL,
-        sourceLayerRange: Range<Int>? = nil,
-        maxSeq: Int,
-        environment: [String: String] = ProcessInfo.processInfo.environment
-    ) throws -> LayerStorage<HybridDecodeKernelSet> {
-        let layerRange = sourceLayerRange ?? (0..<config.nLayer)
-        let kernelOptions = HybridDecodeKernelOptions.resolve(environment: environment)
-        let useDonorDelta = supportsHybridDonorDelta(
-            config: config,
-            environment: environment
-        )
-        var donorHexIDs: HybridDecodeKernelSet.DonorHexIDs? = nil
-        return try LayerStorage<HybridDecodeKernelSet>(count: layerRange.count, throwingInitializer: { localLayerIndex in
-            let layerIndex = layerRange.lowerBound + localLayerIndex
-            let paths = LayerWeightPaths.forLayer(layerIndex, config: config, blobDir: weightDirURL.path)
-            let weights: LayerWeights = switch config.architecture {
-            case .gpt2: try loadHybridLayerWeights(config: config, paths: paths)
-            case .llama: try loadHybridLayerWeightsLlama(config: config, paths: paths)
-            }
-            do {
-                let kernels = try HybridDecodeKernelSet(
-                    weights: weights,
-                    maxSeq: maxSeq,
-                    donorHexIDs: useDonorDelta ? donorHexIDs : nil,
-                    options: kernelOptions
-                )
-                if useDonorDelta {
-                    donorHexIDs = kernels.donorHexIDs
-                }
-                return kernels
-            } catch {
-                throw RealModelInferenceError.runtimeFailure(
-                    "Hybrid decode compilation failed for layer \(layerIndex): \(error). Failing-kernel MIL is dumped to $TMPDIR/espresso-hybrid-<kernel>-<unix-seconds>.mil"
-                )
-            }
-        })
-    }
-
-    private static func compileLayers(
+    static func compileLayers(
         config: MultiModelConfig,
         weightDirURL: URL,
         bucket: Int,
@@ -6847,7 +5251,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         })
     }
 
-    private static func loadHybridLayerWeights(
+    static func loadHybridLayerWeights(
         config: MultiModelConfig,
         paths: LayerWeightPaths
     ) throws -> LayerWeights {
@@ -6958,7 +5362,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         return try loadHybridLayerWeightsLlama(config: config, paths: paths)
     }
 
-    private static func loadLlamaQKNormWeights(
+    static func loadLlamaQKNormWeights(
         config: MultiModelConfig,
         paths: LayerWeightPaths
     ) throws -> LlamaQKNormWeights? {
@@ -7009,7 +5413,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         )
     }
 
-    private static func loadLlamaCPUQKVWeights(
+    static func loadLlamaCPUQKVWeights(
         config: MultiModelConfig,
         paths: LayerWeightPaths
     ) throws -> LlamaCPUQKVWeights {
@@ -7025,390 +5429,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         )
     }
 
-    static func loadExactCPULlamaLayerWeights(
-        config: MultiModelConfig,
-        paths: LayerWeightPaths
-    ) throws -> ExactCPULlamaLayerWeights {
-        let qkNormWeights = try loadLlamaQKNormWeights(config: config, paths: paths)
-        guard let w3Path = paths.w3 else {
-            let layerDirectory = URL(fileURLWithPath: paths.wq).deletingLastPathComponent()
-            throw RealModelInferenceError.runtimeFailure("Missing llama W3 (gate) weight for \(layerDirectory.path)")
-        }
-        return ExactCPULlamaLayerWeights(
-            rmsAtt: try loadWeightTablePreferringFloat32Sidecar(at: paths.rmsAtt, expectedCount: config.dModel),
-            wq: try loadWeightTablePreferringFloat32Sidecar(at: paths.wq, expectedCount: config.dModel * config.attentionDim),
-            wk: try loadWeightTablePreferringFloat32Sidecar(at: paths.wk, expectedCount: config.dModel * config.kvDim),
-            wv: try loadWeightTablePreferringFloat32Sidecar(at: paths.wv, expectedCount: config.dModel * config.kvDim),
-            wo: try loadWeightTablePreferringFloat32Sidecar(at: paths.wo, expectedCount: config.dModel * config.attentionDim),
-            rmsFfn: try loadWeightTablePreferringFloat32Sidecar(at: paths.rmsFfn, expectedCount: config.dModel),
-            w1: try loadWeightTablePreferringFloat32Sidecar(at: paths.w1, expectedCount: config.hiddenDim * config.dModel),
-            w2: try loadWeightTablePreferringFloat32Sidecar(at: paths.w2, expectedCount: config.dModel * config.hiddenDim),
-            w3: try loadWeightTablePreferringFloat32Sidecar(at: w3Path, expectedCount: config.hiddenDim * config.dModel),
-            qNorm: qkNormWeights?.q,
-            kNorm: qkNormWeights?.k,
-            qkvBias: try loadLlamaQKVBiasWeights(config: config, paths: paths)
-        )
-    }
 
-    static func applyPerHeadRMSNormInPlace(
-        values: UnsafeMutableBufferPointer<Float>,
-        weights: UnsafeBufferPointer<Float>,
-        headCount: Int,
-        headDim: Int,
-        epsilon: Float
-    ) {
-        precondition(headCount >= 0)
-        precondition(headDim > 0)
-        precondition(values.count == headCount * headDim)
-        precondition(weights.count == headDim)
-
-        for head in 0..<headCount {
-            let base = head * headDim
-            var sumSq: Float = 0
-            for lane in 0..<headDim {
-                let value = values[base + lane]
-                sumSq += value * value
-            }
-            let invRms = 1.0 / sqrtf(sumSq / Float(headDim) + epsilon)
-            for lane in 0..<headDim {
-                values[base + lane] *= invRms * weights[lane]
-            }
-        }
-    }
-
-    private static func multiplyRowMajorMatrix(
-        matrix: [Float],
-        rows: Int,
-        cols: Int,
-        vector: UnsafeBufferPointer<Float>,
-        into output: UnsafeMutableBufferPointer<Float>
-    ) {
-        precondition(matrix.count == rows * cols)
-        precondition(vector.count == cols)
-        precondition(output.count == rows)
-        matrix.withUnsafeBufferPointer { matrixBuffer in
-            vDSP_mmul(
-                matrixBuffer.baseAddress!,
-                1,
-                vector.baseAddress!,
-                1,
-                output.baseAddress!,
-                1,
-                vDSP_Length(rows),
-                1,
-                vDSP_Length(cols)
-            )
-        }
-    }
-
-    private static func multiplyRowMajorMatrix(
-        matrix: [Float],
-        rows: Int,
-        cols: Int,
-        vector: [Float]
-    ) -> [Float] {
-        var output = [Float](repeating: 0, count: rows)
-        output.withUnsafeMutableBufferPointer { outputBuffer in
-            vector.withUnsafeBufferPointer { vectorBuffer in
-                multiplyRowMajorMatrix(
-                    matrix: matrix,
-                    rows: rows,
-                    cols: cols,
-                    vector: vectorBuffer,
-                    into: outputBuffer
-                )
-            }
-        }
-        return output
-    }
-
-    private static func addBiasInPlace(_ bias: [Float], into output: UnsafeMutableBufferPointer<Float>) {
-        precondition(bias.count == output.count)
-        bias.withUnsafeBufferPointer { biasBuffer in
-            vDSP_vadd(
-                output.baseAddress!,
-                1,
-                biasBuffer.baseAddress!,
-                1,
-                output.baseAddress!,
-                1,
-                vDSP_Length(output.count)
-            )
-        }
-    }
-
-    /// Row-major `(out, in)` projection with an optional additive bias, matching a single
-    /// `nn.Linear` on the PyTorch side and the conv+add pair the ANE kernel emits.
-    private static func projectRowMajorMatrix(
-        matrix: [Float],
-        rows: Int,
-        cols: Int,
-        vector: [Float],
-        bias: [Float]?
-    ) -> [Float] {
-        var output = multiplyRowMajorMatrix(matrix: matrix, rows: rows, cols: cols, vector: vector)
-        guard let bias else { return output }
-        precondition(bias.count == rows)
-        for index in 0..<rows {
-            output[index] += bias[index]
-        }
-        return output
-    }
-
-    private static func roundFloat16Vector(_ values: [Float]) -> [Float] {
-        values.map { Float(Float16($0)) }
-    }
-
-    /// Runs one Llama-family transformer layer on the CPU for a single token position.
-    ///
-    /// This is the single definition of the exact-CPU layer math: the incremental decode
-    /// path and the per-layer parity probe both call it, so a parity measurement cannot
-    /// drift away from what is actually served.
-    ///
-    /// `kCache`/`vCache` are channel-major (`channel * cacheStride + position`) and are
-    /// updated in place for `position`.
-    static func exactCPULlamaLayerForward(
-        hidden: [Float],
-        layer: ExactCPULlamaLayerWeights,
-        config: MultiModelConfig,
-        position: Int,
-        kCache: inout [Float],
-        vCache: inout [Float],
-        cacheStride: Int,
-        roundIntermediatesToFP16: Bool
-    ) -> [Float] {
-        let maybeRound: ([Float]) -> [Float] = { values in
-            roundIntermediatesToFP16 ? Self.roundFloat16Vector(values) : values
-        }
-        let attnNormed = Self.rmsNorm(hidden, weight: layer.rmsAtt, eps: Float(config.normEps))
-        var q = maybeRound(
-            Self.projectRowMajorMatrix(
-                matrix: layer.wq,
-                rows: config.attentionDim,
-                cols: config.dModel,
-                vector: attnNormed,
-                bias: layer.qkvBias?.q
-            )
-        )
-        var k = maybeRound(
-            Self.projectRowMajorMatrix(
-                matrix: layer.wk,
-                rows: config.kvDim,
-                cols: config.dModel,
-                vector: attnNormed,
-                bias: layer.qkvBias?.k
-            )
-        )
-        let vRounded = maybeRound(
-            Self.projectRowMajorMatrix(
-                matrix: layer.wv,
-                rows: config.kvDim,
-                cols: config.dModel,
-                vector: attnNormed,
-                bias: layer.qkvBias?.v
-            )
-        )
-
-        if let qNorm = layer.qNorm {
-            q.withUnsafeMutableBufferPointer { values in
-                qNorm.withUnsafeBufferPointer { weights in
-                    Self.applyPerHeadRMSNormInPlace(
-                        values: values,
-                        weights: weights,
-                        headCount: config.nHead,
-                        headDim: config.headDim,
-                        epsilon: Float(config.normEps)
-                    )
-                }
-            }
-        }
-        if let kNorm = layer.kNorm {
-            k.withUnsafeMutableBufferPointer { values in
-                kNorm.withUnsafeBufferPointer { weights in
-                    Self.applyPerHeadRMSNormInPlace(
-                        values: values,
-                        weights: weights,
-                        headCount: config.nKVHead,
-                        headDim: config.headDim,
-                        epsilon: Float(config.normEps)
-                    )
-                }
-            }
-        }
-
-        q = maybeRound(
-            Self.applyHalfSplitRoPEPerHead(
-                q,
-                heads: config.nHead,
-                headDim: config.headDim,
-                position: position,
-                theta: config.ropeTheta
-            )
-        )
-        k = maybeRound(
-            Self.applyHalfSplitRoPEPerHead(
-                k,
-                heads: config.nKVHead,
-                headDim: config.headDim,
-                position: position,
-                theta: config.ropeTheta
-            )
-        )
-
-        for channel in 0..<config.kvDim {
-            kCache[channel * cacheStride + position] = k[channel]
-            vCache[channel * cacheStride + position] = vRounded[channel]
-        }
-
-        let context = Self.decodeContextFromCaches(
-            qOut: q,
-            kCache: kCache,
-            vCache: vCache,
-            heads: config.nHead,
-            kvHeads: config.nKVHead,
-            headDim: config.headDim,
-            visibleTokenCount: position + 1,
-            cacheStride: cacheStride
-        )
-
-        let projected = maybeRound(
-            zip(
-                hidden,
-                Self.multiplyRowMajorMatrix(
-                    matrix: layer.wo,
-                    rows: config.dModel,
-                    cols: config.attentionDim,
-                    vector: context
-                )
-            ).map(+)
-        )
-        let ffnNormed = Self.rmsNorm(projected, weight: layer.rmsFfn, eps: Float(config.normEps))
-        let gate = Self.multiplyRowMajorMatrix(
-            matrix: layer.w1,
-            rows: config.hiddenDim,
-            cols: config.dModel,
-            vector: ffnNormed
-        )
-        let up = Self.multiplyRowMajorMatrix(
-            matrix: layer.w3,
-            rows: config.hiddenDim,
-            cols: config.dModel,
-            vector: ffnNormed
-        )
-        let activated = zip(gate, up).map { Self.silu($0) * $1 }
-        let down = Self.multiplyRowMajorMatrix(
-            matrix: layer.w2,
-            rows: config.dModel,
-            cols: config.hiddenDim,
-            vector: activated
-        )
-        return maybeRound(zip(projected, down).map(+))
-    }
-
-    private static func rmsNorm(_ input: [Float], weight: [Float], eps: Float) -> [Float] {
-        precondition(input.count == weight.count)
-        var normalized = [Float](repeating: 0, count: input.count)
-        var sumSq: Float = 0
-        input.withUnsafeBufferPointer { inputBuffer in
-            vDSP_dotpr(inputBuffer.baseAddress!, 1, inputBuffer.baseAddress!, 1, &sumSq, vDSP_Length(input.count))
-        }
-        var invRms = 1.0 / sqrtf(sumSq / Float(input.count) + eps)
-        input.withUnsafeBufferPointer { inputBuffer in
-            normalized.withUnsafeMutableBufferPointer { normalizedBuffer in
-                vDSP_vsmul(inputBuffer.baseAddress!, 1, &invRms, normalizedBuffer.baseAddress!, 1, vDSP_Length(input.count))
-            }
-        }
-        weight.withUnsafeBufferPointer { weightBuffer in
-            normalized.withUnsafeMutableBufferPointer { normalizedBuffer in
-                vDSP_vmul(normalizedBuffer.baseAddress!, 1, weightBuffer.baseAddress!, 1, normalizedBuffer.baseAddress!, 1, vDSP_Length(input.count))
-            }
-        }
-        return normalized
-    }
-
-    private static func applyHalfSplitRoPEPerHead(
-        _ input: [Float],
-        heads: Int,
-        headDim: Int,
-        position: Int,
-        theta: Float
-    ) -> [Float] {
-        precondition(input.count == heads * headDim)
-        precondition(headDim % 2 == 0)
-        let halfDim = headDim / 2
-        var output = input
-        for head in 0..<heads {
-            let base = head * headDim
-            for dimPair in 0..<halfDim {
-                let frequency = 1.0 / pow(theta, Float(2 * dimPair) / Float(headDim))
-                let angle = Float(position) * frequency
-                let cosv = cos(angle)
-                let sinv = sin(angle)
-                let i0 = base + dimPair
-                let i1 = base + dimPair + halfDim
-                let v0 = output[i0]
-                let v1 = output[i1]
-                output[i0] = v0 * cosv - v1 * sinv
-                output[i1] = v0 * sinv + v1 * cosv
-            }
-        }
-        return output
-    }
-
-    private static func decodeContextFromCaches(
-        qOut: [Float],
-        kCache: [Float],
-        vCache: [Float],
-        heads: Int,
-        kvHeads: Int,
-        headDim: Int,
-        visibleTokenCount: Int,
-        cacheStride: Int
-    ) -> [Float] {
-        precondition(qOut.count == heads * headDim)
-        precondition(kCache.count == kvHeads * headDim * cacheStride)
-        precondition(vCache.count == kvHeads * headDim * cacheStride)
-        precondition(visibleTokenCount > 0 && visibleTokenCount <= cacheStride)
-        let queriesPerKVHead = max(heads / max(kvHeads, 1), 1)
-        let scale = 1.0 / sqrt(Float(headDim))
-        var context = [Float](repeating: 0, count: heads * headDim)
-
-        for head in 0..<heads {
-            let kvHead = min(head / queriesPerKVHead, kvHeads - 1)
-            let qBase = head * headDim
-            let kvBase = kvHead * headDim
-            var scores = [Float](repeating: 0, count: visibleTokenCount)
-            for token in 0..<visibleTokenCount {
-                var dot: Float = 0
-                for dim in 0..<headDim {
-                    dot += qOut[qBase + dim] * kCache[(kvBase + dim) * cacheStride + token]
-                }
-                scores[token] = dot * scale
-            }
-
-            let maxScore = scores.max() ?? 0
-            var denom: Float = 0
-            for token in 0..<visibleTokenCount {
-                scores[token] = exp(scores[token] - maxScore)
-                denom += scores[token]
-            }
-            let invDenom: Float = denom > 0 ? 1 / denom : 0
-
-            for dim in 0..<headDim {
-                var accum: Float = 0
-                for token in 0..<visibleTokenCount {
-                    accum += scores[token] * invDenom * vCache[(kvBase + dim) * cacheStride + token]
-                }
-                context[qBase + dim] = accum
-            }
-        }
-
-        return context
-    }
-
-    private static func silu(_ value: Float) -> Float {
-        0.5 * value * (1 + tanh(0.5 * value))
-    }
 
     private enum LayerBlockKind: String {
         case attention = "attn"
@@ -7609,14 +5630,14 @@ public struct RealModelInferenceEngine: ~Copyable {
         return values
     }
 
-    private static func compileHead(
+    static func compileHead(
         config: MultiModelConfig,
         weightDirURL: URL,
         assets: GPT2TopLevelAssets,
         spatial: Int,
         inputDType: ANEDType = .fp32,
         outputDType: ANEDType = .fp32,
-        environment: [String: String] = Self.processEnvironment
+        environment: [String: String]
     ) throws -> CompiledHead {
         var graph = buildGPT2HeadGraph(
             config: config,
@@ -7659,7 +5680,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         return CompiledHead(kernel: kernel, inputSurface: inputSurface, outputSurface: outputSurface)
     }
 
-    private static func compileClassifier(
+    static func compileClassifier(
         config: MultiModelConfig,
         assets: GPT2TopLevelAssets,
         spatial: Int
@@ -7698,7 +5719,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         )
     }
 
-    private static func compileLlamaHead(
+    static func compileLlamaHead(
         config: MultiModelConfig,
         weightDirURL: URL,
         assets: LlamaTopLevelAssets,
@@ -7742,7 +5763,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         return CompiledHead(kernel: kernel, inputSurface: inputSurface, outputSurface: outputSurface)
     }
 
-    private static func compileLlamaClassifier(
+    static func compileLlamaClassifier(
         config: MultiModelConfig,
         assets: LlamaTopLevelAssets,
         spatial: Int
@@ -7785,7 +5806,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         )
     }
 
-    private static func compileLlamaRMSNormClassifier(
+    static func compileLlamaRMSNormClassifier(
         config: MultiModelConfig,
         assets: LlamaTopLevelAssets,
         spatial: Int
@@ -7837,7 +5858,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         )
     }
 
-    private static func compileLlamaFactoredClassifier(
+    static func compileLlamaFactoredClassifier(
         config: MultiModelConfig,
         assets: LlamaTopLevelAssets,
         spatial: Int
@@ -8124,7 +6145,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         return graph
     }
 
-    private static func firstInputSurface(from layers: borrowing LayerStorage<CompiledLayer>) throws -> IOSurfaceRef {
+    static func firstInputSurface(from layers: borrowing LayerStorage<CompiledLayer>) throws -> IOSurfaceRef {
         guard layers.count > 0 else {
             throw RealModelInferenceError.runtimeFailure("No compiled layers were produced")
         }
@@ -8136,63 +6157,6 @@ public struct RealModelInferenceEngine: ~Copyable {
             return inputSurface
         } catch {
             throw RealModelInferenceError.runtimeFailure("Failed to chain layer surfaces: \(error)")
-        }
-    }
-
-    private static func loadTokenizer(
-        config: MultiModelConfig,
-        tokenizerDirURL: URL
-    ) throws -> LoadedTokenizer {
-        switch config.architecture {
-        case .gpt2:
-            let vocabURL = tokenizerDirURL.appendingPathComponent("vocab.json")
-            let mergesURL = tokenizerDirURL.appendingPathComponent("merges.txt")
-            guard FileManager.default.fileExists(atPath: vocabURL.path) else {
-                throw RealModelInferenceError.missingPath(vocabURL.path)
-            }
-            guard FileManager.default.fileExists(atPath: mergesURL.path) else {
-                throw RealModelInferenceError.missingPath(mergesURL.path)
-            }
-            do {
-                return .gpt2(try GPT2BPETokenizer(vocabURL: vocabURL, mergesURL: mergesURL))
-            } catch {
-                throw RealModelInferenceError.runtimeFailure("Failed to load GPT-2 tokenizer: \(error)")
-            }
-        case .llama:
-            // Try SentencePiece first (Llama, Mistral)
-            let spCandidates = ["tokenizer.model", "tokenizer.bin"]
-            for candidate in spCandidates {
-                let url = tokenizerDirURL.appendingPathComponent(candidate)
-                if FileManager.default.fileExists(atPath: url.path) {
-                    do {
-                        return .sentencePiece(try SentencePieceTokenizer(modelURL: url))
-                    } catch {
-                        throw RealModelInferenceError.runtimeFailure("Failed to load SentencePiece tokenizer: \(error)")
-                    }
-                }
-            }
-            let tokenizerJSONURL = tokenizerDirURL.appendingPathComponent("tokenizer.json")
-            if FileManager.default.fileExists(atPath: tokenizerJSONURL.path) {
-                do {
-                    return .gpt2(try GPT2BPETokenizer(tokenizerJSONURL: tokenizerJSONURL))
-                } catch {
-                    throw RealModelInferenceError.runtimeFailure("Failed to load tokenizer.json BPE tokenizer: \(error)")
-                }
-            }
-            // Fallback to GPT-2 BPE (Qwen uses BPE with llama-family architecture)
-            let vocabURL = tokenizerDirURL.appendingPathComponent("vocab.json")
-            let mergesURL = tokenizerDirURL.appendingPathComponent("merges.txt")
-            if FileManager.default.fileExists(atPath: vocabURL.path),
-               FileManager.default.fileExists(atPath: mergesURL.path) {
-                do {
-                    return .gpt2(try GPT2BPETokenizer(vocabURL: vocabURL, mergesURL: mergesURL))
-                } catch {
-                    throw RealModelInferenceError.runtimeFailure("Failed to load GPT-2 BPE tokenizer: \(error)")
-                }
-            }
-            throw RealModelInferenceError.missingPath(
-                "No tokenizer found in \(tokenizerDirURL.path) — tried tokenizer.model, tokenizer.bin, tokenizer.json, vocab.json+merges.txt"
-            )
         }
     }
 
@@ -8235,7 +6199,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         return max(spatialBucket(for: tokenCount, maxSeq: maxSeq), minimumSpatial)
     }
 
-    private static func validateDirectory(_ url: URL) throws {
+    static func validateDirectory(_ url: URL) throws {
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory), isDirectory.boolValue else {
             throw RealModelInferenceError.missingPath(url.path)
@@ -8303,218 +6267,6 @@ public struct RealModelInferenceEngine: ~Copyable {
         expected: Int
     ) throws {
         try requireMetadata(metadata, key: key, expected: String(expected))
-    }
-
-    private static func requiredFile(
-        root: URL,
-        candidates: [String],
-        label: String
-    ) throws -> String {
-        for candidate in candidates {
-            let path = root.appendingPathComponent(candidate).path
-            if FileManager.default.fileExists(atPath: path) {
-                return path
-            }
-        }
-        throw RealModelInferenceError.missingPath(
-            "\(root.path)/<\(label): \(candidates.joined(separator: " | "))>"
-        )
-    }
-
-    static func loadWeightTable(at path: String, expectedCount: Int) throws -> [Float] {
-        let values: [Float]
-        do {
-            values = try BlobWeightLoader.load(from: path)
-        } catch {
-            throw RealModelInferenceError.runtimeFailure("Failed to load weight blob \(path): \(error)")
-        }
-        guard values.count == expectedCount else {
-            throw RealModelInferenceError.invalidWeightCount(path: path, expected: expectedCount, actual: values.count)
-        }
-        return values
-    }
-
-    static func loadWeightTable(at path: String, allowedCounts: [Int]) throws -> [Float] {
-        let values: [Float]
-        do {
-            values = try BlobWeightLoader.load(from: path)
-        } catch {
-            throw RealModelInferenceError.runtimeFailure("Failed to load weight blob \(path): \(error)")
-        }
-        guard allowedCounts.contains(values.count) else {
-            let expected = allowedCounts.map(String.init).joined(separator: " or ")
-            throw RealModelInferenceError.runtimeFailure(
-                "Unexpected weight count for \(path): expected \(expected), got \(values.count)"
-            )
-        }
-        return values
-    }
-
-    static func loadRawFP16WeightTableIfNoExactFloat32Sidecar(
-        at path: String,
-        expectedCount: Int
-    ) throws -> [UInt16]? {
-        let sidecarPath = exactFloat32SidecarPath(forBlobPath: path)
-        guard !FileManager.default.fileExists(atPath: sidecarPath) else {
-            return nil
-        }
-
-        let header: BlobWeightLoader.Header
-        do {
-            header = try BlobWeightLoader.readHeader(from: path)
-        } catch {
-            throw RealModelInferenceError.runtimeFailure("Failed to read weight blob header \(path): \(error)")
-        }
-
-        let expectedBytes = expectedCount * MemoryLayout<UInt16>.stride
-        guard Int(header.dataSize) == expectedBytes else {
-            throw RealModelInferenceError.invalidWeightCount(
-                path: path,
-                expected: expectedCount,
-                actual: Int(header.dataSize) / MemoryLayout<UInt16>.stride
-            )
-        }
-
-        let handle: FileHandle
-        do {
-            handle = try FileHandle(forReadingFrom: URL(fileURLWithPath: path))
-        } catch {
-            throw RealModelInferenceError.runtimeFailure("Failed to open weight blob \(path): \(error)")
-        }
-        defer { try? handle.close() }
-
-        do {
-            try handle.seek(toOffset: UInt64(header.dataOffset))
-        } catch {
-            throw RealModelInferenceError.runtimeFailure("Failed to seek weight blob \(path): \(error)")
-        }
-
-        let payload: Data
-        do {
-            payload = try handle.read(upToCount: expectedBytes) ?? Data()
-        } catch {
-            throw RealModelInferenceError.runtimeFailure("Failed to read weight blob payload \(path): \(error)")
-        }
-        guard payload.count == expectedBytes else {
-            throw RealModelInferenceError.invalidWeightCount(
-                path: path,
-                expected: expectedCount,
-                actual: payload.count / MemoryLayout<UInt16>.stride
-            )
-        }
-
-        return payload.withUnsafeBytes { raw in
-            (0..<expectedCount).map { index in
-                let bits = raw.loadUnaligned(
-                    fromByteOffset: index * MemoryLayout<UInt16>.stride,
-                    as: UInt16.self
-                )
-                return UInt16(littleEndian: bits)
-            }
-        }
-    }
-
-    static func exactFloat32SidecarPath(forBlobPath path: String) -> String {
-        if path.hasSuffix(".bin") {
-            return String(path.dropLast(4)) + ".float32.bin"
-        }
-        return path + ".float32"
-    }
-
-    static func loadExactFloat32WeightTable(
-        at path: String,
-        expectedCount: Int
-    ) throws -> [Float]? {
-        let sidecarPath = exactFloat32SidecarPath(forBlobPath: path)
-        guard FileManager.default.fileExists(atPath: sidecarPath) else {
-            return nil
-        }
-
-        let data: Data
-        do {
-            data = try Data(contentsOf: URL(fileURLWithPath: sidecarPath))
-        } catch {
-            throw RealModelInferenceError.runtimeFailure("Failed to read float32 sidecar \(sidecarPath): \(error)")
-        }
-
-        let scalarSize = MemoryLayout<UInt32>.stride
-        let expectedBytes = expectedCount * scalarSize
-        guard data.count == expectedBytes else {
-            throw RealModelInferenceError.invalidWeightCount(
-                path: sidecarPath,
-                expected: expectedCount,
-                actual: data.count / scalarSize
-            )
-        }
-
-        return data.withUnsafeBytes { raw in
-            (0..<expectedCount).map { index in
-                let bits = raw.loadUnaligned(fromByteOffset: index * scalarSize, as: UInt32.self)
-                return Float(bitPattern: UInt32(littleEndian: bits))
-            }
-        }
-    }
-
-    static func loadWeightTablePreferringFloat32Sidecar(
-        at path: String,
-        expectedCount: Int
-    ) throws -> [Float] {
-        if let exactValues = try loadExactFloat32WeightTable(at: path, expectedCount: expectedCount) {
-            return exactValues
-        }
-        return try loadWeightTable(at: path, expectedCount: expectedCount)
-    }
-
-    private static func loadTensor(
-        _ tensor: borrowing TensorBuffer,
-        from path: String,
-        expectedCount: Int
-    ) throws {
-        let values = try loadWeightTable(at: path, expectedCount: expectedCount)
-        tensor.withUnsafeMutableBufferPointer { dst in
-            values.withUnsafeBufferPointer { src in
-                guard let dstBase = dst.baseAddress, let srcBase = src.baseAddress else {
-                    return
-                }
-                dstBase.update(from: srcBase, count: expectedCount)
-            }
-        }
-    }
-
-    private static func buildGroupedWeightBlob(
-        from weights: [Float],
-        rows: Int,
-        colsPerGroup: Int,
-        groups: Int
-    ) -> Data {
-        let compactCount = rows * colsPerGroup
-        let repacked: [Float] = weights.withUnsafeBufferPointer { buffer in
-            if groups == 1 || buffer.count == compactCount {
-                return Array(buffer)
-            }
-
-            let denseCols = colsPerGroup * groups
-            precondition(rows.isMultiple(of: groups))
-            precondition(buffer.count == rows * denseCols)
-
-            let rowsPerGroup = rows / groups
-            var compact = [Float](repeating: 0, count: compactCount)
-            for row in 0..<rows {
-                let group = row / rowsPerGroup
-                let srcStart = row * denseCols + group * colsPerGroup
-                let dstStart = row * colsPerGroup
-                for col in 0..<colsPerGroup {
-                    compact[dstStart + col] = buffer[srcStart + col]
-                }
-            }
-            return compact
-        }
-        return WeightBlob.build(from: repacked, rows: rows, cols: colsPerGroup)
-    }
-
-    private static func fileExists(at path: String?) -> Bool {
-        guard let path else { return false }
-        return FileManager.default.fileExists(atPath: path)
     }
 
     static func resolveBundleWeightReference(
@@ -8603,7 +6355,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         }
     }
 
-    private static func milliseconds(from nanoseconds: UInt64) -> Double {
+    static func milliseconds(from nanoseconds: UInt64) -> Double {
         Double(nanoseconds) / 1_000_000
     }
 
@@ -8614,13 +6366,13 @@ public struct RealModelInferenceEngine: ~Copyable {
         return url.path
     }
 
-    private static func emptyStorage<Element: ~Copyable>(_: Element.Type = Element.self) -> LayerStorage<Element> {
+    static func emptyStorage<Element: ~Copyable>(_: Element.Type = Element.self) -> LayerStorage<Element> {
         LayerStorage<Element>(count: 0) { _ in
             fatalError("unreachable empty storage initializer")
         }
     }
 
-    private static func throwIfCancelled(_ isCancelled: (() -> Bool)?) throws {
+    static func throwIfCancelled(_ isCancelled: (() -> Bool)?) throws {
         if isCancelled?() == true {
             throw RealModelInferenceError.cancelled
         }
@@ -8642,7 +6394,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         )
     }
 
-    private mutating func selectTokenFromNormalizedHidden<R: RandomNumberGenerator>(
+    mutating func selectTokenFromNormalizedHidden<R: RandomNumberGenerator>(
         _ hidden: [Float],
         temperature: Float,
         topP: Float = 1.0,
@@ -8656,7 +6408,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         return sampleToken(from: logits, temperature: temperature, topP: topP, using: &rng)
     }
 
-    private mutating func exactClassifierArgmax(_ hidden: [Float]) -> Int {
+    mutating func exactClassifierArgmax(_ hidden: [Float]) -> Int {
         precondition(hidden.count == config.dModel)
         if let dumpPath = policies.lmHeadHiddenDumpPath,
            !dumpPath.isEmpty {
@@ -8759,7 +6511,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         return logits
     }
 
-    private static func precomputeClassifierBlockMaxNorms(
+    static func precomputeClassifierBlockMaxNorms(
         classifier: UnsafePointer<Float>,
         vocabSize: Int,
         dim: Int,
@@ -8794,64 +6546,6 @@ public struct RealModelInferenceEngine: ~Copyable {
         }
 
         return blockMaxNorms
-    }
-
-    private static func partitionedArgmax(
-        classifier: UnsafePointer<Float>,
-        input: UnsafePointer<Float>,
-        logitsScratch: UnsafeMutablePointer<Float>,
-        blockMaxNorms: UnsafePointer<Float>,
-        vocabSize: Int,
-        dim: Int,
-        blockSize: Int
-    ) -> Int {
-        var inputNormSquared: Float = 0
-        vDSP_svesq(input, 1, &inputNormSquared, vDSP_Length(dim))
-        let inputNorm = sqrtf(inputNormSquared)
-
-        var bestIndex = 0
-        var bestValue: Float = -.infinity
-        var blockIndex = 0
-        var blockStart = 0
-
-        while blockStart < vocabSize {
-            let blockEnd = min(blockStart + blockSize, vocabSize)
-            let blockCount = blockEnd - blockStart
-
-            if blockIndex > 0, bestValue > -.infinity {
-                let upperBound = blockMaxNorms[blockIndex] * inputNorm
-                if upperBound < bestValue {
-                    blockIndex += 1
-                    blockStart = blockEnd
-                    continue
-                }
-            }
-
-            vDSP_mmul(
-                classifier.advanced(by: blockStart * dim),
-                1,
-                input,
-                1,
-                logitsScratch,
-                1,
-                vDSP_Length(blockCount),
-                1,
-                vDSP_Length(dim)
-            )
-
-            var blockMaxValue: Float = 0
-            var blockMaxIndex: vDSP_Length = 0
-            vDSP_maxvi(logitsScratch, 1, &blockMaxValue, &blockMaxIndex, vDSP_Length(blockCount))
-            if blockMaxValue > bestValue {
-                bestValue = blockMaxValue
-                bestIndex = blockStart + Int(blockMaxIndex)
-            }
-
-            blockIndex += 1
-            blockStart = blockEnd
-        }
-
-        return bestIndex
     }
 
     private static func appendLMHeadHiddenDump(_ hidden: [Float], to path: String) {
@@ -8950,7 +6644,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         memcpy(baseAddress, source, byteCount)
     }
 
-    private static func writeFP32SpatialSlice(
+    static func writeFP32SpatialSlice(
         to surface: IOSurfaceRef,
         spatialIndex: Int,
         spatial: Int,
@@ -8996,7 +6690,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         memcpy(destination, baseAddress, byteCount)
     }
 
-    private static func readFP32SpatialSlice(
+    static func readFP32SpatialSlice(
         from surface: IOSurfaceRef,
         spatialIndex: Int,
         spatial: Int,
@@ -9039,60 +6733,8 @@ public struct RealModelInferenceEngine: ~Copyable {
         )
     }
 
-    private static func evaluateGreedyClassifier(
-        norm: borrowing CompiledHead,
-        classifier: borrowing CompiledClassifier,
-        headSpatial: Int,
-        vocab: Int
-    ) throws -> TokenID {
-        do {
-            try norm.kernel.eval()
-            try classifier.kernel.eval()
-            let argmax = try greedyArgmax(
-                classifier: classifier,
-                headSpatial: headSpatial,
-                vocab: vocab
-            )
-            guard let token = TokenID(exactly: argmax.index) else {
-                throw RealModelInferenceError.runtimeFailure(
-                    "Greedy ANE classifier selected out-of-range token \(argmax.index)"
-                )
-            }
-            return token
-        } catch let error as RealModelInferenceError {
-            throw error
-        } catch {
-            throw RealModelInferenceError.runtimeFailure("Hybrid greedy ANE head evaluation failed: \(error)")
-        }
-    }
 
-    private static func greedyArgmax(
-        classifier: borrowing CompiledClassifier,
-        headSpatial: Int,
-        vocab: Int
-    ) throws -> SurfaceIO.FP16ArgmaxResult {
-        if let maxValueSurface = classifier.maxValueSurface {
-            return try SurfaceIO.argmaxFP16SpatialSliceWithHint(
-                from: classifier.outputSurface,
-                channelOffset: 0,
-                spatialIndex: 0,
-                spatial: headSpatial,
-                channels: vocab,
-                hintSurface: maxValueSurface,
-                hintSpatialIndex: 0,
-                hintSpatial: headSpatial
-            )
-        }
-        return try SurfaceIO.argmaxFP16SpatialSlice(
-            from: classifier.outputSurface,
-            channelOffset: 0,
-            spatialIndex: 0,
-            spatial: headSpatial,
-            channels: vocab
-        )
-    }
-
-    private static func zeroSurface(_ surface: IOSurfaceRef) throws {
+    static func zeroSurface(_ surface: IOSurfaceRef) throws {
         guard IOSurfaceLock(surface, [], nil) == kIOReturnSuccess else {
             throw RealModelInferenceError.runtimeFailure("IOSurface lock failed for zero initialization")
         }
@@ -9100,7 +6742,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         memset(IOSurfaceGetBaseAddress(surface), 0, IOSurfaceGetAllocSize(surface))
     }
 
-    private static func debugLogHybridCache(
+    static func debugLogHybridCache(
         label: String,
         surface: IOSurfaceRef,
         maxSeq: Int,
@@ -9126,7 +6768,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         fputs("[hybrid-cache] \(label) \(parts.joined(separator: " "))\n", stderr)
     }
 
-    private static func debugExpectedGPT2KPrefix(
+    static func debugExpectedGPT2KPrefix(
         input: [Float],
         weights: borrowing LayerWeights,
         eps: Float,
@@ -9170,7 +6812,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         return output
     }
 
-    private static func debugExpectedGPT2KPrefixTransposed(
+    static func debugExpectedGPT2KPrefixTransposed(
         input: [Float],
         weights: borrowing LayerWeights,
         eps: Float,
