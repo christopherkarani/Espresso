@@ -260,7 +260,14 @@ enum GoldenTraceRunner {
             }
         }
 
-        let result = try GoldenTraceRunner.run(case: traceCase)
+        let result: (tokens: [Int], trunkLabel: String)
+        do {
+            result = try GoldenTraceRunner.run(case: traceCase)
+        } catch let unavailable as GoldenTraceRunner.CaseUnavailable {
+            // Real-artifact cases skip when weights are absent (hosted CI).
+            skipCase(traceCase.id, unavailable.description)
+            continue
+        }
 
         #expect(result.tokens == traceCase.expectedTokens, """
         golden trace drift in \(traceCase.id):
