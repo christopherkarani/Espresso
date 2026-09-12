@@ -527,7 +527,7 @@ extension RealModelInferenceEngine {
                     throw RealModelInferenceError.runtimeFailure("Hybrid step head evaluation failed: \(error)")
                 }
 
-                nextToken = selectTokenFromNormalizedHidden(
+                nextToken = try selectTokenFromNormalizedHidden(
                     normalized,
                     temperature: temperature,
                     topP: topP,

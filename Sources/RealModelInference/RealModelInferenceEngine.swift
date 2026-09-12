@@ -1203,6 +1203,20 @@ public struct RealModelInferenceEngine: ~Copyable {
     private let classifierBlockMaxNorms: [Float]
     private var classifierLogitsScratch: [Float]
     let classifierStrategy: ClassifierStrategy
+    /// A Metal fault after a successful bring-up is a device error. The CPU tiled
+    /// head accumulates in a different order, so swapping to it mid-stream would
+    /// make greedy output depend on transient GPU state. Fail the generation.
+    static func metalArgmax(_ head: MetalLMHeadArgmax?, hidden: [Float]) throws -> Int {
+        guard let head else {
+            throw RealModelInferenceError.runtimeFailure("metal_fp16_gemv selected without a resident head")
+        }
+        do {
+            return try head.argmax(hidden: hidden)
+        } catch {
+            throw RealModelInferenceError.runtimeFailure("metal_fp16_gemv step failed: \(error)")
+        }
+    }
+
     /// Resident GPU head; non-nil exactly when `classifierStrategy == .metalFP16GEMV`.
     private let metalLMHead: MetalLMHeadArgmax?
     let policies: EnginePolicies
@@ -1763,7 +1777,7 @@ public struct RealModelInferenceEngine: ~Copyable {
                 spatialIndex: sequenceLength - 1
             )
             try Self.throwIfCancelled(isCancelled)
-            let nextToken = selectTokenFromNormalizedHidden(
+            let nextToken = try selectTokenFromNormalizedHidden(
                 lastHidden,
                 temperature: temperature,
                 topP: topP,
@@ -4350,8 +4364,8 @@ public struct RealModelInferenceEngine: ~Copyable {
 
         func takePendingTimings() -> HybridDecodeTimingBreakdown? { pendingTimings }
 
-        func resolveToken(hidden: [Float], temperature: Float, topP: Float) -> TokenID {
-            selector.selectToken(hidden: hidden, temperature: temperature, topP: topP)
+        func resolveToken(hidden: [Float], temperature: Float, topP: Float) throws -> TokenID {
+            try selector.selectToken(hidden: hidden, temperature: temperature, topP: topP)
         }
 
         func decodeText(_ tokens: [Int]) -> String {
@@ -4661,8 +4675,8 @@ public struct RealModelInferenceEngine: ~Copyable {
 
         func takePendingTimings() -> HybridDecodeTimingBreakdown? { pendingTimings }
 
-        func resolveToken(hidden: [Float], temperature: Float, topP: Float) -> TokenID {
-            selector.selectToken(hidden: hidden, temperature: temperature, topP: topP)
+        func resolveToken(hidden: [Float], temperature: Float, topP: Float) throws -> TokenID {
+            try selector.selectToken(hidden: hidden, temperature: temperature, topP: topP)
         }
 
         func decodeText(_ tokens: [Int]) -> String {
@@ -5211,8 +5225,8 @@ public struct RealModelInferenceEngine: ~Copyable {
 
         func takePendingTimings() -> HybridDecodeTimingBreakdown? { nil }
 
-        func resolveToken(hidden: [Float], temperature: Float, topP: Float) -> TokenID {
-            selector.selectToken(hidden: hidden, temperature: temperature, topP: topP)
+        func resolveToken(hidden: [Float], temperature: Float, topP: Float) throws -> TokenID {
+            try selector.selectToken(hidden: hidden, temperature: temperature, topP: topP)
         }
 
         func decodeText(_ tokens: [Int]) -> String {
@@ -6451,16 +6465,16 @@ public struct RealModelInferenceEngine: ~Copyable {
         temperature: Float,
         topP: Float = 1.0,
         using rng: inout R
-    ) -> TokenID {
+    ) throws -> TokenID {
         if temperature <= 0 {
-            let index = exactClassifierArgmax(hidden)
+            let index = try exactClassifierArgmax(hidden)
             return TokenID(index)
         }
         let logits = projectLogits(hidden)
         return sampleToken(from: logits, temperature: temperature, topP: topP, using: &rng)
     }
 
-    mutating func exactClassifierArgmax(_ hidden: [Float]) -> Int {
+    mutating func exactClassifierArgmax(_ hidden: [Float]) throws -> Int {
         precondition(hidden.count == config.dModel)
         if let dumpPath = policies.lmHeadHiddenDumpPath,
            !dumpPath.isEmpty {
@@ -6470,14 +6484,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         case .ane, .cpuPartitionedFP32:
             return partitionedFP32Argmax(hidden)
         case .metalFP16GEMV:
-            if let metalLMHead {
-                do {
-                    return try metalLMHead.argmax(hidden: hidden)
-                } catch {
-                    fputs("[RealModelInference] metal_fp16_gemv step failed (\(error)); using cpu_fp16_tiled\n", stderr)
-                }
-            }
-            return fp16TiledArgmax(hidden)
+            return try Self.metalArgmax(metalLMHead, hidden: hidden)
         case .cpuFP16Tiled:
             return fp16TiledArgmax(hidden)
         }
@@ -6922,7 +6929,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             generatedCount: Int
         ) throws
         func takePendingTimings() -> HybridDecodeTimingBreakdown?
-        func resolveToken(hidden: [Float], temperature: Float, topP: Float) -> TokenID
+        func resolveToken(hidden: [Float], temperature: Float, topP: Float) throws -> TokenID
         func decodeText(_ tokens: [Int]) -> String
         func throwIfCancelled() throws
     }
@@ -6986,7 +6993,7 @@ public struct RealModelInferenceEngine: ~Copyable {
                 case .selected(let token):
                     nextToken = token
                 case .normalizedHidden(let hidden):
-                    nextToken = stepper.resolveToken(hidden: hidden, temperature: temperature, topP: topP)
+                    nextToken = try stepper.resolveToken(hidden: hidden, temperature: temperature, topP: topP)
                 }
 
                 if stepper.tracksDecodeProfile {
@@ -7067,9 +7074,9 @@ public struct RealModelInferenceEngine: ~Copyable {
             self.dim = dModel
         }
 
-        func selectToken(hidden: [Float], temperature: Float, topP: Float) -> TokenID {
+        func selectToken(hidden: [Float], temperature: Float, topP: Float) throws -> TokenID {
             if temperature <= 0 {
-                return TokenID(exactClassifierArgmax(hidden))
+                return TokenID(try exactClassifierArgmax(hidden))
             }
             let logits = projectLogits(hidden)
             return TokenID(
@@ -7082,7 +7089,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             )
         }
 
-        private func exactClassifierArgmax(_ hidden: [Float]) -> Int {
+        private func exactClassifierArgmax(_ hidden: [Float]) throws -> Int {
             precondition(hidden.count == dim)
             if let dumpPath = ProcessInfo.processInfo.environment["ESPRESSO_DUMP_LM_HEAD_HIDDEN"],
                !dumpPath.isEmpty {
@@ -7092,14 +7099,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             case .ane, .cpuPartitionedFP32:
                 return partitionedFP32Argmax(hidden)
             case .metalFP16GEMV:
-                if let metalLMHead {
-                    do {
-                        return try metalLMHead.argmax(hidden: hidden)
-                    } catch {
-                        fputs("[RealModelInference] metal_fp16_gemv step failed (\(error)); using cpu_fp16_tiled\n", stderr)
-                    }
-                }
-                return fp16TiledArgmax(hidden)
+                return try RealModelInferenceEngine.metalArgmax(metalLMHead, hidden: hidden)
             case .cpuFP16Tiled:
                 return fp16TiledArgmax(hidden)
             }

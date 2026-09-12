@@ -90,14 +90,25 @@ public final class MetalLMHeadArgmax {
         guard Self.supports(dim: dim) else {
             throw .invalidArguments("dim \(dim) must be a multiple of 256")
         }
-        guard vocabSize <= Int(UInt32.max) else {
-            throw .invalidArguments("vocabSize \(vocabSize) exceeds UInt32 token-id capacity")
+        guard vocabSize <= Int(UInt32.max), dim <= Int(UInt32.max) else {
+            throw .invalidArguments("vocabSize \(vocabSize) and dim \(dim) must fit UInt32")
         }
-        guard weightsFP16.count >= vocabSize * dim, let weightBase = weightsFP16.baseAddress else {
-            throw .invalidArguments("weightsFP16 has \(weightsFP16.count) elements, need \(vocabSize * dim)")
+        let (elementCount, elementOverflow) = vocabSize.multipliedReportingOverflow(by: dim)
+        let (weightByteCount, byteOverflow) = elementCount.multipliedReportingOverflow(by: MemoryLayout<UInt16>.stride)
+        guard !elementOverflow, !byteOverflow else {
+            throw .invalidArguments("vocabSize \(vocabSize) x dim \(dim) overflows the weight byte count")
+        }
+        guard weightsFP16.count >= elementCount, let weightBase = weightsFP16.baseAddress else {
+            throw .invalidArguments("weightsFP16 has \(weightsFP16.count) elements, need \(elementCount)")
         }
         guard let device = MTLCreateSystemDefaultDevice() else {
             throw .metalUnavailable
+        }
+        let hiddenThreadgroupBytes = dim * MemoryLayout<Float>.stride
+        guard hiddenThreadgroupBytes <= device.maxThreadgroupMemoryLength else {
+            throw .invalidArguments(
+                "dim \(dim) needs \(hiddenThreadgroupBytes) threadgroup bytes, device allows \(device.maxThreadgroupMemoryLength)"
+            )
         }
         guard let commandQueue = device.makeCommandQueue() else {
             throw .commandQueueUnavailable
@@ -128,7 +139,6 @@ public final class MetalLMHeadArgmax {
             throw .pipelineBuildFailed("device threadgroup limit below required stage sizes")
         }
 
-        let weightByteCount = vocabSize * dim * MemoryLayout<UInt16>.stride
         guard let weightBuffer = device.makeBuffer(
             bytes: UnsafeRawPointer(weightBase),
             length: weightByteCount,
