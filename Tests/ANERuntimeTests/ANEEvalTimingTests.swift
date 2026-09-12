@@ -17,4 +17,25 @@ final class ANEEvalTimingTests: XCTestCase {
         XCTAssertEqual(recorder.lastWallMicroseconds, 2.0, accuracy: 1e-9)
         XCTAssertEqual(recorder.lastHWExecutionTimeNS, 0)
     }
+
+    // Regression: with `evalTiming` default-initialized, Swift 6.2.4 -Onone
+    // released an uninitialized slot on this early throw (SIGSEGV in init).
+    func test_kernel_init_throws_cleanly_before_compile_on_empty_donor() {
+        for _ in 0..<64 {
+            do throws(ANEError) {
+                _ = try ANEKernel(
+                    milText: "program(1.0)",
+                    weights: [],
+                    inputSizes: [4],
+                    outputSizes: [4],
+                    donorHexId: ""
+                )
+                XCTFail("expected invalidArguments")
+            } catch {
+                guard case .invalidArguments = error else {
+                    return XCTFail("unexpected error \(error)")
+                }
+            }
+        }
+    }
 }
