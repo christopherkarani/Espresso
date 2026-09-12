@@ -108,6 +108,19 @@ final class MetalLMHeadArgmaxTests: XCTestCase {
         XCTAssertEqual(try head.argmax(hidden: hidden), 17)
     }
 
+    func testAllZeroHiddenPicksLowestIndex() throws {
+        // All logits are zero, so take_better's lowest-index tie rule must return token 0.
+        let vocab = 64
+        let dim = 256
+        let fp16 = TensorBufferFP16(
+            quantizing: TensorBuffer(count: vocab * dim, zeroed: true),
+            rows: vocab,
+            cols: dim
+        )
+        let head = try Self.makeHead(fp16, vocab: vocab, dim: dim)
+        XCTAssertEqual(try head.argmax(hidden: [Float](repeating: 0, count: dim)), 0)
+    }
+
     func testRejectsUnsupportedDim() throws {
         let vocab = 16
         let dim = 100

@@ -35,7 +35,7 @@ public enum MetalLMHeadError: Error, Equatable {
 public final class MetalLMHeadArgmax {
     /// Threads per stage-1 threadgroup (8 SIMD groups of 32 lanes).
     static let stage1Threads = 256
-    /// Vocab rows handled by one stage-1 threadgroup (8 SIMD groups × 8 rows).
+    /// Vocab rows handled by one stage-1 threadgroup (8 SIMD groups × 2 rows).
     static let rowsPerThreadgroup = 16
     static let stage2Threads = 1024
 
@@ -195,31 +195,35 @@ public final class MetalLMHeadArgmax {
         guard let commandBuffer = commandQueue.makeCommandBuffer() else {
             throw .commandBufferUnavailable
         }
-        guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
+        guard let gemvEncoder = commandBuffer.makeComputeCommandEncoder() else {
             throw .commandEncoderUnavailable
         }
         var params = self.params
 
-        encoder.setComputePipelineState(partialPipeline)
-        encoder.setBuffer(weightBuffer, offset: 0, index: 0)
-        encoder.setBuffer(hiddenBuffer, offset: 0, index: 1)
-        encoder.setBuffer(partialBuffer, offset: 0, index: 2)
-        encoder.setBytes(&params, length: MemoryLayout<Params>.stride, index: 3)
-        encoder.setThreadgroupMemoryLength(dim * MemoryLayout<Float>.stride, index: 0)
-        encoder.dispatchThreadgroups(
+        gemvEncoder.setComputePipelineState(partialPipeline)
+        gemvEncoder.setBuffer(weightBuffer, offset: 0, index: 0)
+        gemvEncoder.setBuffer(hiddenBuffer, offset: 0, index: 1)
+        gemvEncoder.setBuffer(partialBuffer, offset: 0, index: 2)
+        gemvEncoder.setBytes(&params, length: MemoryLayout<Params>.stride, index: 3)
+        gemvEncoder.setThreadgroupMemoryLength(dim * MemoryLayout<Float>.stride, index: 0)
+        gemvEncoder.dispatchThreadgroups(
             MTLSize(width: threadgroupCount, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: Self.stage1Threads, height: 1, depth: 1)
         )
+        gemvEncoder.endEncoding()
 
-        encoder.setComputePipelineState(reducePipeline)
-        encoder.setBuffer(partialBuffer, offset: 0, index: 0)
-        encoder.setBuffer(outputBuffer, offset: 0, index: 1)
-        encoder.setBytes(&params, length: MemoryLayout<Params>.stride, index: 2)
-        encoder.dispatchThreadgroups(
+        guard let reduceEncoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw .commandEncoderUnavailable
+        }
+        reduceEncoder.setComputePipelineState(reducePipeline)
+        reduceEncoder.setBuffer(partialBuffer, offset: 0, index: 0)
+        reduceEncoder.setBuffer(outputBuffer, offset: 0, index: 1)
+        reduceEncoder.setBytes(&params, length: MemoryLayout<Params>.stride, index: 2)
+        reduceEncoder.dispatchThreadgroups(
             MTLSize(width: 1, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: Self.stage2Threads, height: 1, depth: 1)
         )
-        encoder.endEncoding()
+        reduceEncoder.endEncoding()
 
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()

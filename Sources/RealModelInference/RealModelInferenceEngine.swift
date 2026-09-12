@@ -463,6 +463,10 @@ public struct RealModelInferenceEngine: ~Copyable {
         }
         let fallback = strategy.runtimeFallback ?? .cpuFP16Tiled
         guard case let .llama(llamaAssets) = assets, let lmHeadFP16 = llamaAssets.lmHeadFP16 else {
+            fputs(
+                "[RealModelInference] metal_fp16_gemv unavailable (missing fp16 lm_head blob); using \(fallback.exactHeadBackendLabel)\n",
+                stderr
+            )
             return (fallback, nil)
         }
         do {

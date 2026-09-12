@@ -193,15 +193,40 @@ extension ForwardPass {
         tokenIndex: Int,
         controls: FusedControlColumns
     ) throws(ANEError) {
-        let dim = handles.dim
-        let maxSeq = handles.maxSeq
-        let laneSpatial = handles.laneSpatial
+        try writeFusedControlSurfaces(
+            mask: handles.mask,
+            posMask: handles.posMask,
+            ropePack: handles.ropePack,
+            dim: handles.dim,
+            maxSeq: handles.maxSeq,
+            laneSpatial: handles.laneSpatial,
+            tokenIndex: tokenIndex,
+            controls: controls
+        )
+    }
+
+    /// Incremental fused-hybrid control writes. Visible for tests that compare
+    /// this against a full-surface rewrite of mask / pos / RoPE.
+    static func writeFusedControlSurfaces(
+        mask: IOSurfaceRef,
+        posMask: IOSurfaceRef,
+        ropePack: IOSurfaceRef,
+        dim: Int,
+        maxSeq: Int,
+        laneSpatial: Int,
+        tokenIndex: Int,
+        controls: FusedControlColumns
+    ) throws(ANEError) {
+        precondition(controls.zeros.count == dim)
+        precondition(controls.ones.count == dim)
+        // rope has headDim elements; headDim ≤ dim is a model invariant.
+        precondition(controls.rope.count <= dim)
         do {
             try mapSurfaceIOToANEError {
                 try controls.zeros.withUnsafeBufferPointer { zeroColumn in
                     if tokenIndex > 0 {
                         try SurfaceIO.writeFP16SpatialSlice(
-                            to: handles.posMask,
+                            to: posMask,
                             channelOffset: 0,
                             spatialIndex: tokenIndex - 1,
                             spatial: maxSeq,
@@ -210,7 +235,7 @@ extension ForwardPass {
                         )
                     }
                     try SurfaceIO.writeFP16SpatialSlice(
-                        to: handles.mask,
+                        to: mask,
                         channelOffset: 0,
                         spatialIndex: tokenIndex,
                         spatial: maxSeq,
@@ -220,7 +245,7 @@ extension ForwardPass {
                 }
                 try controls.ones.withUnsafeBufferPointer { oneColumn in
                     try SurfaceIO.writeFP16SpatialSlice(
-                        to: handles.posMask,
+                        to: posMask,
                         channelOffset: 0,
                         spatialIndex: tokenIndex,
                         spatial: maxSeq,
@@ -230,7 +255,7 @@ extension ForwardPass {
                 }
                 try controls.rope.withUnsafeBufferPointer { ropeColumn in
                     try SurfaceIO.writeFP16SpatialSlice(
-                        to: handles.ropePack,
+                        to: ropePack,
                         channelOffset: 0,
                         spatialIndex: 0,
                         spatial: laneSpatial,
