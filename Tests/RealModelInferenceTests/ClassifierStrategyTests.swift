@@ -20,7 +20,7 @@ import Espresso
     #expect(ClassifierStrategy.select(for: config) == .ane)
 }
 
-@Test func largeVocabSelectsCPU() {
+@Test func largeVocabSelectsMetalGEMV() {
     let config = MultiModelConfig(
         name: "tinyllama-test",
         nLayer: 22,
@@ -35,7 +35,8 @@ import Espresso
         architecture: .llama
     )
     // 32000 * 2048 = 65_536_000 elements > 16_000_000
-    #expect(ClassifierStrategy.select(for: config) == .cpuFP16Tiled)
+    #expect(ClassifierStrategy.select(for: config) == .metalFP16GEMV)
+    #expect(ClassifierStrategy.metalFP16GEMV.runtimeFallback == .cpuFP16Tiled)
 }
 
 @Test func stories110mUsesANEAllowlist() {
@@ -76,7 +77,7 @@ import Espresso
     #expect(ClassifierStrategy.select(for: config, hasExactFloat32LMHead: true) == .cpuPartitionedFP32)
 }
 
-@Test func qwen3VocabWithoutSidecarSelectsFP16TiledCPU() {
+@Test func qwen3VocabWithoutSidecarSelectsMetalGEMV() {
     let config = MultiModelConfig(
         name: "qwen3-0.6b-test",
         nLayer: 28,
@@ -91,10 +92,10 @@ import Espresso
         architecture: .llama
     )
     // 151936 * 1024 = 155_582_464 elements >> 16_000_000
-    #expect(ClassifierStrategy.select(for: config) == .cpuFP16Tiled)
+    #expect(ClassifierStrategy.select(for: config) == .metalFP16GEMV)
 }
 
-@Test func qwen25_15bVocabSelectsFP16TiledCPU() {
+@Test func qwen25_15bVocabSelectsMetalGEMV() {
     let config = MultiModelConfig(
         name: "Qwen2.5-1.5B-Instruct",
         nLayer: 28,
@@ -110,10 +111,13 @@ import Espresso
         preferredDecodePath: .hybrid
     )
     // 151936 * 1536 = 233_373_696 fp16 elements (~467 MB) vs ~16M SRAM (~32 MB).
-    // Capacity policy: stay on cpu_fp16_tiled. Do not move this head to Metal/ANE.
+    // The head cannot live in ANE SRAM; it streams once per token through the Metal GPU
+    // GEMV (≈2 ms on M3 Max vs ≈23 ms on the CPU tiled path). cpu_fp16_tiled stays as
+    // the forced/runtime-fallback backend.
     #expect(config.vocab * config.dModel > 16_000_000)
-    #expect(ClassifierStrategy.select(for: config) == .cpuFP16Tiled)
-    #expect(ClassifierStrategy.select(for: config).exactHeadBackendLabel == "cpu_fp16_tiled")
+    #expect(ClassifierStrategy.select(for: config) == .metalFP16GEMV)
+    #expect(ClassifierStrategy.select(for: config).exactHeadBackendLabel == "metal_fp16_gemv")
+    #expect(ClassifierStrategy.select(for: config).usesCPUExactClassifier)
 }
 
 @Test func gpt2LargeVocabKeepsPartitionedCPUPath() {
@@ -152,7 +156,8 @@ import Espresso
 }
 
 @Test func oneOverThresholdSelectsCPU() {
-    // 250_001 * 64 == 16_000_064 > 16_000_000 → should be .cpuExact
+    // 250_001 * 64 == 16_000_064 > 16_000_000 → leaves the ANE; dModel 64 is below the
+    // Metal GEMV lane width (256), so the CPU tiled head is the exact backend.
     let config = MultiModelConfig(
         name: "boundary-plus-one",
         nLayer: 1,

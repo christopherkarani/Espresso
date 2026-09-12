@@ -526,6 +526,16 @@ import ModelSupport
     )
     #expect(
         RealModelInferenceEngine.forcedExactHeadBackend(
+            environment: ["ESPRESSO_FORCE_EXACT_HEAD_BACKEND": "metal"]
+        ) == .metalFP16GEMV
+    )
+    #expect(
+        RealModelInferenceEngine.forcedExactHeadBackend(
+            environment: ["ESPRESSO_FORCE_EXACT_HEAD_BACKEND": "metal_fp16_gemv"]
+        ) == .metalFP16GEMV
+    )
+    #expect(
+        RealModelInferenceEngine.forcedExactHeadBackend(
             environment: ["ESPRESSO_FORCE_EXACT_HEAD_BACKEND": "bogus"]
         ) == nil
     )

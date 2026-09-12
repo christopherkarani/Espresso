@@ -179,7 +179,7 @@ struct CPUExactLlamaRuntime: Sendable {
             weight: finalNormGamma,
             eps: Float(config.normEps)
         )
-        return TokenID(exactClassifierArgmax(normalized))
+        return TokenID(try exactClassifierArgmax(normalized))
     }
 
     mutating func advance(token: TokenID) throws {

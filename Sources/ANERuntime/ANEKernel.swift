@@ -69,7 +69,10 @@ public struct ANEKernel: ~Copyable {
 
     private let handle: OpaquePointer
     internal let hexId: String
-    private let evalTiming = ANEEvalTimingRecorder()
+    // Assigned in each designated init after the last throw. A default value
+    // here miscompiles at -Onone on Swift 6.2.4: the early-throw path releases
+    // the recorder slot before it is initialized (SIGSEGV in ANEKernel.init).
+    private let evalTiming: ANEEvalTimingRecorder
 
     /// Host wall of the last successful `eval()`, microseconds.
     public var lastEvalWallMicroseconds: Double { evalTiming.lastWallMicroseconds }
@@ -293,6 +296,7 @@ public struct ANEKernel: ~Copyable {
         let hexId = try Self.readHexId(from: rawHandle)
         self.handle = rawHandle
         self.hexId = hexId
+        self.evalTiming = ANEEvalTimingRecorder()
     }
 
     public init(
@@ -423,6 +427,7 @@ public struct ANEKernel: ~Copyable {
         let hexId = try Self.readHexId(from: rawHandle)
         self.handle = rawHandle
         self.hexId = hexId
+        self.evalTiming = ANEEvalTimingRecorder()
     }
 
     private static func writeCompileRetryNotice(_ message: String) {
