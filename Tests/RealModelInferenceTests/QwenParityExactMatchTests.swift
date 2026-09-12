@@ -407,7 +407,7 @@ private func assertQwenGreedyParityMatchesPyTorchReferenceOnANE(
     if expectedTrunk == .fusedHybrid {
         #expect(snapshots.allSatisfy { $0.hopsPerToken == 28 })
         #expect(snapshots.allSatisfy { $0.cachedBindingsEnabled == false })
-        #expect(snapshots.allSatisfy { $0.exactHeadBackend == "cpu_fp16_tiled" })
+        #expect(snapshots.allSatisfy { $0.exactHeadBackend == "metal_fp16_gemv" })
     }
     let results = Array(snapshots.prefix(cases.count))
 

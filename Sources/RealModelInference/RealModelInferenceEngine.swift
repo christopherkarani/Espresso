@@ -443,8 +443,36 @@ public struct RealModelInferenceEngine: ~Copyable {
             return .cpuPartitionedFP32
         case "cpu_fp16_tiled", "fp16_tiled", "fp16":
             return .cpuFP16Tiled
+        case "metal_fp16_gemv", "metal_fp16", "metal":
+            return .metalFP16GEMV
         default:
             return nil
+        }
+    }
+
+    /// Brings up the Metal GEMV head for `.metalFP16GEMV`, or resolves the runtime
+    /// fallback strategy when the device or the FP16 blob is unavailable. Pure
+    /// selection stays in `ClassifierStrategy`; this is the only device probe.
+    static func resolveMetalLMHead(
+        strategy: ClassifierStrategy,
+        config: MultiModelConfig,
+        assets: TopLevelAssets
+    ) -> (strategy: ClassifierStrategy, head: MetalLMHeadArgmax?) {
+        guard strategy == .metalFP16GEMV else {
+            return (strategy, nil)
+        }
+        let fallback = strategy.runtimeFallback ?? .cpuFP16Tiled
+        guard case let .llama(llamaAssets) = assets, let lmHeadFP16 = llamaAssets.lmHeadFP16 else {
+            return (fallback, nil)
+        }
+        do {
+            let head = try lmHeadFP16.withUnsafeBufferPointer { (weights) throws(MetalLMHeadError) in
+                try MetalLMHeadArgmax(weightsFP16: weights, vocabSize: config.vocab, dim: config.dModel)
+            }
+            return (strategy, head)
+        } catch {
+            fputs("[RealModelInference] metal_fp16_gemv unavailable (\(error)); using \(fallback.exactHeadBackendLabel)\n", stderr)
+            return (fallback, nil)
         }
     }
 
@@ -1175,6 +1203,8 @@ public struct RealModelInferenceEngine: ~Copyable {
     private let classifierBlockMaxNorms: [Float]
     private var classifierLogitsScratch: [Float]
     let classifierStrategy: ClassifierStrategy
+    /// Resident GPU head; non-nil exactly when `classifierStrategy == .metalFP16GEMV`.
+    private let metalLMHead: MetalLMHeadArgmax?
     let policies: EnginePolicies
     private var cachedExactCPULlamaWeights: CachedExactCPULlamaWeights?
 
@@ -1227,11 +1257,17 @@ public struct RealModelInferenceEngine: ~Copyable {
             repeating: 0,
             count: min(Self.classifierArgmaxBlockSize, config.vocab)
         )
-        self.classifierStrategy = Self.resolveClassifierStrategy(
+        let resolvedHead = Self.resolveMetalLMHead(
+            strategy: Self.resolveClassifierStrategy(
+                config: config,
+                hasExactFloat32LMHead: hasExactFloat32LMHead,
+                environment: policies.environment
+            ),
             config: config,
-            hasExactFloat32LMHead: hasExactFloat32LMHead,
-            environment: policies.environment
+            assets: assets
         )
+        self.classifierStrategy = resolvedHead.strategy
+        self.metalLMHead = resolvedHead.head
         self.policies = policies
         self.cachedExactCPULlamaWeights = nil
     }
@@ -6432,69 +6468,65 @@ public struct RealModelInferenceEngine: ~Copyable {
         }
         switch classifierStrategy {
         case .ane, .cpuPartitionedFP32:
-            let blockSize = Self.classifierArgmaxBlockSize
-            return hidden.withUnsafeBufferPointer { hiddenBuffer in
-                lmHeadWeights.withUnsafeBufferPointer { weightBuffer in
-                    classifierBlockMaxNorms.withUnsafeBufferPointer { normsBuffer in
-                        classifierLogitsScratch.withUnsafeMutableBufferPointer { scratchBuffer in
-                            guard let hiddenBase = hiddenBuffer.baseAddress,
-                                  let weightBase = weightBuffer.baseAddress,
-                                  let normsBase = normsBuffer.baseAddress,
-                                  let scratchBase = scratchBuffer.baseAddress else {
-                                return 0
-                            }
-                            return Self.partitionedArgmax(
-                                classifier: weightBase,
-                                input: hiddenBase,
-                                logitsScratch: scratchBase,
-                                blockMaxNorms: normsBase,
-                                vocabSize: config.vocab,
-                                dim: config.dModel,
-                                blockSize: blockSize
-                            )
-                        }
-                    }
+            return partitionedFP32Argmax(hidden)
+        case .metalFP16GEMV:
+            if let metalLMHead {
+                do {
+                    return try metalLMHead.argmax(hidden: hidden)
+                } catch {
+                    fputs("[RealModelInference] metal_fp16_gemv step failed (\(error)); using cpu_fp16_tiled\n", stderr)
                 }
             }
+            return fp16TiledArgmax(hidden)
         case .cpuFP16Tiled:
-            guard case let .llama(assets) = assets, let lmHeadFP16 = assets.lmHeadFP16 else {
-                return hidden.withUnsafeBufferPointer { hiddenBuffer in
-                    lmHeadWeights.withUnsafeBufferPointer { weightBuffer in
-                        classifierBlockMaxNorms.withUnsafeBufferPointer { normsBuffer in
-                            classifierLogitsScratch.withUnsafeMutableBufferPointer { scratchBuffer in
-                                guard let hiddenBase = hiddenBuffer.baseAddress,
-                                      let weightBase = weightBuffer.baseAddress,
-                                      let normsBase = normsBuffer.baseAddress,
-                                      let scratchBase = scratchBuffer.baseAddress else {
-                                    return 0
-                                }
-                                return Self.partitionedArgmax(
-                                    classifier: weightBase,
-                                    input: hiddenBase,
-                                    logitsScratch: scratchBase,
-                                    blockMaxNorms: normsBase,
-                                    vocabSize: config.vocab,
-                                    dim: config.dModel,
-                                    blockSize: Self.classifierArgmaxBlockSize
-                                )
-                            }
+            return fp16TiledArgmax(hidden)
+        }
+    }
+
+    private mutating func partitionedFP32Argmax(_ hidden: [Float]) -> Int {
+        let blockSize = Self.classifierArgmaxBlockSize
+        return hidden.withUnsafeBufferPointer { hiddenBuffer in
+            lmHeadWeights.withUnsafeBufferPointer { weightBuffer in
+                classifierBlockMaxNorms.withUnsafeBufferPointer { normsBuffer in
+                    classifierLogitsScratch.withUnsafeMutableBufferPointer { scratchBuffer in
+                        guard let hiddenBase = hiddenBuffer.baseAddress,
+                              let weightBase = weightBuffer.baseAddress,
+                              let normsBase = normsBuffer.baseAddress,
+                              let scratchBase = scratchBuffer.baseAddress else {
+                            return 0
                         }
+                        return Self.partitionedArgmax(
+                            classifier: weightBase,
+                            input: hiddenBase,
+                            logitsScratch: scratchBase,
+                            blockMaxNorms: normsBase,
+                            vocabSize: config.vocab,
+                            dim: config.dModel,
+                            blockSize: blockSize
+                        )
                     }
                 }
             }
-            return hidden.withUnsafeBufferPointer { hiddenBuffer in
-                lmHeadFP16.withUnsafeBufferPointer { weightBuffer in
-                    guard let hiddenBase = hiddenBuffer.baseAddress,
-                          let weightBase = weightBuffer.baseAddress else {
-                        return 0
-                    }
-                    return FP16TiledClassifier.tiledMatvecArgmax(
-                        weights: weightBase,
-                        input: hiddenBase,
-                        vocabSize: config.vocab,
-                        dim: config.dModel
-                    )
+        }
+    }
+
+    /// FP16 tiled CPU head over the packed blob; partitioned FP32 when no FP16 blob was loaded.
+    private mutating func fp16TiledArgmax(_ hidden: [Float]) -> Int {
+        guard case let .llama(assets) = assets, let lmHeadFP16 = assets.lmHeadFP16 else {
+            return partitionedFP32Argmax(hidden)
+        }
+        return hidden.withUnsafeBufferPointer { hiddenBuffer in
+            lmHeadFP16.withUnsafeBufferPointer { weightBuffer in
+                guard let hiddenBase = hiddenBuffer.baseAddress,
+                      let weightBase = weightBuffer.baseAddress else {
+                    return 0
                 }
+                return FP16TiledClassifier.tiledMatvecArgmax(
+                    weights: weightBase,
+                    input: hiddenBase,
+                    vocabSize: config.vocab,
+                    dim: config.dModel
+                )
             }
         }
     }
@@ -7009,6 +7041,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         private let strategy: ClassifierStrategy
         private let lmHeadWeights: [Float]
         private let lmHeadFP16: [UInt16]?
+        private let metalLMHead: MetalLMHeadArgmax?
         private let classifierBlockMaxNorms: [Float]
         private var logitsScratch: [Float]
         private let vocabSize: Int
@@ -7019,6 +7052,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             strategy: ClassifierStrategy,
             lmHeadWeights: [Float],
             lmHeadFP16: [UInt16]?,
+            metalLMHead: MetalLMHeadArgmax?,
             classifierBlockMaxNorms: [Float],
             vocab: Int,
             dModel: Int
@@ -7026,6 +7060,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             self.strategy = strategy
             self.lmHeadWeights = lmHeadWeights
             self.lmHeadFP16 = lmHeadFP16
+            self.metalLMHead = metalLMHead
             self.classifierBlockMaxNorms = classifierBlockMaxNorms
             self.logitsScratch = [Float](repeating: 0, count: vocab)
             self.vocabSize = vocab
@@ -7055,68 +7090,63 @@ public struct RealModelInferenceEngine: ~Copyable {
             }
             switch strategy {
             case .ane, .cpuPartitionedFP32:
-                return hidden.withUnsafeBufferPointer { hiddenBuffer in
-                    lmHeadWeights.withUnsafeBufferPointer { weightBuffer in
-                        classifierBlockMaxNorms.withUnsafeBufferPointer { normsBuffer in
-                            logitsScratch.withUnsafeMutableBufferPointer { scratchBuffer in
-                                guard let hiddenBase = hiddenBuffer.baseAddress,
-                                      let weightBase = weightBuffer.baseAddress,
-                                      let normsBase = normsBuffer.baseAddress,
-                                      let scratchBase = scratchBuffer.baseAddress else {
-                                    return 0
-                                }
-                                return RealModelInferenceEngine.partitionedArgmax(
-                                    classifier: weightBase,
-                                    input: hiddenBase,
-                                    logitsScratch: scratchBase,
-                                    blockMaxNorms: normsBase,
-                                    vocabSize: vocabSize,
-                                    dim: dim,
-                                    blockSize: RealModelInferenceEngine.classifierArgmaxBlockSize
-                                )
-                            }
-                        }
+                return partitionedFP32Argmax(hidden)
+            case .metalFP16GEMV:
+                if let metalLMHead {
+                    do {
+                        return try metalLMHead.argmax(hidden: hidden)
+                    } catch {
+                        fputs("[RealModelInference] metal_fp16_gemv step failed (\(error)); using cpu_fp16_tiled\n", stderr)
                     }
                 }
+                return fp16TiledArgmax(hidden)
             case .cpuFP16Tiled:
-                guard let lmHeadFP16 else {
-                    return hidden.withUnsafeBufferPointer { hiddenBuffer in
-                        lmHeadWeights.withUnsafeBufferPointer { weightBuffer in
-                            classifierBlockMaxNorms.withUnsafeBufferPointer { normsBuffer in
-                                logitsScratch.withUnsafeMutableBufferPointer { scratchBuffer in
-                                    guard let hiddenBase = hiddenBuffer.baseAddress,
-                                          let weightBase = weightBuffer.baseAddress,
-                                          let normsBase = normsBuffer.baseAddress,
-                                          let scratchBase = scratchBuffer.baseAddress else {
-                                        return 0
-                                    }
-                                    return RealModelInferenceEngine.partitionedArgmax(
-                                        classifier: weightBase,
-                                        input: hiddenBase,
-                                        logitsScratch: scratchBase,
-                                        blockMaxNorms: normsBase,
-                                        vocabSize: vocabSize,
-                                        dim: dim,
-                                        blockSize: RealModelInferenceEngine.classifierArgmaxBlockSize
-                                    )
-                                }
+                return fp16TiledArgmax(hidden)
+            }
+        }
+
+        private func partitionedFP32Argmax(_ hidden: [Float]) -> Int {
+            hidden.withUnsafeBufferPointer { hiddenBuffer in
+                lmHeadWeights.withUnsafeBufferPointer { weightBuffer in
+                    classifierBlockMaxNorms.withUnsafeBufferPointer { normsBuffer in
+                        logitsScratch.withUnsafeMutableBufferPointer { scratchBuffer in
+                            guard let hiddenBase = hiddenBuffer.baseAddress,
+                                  let weightBase = weightBuffer.baseAddress,
+                                  let normsBase = normsBuffer.baseAddress,
+                                  let scratchBase = scratchBuffer.baseAddress else {
+                                return 0
                             }
+                            return RealModelInferenceEngine.partitionedArgmax(
+                                classifier: weightBase,
+                                input: hiddenBase,
+                                logitsScratch: scratchBase,
+                                blockMaxNorms: normsBase,
+                                vocabSize: vocabSize,
+                                dim: dim,
+                                blockSize: RealModelInferenceEngine.classifierArgmaxBlockSize
+                            )
                         }
                     }
                 }
-                return hidden.withUnsafeBufferPointer { hiddenBuffer in
-                    lmHeadFP16.withUnsafeBufferPointer { weightBuffer in
-                        guard let hiddenBase = hiddenBuffer.baseAddress,
-                              let weightBase = weightBuffer.baseAddress else {
-                            return 0
-                        }
-                        return FP16TiledClassifier.tiledMatvecArgmax(
-                            weights: weightBase,
-                            input: hiddenBase,
-                            vocabSize: vocabSize,
-                            dim: dim
-                        )
+            }
+        }
+
+        private func fp16TiledArgmax(_ hidden: [Float]) -> Int {
+            guard let lmHeadFP16 else {
+                return partitionedFP32Argmax(hidden)
+            }
+            return hidden.withUnsafeBufferPointer { hiddenBuffer in
+                lmHeadFP16.withUnsafeBufferPointer { weightBuffer in
+                    guard let hiddenBase = hiddenBuffer.baseAddress,
+                          let weightBase = weightBuffer.baseAddress else {
+                        return 0
                     }
+                    return FP16TiledClassifier.tiledMatvecArgmax(
+                        weights: weightBase,
+                        input: hiddenBase,
+                        vocabSize: vocabSize,
+                        dim: dim
+                    )
                 }
             }
         }
@@ -7161,6 +7191,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             strategy: classifierStrategy,
             lmHeadWeights: lmHeadWeights,
             lmHeadFP16: fp16Head,
+            metalLMHead: metalLMHead,
             classifierBlockMaxNorms: classifierBlockMaxNorms,
             vocab: config.vocab,
             dModel: config.dModel

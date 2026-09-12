@@ -56,13 +56,9 @@ extension ForwardPass {
         precondition(tokenIndex < maxSeq)
 
         var t0 = RuntimeClock.now()
+        let controls = FusedControlColumns(dim: dim, headDim: headDim, tokenIndex: tokenIndex, ropeTheta: ropeTheta)
         for handles in surfaceHandles {
-            try writeFusedControlSurfaces(
-                handles: handles,
-                tokenIndex: tokenIndex,
-                headDim: headDim,
-                ropeTheta: ropeTheta
-            )
+            try writeFusedControlSurfaces(handles: handles, tokenIndex: tokenIndex, controls: controls)
         }
         do {
             try mapSurfaceIOToANEError {
@@ -166,45 +162,81 @@ extension ForwardPass {
         try decodeState.commitTokenStep(expectedIndex: tokenIndex)
     }
 
+    /// Per-token control columns shared by every layer of one decode step.
+    ///
+    /// The mask, position one-hot, and RoPE surfaces are identical across layers, so they are
+    /// computed once per step. Only the columns that change are written: the causal mask
+    /// keeps `0` for every committed position (set in earlier steps / cache init) and
+    /// `-1e4` beyond; the position one-hot moves by clearing the previous column; RoPE
+    /// touches channels `0..<headDim` of lane 0 only.
+    struct FusedControlColumns {
+        let zeros: [Float]
+        let ones: [Float]
+        let rope: [Float]
+
+        init(dim: Int, headDim: Int, tokenIndex: Int, ropeTheta: Float) {
+            let halfDim = headDim / 2
+            var rope = [Float](repeating: 0, count: headDim)
+            for idx in 0..<halfDim {
+                let angle = Float(tokenIndex) / powf(ropeTheta, Float(2 * idx) / Float(headDim))
+                rope[idx] = cosf(angle)
+                rope[halfDim + idx] = sinf(angle)
+            }
+            self.zeros = [Float](repeating: 0, count: dim)
+            self.ones = [Float](repeating: 1, count: dim)
+            self.rope = rope
+        }
+    }
+
     private static func writeFusedControlSurfaces(
         handles: FusedHybridDecodeSurfaceHandles,
         tokenIndex: Int,
-        headDim: Int,
-        ropeTheta: Float
+        controls: FusedControlColumns
     ) throws(ANEError) {
         let dim = handles.dim
         let maxSeq = handles.maxSeq
         let laneSpatial = handles.laneSpatial
-        let halfDim = headDim / 2
-
-        var mask = [Float](repeating: -1e4, count: dim * maxSeq)
-        var pos = [Float](repeating: 0, count: dim * maxSeq)
-        for spatial in 0...tokenIndex {
-            for channel in 0..<dim {
-                mask[channel * maxSeq + spatial] = 0
-            }
-        }
-        for channel in 0..<dim {
-            pos[channel * maxSeq + tokenIndex] = 1
-        }
-
-        var rope = [Float](repeating: 0, count: dim * laneSpatial)
-        for idx in 0..<halfDim {
-            let angle = Float(tokenIndex) / powf(ropeTheta, Float(2 * idx) / Float(headDim))
-            rope[idx * laneSpatial] = cosf(angle)
-            rope[(halfDim + idx) * laneSpatial] = sinf(angle)
-        }
-
         do {
             try mapSurfaceIOToANEError {
-                try mask.withUnsafeBufferPointer { src in
-                    try SurfaceIO.writeFP16(to: handles.mask, data: src, channels: dim, spatial: maxSeq)
+                try controls.zeros.withUnsafeBufferPointer { zeroColumn in
+                    if tokenIndex > 0 {
+                        try SurfaceIO.writeFP16SpatialSlice(
+                            to: handles.posMask,
+                            channelOffset: 0,
+                            spatialIndex: tokenIndex - 1,
+                            spatial: maxSeq,
+                            data: zeroColumn,
+                            channels: dim
+                        )
+                    }
+                    try SurfaceIO.writeFP16SpatialSlice(
+                        to: handles.mask,
+                        channelOffset: 0,
+                        spatialIndex: tokenIndex,
+                        spatial: maxSeq,
+                        data: zeroColumn,
+                        channels: dim
+                    )
                 }
-                try pos.withUnsafeBufferPointer { src in
-                    try SurfaceIO.writeFP16(to: handles.posMask, data: src, channels: dim, spatial: maxSeq)
+                try controls.ones.withUnsafeBufferPointer { oneColumn in
+                    try SurfaceIO.writeFP16SpatialSlice(
+                        to: handles.posMask,
+                        channelOffset: 0,
+                        spatialIndex: tokenIndex,
+                        spatial: maxSeq,
+                        data: oneColumn,
+                        channels: dim
+                    )
                 }
-                try rope.withUnsafeBufferPointer { src in
-                    try SurfaceIO.writeFP16(to: handles.ropePack, data: src, channels: dim, spatial: laneSpatial)
+                try controls.rope.withUnsafeBufferPointer { ropeColumn in
+                    try SurfaceIO.writeFP16SpatialSlice(
+                        to: handles.ropePack,
+                        channelOffset: 0,
+                        spatialIndex: 0,
+                        spatial: laneSpatial,
+                        data: ropeColumn,
+                        channels: controls.rope.count
+                    )
                 }
             }
         } catch {
